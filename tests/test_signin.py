@@ -92,6 +92,23 @@ def test_a_refused_exchange_is_reported_and_not_retried(env):
     assert not s.submit(f"https://example.com/cb?code=abc&state={st}")["ok"] and len(calls) == 1
 
 
+def test_no_new_sign_in_while_one_is_finishing(env):
+    s = None
+    seen = []
+
+    def during_exchange(cb, url):
+        seen.append(s.start())        # a second click while Schwab is answering
+    s = si.SignIn(exchange_fn=during_exchange)
+    st = _state(s.start())
+    assert s.submit(f"https://example.com/cb?code=abc&state={st}")["ok"]
+    assert seen[0]["ok"] is False and s.status()["phase"] == "done"
+
+
+def test_start_needs_the_secret_too(env, monkeypatch):
+    monkeypatch.delenv("SCHWAB_APP_SECRET")
+    assert si.SignIn().start()["ok"] is False
+
+
 def test_cancel_closes_the_sign_in(env):
     s, calls = _flow()
     st = _state(s.start())
@@ -133,14 +150,15 @@ def test_listener_catches_schwabs_redirect_and_stops(env, monkeypatch, tmp_path)
     assert page.status_code == 200 and "Signed in to Schwab" in page.text
     assert calls == [(f"https://127.0.0.1:{port}", f"https://127.0.0.1:{port}/?code=abc&state={_state(r)}")]
     assert s.status()["phase"] == "done" and s.status()["listening"] is False
-    for _ in range(50):     # the listener shuts down in the background
-        try:
-            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
-            time.sleep(0.05)
-        except OSError:
-            break
-    else:
-        pytest.fail("listener still accepting connections after the sign-in")
+    with pytest.raises(OSError):     # the port is closed as soon as the sign-in is done
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+
+
+def test_restarting_a_sign_in_rebinds_the_port(env, monkeypatch, tmp_path):
+    monkeypatch.setenv("SCHWAB_CALLBACK_URL", f"https://127.0.0.1:{_free_port()}")
+    s = si.SignIn(exchange_fn=lambda cb, url: None, cert_fn=lambda: si.ensure_certificate(tmp_path))
+    assert s.start()["listening"] and s.start()["listening"]
+    s.cancel()
 
 
 def test_signin_endpoints_need_the_dashboard_header():

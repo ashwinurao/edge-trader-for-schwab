@@ -129,11 +129,13 @@ class SignIn:
 
     def start(self) -> dict:
         key = os.environ.get("SCHWAB_APP_KEY")
-        if not key:
-            return {"ok": False, "error": "SCHWAB_APP_KEY is not set: put your app key and secret in .env, "
-                                          "then restart Edge Trader."}
+        if not key or not os.environ.get("SCHWAB_APP_SECRET"):
+            return {"ok": False, "error": "SCHWAB_APP_KEY / SCHWAB_APP_SECRET are not set: put your app key and "
+                                          "secret in .env, then restart Edge Trader."}
         cb = callback_url()
         with self._lock:
+            if self.phase == "exchanging":     # its result would overwrite the new sign-in
+                return {"ok": False, "error": "A sign-in is finishing with Schwab. Wait a moment."}
             self._stop_listener()
             self._state = secrets.token_urlsafe(24)
             self._deadline = time.monotonic() + FLOW_SECONDS
@@ -218,14 +220,20 @@ class SignIn:
         return True
 
     def _stop_listener(self) -> None:
+        """Close the port before returning, so a new sign-in can bind it straight away. Never called
+        from the serve_forever thread (requests run in their own threads), so shutdown() cannot hang."""
         server, self._server, self.listening = self._server, None, False
         if server is not None:
-            # shutdown() waits for serve_forever, which may be in the thread calling us: do it aside.
-            threading.Thread(target=lambda: (server.shutdown(), server.server_close()), daemon=True).start()
+            server.shutdown()
+            server.server_close()
 
 
 class _CatchServer(ThreadingHTTPServer):
     daemon_threads = True
+    block_on_close = False     # server_close() runs inside a request thread: it must not join it
+    # On Windows SO_REUSEADDR lets a second socket bind a port that is already listening; the port
+    # must be ours alone while a code can arrive on it.
+    allow_reuse_address = False
     signin: SignIn
 
     def handle_error(self, request, client_address):

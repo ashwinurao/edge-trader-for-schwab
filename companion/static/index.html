@@ -1088,7 +1088,7 @@ async function startSignin() {
     const r = await post("/api/signin/start");
     if (!r.ok) { if (w) w.close(); signinError(r.error || "Could not start the sign-in."); return; }
     SI.url = r.auth_url; SI.drawn = "";
-    if (w) w.location.href = r.auth_url;
+    if (w) { w.opener = null; w.location.href = r.auth_url; }
   } catch (e) {
     if (w) w.close();
     signinError("Edge Trader did not answer. Is it still running?");
