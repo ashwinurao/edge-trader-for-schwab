@@ -22,6 +22,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import __version__
 from .poller import Poller
+from .signin import SignIn
 from .trading import Trader
 from .view import private_view
 
@@ -49,6 +50,7 @@ class DemoPoller:
 
     def start(self): pass
     def stop(self): pass
+    def wake(self): pass
     def _merged_orders(self): return []
     def note_external_request(self, retry_after=None): pass
     def cooldown_left(self): return 0.0
@@ -59,6 +61,7 @@ trader = Trader(poller.store)
 poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
+signin = SignIn(on_done=poller.wake)
 
 
 @asynccontextmanager
@@ -70,6 +73,7 @@ async def lifespan(_app: FastAPI):
         from . import update_check
         threading.Thread(target=lambda: UPDATE.update({"info": update_check.check()}), daemon=True).start()
     yield
+    signin.cancel()
     poller.stop()
 
 
@@ -87,7 +91,8 @@ async def only_local_host(request: Request, call_next):
                                               or request.url.path in ("/api/ticket/submit", "/api/ticket/cancel",
                                                                       "/api/ticket/cancel_entries", "/api/ticket/arm",
                                                                       "/api/ticket/preview", "/api/ticket/plan",
-                                                                      "/api/ticket/lookup")):
+                                                                      "/api/ticket/lookup")
+                                              or request.url.path.startswith("/api/signin/")):
         return JSONResponse({"ok": False, "error": "Demo mode: no orders and no Schwab calls."})
     return await call_next(request)
 
@@ -132,7 +137,30 @@ def state():
     if PRIVATE:
         snap = private_view(snap)
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
-                         "version": __version__}, headers={"Cache-Control": "no-store"})
+                         "signin": signin.status(), "version": __version__}, headers={"Cache-Control": "no-store"})
+
+
+# Schwab sign-in from the dashboard (companion/signin.py): no console, no login.bat.
+
+@app.post("/api/signin/start")
+async def signin_start(request: Request):
+    """Open a sign-in: returns Schwab's authorize URL for the browser to open in a new tab."""
+    _guard(request)
+    return await run_in_threadpool(signin.start)
+
+
+@app.post("/api/signin/paste")
+async def signin_paste(request: Request):
+    """The address Schwab redirected to, pasted by hand when the local listener could not catch it."""
+    _guard(request)
+    url = str((await request.json()).get("url") or "")[:4000]
+    return await run_in_threadpool(signin.submit, url)
+
+
+@app.post("/api/signin/cancel")
+async def signin_cancel(request: Request):
+    _guard(request)
+    return signin.cancel()
 
 
 @app.post("/api/ui/select")

@@ -98,6 +98,11 @@
   .banner.update { background: var(--blue-bg); color: #b9d0ff; border-color: rgba(76,141,255,.4); font-weight: 500; }
   .banner.update a { color: #fff; } .banner.update button { margin-left: 10px; }
   .banner.conn { background: var(--red); color: #fff; font-size: 14px; font-weight: 700; padding: 10px 16px; }
+  .banner.signin { background: var(--blue-bg); color: #b9d0ff; border-color: rgba(76,141,255,.4); font-weight: 500; }
+  .banner.signin.bad { background: var(--red-bg); color: var(--red); border-color: rgba(229,83,75,.4); }
+  .banner.signin a { color: #fff; } .banner.signin .btn { margin-left: 8px; }
+  .banner.signin input { width: min(360px, 60vw); margin-left: 8px; padding: 3px 6px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; }
+  #auth.click { cursor: pointer; }
 
   .stats { display: grid; grid-template-columns: 1.5fr 1fr 1fr .8fr .8fr; border-bottom: 1px solid var(--line); }
   .stat { padding: 6px 16px; border-right: 1px solid var(--line); min-width: 0; } .stat:last-child { border: 0; }
@@ -292,6 +297,7 @@
   <span class="clock" id="clock"></span>
   <span class="pill" id="mkt-state"></span>
   <span class="pill" id="auth">auth</span>
+  <button type="button" class="btn sm only-main" id="signin-btn" style="display:none" title="Sign in to Schwab in a new tab; Edge Trader picks up the login by itself">Sign in to Schwab</button>
   <button type="button" class="btn sm ghost voice" id="voice" title="Spoken alert 10 minutes before the close if day trades are still open. Click to switch on/off; Shift+click to test."></button>
   <button type="button" class="armchip" id="arm-chip" title="Entries need arming; position actions do not">Entries disarmed</button>
   <span class="only-main"><button type="button" class="btn sm ghost" data-open="entry" title="Small always-on-top window with the New trade ticket">Entry ⧉</button>
@@ -301,6 +307,7 @@
 <div id="strip" class="strip only-manage"></div>
 <div class="banner update" id="update-banner"></div>
 <div class="banner close-alert" id="close-alert"></div>
+<div class="banner signin only-main" id="signin-banner"></div>
 <div class="banner" id="banner"></div>
 <div class="banner conn" id="conn-banner"></div>
 <div class="stats">
@@ -1037,6 +1044,67 @@ function renderUpdate(st) {
     <button type="button" class="btn sm ghost" id="update-hide">Hide</button>`;
   $("update-hide").onclick = () => { UPDATE_HIDDEN = u.version; try { localStorage.setItem("updateHidden", u.version); } catch (e) {} b.style.display = "none"; };
 }
+// Schwab sign-in from the dashboard: the server catches Schwab's redirect on https://127.0.0.1, or
+// the address is pasted here when it cannot. The banner is redrawn only when the sign-in changes,
+// so a half-typed paste is not wiped by the next state update.
+const SI = {busy: false, drawn: "", url: null, demo: false};
+function renderSignin(st) {
+  const s = st.signin || {phase: "idle"}, hl = st.auth_hours_left, b = $("signin-banner");
+  const open = s.phase === "waiting" || s.phase === "exchanging";
+  SI.demo = !!st.demo;
+  $("signin-btn").style.display = !st.demo && !VIEW && !open && (hl == null || hl < 48) ? "" : "none";
+  if (VIEW || st.demo || s.phase === "idle") {
+    if (SI.drawn !== "error") { b.style.display = "none"; SI.drawn = ""; }
+    return;
+  }
+  const key = `${s.phase}|${s.message}|${s.listening}|${SI.url}`;
+  if (key === SI.drawn) return;
+  SI.drawn = key;
+  b.className = "banner signin only-main" + (s.phase === "failed" || s.phase === "expired" ? " bad" : "");
+  b.style.display = "block";
+  const reopen = s.phase === "waiting" && SI.url ? ` <a href="${esc(SI.url)}" target="_blank" rel="noopener">Open Schwab's page</a>` : "";
+  const paste = s.phase === "waiting" ? `<input id="si-url" placeholder="${esc(s.callback)}/?code=...&amp;state=..." autocomplete="off" spellcheck="false">`
+    + `<button type="button" class="btn sm" id="si-use">Use address</button>` : "";
+  const again = s.phase === "failed" || s.phase === "expired" ? `<button type="button" class="btn sm" id="si-again">Sign in again</button>` : "";
+  const close = s.phase === "exchanging" ? "" : `<button type="button" class="btn sm ghost" id="si-close">${s.phase === "waiting" ? "Cancel" : "Close"}</button>`;
+  b.innerHTML = `<b>Schwab sign-in:</b> ${esc(s.message)}${reopen}${paste}${again}${close} <span id="si-err"></span>`;
+  if ($("si-use")) $("si-use").onclick = pasteSignin;
+  if ($("si-url")) $("si-url").onkeydown = e => { if (e.key === "Enter") pasteSignin(); };
+  if ($("si-again")) $("si-again").onclick = startSignin;
+  if ($("si-close")) $("si-close").onclick = () => { SI.url = null; post("/api/signin/cancel").catch(() => {}); };
+}
+function signinError(text) {
+  const b = $("signin-banner");
+  if ($("si-err")) { $("si-err").textContent = text; return; }
+  b.className = "banner signin only-main bad"; b.style.display = "block"; SI.drawn = "error";
+  b.innerHTML = `<b>Schwab sign-in:</b> ${esc(text)} <button type="button" class="btn sm ghost" id="si-close">Close</button>`;
+  $("si-close").onclick = () => { b.style.display = "none"; SI.drawn = ""; };
+}
+async function startSignin() {
+  if (SI.busy || SI.demo || VIEW) return;
+  SI.busy = true;
+  const w = window.open("", "_blank");   // opened inside the click, so the popup blocker lets it through
+  try {
+    const r = await post("/api/signin/start");
+    if (!r.ok) { if (w) w.close(); signinError(r.error || "Could not start the sign-in."); return; }
+    SI.url = r.auth_url; SI.drawn = "";
+    if (w) w.location.href = r.auth_url;
+  } catch (e) {
+    if (w) w.close();
+    signinError("Edge Trader did not answer. Is it still running?");
+  } finally { SI.busy = false; }
+}
+async function pasteSignin() {
+  const url = ($("si-url")?.value || "").trim();
+  if (!url) return signinError("Paste the address of the page Schwab sent you to.");
+  try {
+    const r = await post("/api/signin/paste", {url});
+    if (!r.ok) signinError(r.error || "Sign-in failed.");
+  } catch (e) { signinError("Edge Trader did not answer. Is it still running?"); }
+}
+$("signin-btn").onclick = startSignin;
+$("auth").onclick = () => { if ($("auth").classList.contains("click")) startSignin(); };
+
 function render(st) {
   renderUpdate(st);
   $("status").textContent = st.demo ? "DEMO: invented data, no orders" : (st.status || "starting");
@@ -1045,7 +1113,9 @@ function render(st) {
   $("fresh").innerHTML = freshness(st.freshness);
   const hl = st.auth_hours_left;
   $("auth").textContent = hl == null ? "login ?" : hl > 48 ? `Login ${Math.floor(hl / 24)}d left` : `Login ${Math.floor(hl)}h left`;
-  $("auth").className = "pill" + (hl == null || hl < 4 ? " bad" : hl < 24 ? " warn" : "");
+  $("auth").className = "pill" + (hl == null || hl < 4 ? " bad" : hl < 24 ? " warn" : "") + (st.demo || VIEW ? "" : " click");
+  $("auth").title = st.demo || VIEW ? "" : "Click to sign in to Schwab again (the login lasts 7 days)";
+  renderSignin(st);
   const banner = $("banner");
   if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
   else banner.style.display = "none";

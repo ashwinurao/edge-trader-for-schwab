@@ -86,6 +86,7 @@ class Poller:
         self._sent: deque[float] = deque()
         self._cooldown_until = 0.0
         self._stop = threading.Event()
+        self._wake = threading.Event()       # set by a sign-in from the dashboard
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
@@ -99,6 +100,15 @@ class Poller:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        """A new Schwab login was saved: connect now instead of after the auth wait."""
+        self._wake.set()
+
+    def _auth_wait(self, seconds: float) -> None:
+        self._wake.wait(seconds)
+        self._wake.clear()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -519,7 +529,7 @@ class Poller:
                 if self.client is None:
                     if not self._connect():
                         self._publish_status()
-                        self._stop.wait(30)
+                        self._auth_wait(30)
                         continue
                     self.status = "loading 60 days of fills"
                     self._publish_status()
@@ -532,10 +542,10 @@ class Poller:
                 left = schwab.auth_hours_left()
                 if left is None or left < schwab.SAFETY_HOURS:
                     # Keep serving cached data, clearly stale; never trigger an interactive login.
-                    self.status = "Schwab login expiring: run login.bat (python -m companion.login)"
+                    self.status = "Schwab login expiring: click Sign in (or run login.bat)"
                     self.client = None
                     self._publish_status()
-                    self._stop.wait(60)
+                    self._auth_wait(60)
                     continue
 
                 changed = False

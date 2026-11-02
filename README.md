@@ -114,7 +114,7 @@ steps with a video):
    for orders through the API.
 6. Open the app (**Modify App**) and check its **Order Limit** is above 0. With 0, every order is
    refused with HTTP 429 even though everything else works.
-7. Copy the **App Key** and **Secret** into `.env`. On your first `login.bat`, Schwab asks you to agree
+7. Copy the **App Key** and **Secret** into `.env`. On your first sign-in, Schwab asks you to agree
    to the terms and pick the account(s) the app may use.
 
 ## Quick start
@@ -126,10 +126,17 @@ Requirements: Windows 10 or 11 and [Python 3.11 or newer](https://www.python.org
 
 1. `setup.bat`, once. It creates `.venv`, installs Schwabdev, FastAPI and the rest, and creates `.env`.
 2. Put your Schwab App Key and Secret in `.env` (see [Your Schwab app](#your-schwab-app)).
-3. `login.bat`. It opens Schwab's sign-in page through Schwabdev; approve, then paste the address of
-   the page you land on (it will not load, that is expected). Repeat about once a week: Schwab's
-   sign-in lasts 7 days.
-4. `launch.bat`, every time. It opens http://127.0.0.1:8770. `stop.bat` stops it.
+3. `launch.bat`, every time. It opens http://127.0.0.1:8770. `stop.bat` stops it.
+4. Click **Sign in to Schwab** at the top of the dashboard (it shows when you are not signed in or the
+   sign-in is running out; the "Login" pill does the same any time). Schwab's page opens in a new
+   tab; approve and pick your account. Schwab then sends that tab back to `https://127.0.0.1`, where
+   Edge Trader catches the sign-in by itself and connects. The first time, the browser warns about
+   127.0.0.1's certificate (Edge Trader makes its own, kept in `data/signin-tls/`): choose
+   **Advanced**, then **Proceed to 127.0.0.1**. Repeat about once a week: Schwab's sign-in lasts 7 days.
+
+   If the sign-in cannot be caught (port 443 already in use, or a callback URL that is not on this
+   computer), the dashboard asks you to paste the address of the page Schwab sent you to instead.
+   `login.bat` still works too, from a console window.
 
 **Manual setup (Mac, Linux, or if you prefer):**
 

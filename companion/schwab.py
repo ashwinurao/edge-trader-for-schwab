@@ -3,7 +3,8 @@
 Keys come from `.env` in the app folder (SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_CALLBACK_URL);
 SCHWAB_ENV_FILE can point to another .env to share keys with another app. Tokens live in
 ~/.schwabdev/tokens.db (SCHWAB_TOKENS_DB overrides); schwabdev coordinates refreshes across
-processes, so apps sharing the token file can run at once. `python -m companion.login` signs in.
+processes, so apps sharing the token file can run at once. The dashboard's Sign in button
+(companion/signin.py) or `python -m companion.login` signs in.
 
 Never opens a streamer: Schwab allows one per user and another app (a scanner, a charting tool)
 may hold it. REST polling only.
@@ -102,12 +103,12 @@ def make_client(allowed: frozenset[str] = _ALLOWED) -> ReadOnlyClient:
     left = auth_hours_left()
     if left is None or left < SAFETY_HOURS:
         raise AuthExpired(
-            "Schwab login expired or expiring. Run login.bat (python -m companion.login), "
-            "then restart Edge Trader.")
+            "Schwab login expired or expiring. Click Sign in at the top of the dashboard "
+            "(or run login.bat).")
     import schwabdev
 
     def _no_prompt(*_a, **_k):
-        raise AuthExpired("Schwab needs a browser login: run login.bat (python -m companion.login)")
+        raise AuthExpired("Schwab needs a browser login: click Sign in at the top of the dashboard")
 
     key = os.environ.get("SCHWAB_APP_KEY")
     secret = os.environ.get("SCHWAB_APP_SECRET")
