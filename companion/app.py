@@ -28,7 +28,13 @@ from .view import private_view
 
 STATIC = Path(__file__).resolve().parent / "static"
 PORT = int(os.environ.get("COMPANION_PORT", "8770"))
-ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
+# Server mode (Docker on a home server): listen on COMPANION_HOST and accept the extra host:port
+# names in EDGE_TRADER_HOSTS (e.g. 192.168.1.10:8770). There is no login page, so publish the port
+# on the LAN only, never on the internet.
+BIND = os.environ.get("COMPANION_HOST", "127.0.0.1")
+EXTRA_HOSTS = {h.strip() for h in os.environ.get("EDGE_TRADER_HOSTS", "").split(",") if h.strip()}
+SERVER = os.environ.get("EDGE_TRADER_SERVER") == "1"   # no desktop here: floating windows open in the browser
+ORIGINS = {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"} | {f"http://{h}" for h in EXTRA_HOSTS}
 DEMO = os.environ.get("EDGE_TRADER_DEMO") == "1"     # synthetic data, no Schwab, no orders
 PRIVATE = os.environ.get("EDGE_TRADER_PRIVATE") == "1"   # hide carried positions and account value
 
@@ -78,7 +84,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Edge Trader for Schwab", lifespan=lifespan, docs_url=None, redoc_url=None)
-HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"} | EXTRA_HOSTS
 
 
 @app.middleware("http")
@@ -136,7 +142,7 @@ def state():
     snap = poller.snapshot()
     if PRIVATE:
         snap = private_view(snap)
-    return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO,
+    return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO, "server": SERVER,
                          "signin": signin.status(), "version": __version__}, headers={"Cache-Control": "no-store"})
 
 
@@ -207,6 +213,8 @@ async def floating_open(request: Request):
     kind = (await request.json()).get("kind")
     if kind not in ("entry", "manage"):
         raise HTTPException(400, "kind must be entry or manage")
+    if SERVER:      # the window would open on the server, not in front of you
+        return {"ok": False, "error": "server mode: the page opens it as a browser window"}
     exe = Path(sys.executable)
     pyw = exe.with_name("pythonw.exe")
     subprocess.Popen([str(pyw if pyw.exists() else exe), "-m", "companion.floating", kind],
@@ -387,4 +395,4 @@ def main() -> None:
     logging.getLogger("companion").info("Edge Trader %s starting (pid %s)%s", __version__, os.getpid(),
                                         " in DEMO mode" if DEMO else "")
     # One process, no reload: exactly one poller.
-    uvicorn.run(app, host="127.0.0.1", port=PORT, workers=1, log_level="warning")
+    uvicorn.run(app, host=BIND, port=PORT, workers=1, log_level="warning")

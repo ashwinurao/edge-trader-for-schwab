@@ -1,0 +1,25 @@
+# Edge Trader on a home server. Settings come from .env next to this file (never committed):
+#   SCHWAB_APP_KEY, SCHWAB_APP_SECRET        the Schwab app
+#   LAN_IP                                   the server's LAN address; the port is published there only
+#   EDGE_TRADER_HOSTS                        host:port names you open it by, e.g. 192.168.1.10:8770
+#   EDGE_TRADER_DATA                         folder for Edge Trader's data (orders, fills, tokens)
+# Shared login (optional, when another app on the server already signs in with the same Schwab app):
+#   SHARED_SCHWAB_DIR                        folder holding the other app's token file (mounted read-only)
+#   SCHWAB_SHARED_TOKEN_FILE                 the file inside the container, e.g. /shared-schwab/token.fernet
+#   SCHWAB_SHARED_TOKEN_KEY                  its Fernet key
+#   SCHWAB_SHARED_APP_NAME                   that app's name, for "sign in again in ..." messages
+# There is no login page: never publish this port to the internet.
+services:
+  edge-trader:
+    build: .
+    image: edge-trader:local
+    container_name: edge-trader
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: ${TZ:-America/New_York}
+    ports:
+      - "${LAN_IP:?set LAN_IP in .env}:8770:8770"
+    volumes:
+      - ${EDGE_TRADER_DATA:-./data}:/app/data
+      - ${SHARED_SCHWAB_DIR:-./shared-schwab-unused}:/shared-schwab:ro

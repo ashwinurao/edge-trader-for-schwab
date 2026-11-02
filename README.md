@@ -151,6 +151,30 @@ cp .env.example .env                                     # then put your App Key
 Every install starts empty: Edge Trader shows only what your Schwab account reports, and keeps
 nothing from anyone else.
 
+## Running on a home server (Docker)
+
+`compose.yaml` runs Edge Trader in a container (built from the `Dockerfile`) and publishes it on
+your server's LAN address only. There is no login page and the app can place orders, so never
+expose the port to the internet: open it from your home network (or a VPN into it).
+
+1. Clone the repo on the server and create `.env` next to `compose.yaml` with `SCHWAB_APP_KEY`,
+   `SCHWAB_APP_SECRET`, `LAN_IP` (e.g. `192.168.1.10`), `EDGE_TRADER_HOSTS` (e.g.
+   `192.168.1.10:8770`, the address you type in the browser) and `EDGE_TRADER_DATA` (a folder for
+   its data).
+2. `docker compose up -d --build`, then open `http://<LAN_IP>:8770`.
+
+The Entry and Manage buttons open browser popups in this mode. For always-on-top windows, run
+`python -m companion.floating entry` on your PC with `EDGE_TRADER_URL=http://<LAN_IP>:8770`.
+
+**Sharing another app's Schwab login.** Schwab allows one app per developer and one valid sign-in
+per app: when two programs use the same app key, each sign-in revokes the other's. If another app
+on the server already signs in (with schwab-py, storing a Fernet-encrypted token file), point Edge
+Trader at that file instead and it never signs in itself: set `SHARED_SCHWAB_DIR` (the folder,
+mounted read-only), `SCHWAB_SHARED_TOKEN_FILE` (e.g. `/shared-schwab/token.fernet`),
+`SCHWAB_SHARED_TOKEN_KEY` (its Fernet key) and optionally `SCHWAB_SHARED_APP_NAME`. Edge Trader
+picks up each new sign-in from that file and makes its own access tokens from it; renew the login
+in the other app every 7 days.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update

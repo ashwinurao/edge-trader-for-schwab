@@ -6,11 +6,19 @@ SCHWAB_ENV_FILE can point to another .env to share keys with another app. Tokens
 processes, so apps sharing the token file can run at once. The dashboard's Sign in button
 (companion/signin.py) or `python -m companion.login` signs in.
 
+Shared login (SCHWAB_SHARED_TOKEN_FILE + SCHWAB_SHARED_TOKEN_KEY): Schwab keeps one valid sign-in
+per app, so when another app signs in with the same key it revokes ours, and the reverse. With these
+set, Edge Trader never signs in itself. It reads the other app's login (a schwab-py token file,
+Fernet-encrypted) whenever that file changes, copies it into its own tokens.db, and schwabdev makes
+Edge Trader's own access tokens from it. The other file is only ever read.
+
 Never opens a streamer: Schwab allows one per user and another app (a scanner, a charting tool)
 may hold it. REST polling only.
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -58,8 +66,77 @@ class AuthExpired(RuntimeError):
     pass
 
 
+SHARED_TOKEN_FILE = (Path(os.path.expanduser(os.environ["SCHWAB_SHARED_TOKEN_FILE"]))
+                     if os.environ.get("SCHWAB_SHARED_TOKEN_FILE") else None)
+_shared_seen: tuple | None = None     # (mtime_ns, size) of the shared file last copied
+log = logging.getLogger("companion.schwab")
+
+
+def shared_login() -> bool:
+    return SHARED_TOKEN_FILE is not None
+
+
+def signin_hint() -> str:
+    """What to do when the Schwab login is missing or running out."""
+    if shared_login():
+        name = os.environ.get("SCHWAB_SHARED_APP_NAME") or "the app whose login Edge Trader shares"
+        return f"sign in to Schwab again in {name}"
+    return "click Sign in at the top of the dashboard (or run login.bat)"
+
+
+_SCHEMA = """CREATE TABLE IF NOT EXISTS schwabdev (
+    access_token_issued TEXT NOT NULL, refresh_token_issued TEXT NOT NULL,
+    access_token TEXT NOT NULL, refresh_token TEXT NOT NULL, id_token TEXT NOT NULL,
+    expires_in INTEGER, token_type TEXT, scope TEXT)"""   # schwabdev's own table
+
+
+def sync_shared_token(src: Path | None = None, key: str | None = None, db: Path | None = None) -> bool:
+    """Copy the shared login into tokens.db if it changed since the last copy. Returns True if copied.
+
+    Only a new refresh token is copied: access tokens refreshed here stay ours. Never raises: a
+    missing or unreadable file leaves tokens.db as it is (the login then runs out and says so)."""
+    global _shared_seen
+    src, db = src or SHARED_TOKEN_FILE, db or TOKENS_DB
+    key = key or os.environ.get("SCHWAB_SHARED_TOKEN_KEY", "")
+    if src is None:
+        return False
+    try:
+        st = src.stat()
+        seen = (st.st_mtime_ns, st.st_size)
+        if seen == _shared_seen:
+            return False
+        from cryptography.fernet import Fernet
+        payload = json.loads(Fernet(key.encode()).decrypt(src.read_bytes()))
+        tok = payload["token"]
+        refresh = tok["refresh_token"]
+        rt_issued = datetime.fromtimestamp(float(payload["creation_timestamp"]), timezone.utc)
+        expires_in = int(tok.get("expires_in") or 1800)
+        at_issued = (datetime.fromtimestamp(float(tok["expires_at"]) - expires_in, timezone.utc)
+                     if tok.get("expires_at") else rt_issued)
+    except Exception as e:
+        log.warning("shared Schwab login %s not readable: %s", src, type(e).__name__)
+        return False
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db, timeout=30) as con:
+        con.execute(_SCHEMA)
+        row = con.execute("select refresh_token from schwabdev").fetchone()
+        if row and row[0] == refresh:
+            _shared_seen = seen       # the other app refreshed its access token: nothing new for us
+            return False
+        con.execute("delete from schwabdev")
+        con.execute("insert into schwabdev values (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (at_issued.isoformat(), rt_issued.isoformat(), tok.get("access_token") or "", refresh,
+                     tok.get("id_token") or "", expires_in, tok.get("token_type") or "Bearer",
+                     tok.get("scope") or "api"))
+    _shared_seen = seen
+    log.info("copied the shared Schwab login (issued %s)", rt_issued.isoformat(timespec="seconds"))
+    return True
+
+
 def refresh_token_age_days(db: Path = TOKENS_DB) -> float | None:
     """Days since Schwab issued the refresh token, or None. Reads only the timestamp."""
+    if shared_login() and db == TOKENS_DB:
+        sync_shared_token()
     try:
         with sqlite3.connect(db) as con:
             row = con.execute("select refresh_token_issued from schwabdev").fetchone()
@@ -103,12 +180,11 @@ def make_client(allowed: frozenset[str] = _ALLOWED) -> ReadOnlyClient:
     left = auth_hours_left()
     if left is None or left < SAFETY_HOURS:
         raise AuthExpired(
-            "Schwab login expired or expiring. Click Sign in at the top of the dashboard "
-            "(or run login.bat).")
+            f"Schwab login expired or expiring: {signin_hint()}.")
     import schwabdev
 
     def _no_prompt(*_a, **_k):
-        raise AuthExpired("Schwab needs a browser login: click Sign in at the top of the dashboard")
+        raise AuthExpired(f"Schwab needs a browser login: {signin_hint()}")
 
     key = os.environ.get("SCHWAB_APP_KEY")
     secret = os.environ.get("SCHWAB_APP_SECRET")

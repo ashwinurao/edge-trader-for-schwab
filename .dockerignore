@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+venv
+.env
+data
+tests
+docs
+scripts
+**/__pycache__
+*.pyc
+*.bat
+*.lnk

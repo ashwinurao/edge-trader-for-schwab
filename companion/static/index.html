@@ -498,7 +498,11 @@ document.addEventListener("click", e => {
     return;
   }
   const o = e.target.closest("[data-open]");
-  if (o) post("/api/floating/open", {kind: o.dataset.open}).catch(() => {});
+  if (!o) return;
+  // Server mode: a native window would open on the server, so open the compact view as a popup here.
+  if (SERVER_MODE) window.open(`/?view=${o.dataset.open}`, `edge-${o.dataset.open}`,
+    o.dataset.open === "entry" ? "popup,width=380,height=700" : "popup,width=560,height=560");
+  else post("/api/floating/open", {kind: o.dataset.open}).catch(() => {});
 });
 let ONTOP = true;
 $("ontop").addEventListener("click", async () => {
@@ -1047,12 +1051,14 @@ function renderUpdate(st) {
 // Schwab sign-in from the dashboard: the server catches Schwab's redirect on https://127.0.0.1, or
 // the address is pasted here when it cannot. The banner is redrawn only when the sign-in changes,
 // so a half-typed paste is not wiped by the next state update.
-const SI = {busy: false, drawn: "", url: null, demo: false};
+const SI = {busy: false, drawn: "", url: null, demo: false, shared: false};
+let SERVER_MODE = false;
 function renderSignin(st) {
   const s = st.signin || {phase: "idle"}, hl = st.auth_hours_left, b = $("signin-banner");
   const open = s.phase === "waiting" || s.phase === "exchanging";
-  SI.demo = !!st.demo;
-  $("signin-btn").style.display = !st.demo && !VIEW && !open && (hl == null || hl < 48) ? "" : "none";
+  SI.demo = !!st.demo; SI.shared = !!s.shared; SERVER_MODE = !!st.server;
+  // A shared login is renewed in the app it belongs to: signing in here would revoke it.
+  $("signin-btn").style.display = !st.demo && !VIEW && !SI.shared && !open && (hl == null || hl < 48) ? "" : "none";
   if (VIEW || st.demo || s.phase === "idle") {
     if (SI.drawn !== "error") { b.style.display = "none"; SI.drawn = ""; }
     return;
@@ -1113,8 +1119,10 @@ function render(st) {
   $("fresh").innerHTML = freshness(st.freshness);
   const hl = st.auth_hours_left;
   $("auth").textContent = hl == null ? "login ?" : hl > 48 ? `Login ${Math.floor(hl / 24)}d left` : `Login ${Math.floor(hl)}h left`;
-  $("auth").className = "pill" + (hl == null || hl < 4 ? " bad" : hl < 24 ? " warn" : "") + (st.demo || VIEW ? "" : " click");
-  $("auth").title = st.demo || VIEW ? "" : "Click to sign in to Schwab again (the login lasts 7 days)";
+  const shared = !!(st.signin && st.signin.shared);
+  $("auth").className = "pill" + (hl == null || hl < 4 ? " bad" : hl < 24 ? " warn" : "") + (st.demo || VIEW || shared ? "" : " click");
+  $("auth").title = st.demo || VIEW ? "" : shared ? "Schwab login shared with another app: sign in again there when it runs out (7 days)"
+    : "Click to sign in to Schwab again (the login lasts 7 days)";
   renderSignin(st);
   const banner = $("banner");
   if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
