@@ -11,3 +11,5 @@ scripts
 *.pyc
 *.bat
 *.lnk
+.claude
+.logs
