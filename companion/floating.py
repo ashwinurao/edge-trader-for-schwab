@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 
 PORT = int(os.environ.get("COMPANION_PORT", "8770"))
+# EDGE_TRADER_URL points the windows at an Edge Trader running elsewhere (e.g. on a home server).
+URL = os.environ.get("EDGE_TRADER_URL", f"http://127.0.0.1:{PORT}").rstrip("/")
 DATA = Path(__file__).resolve().parent.parent / "data"
 GEOM = DATA / "floating.json"
 DEFAULTS = {"entry": {"width": 380, "height": 700}, "manage": {"width": 560, "height": 560}}
@@ -62,7 +64,7 @@ def main() -> None:
         raise SystemExit("usage: python -m companion.floating entry|manage")
     g = {**DEFAULTS[kind], **_load().get(kind, {})}
     api = Api(kind)
-    win = webview.create_window(TITLES[kind], f"http://127.0.0.1:{PORT}/?view={kind}", js_api=api,
+    win = webview.create_window(TITLES[kind], f"{URL}/?view={kind}", js_api=api,
                                 width=g["width"], height=g["height"], x=g.get("x"), y=g.get("y"),
                                 on_top=g.get("pinned", True), min_size=(320, 300),
                                 background_color="#0b0e13")

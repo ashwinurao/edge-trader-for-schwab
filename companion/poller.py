@@ -542,7 +542,7 @@ class Poller:
                 left = schwab.auth_hours_left()
                 if left is None or left < schwab.SAFETY_HOURS:
                     # Keep serving cached data, clearly stale; never trigger an interactive login.
-                    self.status = "Schwab login expiring: click Sign in (or run login.bat)"
+                    self.status = f"Schwab login expiring: {schwab.signin_hint()}"
                     self.client = None
                     self._publish_status()
                     self._auth_wait(60)

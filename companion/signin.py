@@ -125,9 +125,13 @@ class SignIn:
             if self.phase == "waiting" and time.monotonic() > self._deadline:
                 self._finish("expired", "The sign-in timed out. Click Sign in to start again.")
             return {"phase": self.phase, "message": self.message, "listening": self.listening,
-                    "callback": callback_url()}
+                    "callback": callback_url(), "shared": schwab.shared_login()}
 
     def start(self) -> dict:
+        if schwab.shared_login():
+            # Signing in here would revoke the other app's login (one per Schwab app).
+            return {"ok": False, "error": f"Edge Trader shares another app's Schwab login here: "
+                                          f"{schwab.signin_hint()}."}
         key = os.environ.get("SCHWAB_APP_KEY")
         if not key or not os.environ.get("SCHWAB_APP_SECRET"):
             return {"ok": False, "error": "SCHWAB_APP_KEY / SCHWAB_APP_SECRET are not set: put your app key and "
