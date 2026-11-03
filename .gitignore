@@ -8,6 +8,9 @@ data/
 *.db-shm
 *.log
 
+# scratch artifacts (test output, screenshots, notes)
+.logs/
+
 # python
 __pycache__/
 *.pyc
