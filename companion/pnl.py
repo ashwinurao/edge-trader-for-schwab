@@ -22,6 +22,9 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 EPS = 1e-9
+# Stocks, ETFs and options: the equity session. Schwab types ETFs (SOXL, TQQQ, ...) as
+# COLLECTIVE_INVESTMENT, not EQUITY.
+SECURITIES = frozenset({"EQUITY", "COLLECTIVE_INVESTMENT", "OPTION"})
 
 
 def parse_time(s: str) -> datetime:
