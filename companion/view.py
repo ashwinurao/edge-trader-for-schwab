@@ -10,7 +10,7 @@ import re
 from datetime import datetime, timezone
 
 from .orders import PendingOrder, pending_orders, stop_coverage
-from .pnl import (Book, Fill, build_book, fills_from_transactions, opening_inventory,
+from .pnl import (SECURITIES, Book, Fill, build_book, fills_from_transactions, opening_inventory,
                   session_day)
 
 _OCC = re.compile(r"^(?P<root>[A-Z.]+)\s*(?P<y>\d\d)(?P<m>\d\d)(?P<d>\d\d)(?P<cp>[CP])(?P<strike>\d{8})$")
@@ -192,7 +192,7 @@ def _filled_in_orders(orders: list[dict], day) -> float:
     def walk(o):
         nonlocal total
         legs = o.get("orderLegCollection") or []
-        if legs and all((l.get("instrument") or {}).get("assetType") in ("EQUITY", "OPTION") for l in legs):
+        if legs and all((l.get("instrument") or {}).get("assetType") in SECURITIES for l in legs):
             # Each execution carries its own time: an old GTC order that fills today counts today.
             for act in o.get("orderActivityCollection") or []:
                 if act.get("executionType") != "FILL":
@@ -229,19 +229,24 @@ def build_state(*, account: dict | None, orders: list[dict], txns: list[dict], q
     acct = (account or {}).get("securitiesAccount") or {}
 
     positions = _position_rows(acct, pend, quotes, book, orders_fresh) if acct else []
-    closed_today = sorted(book.closed_on(eq_today, {"EQUITY", "OPTION"})
+    closed_today = sorted(book.closed_on(eq_today, SECURITIES)
                           + book.closed_on(fut_today, {"FUTURE"}),
                           key=lambda t: t.closed, reverse=True)
-    sec = book.realized_on(eq_today, fills, {"EQUITY", "OPTION"})
+    sec = book.realized_on(eq_today, fills, SECURITIES)
     fut = book.realized_on(fut_today, fills, {"FUTURE"})
     for r in (sec, fut):
         r["complete"] = r["lots_complete"] and history_complete
-    # Stock and option shares Schwab's orders report as filled today versus the fills already in
+    # Stock, ETF and option shares Schwab's orders report as filled today versus the fills already in
     # /transactions: more in the orders means fills are still on their way.
     order_filled = _filled_in_orders(orders, eq_today)
-    tx_filled = sum(abs(f.qty) for f in fills if f.asset_type in ("EQUITY", "OPTION") and f.day == eq_today)
+    tx_filled = sum(abs(f.qty) for f in fills if f.asset_type in SECURITIES and f.day == eq_today)
     sec["fills_pending"] = max(0.0, order_filled - tx_filled)
     if sec["fills_pending"] > 1e-9:
+        sec["complete"] = False
+    # Fills today of an asset type the P&L does not handle: name them, never a silent gap.
+    sec["uncounted"] = sorted({f.symbol for f in fills if f.day == eq_today
+                               and f.asset_type not in SECURITIES and f.asset_type != "FUTURE"})
+    if sec["uncounted"]:
         sec["complete"] = False
 
     # Futures: realized only. Open futures and futures orders are invisible to the API.

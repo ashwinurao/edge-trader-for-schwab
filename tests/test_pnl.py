@@ -157,3 +157,36 @@ def test_futures_evening_fill_belongs_to_next_session():
     )
     assert b.trades[0].close_day == D
     assert b.realized_on(D, fills)["gross"] == 20.0
+
+
+def test_etf_trades_count_with_stocks():
+    # Schwab types ETFs (SOXL, TQQQ, ...) as COLLECTIVE_INVESTMENT: they belong in today's stock P&L.
+    from datetime import datetime, timezone
+
+    from companion.view import build_state
+    txns = [
+        txn("2026-10-20T14:00:00+0000", "SOXL", -200, 78.0, "OPENING", asset="COLLECTIVE_INVESTMENT", fee=0.3),
+        txn("2026-10-20T14:30:00+0000", "SOXL", 200, 76.0, "CLOSING", asset="COLLECTIVE_INVESTMENT"),
+        txn("2026-10-20T15:00:00+0000", "TSX", 100, 10.0, "OPENING"),
+        txn("2026-10-20T15:05:00+0000", "TSX", -100, 11.0, "CLOSING", fee=0.1),
+    ]
+    st = build_state(account=None, orders=[], txns=txns, quotes={}, prev_session={}, freshness={},
+                     history_complete=True, orders_fresh=True, auth_hours_left=None,
+                     now=datetime(2026, 10, 20, 21, 0, tzinfo=timezone.utc))
+    assert [t["symbol"] for t in st["closed"]] == ["TSX", "SOXL"]
+    sec = st["summary"]["realized"]["securities"]
+    assert sec["gross"] == 500.0 and abs(sec["net"] - 499.6) < 1e-9
+    assert sec["complete"] and sec["uncounted"] == []
+
+
+def test_unknown_asset_type_marks_realized_incomplete():
+    from datetime import datetime, timezone
+
+    from companion.view import build_state
+    txns = [txn("2026-10-20T14:00:00+0000", "XYZ", 10, 5.0, "OPENING", asset="MUTUAL_FUND"),
+            txn("2026-10-20T14:30:00+0000", "XYZ", -10, 6.0, "CLOSING", asset="MUTUAL_FUND")]
+    st = build_state(account=None, orders=[], txns=txns, quotes={}, prev_session={}, freshness={},
+                     history_complete=True, orders_fresh=True, auth_hours_left=None,
+                     now=datetime(2026, 10, 20, 21, 0, tzinfo=timezone.utc))
+    sec = st["summary"]["realized"]["securities"]
+    assert sec["uncounted"] == ["XYZ"] and not sec["complete"]

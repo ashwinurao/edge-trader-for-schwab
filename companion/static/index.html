@@ -1144,6 +1144,7 @@ function render(st) {
   if (!st.history_complete) parts.push(`<span class="neg">fill history still loading</span>`);
   if (r.stale) parts.push(`<span class="amb">fills not refreshed: may be behind</span>`);
   if (r.securities.fills_pending) parts.push(`<span class="amb">${qty(r.securities.fills_pending)} filled shares not in the ledger yet</span>`);
+  if ((r.securities.uncounted || []).length) parts.push(`<span class="neg">${esc(r.securities.uncounted.join(", "))} not counted</span>`);
   $("k-real-s").innerHTML = parts.join(" · ");
   const o = st.summary.open_pnl;
   const dayOpen = (o.intraday || 0) + (o.mixed || 0);
