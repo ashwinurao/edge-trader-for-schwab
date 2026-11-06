@@ -857,6 +857,36 @@ class Trader:
                 return hit
         return None
 
+    @staticmethod
+    def _refusal(node: dict | None) -> str:
+        """Schwab's own reason on a rejected order or tree, without its pointer to the sibling
+        ("; Order Rejected due to Order: n"). Schwab answers HTTP 201 first and rejects after, so
+        the reason is only on the order (seen 2026-11-06)."""
+        def walk(o):
+            yield o.get("statusDescription")
+            for ch in o.get("childOrderStrategies") or []:
+                yield from walk(ch)
+        for text in walk(node or {}):
+            if text:
+                return " ".join(text.split("; Order Rejected due to")[0].replace("|", " ").split())[:300]
+        return ""
+
+    def _exits_left(self, client, symbol: str, side: str) -> str:
+        """What is working for the position now, read fresh and without the poller's snapshot,
+        which can still show an exit just replaced. An older GTC exit may be missed: the warning
+        then says more than it should, never less."""
+        from .orders import pending_orders
+        try:
+            after = self._fresh_orders(client)
+        except Exception:
+            return "Could not read the working orders: check thinkorswim."
+        live = [p for p in pending_orders(after, terminal_ids(after))
+                if p.symbol == symbol and p.live and p.exits(side)]
+        if not any(p.role == "STOP" for p in live):
+            return "WARNING: no working stop seen for this position: check thinkorswim now."
+        return ("Your stop and target are still working." if any(p.role == "TARGET" for p in live)
+                else "Your stop is still working.")
+
     def cancel_symbol_orders(self, symbol: str, orders: list[dict], known_terminal: set[int]) -> dict:
         """Cancel every working order for this symbol (entries, stops, targets). Position stays."""
         symbol = symbol.upper().strip()
@@ -954,9 +984,10 @@ class Trader:
 
     def close_position(self, symbol: str, orders: list[dict], known_terminal: set[int],
                        confirm_leg: bool = False) -> dict:
-        """One market order for the whole position. Schwab cancels the symbol's other working
-        orders (stop, target) itself when it enters (previewOrder warning, 2026-10-22), the way
-        thinkorswim's Flatten works; the companion checks afterwards and cleans up anything left."""
+        """One market order for the whole position. With a stop (or else a target) working for the
+        whole size it replaces that order in one PUT, because Schwab rejected a separate market
+        order as oversold while the exits worked (2026-11-06). With no such exit it is sent as a
+        new order. Once it has filled, the companion cleans up anything left working."""
         symbol = symbol.upper().strip()
         if not market_open():
             return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
@@ -1036,6 +1067,21 @@ class Trader:
         log.warning("LEG GUARD %s: %s", symbol, why)
         return {"ok": False, "symbol": symbol, "needs_confirm": True, "error": why + " Nothing was sent."}
 
+    @staticmethod
+    def _exit_to_replace(symbol: str, side: str, size: float, orders: list[dict], known_terminal: set[int]):
+        """The one working order a Close can replace: a stop for the whole size, or else a target
+        for the whole size, alone or with its OCO alternatives. None when anything else works
+        (several exits, a part of the size, independent stop and target)."""
+        from .orders import pending_orders
+        live = [p for p in pending_orders(orders, terminal_ids(orders) | known_terminal)
+                if p.symbol == symbol and p.live and p.exits(side)]
+        stops = [p for p in live if p.role == "STOP"]
+        pick = stops[0] if len(stops) == 1 else None if stops else live[0] if len(live) == 1 else None
+        if pick is None or pick.legs != 1 or abs(pick.qty - size) > 1e-9:
+            return None
+        rest = [p for p in live if p.order_id != pick.order_id]
+        return pick if all(p.oco_id is not None and p.oco_id == pick.oco_id for p in rest) else None
+
     def _close_locked(self, symbol: str, orders: list[dict], known_terminal: set[int],
                       confirm_leg: bool = False) -> dict:
         client = self._ensure()
@@ -1066,10 +1112,15 @@ class Trader:
                  "duration": "DAY",
                  "orderLegCollection": [{"instruction": instr, "quantity": int(size) if size == int(size) else size,
                                          "instrument": {"symbol": symbol, "assetType": asset}}]}
-        self.store.log_action("close", symbol, None, "SENDING", f"{instr} {size:g} MARKET")
-        log.warning("CLOSE %s %s %s MARKET", instr, size, symbol)
+        side = "LONG" if qty > 0 else "SHORT"
+        via = self._exit_to_replace(symbol, side, size, orders, known_terminal)
+        how = f", replacing {via.role.lower()} {via.order_id}" if via else ""
+        self.store.log_action("close", symbol, via.order_id if via else None, "SENDING", f"{instr} {size:g} MARKET{how}")
+        log.warning("CLOSE %s %s %s MARKET%s", instr, size, symbol, how)
         try:
-            r = self._logged("place_order", lambda: client.place_order(self._hash, order))
+            # One PUT swaps the exit for the market order: the position never waits without a stop.
+            r = (self._logged("replace_order", lambda: client.replace_order(self._hash, via.order_id, order)) if via
+                 else self._logged("place_order", lambda: client.place_order(self._hash, order)))
         except Exception as e:
             self.store.log_action("close", symbol, None, "UNKNOWN", repr(e))
             return {"ok": False, "symbol": symbol, "unresolved_close": True,
@@ -1104,25 +1155,36 @@ class Trader:
                 for e in a.get("executionLegs") or []]
         avg = (sum(e["price"] * e["quantity"] for e in legs) / sum(e["quantity"] for e in legs)) if legs else None
         status = final.get("status") or ("UNKNOWN" if oid is None else "SENT")
+        why = self._refusal(final)
         self.store.log_action("close", symbol, oid, status,
-                              f"{instr} {filled:g}/{size:g}" + (f" @ {avg:.4f}" if avg else ""))
-        # Verify afterwards: anything still working for the symbol (Schwab should have cancelled
-        # it) is cancelled now, and a flipped position is reported loudly.
+                              f"{instr} {filled:g}/{size:g}" + (f" @ {avg:.4f}" if avg else "") + (f": {why}" if why else ""))
+        if not filled and status in ("REJECTED", "CANCELED", "EXPIRED"):
+            # HTTP 201 and then rejected: the position is still open, so its exits stay.
+            text = (f"Schwab {status.lower()} the close{': ' + why if why else ''}. {symbol} is still open. "
+                    + self._exits_left(client, symbol, side))
+            return {"ok": False, "symbol": symbol, "order_id": oid, "filled": 0.0, "qty": size, "avg": None,
+                    "unresolved_close": False, "message": text, "error": text}
+        done = filled >= size - 1e-9
+        # Verify afterwards: once the close has filled, anything still working for the symbol is
+        # cancelled, and a flipped position is reported loudly. Never before it has filled: on
+        # 2026-11-06 this ran after a rejected close and cancelled a live stop and target.
         notes = []
         try:
-            leftover = self._cancel_fast(client, symbol, self._fresh_orders(client, orders),
-                                         known_terminal | ({oid} if oid else set()))
-            if leftover["results"]:
-                notes.append(f"Cancelled {len(leftover['results'])} {symbol} order(s) Schwab had left working.")
-            if not leftover["ok"]:
-                notes.append("Some orders are still working: check thinkorswim.")
+            if done:
+                leftover = self._cancel_fast(client, symbol, self._fresh_orders(client, orders),
+                                             known_terminal | ({oid} if oid else set()) | ({via.order_id} if via else set()))
+                if leftover["results"]:
+                    notes.append(f"Cancelled {len(leftover['results'])} {symbol} order(s) Schwab had left working.")
+                if not leftover["ok"]:
+                    notes.append("Some orders are still working: check thinkorswim.")
+            else:
+                notes.append("Your stop and target were not touched.")
             after, _ = self._position(client, symbol)
             if abs(after) > 1e-9 and (after > 0) != (qty > 0):
                 notes.append(f"WARNING: you are now {'LONG' if after > 0 else 'SHORT'} {abs(after):g} {symbol} "
                              "(a stop likely filled at the same moment). Fix it in thinkorswim now.")
         except Exception as e:
             notes.append(f"Could not verify afterwards ({e}). Check thinkorswim.")
-        done = filled >= size - 1e-9
         head = (f"Closed {symbol}: {instr.replace('_', ' ').lower()} {filled:g} @ {avg:.2f}." if done and avg
                 else f"Close sent, {filled:g} of {size:g} filled so far (Schwab: {status}).")
         text = " ".join([head] + notes)
@@ -1509,24 +1571,25 @@ class Trader:
                 if looser else f" The trail restarts about {fmt(start, tk)}.")
 
     def set_target(self, symbol: str, price, r_mult, orders: list[dict], known_terminal: set[int],
-                   basis: dict | None, prior_trail_level=None) -> dict:
+                   basis: dict | None) -> dict:
         """Put one target on the whole position, at a price or at R x the frozen risk (entry fill
-        and original stop of the companion ticket). Sent as ONE new OCO with the current stop for
-        the full size; Schwab drops the old exits as it enters, so the stop is never removed first."""
+        and original stop of the companion ticket). A working target is replaced in place, like
+        Move stop, so the stop and OCO stay as they are. A new OCO next to working exits was
+        rejected as oversold (2026-11-06), so a position with a stop and no target is refused."""
         symbol = symbol.upper().strip()
         if not market_open():
             return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
         if not self._send_lock.acquire(blocking=False):
             return {"ok": False, "symbol": symbol, "error": "Another order action is in progress."}
         try:
-            return self._set_target_locked(symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level)
+            return self._set_target_locked(symbol, price, r_mult, orders, known_terminal, basis)
         except Exception as e:
             log.exception("set target failed")
             return {"ok": False, "symbol": symbol, "error": f"Set target failed: {e}. Check thinkorswim."[:300]}
         finally:
             self._send_lock.release()
 
-    def _set_target_locked(self, symbol, price, r_mult, orders, known_terminal, basis, prior_trail_level=None) -> dict:
+    def _set_target_locked(self, symbol, price, r_mult, orders, known_terminal, basis) -> dict:
         from decimal import ROUND_CEILING, ROUND_HALF_UP
         from .bracket import _to_tick
         from .orders import pending_orders
@@ -1540,7 +1603,7 @@ class Trader:
         side = "LONG" if qty > 0 else "SHORT"
         q = self.quote(symbol, max_age=0)
         tk = self._ticks(symbol, asset, q)
-        unit_w, us = _units(asset)
+        unit_w, _ = _units(asset)
 
         def f(v) -> str:
             return fmt(v, tk)
@@ -1574,40 +1637,94 @@ class Trader:
             return {"ok": False, "symbol": symbol,
                     "error": f"{symbol} has other working orders ({len(others)}) that Schwab would cancel. "
                              "Set this target in thinkorswim."}
-        stop, _ = self._exit_plan(pend, symbol, side, 0)
-        trail = self._trail_of(pend, symbol, side)
         label = f"{r_mult:g}R = {f(target)}" if r_mult else f(target)
-        if trail:
-            self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + {_trail_txt(trail)}")
-            res = self._create_stop(client, symbol, side, abs(qty), asset, None, [], set(), target=target,
-                                    rebuild=True, trail=trail)
-            msg = (res["message"] if res.get("closed") else
-                   (f"Target set at {label} with the trailing stop ({_trail_txt(trail)}) as one OCO."
-                    if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
-                   + self._restart_note(symbol, side, trail, prior_trail_level))
-            self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
-            return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
-                    "error": None if res.get("ok") else msg}
-        if stop is None:
-            # No stop to pair it with: a lone target (the row keeps showing NO STOP SEEN).
-            instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
-                     ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
-            self.store.log_action("set_target", symbol, None, "SENDING", f"target {label}, no stop")
-            r = self._place_exit(client, symbol, instr, asset, int(abs(qty)), target)
-            ok = r.status_code in (200, 201)
-            msg = (f"Target set at {label} for {abs(qty):g} {unit_w}. WARNING: there is no stop: use Stop to B/E "
-                   "or Move stop." if ok else f"Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}")
-            self.store.log_action("set_target", symbol, None, "DONE" if ok else "REJECTED", msg)
-            return {"ok": ok, "symbol": symbol, "message": msg, "error": None if ok else msg}
-        self.store.log_action("set_target", symbol, None, "SENDING", f"target {label} + stop {stop}, {abs(qty):g} {us}")
-        res = self._create_stop(client, symbol, side, abs(qty), asset, Decimal(str(stop)), [], set(),
-                                target=target, rebuild=True)
-        msg = (res["message"] if res.get("closed") else
-               f"Target set at {label} with stop {stop} for {abs(qty):g} {unit_w} as one OCO." + res.get("note", "")
-               if res.get("ok") else res.get("error") or res.get("message") or "Not confirmed: check thinkorswim.")
-        self.store.log_action("set_target", symbol, None, "DONE" if res.get("ok") else "CHECK", msg)
-        return {"ok": bool(res.get("ok")), "symbol": symbol, "target": f(target), "message": msg,
-                "error": None if res.get("ok") else msg}
+        exits = [p for p in pend if p.symbol == symbol and p.live and p.exits(side)]
+        targets = [p for p in exits if p.role == "TARGET"]
+        if len(targets) > 1 or (targets and (targets[0].legs != 1 or abs(targets[0].qty - abs(qty)) > 1e-9)):
+            return {"ok": False, "symbol": symbol,
+                    "error": f"{symbol} has several or partial targets. Nothing was sent. Set this target in thinkorswim."}
+        if targets:
+            return self._replace_target(client, symbol, side, abs(qty), targets[0], target, label, f, unit_w)
+        if exits:
+            # Schwab rejects a second exit for the same shares as oversold (2026-11-06).
+            return {"ok": False, "symbol": symbol,
+                    "error": f"{symbol} has a working stop and no target. Schwab would reject a target next to it, "
+                             "so nothing was sent. Set this target in thinkorswim."}
+        # No exits at all: a lone target (the row keeps showing NO STOP SEEN).
+        instr = {("EQUITY", True): "SELL", ("EQUITY", False): "BUY_TO_COVER",
+                 ("OPTION", True): "SELL_TO_CLOSE", ("OPTION", False): "BUY_TO_CLOSE"}.get((asset, side == "LONG"))
+        self.store.log_action("set_target", symbol, None, "SENDING", f"target {label}, no stop")
+        r = self._place_exit(client, symbol, instr, asset, int(abs(qty)), target)
+        ok = r.status_code in (200, 201)
+        msg = (f"Target set at {label} for {abs(qty):g} {unit_w}. WARNING: there is no stop: use Stop to B/E "
+               "or Move stop." if ok else f"Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}")
+        if ok:
+            tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+            d = self._logged("order_details", lambda: client.order_details(self._hash, int(tail))) if tail.isdigit() else None
+            cur = d.json() if d is not None and d.status_code == 200 else {}
+            if cur.get("status") == "REJECTED":
+                ok, msg = False, f"Schwab rejected the target: {self._refusal(cur) or 'no reason given'}."
+        self.store.log_action("set_target", symbol, None, "DONE" if ok else "REJECTED", msg)
+        return {"ok": ok, "symbol": symbol, "message": msg, "error": None if ok else msg}
+
+    def _replace_target(self, client, symbol: str, side: str, size: float, old, target: Decimal, label: str,
+                        f, unit_w: str) -> dict:
+        """Change a working target's price with one PUT, as Move stop does for a stop: Schwab keeps
+        it in its OCO, and the stop is not touched."""
+        from .orders import pending_orders
+
+        def done(status: str, msg: str, ok: bool = False) -> dict:
+            self.store.log_action("set_target", symbol, None, status, msg)
+            return {"ok": ok, "symbol": symbol, "target": f(target), "message": msg, "error": None if ok else msg}
+        d = self._logged("order_details", lambda: client.order_details(self._hash, old.order_id))
+        cur = d.json() if d.status_code == 200 else {}
+        if cur.get("status") not in LIVE:
+            return done("REJECTED", f"The target is {cur.get('status') or 'not readable'} now. Nothing was sent.")
+        body = {"orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": cur.get("session", "NORMAL"),
+                "duration": cur.get("duration", "DAY"), "price": f(target),
+                "orderLegCollection": [{"instruction": l.get("instruction"),
+                                        "quantity": int(l.get("quantity")) if float(l.get("quantity") or 0).is_integer()
+                                        else l.get("quantity"),
+                                        "instrument": {"symbol": (l.get("instrument") or {}).get("symbol"),
+                                                       "assetType": (l.get("instrument") or {}).get("assetType", "EQUITY")}}
+                                       for l in cur.get("orderLegCollection") or []]}
+        self.store.log_action("set_target", symbol, old.order_id, "SENDING",
+                              f"{f(Decimal(str(cur.get('price') or 0)))} -> {label}")
+        log.warning("SET TARGET %s %s -> %s", symbol, old.order_id, label)
+        try:
+            r = self._logged("replace_order", lambda: client.replace_order(self._hash, old.order_id, body))
+        except Exception as e:
+            self.store.log_action("set_target", symbol, old.order_id, "UNKNOWN", repr(e))
+            return done("CHECK", "No answer from Schwab: the target MAY have moved. Check thinkorswim.")
+        if r.status_code not in (200, 201):
+            return done("REJECTED", f"Schwab refused the target (HTTP {r.status_code}): {r.text[:150]}. "
+                                    + self._exits_left(client, symbol, side))
+        tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
+        new_id = int(tail) if tail.isdigit() else None
+        time.sleep(0.6)
+        after = self._fresh_orders(client)
+        node = self._find_in(after, new_id) if new_id is not None else None
+        if (node or {}).get("status") == "REJECTED":
+            return done("REJECTED", f"Schwab rejected the target: {self._refusal(node) or 'no reason given'}. "
+                                    + self._exits_left(client, symbol, side))
+        if (node or {}).get("status") == "FILLED":
+            left, _ = self._position(client, symbol)
+            if abs(left) < 1e-9:
+                return done("DONE", f"The target {label} filled as it entered: position closed.", ok=True)
+            return done("CHECK", f"The target {label} filled as it entered, but {abs(left):g} {unit_w} are still open: "
+                                 "check their stop in thinkorswim.")
+        live = [p for p in pending_orders(after, terminal_ids(after)) if p.symbol == symbol and p.live and p.exits(side)]
+        new = next((p for p in live if p.order_id == new_id), None)
+        if new is None:
+            return done("CHECK", f"Target change to {label} not confirmed yet: check thinkorswim.")
+        msg = f"Target moved to {label} on {new.qty:g} of {size:g} {unit_w}."
+        if old.oco_id is None:
+            return done("DONE", msg, ok=True)
+        if new.oco_id is None:
+            return done("CHECK", msg + " WARNING: the new target is NOT linked to the stop (OCO broken): fix in thinkorswim.")
+        if not any(p.role == "STOP" and p.oco_id == new.oco_id for p in live):
+            return done("CHECK", msg + " WARNING: the stop is no longer working after the move. Check thinkorswim.")
+        return done("DONE", msg + " OCO kept: the stop is still working and linked to the target.", ok=True)
 
     # ---- partials --------------------------------------------------------------------------
 
@@ -1617,9 +1734,11 @@ class Trader:
         """Sell (or cover) part of the position at market, then put the stop and target back on
         the shares that are left, at the same prices, as one OCO.
 
-        Schwab cancels the symbol's working orders when the partial enters (same as thinkorswim),
-        so protection is rebuilt right after the fill: about a second without a stop on the
-        remaining shares instead of a manual re-entry. 100% (or all shares) is a Close."""
+        Assumes Schwab cancels the symbol's working orders when the partial enters (same as
+        thinkorswim), so protection is rebuilt right after the fill: about a second without a stop
+        on the remaining shares instead of a manual re-entry. If Schwab rejects the partial as
+        oversold instead (2026-11-06), nothing is rebuilt and the exits stay. 100% (or all shares)
+        is a Close."""
         symbol = symbol.upper().strip()
         if not market_open():
             return {"ok": False, "symbol": symbol, "error": "Regular hours only (9:30 to 16:00 ET)."}
@@ -1730,6 +1849,12 @@ class Trader:
         tail = r.headers.get("Location", "").rstrip("/").split("/")[-1]
         oid = int(tail) if tail.isdigit() else None
         final = self._wait_fill(client, oid, self.MID_WAIT_S if price else 2.5) if oid else {}
+        if final.get("status") == "REJECTED":
+            # HTTP 201 and then rejected (oversold, 2026-11-06): no shares moved, so no rebuild.
+            why = self._refusal(final) or "no reason given"
+            self.store.log_action("partial", symbol, oid, "REJECTED", f"{instr} 0/{n} ({how}): {why}")
+            return {"error": f"Schwab rejected the partial: {why}. "
+                             + self._exits_left(client, symbol, "LONG" if selling else "SHORT")}
         fills = self._fills(final)
         filled = sum(q for q, _ in fills)
         if price and oid and filled < n - 1e-9 and final.get("status") not in TERMINAL:
@@ -1913,12 +2038,13 @@ class Trader:
                      price: Decimal | None, fresh: list[dict], terminal: set[int],
                      target: Decimal | None = None, rebuild: bool = False, trail: dict | None = None,
                      preview: bool = False) -> dict:
-        """Create a stop for the whole position. Schwab cancels an instrument's working orders
-        when a new order is entered, so an existing single target is re-sent together with the
-        new stop as one OCO (the target survives and gets linked).
+        """Create a stop for the whole position. An existing single target is re-sent together
+        with the new stop as one OCO, on the assumption that Schwab cancels the old exits as it
+        enters. On 2026-11-06 Schwab rejected such an OCO as oversold instead (HTTP 201, then
+        REJECTED): that comes back as a plain refusal, and the old exits stay working.
 
-        rebuild=True (after a partial): Schwab already cancelled the old exits; send exactly
-        `target` (if any) + stop for `qty`, without looking at what is working.
+        rebuild=True (after a partial, or a trailing change): send exactly `target` (if any) + stop
+        for `qty`, without looking at what is working.
 
         preview=True asks Schwab's order preview first and sends nothing it refuses (the result
         then has not_sent=True). Only for a change that keeps the current exits working until the
@@ -1996,6 +2122,13 @@ class Trader:
                 self.store.record_stop(symbol, price, new_id)   # r_basis checks it worked before using it
         time.sleep(0.6)
         after = self._fresh_orders(client)
+        sent = self._find_in(after, new_id) if new_id is not None else None
+        if (sent or {}).get("status") == "REJECTED":
+            # 2026-11-06: this read "Stop created for 0 of N shares", with the old exits still live.
+            text = (f"Schwab rejected this {what}: {self._refusal(sent) or 'no reason given'}. "
+                    + self._exits_left(client, symbol, side))
+            self.store.log_action("create_stop", symbol, new_id, "REJECTED", text)
+            return {"ok": False, "symbol": symbol, "rejected": True, "error": text}
         # Only the order we just sent counts (a delayed read can still show the previous exits).
         live = [p for p in pending_orders(after, terminal_ids(after)) if p.symbol == symbol and p.live
                 and p.exits(side) and (new_id is None or p.group_id == new_id)]

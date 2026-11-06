@@ -367,13 +367,17 @@ class Broker(FakeClient):
     """Fake Schwab with order states and one position."""
 
     def __init__(self, orders, position=("MXR", -57.0, "EQUITY"), stuck=(), auto_cancel=True, after_qty=None,
-                 fill_limits=False, ins=None, others=()):
+                 fill_limits=False, ins=None, others=(), oversold=False):
         super().__init__()
         self.ins, self.others = ins or {}, list(others)   # extra instrument fields; other positions held
         self.orders = {o["orderId"]: o for o in orders}
         self.sym, self.qty, self.asset = position
         self.stuck, self.cancelled = set(stuck), []
-        self.auto_cancel, self.after_qty, self.fill_limits = auto_cancel, after_qty, fill_limits
+        # oversold=True is what Schwab did live on 2026-11-06: a new exit next to working exits for
+        # the same shares gets HTTP 201 and then REJECTED, and the old exits stay. auto_cancel is
+        # the older assumption, kept as the default for flows not yet seen live with oversold.
+        self.oversold = oversold
+        self.auto_cancel, self.after_qty, self.fill_limits = auto_cancel and not oversold, after_qty, fill_limits
         self._next_fill = 900
 
     def _fill(self, order, price):
@@ -419,7 +423,8 @@ class Broker(FakeClient):
         return JsonResp(200, rows)
 
     def replace_order(self, _h, oid, body):
-        """Like Schwab/thinkorswim: old stop REPLACED, new stop added to the same OCO."""
+        """Like Schwab/thinkorswim: old order REPLACED, the new one added to the same OCO. A market
+        body fills at once and the OCO cancels its other legs."""
         self.replaced = getattr(self, "replaced", []) + [(oid, body)]
         for o in self.orders.values():
             for parent in [o] + list(o.get("childOrderStrategies") or []):
@@ -427,11 +432,64 @@ class Broker(FakeClient):
                 for k in list(kids):
                     if k.get("orderId") == oid:
                         k["status"] = "REPLACED"
-                        new = {**k, "orderId": oid + 1000, "status": "WORKING",
-                               "stopPrice": float(body["stopPrice"])}
+                        new = {**k, "orderId": oid + 1000, "status": "WORKING", "orderType": body["orderType"]}
+                        for f in ("stopPrice", "price"):
+                            new.pop(f, None)
+                            if f in body:
+                                new[f] = float(body[f])
+                        if body["orderType"] == "MARKET":
+                            self._fill_replacement(new, body)
+                            for other in kids:
+                                if other.get("status") in trading.LIVE:
+                                    other["status"] = "CANCELED"
                         kids.append(new)
                         return Resp(201, {"Location": f".../orders/{oid + 1000}"})
+        if oid in self.orders:                                 # a stop or target on its own
+            old = self.orders[oid]
+            old["status"] = "REPLACED"
+            new = {**old, "orderId": oid + 1000, "status": "WORKING", "orderType": body["orderType"]}
+            if body["orderType"] == "MARKET":
+                self._fill_replacement(new, body)
+            self.orders[oid + 1000] = new
+            return Resp(201, {"Location": f".../orders/{oid + 1000}"})
         return Resp(400, text="not found")
+
+    def _fill_replacement(self, new, body):
+        leg = body["orderLegCollection"][0]
+        n = float(leg["quantity"])
+        self.qty += n if leg["instruction"].startswith("BUY") else -n
+        new.update(status="FILLED", filledQuantity=n, orderActivityCollection=[
+            {"executionType": "FILL", "executionLegs": [{"quantity": n, "price": 906.5}]}])
+
+    def _working_exit_qty(self):
+        """Shares the working exits already hold: an OCO's legs are alternatives and count once."""
+        def held(o):
+            kids = o.get("childOrderStrategies") or []
+            if o.get("orderStrategyType") == "OCO":
+                return max((held(k) for k in kids), default=0.0)
+            own = 0.0
+            if o.get("status") in trading.LIVE and any(
+                    (l.get("instrument") or {}).get("symbol") == self.sym
+                    and l.get("instruction") in ("SELL", "BUY_TO_COVER", "SELL_TO_CLOSE", "BUY_TO_CLOSE")
+                    for l in o.get("orderLegCollection") or []):
+                own = float(o.get("quantity") or 0)
+            return own + sum(held(k) for k in kids)
+        return sum(held(o) for o in self.orders.values())
+
+    def _reject_oversold(self, order):
+        """The status and text Schwab gave on 2026-11-06, under an HTTP 201."""
+        import copy
+        self._next_fill += 10
+        oid = self._next_fill
+        why = ("This order may result in an oversold/overbought position in your account.  "
+               "Please check your position quantity and/or open orders.")
+        new = {**copy.deepcopy(order), "orderId": oid, "status": "REJECTED", "statusDescription": why,
+               "filledQuantity": 0}
+        for i, ch in enumerate(new.get("childOrderStrategies") or []):
+            ch.update(orderId=oid + i + 1, status="REJECTED", filledQuantity=0,
+                      statusDescription=f"{why}; Order Rejected due to Order: {oid}")
+        self.orders[oid] = new
+        return Resp(201, {"Location": f".../orders/{oid}"})
 
     def account_details(self, _h, fields=None):
         pos = [] if not self.qty else [{"instrument": {"symbol": self.sym, "assetType": self.asset, **self.ins},
@@ -440,7 +498,8 @@ class Broker(FakeClient):
         return JsonResp(200, {"securitiesAccount": {"positions": pos}})
 
     def _kill_symbol_orders(self):
-        """Real Schwab: entering an order cancels the instrument's other working orders."""
+        """The older assumption: entering an order cancels the instrument's other working orders.
+        Not what Schwab did on 2026-11-06: see oversold in __init__."""
         def kill(o):
             syms = {(l.get("instrument") or {}).get("symbol") for l in o.get("orderLegCollection") or []}
             if o.get("status") in trading.LIVE and (not syms or syms == {self.sym}):
@@ -455,6 +514,10 @@ class Broker(FakeClient):
         self.placed.append(order)
         if self.auto_cancel:
             self._kill_symbol_orders()
+        first = (order.get("childOrderStrategies") or [order])[0]
+        size = float(((first.get("orderLegCollection") or [{}])[0]).get("quantity") or 0)
+        if self.oversold and self._working_exit_qty() + size > abs(self.qty) + 1e-9:
+            return self._reject_oversold(order)
         if order.get("orderType") == "MARKET":
             return self._fill(order, 906.5)
         if order.get("orderType") == "LIMIT" and order.get("orderStrategyType") == "SINGLE" and self.fill_limits:
@@ -502,15 +565,104 @@ def test_cancel_symbol_orders_cancels_each_live_exit(trader, monkeypatch):
     assert r["ok"] and sorted(trader._client.cancelled) == [51, 52]       # AKMX untouched
 
 
-def test_close_is_one_market_order_and_schwab_cancels_the_oco(trader, monkeypatch):
+def test_close_replaces_the_stop_with_one_market_order(trader, monkeypatch):
+    # 2026-11-06, option A: one PUT, so the position never waits without a stop.
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
-    trader._client = Broker([_mu_oco()])
+    trader._client = Broker([_mu_oco()], oversold=True)
     r = trader.close_position("MXR", list(trader._client.orders.values()), set())
     assert r["ok"] and r["filled"] == 57 and r["avg"] == 906.5
-    (order,) = trader._client.placed
+    assert trader._client.placed == []
+    (oid, order), = trader._client.replaced
     leg = order["orderLegCollection"][0]
+    assert oid == 51                                 # the stop, not the target
     assert order["orderType"] == "MARKET" and leg["instruction"] == "BUY_TO_COVER" and leg["quantity"] == 57
-    assert trader._client.cancelled == []            # no pre-cancel round trip: Schwab did it
+    assert "stopPrice" not in order and "price" not in order
+    assert trader._client.cancelled == []            # no pre-cancel round trip: the OCO did it
+
+
+def _reject_replacement(client, oid, body):
+    """HTTP 201 on the PUT, and then the new order is rejected. The old stop's fate is the caller's."""
+    client.orders[oid + 1000] = {"orderId": oid + 1000, "status": "REJECTED",
+                                 "statusDescription": "Order cannot be replaced.", "filledQuantity": 0}
+    return Resp(201, {"Location": f".../orders/{oid + 1000}"})
+
+
+def test_a_rejected_close_never_cancels_the_exits(trader, monkeypatch):
+    # 2026-11-06: a rejected close cancelled the live stop and target and left the position open.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()], oversold=True)
+    r = trader.close_position("MXR", [], set())               # a stale snapshot: a plain market order
+    assert not r["ok"] and trader._client.cancelled == []
+    assert not r["unresolved_close"]
+    assert "oversold/overbought" in r["error"] and "Order Rejected due to" not in r["error"]
+    assert "still open" in r["error"] and "Your stop and target are still working" in r["error"]
+    live = trader._client.orders[50]["childOrderStrategies"]
+    assert [o["status"] for o in live] == ["WORKING", "WORKING"]
+
+
+def test_close_says_so_when_schwab_refuses_the_replacement(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()], oversold=True)
+    trader._client.replace_order = lambda h, o, b: Resp(400, text="cannot change the order type")
+    r = trader.close_position("MXR", list(trader._client.orders.values()), set())
+    assert not r["ok"] and "cannot change the order type" in r["error"] and "still be working" in r["error"]
+    assert trader._client.placed == [] and trader._client.cancelled == []      # never a second order
+
+
+def test_close_warns_when_the_rejected_replacement_took_the_stop_with_it(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    client = trader._client = Broker([_mu_oco()], oversold=True)
+
+    def gone(h, oid, body):
+        client._find(51)["status"] = "REPLACED"
+        client._find(52)["status"] = "CANCELED"
+        return _reject_replacement(client, oid, body)
+    client.replace_order = gone
+    r = trader.close_position("MXR", list(client.orders.values()), set())
+    assert not r["ok"] and "Order cannot be replaced" in r["error"]
+    assert "WARNING: no working stop seen" in r["error"]
+
+
+def test_close_with_no_answer_on_the_replacement_blocks_the_next_one(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_mu_oco()], oversold=True)
+    trader._client.replace_order = lambda h, o, b: (_ for _ in ()).throw(TimeoutError("read timed out"))
+    snapshot = list(trader._client.orders.values())
+    r = trader.close_position("MXR", snapshot, set())
+    assert r["unresolved_close"] and "MAY have been sent" in r["error"]
+    assert "Resolve" in trader.close_position("MXR", snapshot, set())["error"]
+
+
+def test_close_does_not_replace_when_the_exits_are_not_one_whole_size(trader, monkeypatch):
+    # Independent stop and target, or a stop for part of the size: a replace would not free the
+    # shares, so a plain market order goes and Schwab decides. A rejection leaves the exits alone.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    for exits in ([_leaf(51, "STOP", 57, stopPrice=913.23), _leaf(52, "LIMIT", 57, price=900.18)],
+                  [_leaf(51, "STOP", 20, stopPrice=913.23)]):
+        trader._client = Broker(exits, oversold=True)
+        r = trader.close_position("MXR", list(trader._client.orders.values()), set())
+        assert not r["ok"] and "oversold/overbought" in r["error"]
+        assert not hasattr(trader._client, "replaced") and len(trader._client.placed) == 1
+        assert trader._client.cancelled == []
+
+
+def test_close_replaces_a_lone_target_when_there_is_no_stop(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = Broker([_leaf(52, "LIMIT", 57, price=900.18)], oversold=True)
+    r = trader.close_position("MXR", list(trader._client.orders.values()), set())
+    assert r["ok"] and trader._client.replaced[0][0] == 52 and trader._client.placed == []
+
+
+def test_a_partly_filled_close_keeps_the_exits(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    client = trader._client = Broker([_mu_oco()], auto_cancel=False)
+
+    def part(h, order):
+        client.orders[901] = {"orderId": 901, "status": "WORKING", "filledQuantity": 20}
+        return Resp(201, {"Location": ".../orders/901"})
+    client.place_order = part
+    r = trader.close_position("MXR", [], set())
+    assert not r["ok"] and client.cancelled == [] and "were not touched" in r["error"]
 
 
 def test_close_cleans_up_orders_schwab_left_working(trader, monkeypatch):
@@ -705,16 +857,88 @@ def _mu_quote(trader, monkeypatch, bid=906.0, ask=906.2):
     monkeypatch.setattr(trader, "quote", lambda s, max_age=0: {"bid": bid, "ask": ask})
 
 
-def test_set_target_in_r_sends_one_oco_with_the_current_stop(trader, monkeypatch):
+def test_set_target_in_r_replaces_the_working_target(trader, monkeypatch):
+    # 2026-11-06: a new OCO next to the working exits was rejected as oversold, every time.
     _mu_quote(trader, monkeypatch)
-    trader._client = Broker([_mu_oco()])                      # short 57, stop 913.23, target 900.18
+    trader._client = Broker([_mu_oco()], oversold=True)       # short 57, stop 913.23, target 900.18
     basis = {"side": "SHORT", "entry": 910.0, "rps": 3.0}     # frozen R from the ticket
     r = trader.set_target("MXR", None, 3, [], set(), basis)
     assert r["ok"] and r["target"] == "901.00", r
-    (order,) = trader._client.placed
-    target, stop = order["childOrderStrategies"]
-    assert order["orderStrategyType"] == "OCO" and target["price"] == "901.00"
-    assert stop["stopPrice"] == "913.23" and stop["orderLegCollection"][0]["quantity"] == 57
+    assert trader._client.placed == [] and "OCO kept" in r["message"]
+    (oid, body), = trader._client.replaced
+    assert oid == 52 and body["orderType"] == "LIMIT" and body["price"] == "901.00"
+    assert body["orderLegCollection"][0]["quantity"] == 57
+    stop = trader._client._find(51)
+    assert stop["status"] == "WORKING" and stop["stopPrice"] == 913.23          # never touched
+
+
+def test_set_target_refuses_a_stop_with_no_target_and_sends_nothing(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    trader._client = Broker([_leaf(51, "STOP", 57, stopPrice=913.23)], oversold=True)
+    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    assert not r["ok"] and "nothing was sent" in r["error"] and "thinkorswim" in r["error"]
+    assert trader._client.placed == [] and not hasattr(trader._client, "replaced")
+
+
+def test_set_target_refuses_several_or_partial_targets(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    for exits in ([_leaf(52, "LIMIT", 20, price=900.18), _leaf(53, "LIMIT", 37, price=899.0)],
+                  [_leaf(52, "LIMIT", 20, price=900.18)]):
+        trader._client = Broker(exits, oversold=True)
+        r = trader.set_target("MXR", "898.00", None, [], set(), None)
+        assert not r["ok"] and "several or partial" in r["error"]
+        assert trader._client.placed == [] and not hasattr(trader._client, "replaced")
+
+
+def test_set_target_reports_a_refused_or_rejected_replacement(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    client = trader._client = Broker([_mu_oco()], oversold=True)
+    client.replace_order = lambda h, o, b: Resp(400, text="not today")
+    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    assert not r["ok"] and "not today" in r["error"] and "still working" in r["error"]
+    client.replace_order = lambda h, o, b: _reject_replacement(client, o, b)
+    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    assert not r["ok"] and "Order cannot be replaced" in r["error"] and "still working" in r["error"]
+    assert client.placed == [] and client.cancelled == []
+
+
+def test_set_target_with_no_answer_says_it_may_have_moved(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    trader._client = Broker([_mu_oco()], oversold=True)
+    trader._client.replace_order = lambda h, o, b: (_ for _ in ()).throw(TimeoutError("read timed out"))
+    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    assert not r["ok"] and "MAY have moved" in r["error"]
+
+
+def test_a_new_oco_rejected_after_http_201_shows_schwabs_reason(trader, monkeypatch):
+    # 2026-11-06: this read "Stop created for 0 of N shares. WARNING: the target is not working".
+    _mu_quote(trader, monkeypatch)
+    trader._client = Broker([_leaf(52, "LIMIT", 57, price=900.18)], oversold=True)
+    r = trader.move_stop("MXR", "910.00", [], set())          # no stop: creates one with the target
+    assert not r["ok"] and "oversold/overbought" in r["error"]
+    assert "0 of" not in r["error"] and "Stop created" not in r["error"]
+    assert "no working stop seen" in r["error"]               # true here: the target works alone
+    assert trader._client._find(52)["status"] == "WORKING"
+
+
+def test_a_lone_target_rejected_after_http_201_is_not_reported_as_set(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    client = trader._client = Broker([])
+
+    def reject(h, order):
+        client.placed.append(order)
+        return client._reject_oversold(order)
+    client.place_order = reject
+    r = trader.set_target("MXR", "900", None, [], set(), None)
+    assert not r["ok"] and "oversold/overbought" in r["error"] and "Target set" not in r["error"]
+
+
+def test_a_partial_rejected_after_http_201_sends_no_rebuild(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = Broker([_mu_oco()], oversold=True)
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert not r["ok"] and "oversold/overbought" in r["error"] and "still working" in r["error"]
+    assert len(trader._client.placed) == 1 and trader._client.cancelled == []
 
 
 def test_set_target_at_a_price_and_refusals(trader, monkeypatch):
@@ -724,7 +948,7 @@ def test_set_target_at_a_price_and_refusals(trader, monkeypatch):
     assert "through the market" in trader.set_target("MXR", "907", None, [], set(), None)["error"]
     assert trader._client.placed == []
     r = trader.set_target("MXR", "895.5", None, [], set(), None)
-    assert r["ok"] and trader._client.placed[0]["childOrderStrategies"][0]["price"] == "895.50"
+    assert r["ok"] and trader._client.replaced[0][1]["price"] == "895.50"
 
 
 def test_set_target_without_a_stop_sends_a_lone_target(trader, monkeypatch):
@@ -799,11 +1023,12 @@ def test_move_stop_on_a_trailing_position_goes_back_to_fixed(trader, monkeypatch
 
 def test_set_target_keeps_the_trailing_stop(trader, monkeypatch):
     _quote_mark(trader, monkeypatch)
-    trader._client = Broker([_mu_trailing()])
+    trader._client = Broker([_mu_trailing()], oversold=True)
     r = trader.set_target("MXR", "898.00", None, [], set(), None)
     assert r["ok"], r
-    target, stop = trader._client.placed[0]["childOrderStrategies"]
-    assert target["price"] == "898.00" and stop["orderType"] == "TRAILING_STOP"
+    assert trader._client.placed == [] and trader._client.replaced[0][1]["price"] == "898.00"
+    stop = trader._client._find(51)
+    assert stop["status"] == "WORKING" and stop["orderType"] == "TRAILING_STOP"   # not restarted
 
 
 def test_autobe_ticket_sends_a_fixed_stop_and_records_one_move(trader):
@@ -897,8 +1122,9 @@ def test_auto_breakeven_leaves_a_stop_from_another_order_alone(trader, monkeypat
     assert not r["ok"] and not getattr(trader._client, "replaced", [])
 
 
-def test_auto_breakeven_follows_an_oco_the_companion_rebuilt(trader, monkeypatch):
-    # META 2026-11-02: Replace target rebuilt the OCO and Auto B/E then skipped at +1R.
+def test_auto_breakeven_still_moves_the_stop_after_set_target(trader, monkeypatch):
+    # META 2026-11-02: Replace target rebuilt the OCO and Auto B/E then skipped at +1R. Set target
+    # now replaces in place (2026-11-06), so the stop stays the ticket's own.
     _mu_quote(trader, monkeypatch)
     trader._client = Broker([_ticket_tree(_mu_oco())])              # MXR short 57, stop 913.23
     trader.store.insert_ticket({"ticket_id": "t-mxr", "symbol": "MXR", "side": "SHORT", "qty": 57, "limit": "908.00",
@@ -906,15 +1132,12 @@ def test_auto_breakeven_follows_an_oco_the_companion_rebuilt(trader, monkeypatch
     trader.store.update_ticket("t-mxr", "ACCEPTED", order_id=40)
     trader.store.add_auto_be("t-mxr", "MXR")
     r = trader.set_target("MXR", "898.00", None, [], set(), None)
-    assert r["ok"] and "Auto B/E stays on this stop" in r["message"], r
-    new_oco = trader._client.placed[0]
-    assert trader.store.auto_be_orders("t-mxr") == [max(trader._client.orders)]
-    assert new_oco["orderStrategyType"] == "OCO"
+    assert r["ok"] and trader._client.placed == [], r
     assert trader.store.set_auto_be("t-mxr", "SENDING", only_from="PENDING")
     r = trader.auto_breakeven("t-mxr", "MXR", "SHORT", 908.0, [], set())
     assert r["state"] == "DONE", r
-    (oid, body), = trader._client.replaced
-    assert body["stopPrice"] == "908.00"
+    (_, target), (oid, body) = trader._client.replaced
+    assert target["price"] == "898.00" and oid == 51 and body["stopPrice"] == "908.00"
     # A trailing stop the companion sets is never linked: Auto B/E does not touch trails.
     assert trader.store.link_auto_be("MXR", 1, "2000-01-01") == []   # no PENDING ticket left
 
@@ -924,13 +1147,10 @@ def test_a_target_that_fills_as_it_enters_reports_the_close(trader, monkeypatch)
     _mu_quote(trader, monkeypatch)
 
     class FillsAtOnce(Broker):
-        def place_order(self, h, order):
-            r = super().place_order(h, order)
-            oco = self.orders[max(self.orders)]
-            tgt, stop = oco["childOrderStrategies"]
-            tgt.update(status="FILLED", filledQuantity=57, orderActivityCollection=[
-                {"executionType": "FILL", "executionLegs": [{"quantity": 57, "price": 899.5}]}])
-            stop["status"], oco["status"], self.qty = "CANCELED", "FILLED", 0.0
+        def replace_order(self, h, oid, body):
+            r = super().replace_order(h, oid, body)
+            self._find(oid + 1000).update(status="FILLED", filledQuantity=57)
+            self._find(51)["status"], self.qty = "CANCELED", 0.0
             return r
     trader._client = FillsAtOnce([_mu_oco()])
     r = trader.set_target("MXR", "900.00", None, [], set(), None)
@@ -1016,17 +1236,14 @@ def test_a_claimed_ticket_still_gets_the_rebuilt_exits(trader, monkeypatch):
 def test_the_link_is_kept_when_the_check_read_is_late(trader, monkeypatch):
     # ChatGPT audit 2026-11-02 (medium): Schwab accepted the OCO but the read after it missed it.
     _mu_quote(trader, monkeypatch)
-    trader._client = Broker([_filled_entry(_mu_oco())])
+    client = trader._client = Broker([_filled_entry(_mu_oco())])
     tid = _pending_autobe(trader)
-    real, calls = trader._fresh_orders, []
-
-    def late(client, orders=None):
-        calls.append(1)
-        return real(client, orders) if len(calls) == 1 else []
-    monkeypatch.setattr(trader, "_fresh_orders", late)
-    r = trader.set_target("MXR", "898.00", None, [], set(), None)
+    monkeypatch.setattr(trader, "_fresh_orders", lambda client, orders=None: [])
+    # Set target no longer sends an OCO (2026-11-06): the rebuild after a partial still does.
+    r = trader._create_stop(client, "MXR", "SHORT", 57, "EQUITY", Decimal("913.23"), [], set(),
+                            target=Decimal("898.00"), rebuild=True)
     assert not r["ok"]                                              # not confirmed: says so
-    assert trader.store.auto_be_orders(tid) == [max(trader._client.orders)]
+    assert trader.store.auto_be_orders(tid) == [max(client.orders)]
 
 
 def test_a_filled_target_is_only_a_close_when_the_account_is_flat(trader, monkeypatch):
@@ -1034,12 +1251,10 @@ def test_a_filled_target_is_only_a_close_when_the_account_is_flat(trader, monkey
     _mu_quote(trader, monkeypatch)
 
     class FillsButNotFlat(Broker):
-        def place_order(self, h, order):
-            r = super().place_order(h, order)
-            oco = self.orders[max(self.orders)]
-            tgt, stop = oco["childOrderStrategies"]
-            tgt.update(status="FILLED", filledQuantity=57)
-            stop["status"], oco["status"], self.qty = "CANCELED", "FILLED", -28.0
+        def replace_order(self, h, oid, body):
+            r = super().replace_order(h, oid, body)
+            self._find(oid + 1000).update(status="FILLED", filledQuantity=57)
+            self._find(51)["status"], self.qty = "CANCELED", -28.0
             return r
     trader._client = FillsButNotFlat([_mu_oco()])
     r = trader.set_target("MXR", "900.00", None, [], set(), None)
@@ -1261,11 +1476,10 @@ def test_option_set_target_refuses_an_off_grid_price(trader, monkeypatch):
     assert not r["ok"] and "0.05 steps" in r["error"] and trader._client.placed == []
     r = trader.set_target(OPT, "0.95", None, [], set(), None)
     assert r["ok"] and r["target"] == "0.95", r
-    (order,) = trader._client.placed
-    target, stop = order["childOrderStrategies"]
-    assert target["price"] == "0.95" and stop["stopPrice"] == "0.30"
-    assert target["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
-    assert trader._client.previewed == []                     # a fixed stop needs no preview
+    assert trader._client.placed == []
+    (_, body), = trader._client.replaced
+    assert body["price"] == "0.95" and body["orderLegCollection"][0]["instruction"] == "SELL_TO_CLOSE"
+    assert trader._client.previewed == []                     # a price change needs no preview
 
 
 def test_option_target_in_r_uses_the_frozen_premium_basis(trader, monkeypatch):
