@@ -369,8 +369,8 @@ async def position_partial(request: Request):
 
 @app.post("/api/position/set_target")
 async def position_set_target(request: Request):
-    """One target for the whole position at {"price": x} or {"r": n} (frozen R), paired with
-    the current stop in one OCO."""
+    """One target for the whole position at {"price": x} or {"r": n} (frozen R). A working
+    target is replaced in place, so it stays in its OCO with the stop."""
     _guard(request)
     body = await request.json()
     sym = str(body.get("symbol") or "").upper().strip()
@@ -378,8 +378,7 @@ async def position_set_target(request: Request):
     # R only from the ticket that opened THIS position (the row's Live R basis), never an older one.
     pos = next((p for p in (poller.snapshot().get("positions") or []) if p["symbol"] == sym), None)
     return await run_in_threadpool(trader.set_target, sym, body.get("price"), float(r) if r else None,
-                                   poller._merged_orders(), set(poller.terminal), pos and pos.get("r"),
-                                   ((pos or {}).get("trail") or {}).get("level"))
+                                   poller._merged_orders(), set(poller.terminal), pos and pos.get("r"))
 
 
 @app.post("/api/position/trail")

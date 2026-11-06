@@ -15,9 +15,11 @@ These decide most review questions:
    "Auto B/E 1R", chosen per ticket by the user: it moves that ticket's own fixed stop to break-even
    once at +1R, never loosens a stop and is never retried. Any other change that would act without a
    click will not be merged.
-2. **Protection is never removed first.** Schwab cancels a symbol's working orders when a new order
-   for it is entered, so exits are replaced by sending the new bracket (Schwab drops the old one),
-   never by cancelling the stop and then sending a new one.
+2. **Protection is never removed first.** Exits change in place with one replace request, including
+   Close, which replaces the working stop with a market order. Never cancel the stop and then send
+   a new order, and never cancel an exit until the close has filled. A new exit next to working
+   exits may be rejected as oversold with the old exits still working (seen 2026-11-06 on shorts,
+   Ash's approval is in that PR): HTTP 201 does not mean accepted, so read the order's status.
 3. **An incomplete view never looks complete.** P&L carries its coverage (matched, estimated,
    unresolved, stale); unknown is never shown as zero; a stale connection disables order buttons.
 4. **When unsure, refuse.** An order with an unclear outcome blocks further orders for that symbol
@@ -56,9 +58,10 @@ What to add:
 
 - **A fix:** a test that fails without it.
 - **Order logic** (`companion/trading.py`, `companion/bracket.py`): tests against the fake broker in
-  `tests/test_trading.py` (`Broker` simulates working orders, fills, replaces and Schwab's
-  cancel-on-new-order behavior). Cover the unhappy paths: no answer, HTTP 5xx, partial fills, a
-  position that changed in between.
+  `tests/test_trading.py` (`Broker` simulates working orders, fills and replaces; `oversold=True`
+  is the rejection Schwab gave on 2026-11-06, and the default `auto_cancel` is the older
+  cancel-on-new-order assumption). Cover the unhappy paths: no answer, HTTP 5xx, HTTP 201 then
+  rejected, partial fills, a position that changed in between.
 - **P&L** (`companion/pnl.py`): fills with hand-worked expected values.
 - **A UI change:** a screenshot from `--demo` in the pull request.
 

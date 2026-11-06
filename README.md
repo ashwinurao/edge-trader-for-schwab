@@ -73,8 +73,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
   shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
   confirmation on every click) and either way you can send **no target**. The order then carries only
-  what you picked; add the missing stop or target later from the trade (Set stop / Set target), and
-  once it has both they are paired as one OCO.
+  what you picked; add a missing stop later with Set stop. A position that has a stop and no target
+  gets its target in thinkorswim: Set target refuses it, because Schwab rejects a second exit for
+  the same shares (see Good to know).
 - **Options on the ticket:** switch the ticket to Option, type the underlying, pick the expiry, calls
   or puts and a strike from the chain (bid, ask, mark, delta, spread and open interest), then buy to
   open or sell to open. Stop and targets are option prices; contracts are sized from your risk (one
@@ -234,8 +235,12 @@ folder across, run `setup.bat` once, then `launch.bat`.
   app once Schwab shows it working (a stop set in thinkorswim does not count).
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
   works alongside thinkorswim and other tools. It keeps its own requests well under Schwab's limits.
-- **Schwab cancels a symbol's working orders when a new order for it is entered.** Edge Trader is built
-  around that: partials, target changes and trails send one new bracket for the remaining shares.
+- **Schwab can reject a new exit while old exits work.** On 2026-11-06 Schwab answered HTTP 201 and then
+  rejected new exits on short positions as "oversold/overbought", and the old exits stayed. Long
+  positions are not confirmed either way. So Move stop and Replace target change the working order in
+  place, and Close replaces the working stop (or else the target) with a market order. Partials, Set
+  stop next to a target, and trails still send a new order: if Schwab rejects it, the app shows Schwab's
+  reason and what is still working, and nothing else is sent. Use thinkorswim for those.
 - **Planned risk is not maximum loss:** a stop becomes a market order when it triggers and can fill
   past its price on a gap or a halt.
 - **Recording mode:** `.venv\Scripts\python.exe -m companion --private` hides positions carried from
