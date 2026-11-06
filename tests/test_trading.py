@@ -2112,3 +2112,110 @@ def test_a_spread_order_pending_cancel_still_asks_first(trader, monkeypatch):
     trader._client = _call_leg(1.0, [_opt("META  261120P00590000", 1.0, "PUT")], orders=[spread])
     r = trader.close_position(LONG_C, [], set())
     assert r["needs_confirm"] and "multi-leg" in r["error"] and trader._client.placed == []
+
+
+# ---- ETFs (Schwab type COLLECTIVE_INVESTMENT) -------------------------------------------------
+# Live test 2026-11-06: a 1-share SPY short was placed from the ticket (sent as EQUITY), but Close
+# refused it, because Schwab reports ETF positions as COLLECTIVE_INVESTMENT and the position
+# buttons only knew EQUITY and OPTION. Ash's go (2026-11-06 20:09 UTC, project thread): treat ETFs
+# like stocks. The same MXR fixtures, with every type label switched to Schwab's ETF label.
+ETF = "COLLECTIVE_INVESTMENT"
+
+
+def _as_etf(order):
+    import copy
+    o = copy.deepcopy(order)
+
+    def walk(n):
+        for leg in n.get("orderLegCollection") or []:
+            leg["instrument"]["assetType"] = ETF
+        for ch in n.get("childOrderStrategies") or []:
+            walk(ch)
+    walk(o)
+    return o
+
+
+def _etf_broker(orders=(), **kw):
+    return Broker([_as_etf(o) for o in orders], position=("MXR", -57.0, ETF), **kw)
+
+
+def _sent_types(*orders):
+    types = set()
+
+    def walk(n):
+        for leg in n.get("orderLegCollection") or []:
+            types.add(leg["instrument"]["assetType"])
+        for ch in n.get("childOrderStrategies") or []:
+            walk(ch)
+    for o in orders:
+        walk(o)
+    return types
+
+
+def test_etf_close_replaces_the_stop_with_one_market_order(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _etf_broker([_mu_oco()], oversold=True)
+    r = trader.close_position("MXR", list(trader._client.orders.values()), set())
+    assert r["ok"] and r["filled"] == 57, r
+    (oid, order), = trader._client.replaced
+    assert oid == 51 and order["orderType"] == "MARKET"
+    assert order["orderLegCollection"][0]["instruction"] == "BUY_TO_COVER"
+    assert _sent_types(order) == {"EQUITY"}          # the label the ticket's SPY entry used live
+
+
+def test_etf_close_without_exits_sends_a_market_order(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _etf_broker()
+    r = trader.close_position("MXR", [], set())
+    assert r["ok"] and r["filled"] == 57, r
+    (order,) = trader._client.placed
+    assert order["orderType"] == "MARKET" and order["orderLegCollection"][0]["quantity"] == 57
+
+
+def test_etf_move_stop_keeps_the_oco_and_its_target(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _etf_broker([_mu_oco()])
+    r = trader.move_stop("MXR", "910.00", [], set())
+    assert r["ok"] and r["oco_kept"], r
+    (oid, body), = trader._client.replaced
+    assert oid == 51 and body["stopPrice"] == "910.00" and _sent_types(body) == {"EQUITY"}
+
+
+def test_etf_partial_market_then_rebuilds_oco_on_the_rest(trader, monkeypatch):
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    trader._client = _etf_broker([_mu_oco()])
+    r = trader.take_partial("MXR", 0.5, None, [], set(), mode="market")
+    assert r["ok"], r
+    partial, rebuild = trader._client.placed
+    assert partial["orderLegCollection"][0]["quantity"] == 28 and rebuild["orderStrategyType"] == "OCO"
+    assert _sent_types(partial, rebuild) == {"EQUITY"}
+
+
+def test_etf_set_target_replaces_the_working_target(trader, monkeypatch):
+    _mu_quote(trader, monkeypatch)
+    trader._client = _etf_broker([_mu_oco()], oversold=True)
+    r = trader.set_target("MXR", "901.00", None, [], set(), None)
+    assert r["ok"] and r["target"] == "901.00", r
+    (oid, body), = trader._client.replaced
+    assert oid == 52 and body["price"] == "901.00" and _sent_types(body) == {"EQUITY"}
+
+
+def test_etf_trail_replaces_exits_with_target_and_trailing_stop(trader, monkeypatch):
+    _quote_mark(trader, monkeypatch)
+    trader._client = _etf_broker([_mu_oco()])
+    r = trader.set_trail("MXR", "$", 2.5, "MARK", [], set(), None)
+    assert r["ok"], r
+    (order,) = trader._client.placed
+    assert order["childOrderStrategies"][1]["orderType"] == "TRAILING_STOP"
+    assert _sent_types(order) == {"EQUITY"}
+
+
+def test_etf_long_next_to_a_short_call_still_asks_first(trader, monkeypatch):
+    # The covered-call guard (_leg_risk) must see ETF shares as shares too.
+    monkeypatch.setattr(trading.time, "sleep", lambda s: None)
+    call = {"instrument": {"symbol": "MXR   261120C00950000", "assetType": "OPTION", "putCall": "CALL",
+                           "underlyingSymbol": "MXR"}, "longQuantity": 0, "shortQuantity": 1}
+    trader._client = Broker([], position=("MXR", 100.0, ETF), others=[call])
+    r = trader.close_position("MXR", [], set())
+    assert not r["ok"] and r["needs_confirm"] and "UNCOVERED" in r["error"], r
+    assert trader._client.placed == []

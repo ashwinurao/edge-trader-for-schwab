@@ -164,6 +164,14 @@ def _trail_txt(spec: dict) -> str:
     return f"trailing {dist} from {spec['basis'].lower()}"
 
 
+def _trade_asset(asset_type: str | None) -> str | None:
+    """The asset type the position buttons trade with. Schwab reports ETFs (SPY, SOXL, ...) as
+    COLLECTIVE_INVESTMENT, but they trade exactly like stock shares, and the ticket already sends
+    them as EQUITY (a live SPY entry on 2026-11-06). Close, Partial, stop, target and trail refused
+    them until Ash's go to treat ETFs like stocks (2026-11-06 20:09 UTC, project thread)."""
+    return "EQUITY" if asset_type == "COLLECTIVE_INVESTMENT" else asset_type
+
+
 def _units(asset: str | None) -> tuple[str, str]:
     """(word, short) for the position's size in messages."""
     return ("contracts", "ct") if asset == "OPTION" else ("shares", "sh")
@@ -926,7 +934,7 @@ class Trader:
             ins = p.get("instrument") or {}
             if ins.get("symbol") == symbol:
                 return (float(p.get("longQuantity") or 0) - float(p.get("shortQuantity") or 0),
-                        ins.get("assetType"))
+                        _trade_asset(ins.get("assetType")))
         return 0.0, None
 
     @staticmethod
@@ -1302,7 +1310,7 @@ class Trader:
                                         "quantity": int(l.get("quantity")) if float(l.get("quantity") or 0).is_integer()
                                         else l.get("quantity"),
                                         "instrument": {"symbol": (l.get("instrument") or {}).get("symbol"),
-                                                       "assetType": (l.get("instrument") or {}).get("assetType", "EQUITY")}}
+                                                       "assetType": _trade_asset((l.get("instrument") or {}).get("assetType", "EQUITY"))}}
                                        for l in legs],
             }
             if cur.get("orderType") == "STOP_LIMIT" and cur.get("price") is not None:
@@ -1686,7 +1694,7 @@ class Trader:
                                         "quantity": int(l.get("quantity")) if float(l.get("quantity") or 0).is_integer()
                                         else l.get("quantity"),
                                         "instrument": {"symbol": (l.get("instrument") or {}).get("symbol"),
-                                                       "assetType": (l.get("instrument") or {}).get("assetType", "EQUITY")}}
+                                                       "assetType": _trade_asset((l.get("instrument") or {}).get("assetType", "EQUITY"))}}
                                        for l in cur.get("orderLegCollection") or []]}
         self.store.log_action("set_target", symbol, old.order_id, "SENDING",
                               f"{f(Decimal(str(cur.get('price') or 0)))} -> {label}")
