@@ -1478,11 +1478,22 @@ function lookupSymbol() {
     } catch (e) { /* the plan box reports connection problems */ }
   }, 300);
 }
+// crypto.randomUUID exists only in secure contexts (HTTPS or localhost). The dashboard is
+// usually opened over plain HTTP on the LAN (http://<server>:8770), where it is missing and the
+// ticket went out without an id, so the server refused it ("missing ticket id", trading.py).
+// crypto.getRandomValues works over plain HTTP and gives the same random version-4 id.
+function newTicketId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;    // RFC 4122 version 4, variant 1
+  const h = Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
 function onTicketEdit() {
   // Any edit invalidates the shown plan at once: the button can never send stale numbers.
   T.plan = null; T.seq++;
   const k = keyOf(ticketReq());
-  if (k !== T.intentKey) { T.intentKey = k; T.ticketId = crypto.randomUUID(); }
+  if (k !== T.intentKey) { T.ticketId = newTicketId(); T.intentKey = k; }
   renderTargets();
   renderTicket();
   scheduleRefresh();
@@ -1606,7 +1617,7 @@ async function submitTicket() {
       msg.textContent = r.duplicate ? `Already sent: order ${r.order_id ?? "(id pending)"}.`
         : `Sent: order ${r.order_id ?? "(id pending)"}, ${r.plan.asset === "OPTION" ? (r.plan.side === "LONG" ? "buy to open" : "sell to open") : r.plan.side} ${r.plan.qty} ${r.plan.asset === "OPTION" ? optName(r.plan.symbol) : r.plan.symbol} ${r.plan.market ? "at market" : "@ " + r.plan.limit}, stop ${r.plan.has_stop ? (r.plan.stop || "trailing") : "none"}, target ${r.plan.has_target ? r.plan.target : "none"}.`;
     } else {
-      if (r.status === "RATE_LIMITED") T.ticketId = crypto.randomUUID();   // nothing placed: retry allowed
+      if (r.status === "RATE_LIMITED") T.ticketId = newTicketId();   // nothing placed: retry allowed
       else if (r.status || r.duplicate) T.sentKey = T.intentKey;   // reached Schwab: this intent is spent
       msg.className = "tk-msg " + (r.status === "UNKNOWN" || r.status === "RATE_LIMITED" ? "warn" : "bad");
       msg.textContent = r.error || "Not sent.";
