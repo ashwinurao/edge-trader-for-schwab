@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__
+from . import __version__, fills_feed
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -146,6 +146,16 @@ def state():
         snap = private_view(snap)
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO, "server": SERVER,
                          "signin": signin.status(), "version": __version__}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/fills")
+def fills(since: str):
+    """Stored fills for Trading Journal AI's auto-import (companion/fills_feed.py). Never calls Schwab."""
+    try:
+        body = fills_feed.fills_since(poller, since)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse(body, headers={"Cache-Control": "no-store"})
 
 
 # Schwab sign-in from the dashboard (companion/signin.py): no console, no login.bat.

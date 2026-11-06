@@ -44,6 +44,8 @@ name are refused). It needs no account and sends no telemetry.
 
 - Your Schwab tokens (`~/.schwabdev/tokens.db`, managed by Schwabdev) and your app key and secret (`.env`).
 - Everything the app records: positions, orders, fills, the action log and your settings, in `data/companion.db`.
+  Your fills (without the account number) can be read at `/api/fills` by apps that reach Edge Trader's
+  address, such as Trading Journal AI on the same server (see "Running on a home server").
 
 ### What leaves your computer
 
@@ -184,6 +186,12 @@ mounted read-only), `SCHWAB_SHARED_TOKEN_FILE` (e.g. `/shared-schwab/token.ferne
 `SCHWAB_SHARED_TOKEN_KEY` (its Fernet key) and optionally `SCHWAB_SHARED_APP_NAME`. Edge Trader
 picks up each new sign-in from that file and makes its own access tokens from it; renew the login
 in the other app every 7 days.
+
+**Fills for Trading Journal AI.** `GET /api/fills?since=2026-11-05T14:30:00Z` returns the Schwab
+fills Edge Trader already stores (Schwab's TRADE transactions, without the account number) and
+`complete`, which is true only when the 60-day fill history is loaded and the 10-second fills poll
+is fresh. It only reads the local database and never calls Schwab. Trading Journal AI uses it to
+import trades automatically. Its requests must use an address listed in `EDGE_TRADER_HOSTS`.
 
 ## Updating to a new release
 
