@@ -219,6 +219,9 @@ folder across, run `setup.bat` once, then `launch.bat`.
 
 - **Futures:** Schwab's API reports futures fills but not futures positions or orders, so Edge Trader
   shows futures realized P&L only and cannot trade futures.
+- **ETFs** (SPY, SOXL, ...) trade and are managed exactly like stocks. Schwab labels them
+  `COLLECTIVE_INVESTMENT`; Edge Trader sends their orders as `EQUITY`, the only stock type Schwab's
+  order API accepts.
 - **Options:** single calls and puts, bought or sold to open from the ticket and managed like stocks
   (close, cancel, stops, Auto B/E, partials, targets, trailing stops). Prices follow each contract's own
   steps (pennies, nickels or dimes). Schwab does not document trailing stops on options, so each one is
