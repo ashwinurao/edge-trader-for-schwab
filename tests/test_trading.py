@@ -76,6 +76,20 @@ def test_same_ticket_twice_never_sends_twice(trader):
     assert r["duplicate"] and len(trader._client.placed) == 1
 
 
+@pytest.mark.parametrize("tid", [None, "", "short"])
+def test_missing_ticket_id_sends_nothing(trader, tid):
+    # The ticket id is the duplicate-order guard: without one, a double click could send twice.
+    r = trader.submit(req(ticket_id=tid))
+    assert r == {"ok": False, "error": "missing ticket id"} and trader._client.placed == []
+
+
+def test_random_v4_ticket_id_sends_once(trader):
+    # The shape the page's newTicketId() makes over plain HTTP (index.html).
+    tid = "3f2b8c1e-9a4d-4e7f-8b21-0c5d6e7f8a9b"
+    assert trader.submit(req(ticket_id=tid))["ok"]
+    assert trader.submit(req(ticket_id=tid))["duplicate"] and len(trader._client.placed) == 1
+
+
 def test_arming_lapses_at_the_close(trader):
     trader.store.set_setting("trading_armed_at", "2026-10-19T14:00:00+00:00")   # 10:00 ET yesterday
     assert not trader.armed
