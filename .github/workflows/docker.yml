@@ -1,0 +1,54 @@
+name: Docker
+
+# Fork CI (Ash, project thread, 2026-11-07): every pull request and every push to main
+# runs the tests inside the Dockerfile's own Python and builds the image Unraid runs.
+# Upstream's ci.yml is left as it is, so upstream syncs stay easy (CLAUDE.md).
+# GitHub-hosted machines only: never add a self-hosted runner to this public repo, because
+# a pull request from any fork could run code on it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests in python:3.11-slim
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The Dockerfile's base image, so the tests see the same Python the server runs.
+    container: python:3.11-slim
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: python -m pip install --no-cache-dir -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  image:
+    name: Build the Unraid image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # The same build Unraid runs with `docker compose up -d --build`. Nothing is pushed.
+      - name: Build image
+        run: docker build --tag edge-trader:ci .
+
+      # The image starts Python and finds the app as its own user, without a .env.
+      - name: Import the app inside the image
+        run: docker run --rm --network none edge-trader:ci python -c "import companion.app"
