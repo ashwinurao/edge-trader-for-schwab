@@ -30,6 +30,11 @@ list is the order-safety contract and wins over anything here.
   hand-worked expected values.
 - UI changes need real browser evidence: screenshots from `python -m companion --demo`.
 - Keep scratch artifacts in the ignored `.logs/` folder.
+- GitHub checks (Ash, project thread, 2026-11-07): `.github/workflows/docker.yml` runs
+  the tests inside `python:3.11-slim` (the Dockerfile's base) and builds the server image
+  on every PR and push to `main`. Upstream's `ci.yml` runs too. Do not merge on a red
+  check. GitHub-hosted machines only: this repo is public, so it never gets a
+  self-hosted runner.
 
 ## Branches and pull requests
 
@@ -56,7 +61,7 @@ recommended option only where it is reversible and not protected.
 - Approved test expectations.
 - New or upgraded dependencies, new network calls or external services.
 - Anything on the live server beyond the standard pull and rebuild of `main`.
-- Turning on GitHub-hosted CI.
+- New workflows that deploy, use secrets or run on a self-hosted runner.
 
 ## Style
 
