@@ -11,10 +11,13 @@ GitHub's private vulnerability reporting.
 These decide most review questions:
 
 1. **Every order is the user's click.** Nothing places, replaces or cancels an order on its own: no
-   automation, no retries of an order request, no background jobs that trade. The one exception is
-   "Auto B/E 1R", chosen per ticket by the user: it moves that ticket's own fixed stop to break-even
-   once at +1R, never loosens a stop and is never retried. Any other change that would act without a
-   click will not be merged.
+   automation, no retries of an order request, no background jobs that trade. There are two
+   exceptions, each the user's opt-in for one trade. "Auto B/E 1R", chosen per ticket: it moves that
+   ticket's own fixed stop to break-even once at +1R, never loosens a stop and is never retried.
+   "Send when hit", ticked per spread stop (upstream v1.3.0, `companion/spreads/spread_stop.py`;
+   allowed in this fork by Ash on 2026-11-09, fork PR #12): when the app-watched stop fires, the app
+   sends that spread's close once, only while it runs, never retried. Any other change that would act
+   without a click will not be merged.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working
