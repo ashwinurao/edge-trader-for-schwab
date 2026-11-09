@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 
 PAGE = Path(__file__).resolve().parent.parent / "companion" / "static" / "index.html"
+# The spread ticket (upstream v1.3.0) runs inside the same page and uses the page's newTicketId().
+SPREADS = Path(__file__).resolve().parent.parent / "companion" / "spreads" / "static" / "spreads.js"
 
 
 def _page():
@@ -30,7 +32,14 @@ def test_page_never_calls_random_uuid_directly():
     # Every ticket id goes through newTicketId(), which has the plain-HTTP fallback.
     outside = _page().replace(_new_ticket_id_source(), "")
     assert "crypto.randomUUID()" not in outside
-    assert outside.count("newTicketId()") >= 2       # new intent, and the rate-limited retry
+    assert outside.count("newTicketId()") >= 3       # new intent, the rate-limited retry, a cancelled entry
+
+
+def test_spread_ticket_never_calls_random_uuid_directly():
+    # The spread ticket sends its own ticket id, so it needs the same plain-HTTP fallback.
+    spreads = SPREADS.read_text(encoding="utf-8")
+    assert "crypto.randomUUID()" not in spreads
+    assert spreads.count("newTicketId()") >= 2       # new intent, and the rate-limited retry
 
 
 NODE = shutil.which("node")

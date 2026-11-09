@@ -1045,7 +1045,7 @@ document.addEventListener("click", async e => {
     // The ticket's own entry confirmed CANCELED with nothing filled: the same ticket can be sent again.
     if (T.sentOrderId != null && (act === "all" ? r.results || [] : [r])
           .some(x => x.ok && String(x.order_id) === String(T.sentOrderId))) {
-      T.sentKey = null; T.sentOrderId = null; T.ticketId = crypto.randomUUID();
+      T.sentKey = null; T.sentOrderId = null; T.ticketId = newTicketId();
       renderTicket(); scheduleRefresh(100);
     }
     if (act === "all") {

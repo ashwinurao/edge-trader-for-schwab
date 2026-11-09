@@ -240,7 +240,7 @@
   const keyOf = q => [q.underlying, q.kind, q.near, q.far, q.entry, q.limit_price, q.size_mode, q.qty, q.risk].join("|");
   function edited() {
     const k = keyOf(req());
-    if (k !== S.intentKey) { S.intentKey = k; S.ticketId = crypto.randomUUID(); S.preview = null; $("sp-prevmsg").textContent = ""; $("sp-msg").textContent = ""; }
+    if (k !== S.intentKey) { S.intentKey = k; S.ticketId = newTicketId(); S.preview = null; $("sp-prevmsg").textContent = ""; $("sp-msg").textContent = ""; }
     schedule(250);
   }
   function schedule(ms) { clearTimeout(S.timer); S.timer = setTimeout(refresh, ms); }
@@ -349,7 +349,7 @@
         msg.textContent = r.duplicate ? `Already sent: order ${r.order_id}.` : `Sent: order ${r.order_id}, ${KIND_TXT[p.kind]} ${p.limit}. It shows in Open trades.`;
         if (r.spread_id) selectSpread(r.spread_id);
       } else {
-        if (r.status === "RATE_LIMITED") S.ticketId = crypto.randomUUID();
+        if (r.status === "RATE_LIMITED") S.ticketId = newTicketId();
         else if (r.status || r.duplicate || r.spread_id) S.sentKey = S.intentKey;
         msg.className = "tk-msg " + (r.status === "UNKNOWN" || r.status === "RATE_LIMITED" ? "warn" : "bad");
         msg.textContent = r.error || "Not sent.";
