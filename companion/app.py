@@ -145,7 +145,7 @@ def state():
     if PRIVATE:
         snap = private_view(snap)
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO, "server": SERVER,
-                         "signin": signin.status(), "version": __version__}, headers={"Cache-Control": "no-store"})
+                         "signin": signin.status(), "version": __version__, "features": FEATURES}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/fills")
@@ -392,6 +392,15 @@ async def position_trail(request: Request):
     return await run_in_threadpool(trader.set_trail, sym, body.get("unit") or "R", body.get("value"),
                                    body.get("basis") or "MARK", poller._merged_orders(), set(poller.terminal),
                                    pos and pos.get("r"), ((pos or {}).get("trail") or {}).get("level"))
+
+
+# Optional features (companion/spreads; a build may leave a feature out) add their own endpoints and
+# name the page scripts the dashboard loads for them.
+try:
+    from .spreads import routes as _feature_routes
+except ImportError:
+    _feature_routes = None
+FEATURES = _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
 
 
 @app.post("/api/position/resolve_close")
