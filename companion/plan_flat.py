@@ -22,9 +22,13 @@ Flat all (Part A): one button ends the morning's plan trades.
   check thinkorswim). A refused or unclear row does not stop the others. A 429 stops the batch.
 - It closes only what the plan's own entries opened: the row's entry filled today, the account is
   on the same side, and holds no more shares of the name than the entry filled.
-- It refuses: ARM off, market closed, Schwab's order list or positions old, a 429 pause, a batch
-  already running; per row: a name blocked by an unclear order, a click still running, an entry
-  partly filled and still working.
+- It refuses: market closed, Schwab's order list or positions old, a 429 pause, a batch already
+  running, a list that changed since the page showed it; per row: a name blocked by an unclear
+  order, a click still running, an entry partly filled and still working.
+- It needs no ARM, and never turns ARM on: its cancels and closes only remove risk, and the
+  dashboard's Cancel entry and Close need no ARM either. ARM turning off during a batch does not stop
+  it. A restart turns ARM off, so this is the case where it matters (brief 27; Ash's "3 yes", project
+  thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC; seen live 19:52:15 UTC).
 - While a batch runs, PlanDesk holds new entries (HOLD): Place and Flip refuse, Cancel works. The
   batch first calls `before_batch` (Step 6 wires its Disarm there); if that raises, it is logged
   and the batch goes on. Architect's review 1 of Step 9, 2026-11-13.
@@ -35,9 +39,10 @@ shares, the dashboard's own protection (Trader.brackets: PROTECTED, PARTIAL, NO_
 ticket. Shares without a working stop for longer than cover.grace_seconds (playbook) turn the row
 red: "N of M shares have no stop", with one Add stop button. The click sends a stop for those
 shares at the row's stop price (the stop its entry was sent with) through the dashboard's own stop
-path (Trader.move_stop), with that path's refusals. That path creates a stop only when the position
-has none, for the whole position; when part is covered it would move the working stop instead, so a
-partly covered row refuses and says to set the rest in thinkorswim. Nothing is added automatically.
+path (Trader.move_stop), with that path's refusals, and it needs ARM. That path creates a stop only
+when the position has none, for the whole position; when part is covered it would move the working
+stop instead, so a partly covered row refuses and says to set the rest in thinkorswim. Nothing is
+added automatically.
 The grace is measured when the page asks (GET /api/opening-plan/flat, every 2 s), not by a server
 clock: with the page closed no row turns red (README, "Before any stage above 1 share").
 
@@ -202,9 +207,14 @@ class PlanFlat:
         except Exception:
             return 0.0
 
-    def _refusal(self) -> str:
-        """Why no batch (and no Add stop) can go now, or ""."""
-        if not self.desk._armed():
+    def _refusal(self, need_arm: bool = False) -> str:
+        """Why no batch (or, with need_arm, no Add stop) can go now, or "".
+
+        Flat all needs no ARM: it only cancels unfilled plan entries and closes plan shares, and both
+        only remove risk, like the dashboard's own Cancel entry and Close (brief 27; Ash's "3 yes",
+        project thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC). Add stop keeps
+        its ARM check: brief 27 covers Flat all only."""
+        if need_arm and not self.desk._armed():
             return "ARM is off. Arm on the dashboard first. Nothing was sent."
         if not self.desk._market_open():
             return "The market is closed (9:30 to 16:00 ET). Nothing was sent."
@@ -377,11 +387,9 @@ class PlanFlat:
         stopped = ""
         for it in work:
             res = results[it["ticker"]]
-            if not stopped:
-                if self._cooldown() > 0:
-                    stopped = THROTTLED
-                elif not self.desk._armed():
-                    stopped = "Not sent: ARM turned off during the batch."
+            # ARM turning off mid-batch does not stop it (brief 27): the rest only removes risk too.
+            if not stopped and self._cooldown() > 0:
+                stopped = THROTTLED
             if stopped:
                 res.update(result=NOT_SENT, text=stopped)
                 continue
@@ -473,7 +481,7 @@ class PlanFlat:
                           if red else ""), "add_stop": ""}
             if red:
                 if refusal is None:
-                    refusal = self._refusal()
+                    refusal = self._refusal(need_arm=True)
                 c["add_stop"] = refusal or self._add_stop_refusal(ticker, prot, stop)
             out[ticker] = c
         return out

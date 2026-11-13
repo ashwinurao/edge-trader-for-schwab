@@ -492,9 +492,13 @@ by the clock: every order is your click.
   the same side and holds no more shares of that name than the entry filled. A larger or opposite
   position is refused for that row ("Close it on the dashboard"). So is an entry that is partly filled
   and still working.
-- It refuses when entries are not armed, the market is closed, Schwab's order list or positions are
-  old, Schwab is throttling, or a batch is already running. A name blocked by an unclear order is
-  refused for that row only.
+- It refuses when the market is closed, Schwab's order list or positions are old, Schwab is
+  throttling, or a batch is already running. A name blocked by an unclear order is refused for that
+  row only.
+- It works with ARM off, and never turns ARM on. Its cancels and closes only remove risk, like the
+  dashboard's own Cancel entry and Close, which need no ARM either. A restart turns ARM off, so after a
+  restart Flat all still cancels a resting entry. ARM turning off during a batch does not stop it.
+  Place and Flip still need ARM.
 - While a batch runs, no new plan entry goes: Place and Flip refuse with "Flat all is running: no new
   entries until it ends. Nothing was sent." Cancel still works. So Flat all never says "done" while a
   new order rests. A batch first calls the hook Step 6 wires to its Disarm.
