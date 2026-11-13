@@ -40,6 +40,14 @@ in playbook.json "automatic", each a start number Ash has not approved):
 
 Fills are estimates: a snapshot shows the latest trade only, so a fill counts when a seen trade
 is inside the order's price band; trades between two readings are not seen.
+
+Step 6 (the armed send, brief 16 item 3): a pick may carry `entry`, the real entry as Edge Trader's
+row record and Schwab's order list say (companion/plan_auto/executor.py builds it): state "none",
+"working" (with its side, trigger, limit, stop, the range it was built on and the row's flips),
+"filled", "ended" (ended unfilled, or the plan left it) or "unclear". With it the pick's state
+follows the real entry and the engine makes no fill estimate: it says would_place while nothing
+rests, would_flip on each reading past the flip line while the entry rests untriggered, and
+would_cancel while an unfilled entry rests past its time. Without it the engine behaves exactly as before (the shadow and the replay).
 Each no_action is said once per pick until its reason changes, so the log stays readable.
 """
 from __future__ import annotations
@@ -214,6 +222,9 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
                  rules: Rules) -> None:
     sym = str(pick.get("symbol"))
     ps = st["picks"].setdefault(sym, {"state": WAIT, "flips": 0})
+    entry = pick.get("entry") if isinstance(pick.get("entry"), Mapping) else None
+    if entry is not None:
+        _follow(ps, entry, pick, reading, rules)
     if ps["state"] in (FILLED, DONE):
         return
     watch_end = datetime.combine(day, rules.watch_until_et, tzinfo=ET)
@@ -249,7 +260,7 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
         if hold or last is None or age is None or age > rules.stale_after_seconds:
             _say(st, out, sym, STALE, hold or _stale_why(age, by_quote), now, seen)
             return
-        _on_price(st, out, sym, ps, last, now, rules, seen)
+        _on_price(st, out, sym, ps, last, now, rules, seen, real=entry is not None)
         return
 
     # WAIT: no order yet.
@@ -314,7 +325,55 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
     if calm:
         why += f"; calm day, {rules.calm_multiplier:g}x the risk"
     _act(st, out, sym, "would_place", why, **_order_out(o), calm=calm, risk_used=_f(risk_used), **seen)
-    _on_price(st, out, sym, ps, last, now, rules, seen)
+    if entry is None:
+        _on_price(st, out, sym, ps, last, now, rules, seen)
+    # With a real entry nothing is estimated: the next reading's entry says what Schwab has.
+
+
+def _follow(ps: dict, entry: Mapping, pick: Mapping, reading: Mapping, rules: Rules) -> None:
+    """The pick's state from its real entry (Step 6). Never an estimate."""
+    state = entry.get("state")
+    if state == "filled":
+        ps["state"] = FILLED
+        return
+    if state == "none":
+        if ps["state"] == WORKING:
+            ps["state"] = WAIT              # nothing rests: decide again on this reading
+        return
+    if state != "working":
+        ps["state"] = DONE                  # ended unfilled, left by the plan, or unclear
+        return
+    side = str(entry.get("side") or "").lower()
+    trig, lim, stop = _dec(entry.get("trigger")), _dec(entry.get("limit")), _dec(entry.get("stop"))
+    high = _dec(entry.get("high")) or _dec(pick.get("high"))
+    low = _dec(entry.get("low")) or _dec(pick.get("low"))
+    if side not in ("long", "short") or None in (trig, lim, stop, high, low):
+        ps["state"] = DONE                  # can't tell what rests: act on nothing
+        return
+    rps = trig - stop if side == "long" else stop - trig
+    width = high - low
+    flip_at = high - rules.flip_line * width if side == "long" else low + rules.flip_line * width
+    if ps.get("entry_id") != entry.get("order_id"):
+        # A new entry: its pullback wait starts when its trigger is seen to trade, or at the
+        # record's own wait_from (a chase rests past its trigger from the send, brief 18).
+        ps.update(entry_id=entry.get("order_id"), triggered_at=_when(entry.get("wait_from")))
+    if "risk_used" not in ps:
+        risk = _dec(reading.get("risk"))
+        if risk is not None:
+            ps["risk_used"] = risk * rules.calm_multiplier if reading.get("calm") else risk
+    ps.update(state=WORKING, high=high, low=low, flips=int(entry.get("flips") or 0),
+              order={"side": side, "trigger": trig, "limit": lim, "stop": stop, "cap": abs(lim - trig),
+                     "rps": rps, "shares": entry.get("shares"), "flip_at": flip_at})
+
+
+def _when(text: Any) -> Optional[datetime]:
+    if isinstance(text, datetime):
+        return text if text.utcoffset() is not None else None
+    try:
+        dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.utcoffset() is not None else None
 
 
 def _stale_why(age: Optional[float], by_quote: bool = False) -> str:
@@ -324,12 +383,21 @@ def _stale_why(age: Optional[float], by_quote: bool = False) -> str:
 
 
 def _on_price(st: dict, out: list, sym: str, ps: dict, last: Decimal, now: datetime, rules: Rules,
-              seen: dict) -> None:
-    """A fresh price against a working order: fill, wait for a pullback, or flip."""
+              seen: dict, real: bool = False) -> None:
+    """A fresh price against a working order: fill, wait for a pullback, or flip. `real`: the order
+    is a real entry (Step 6): no fill estimate, and one would_flip per resting entry."""
     o = ps["order"]
     s = _sign(o["side"])
     past_trigger = s * (last - o["trigger"]) >= 0
     inside_limit = s * (o["limit"] - last) >= 0
+    if real and (ps.get("triggered_at") is not None or past_trigger):
+        # The trigger traded: Schwab's answer says whether it filled. Unfilled after
+        # pullback_wait_seconds, the WORKING branch says would_cancel.
+        if ps.get("triggered_at") is None:
+            ps["triggered_at"] = now
+            _say(st, out, sym, "triggered", f"price {last} is at or past the trigger {o['trigger']}: "
+                 f"the entry may fill; unfilled, it is cancelled after {rules.pullback_wait_seconds:g} s", now, seen)
+        return
     if ps.get("triggered_at") is not None or past_trigger:
         if inside_limit:
             ps["state"] = FILLED
@@ -352,7 +420,15 @@ def _on_price(st: dict, out: list, sym: str, ps: dict, last: Decimal, now: datet
         return
     new_side = "short" if o["side"] == "long" else "long"
     # The same risk on the new side: shares from that side's own risk per share.
-    n = order_for(new_side, ps["high"], ps["low"], ps["risk_used"], rules)
+    n = order_for(new_side, ps["high"], ps["low"], ps.get("risk_used") or Decimal(0), rules)
+    if real:
+        # Said on each reading while it holds: the flip handler (Step 7) acts, or declines and
+        # gets it again; the next reading's entry shows what Schwab has. The flips count is the
+        # row's own (entry["flips"]).
+        _act(st, out, sym, "would_flip", f"price {last} crossed the flip line {round(float(o['flip_at']), 4)}: "
+             f"cancel the {o['side']} entry, place the {new_side} one", flips=ps["flips"] + 1,
+             **{"from": o["side"]}, **_order_out(n), **seen)
+        return
     ps["flips"] += 1
     ps["order"] = n
     _act(st, out, sym, "would_flip", f"price {last} crossed the flip line {round(float(o['flip_at']), 4)}: "

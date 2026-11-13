@@ -93,6 +93,22 @@
   .flatline { font: 400 12px var(--sans); white-space: normal; }
   .flatline.done { color: var(--green); } .flatline.nothing { color: var(--muted); }
   .flatline.refused, .flatline.not_sent { color: var(--amber); } .flatline.unclear { color: var(--red); font-weight: 600; }
+  /* The armed plan's panel (companion/plan_auto, Step 6): only when GET /api/opening-plan/auto answers. */
+  .auto { margin: 10px 16px 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line-hi); background: var(--panel); }
+  .auto.armed { border-color: rgba(229,83,75,.7); box-shadow: 0 0 0 1px rgba(229,83,75,.25) inset; }
+  .auto .hd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .auto h2 { font-size: 14px; margin: 0; }
+  .auto .lines { margin-top: 8px; display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 12.5px; }
+  .auto .lines .tk { font-size: 13px; }
+  .btn.arm { border-color: rgba(229,83,75,.7); color: var(--red); }
+  .btn.disarm { border-color: rgba(214,165,43,.7); color: var(--amber); }
+  .ovl { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; z-index: 10; }
+  .ovl .dlg { max-width: none; width: min(680px, 94vw); max-height: 86vh; overflow: auto; background: var(--panel); border: 1px solid var(--line-hi); border-radius: 10px; padding: 16px 18px; }
+  .ovl .dlg h3 { margin: 0 0 8px; font-size: 16px; }
+  .ovl .dlg ul { margin: 4px 0 10px; padding-left: 18px; } .ovl .dlg li { margin: 2px 0; font-size: 13px; }
+  .ovl .dlg .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; margin-top: 10px; }
+  .ovl .dlg table { min-width: 0; margin: 0; } .ovl .dlg td { padding: 3px 10px 3px 0; border: none; font-size: 13px; }
+  .ovl .dlg .row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
   .bp { font: 500 12.5px var(--sans); color: var(--muted); }
   .bp b { font: 600 13px var(--mono); color: var(--text); }
   table.preview td { background: repeating-linear-gradient(135deg, transparent 0 10px, rgba(214,165,43,.05) 10px 20px); }
@@ -123,6 +139,8 @@
   <span id="flat-slot"></span>
 </div>
 <div id="banners"></div>
+<div id="auto"></div>
+<div id="ovl"></div>
 <div class="dlg-bg" id="flat-dlg"><div class="dlg" role="dialog" aria-modal="true" aria-labelledby="flat-h">
   <h2 id="flat-h">Flat all: end the plan's trades</h2>
   <div class="mut msg">Cancels first, then closes, one row at a time in rank order: an unfilled entry through the dashboard's own Cancel
@@ -144,6 +162,8 @@ let lastOk = 0, lastView = null, refresh = 2000, busy = false, typing = false;
 // Row buttons (companion/plan_entries.py): only when the server has them (EDGE_TRADER_PLAN_BUTTONS=1
 // and EDGE_TRADER_BREAK_ENTRY=1); a 404 means no buttons.
 let entries = null, entriesOff = false;
+// The armed plan (companion/plan_auto, Step 6): only when the server has it (EDGE_TRADER_PLAN_AUTO=1); 404: no panel.
+let auto = null, autoOff = false, autoMsg = null;
 // Flat all and the cover watch (companion/plan_flat.py, Step 9): only when the server has them
 // (EDGE_TRADER_PLAN_FLAT=1 with the plan buttons); a 404 means no Flat all button and no cover lines.
 let flat = null, flatOff = false, flatShown = null, flatBusy = false, flatSaid = null;
@@ -188,6 +208,9 @@ function notes(r) {
   if (e) {
     const st = e.entry, m = said[r.ticker];
     if (m) out.push(`<div class="${m.ok ? "mutline" : "badline"}">${esc(m.text)}</div>`);
+    if (st.origin === "auto" && st.state !== "NONE") out.push(`<div class="${st.red ? "badline" : "warnline"}">Sent by the armed plan.</div>`);
+    // Ruling of 2026-11-13 16:17 UTC: a click takes the row for the day (only said when the armed plan is on).
+    if (st.origin === "click" && auto) out.push(`<div class="mutline">Yours since your click. The armed plan leaves this row for today.</div>`);
     if (st.text && !(m && m.text === st.text)) out.push(`<div class="${st.red ? "badline" : "mutline"}">${esc(st.text)}</div>`);
     else if (!st.text && e.place.long && e.place.long === e.place.short && e.place.long !== b.text && !m)
       out.push(`<div class="mutline">Place: ${esc(e.place.long)}</div>`);
@@ -472,6 +495,7 @@ function render(v, browserStale) {
   if (c.calm == null && c.text && v.rows.length) banners.push(`<div class="banner warn">${esc(c.text)}</div>`);
   if (entries && entries.error) banners.push(`<div class="banner bad">${esc(entries.error)}</div>`);
   if (entries && entries.orders_old) banners.push(`<div class="banner bad">${esc(entries.orders_old)} Cancel still works.</div>`);
+  if (auto && !auto.armed && auto.resting_text) banners.push(`<div class="banner bad">${esc(auto.resting_text)}</div>`);
   if (flat && flat.last && flat.last.rows) {
     const L = flat.last, n = k => L.rows.filter(x => x.result === k).length;
     const parts = [["done", "done"], ["refused", "refused"], ["unclear", "unclear: check thinkorswim"], ["not_sent", "not sent"]]
@@ -481,6 +505,7 @@ function render(v, browserStale) {
   }
   $("flat-slot").innerHTML = `${flat ? flatButton() : ""}`;
   $("banners").innerHTML = banners.join("");
+  renderAuto();
   if (pv) {
     $("wrap").innerHTML = !pv.rows.length ? `<div class="empty">No preview rows.</div>`
       : `<table class="preview${old ? " stale" : ""}"><thead><tr>
@@ -520,6 +545,7 @@ async function tick() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     lastView = await r.json();
     await readEntries();
+    await readAuto();
     await readFlat();
     lastOk = Date.now();
     refresh = Math.max(1000, (lastView.playbook.refresh_seconds || 2) * 1000);
@@ -552,6 +578,93 @@ async function readEntries() {
   } catch (e) {
     entries = null;      // no answer: no buttons, rather than buttons on old state
   }
+}
+
+async function readAuto() {
+  if (autoOff) return;
+  try {
+    const r = await fetch("/api/opening-plan/auto", {cache: "no-store"});
+    if (r.status === 404) { autoOff = true; auto = null; return; }   // the armed plan is off
+    auto = r.ok ? await r.json() : null;
+  } catch (e) {
+    auto = null;
+  }
+}
+
+function autoLine(p) {
+  const d = p.decision || {}, a = p.action || {};
+  const what = p.left ? `<span class="badline">${esc(p.left)}</span>`
+    : a.event ? `${esc(a.event.replace("_", " "))}${a.status ? " " + esc(a.status) : ""}${a.at_et ? ` at ${esc(a.at_et)} ET` : ""}`
+    : `<span class="mut">${esc(d.why || p.note || "–")}</span>`;
+  return `<span class="tk">${esc(p.ticker)}</span><span>${d.kind && !p.left ? `<span class="mut">${esc(d.kind)}</span> · ` : ""}${what}</span>`;
+}
+
+function renderAuto() {
+  const el = $("auto");
+  if (!auto) { el.innerHTML = ""; return; }
+  const a = auto, u = a.used || {}, b = a.bounds || {};
+  const state = a.armed ? `<span class="pill bad">ARMED since ${esc(a.armed_at_et)} ET · ends ${esc(a.until_et)} ET</span>`
+    : a.disarmed ? `<span class="pill warn">Disarmed at ${esc(a.disarmed.at_et)} ET</span>` : `<span class="pill">Not armed</span>`;
+  const why = !a.armed && a.disarmed ? `<div class="${a.blocked_today ? "badline" : "mutline"}" style="margin-top:6px">Disarmed: ${esc(a.disarmed.why)}${a.blocked_today ? " No new Arm today." : ""}</div>` : "";
+  const lines = (a.picks || []).map(autoLine).join("");
+  el.className = `auto${a.armed ? " armed" : ""}`;
+  el.innerHTML = `<div class="hd"><h2>Armed plan</h2>${state}
+      <span class="mut msg">${esc(a.playbook)} · orders ${u.orders_day ?? 0}/${b.orders_per_day} today · Schwab calls ${u.calls_minute ?? 0}/${b.calls_per_minute} a minute (sends)</span>
+      <span class="sp"></span>
+      ${a.armed ? `<button class="btn disarm" id="auto-disarm" type="button">Disarm</button>` : `<button class="btn arm" id="auto-arm" type="button">Arm…</button>`}
+    </div>${why}
+    ${a.problem ? `<div class="badline" style="margin-top:6px">${esc(a.problem)}</div>` : ""}
+    ${a.tape_note ? `<div class="mutline" style="margin-top:6px">${esc(a.tape_note)}</div>` : ""}
+    ${a.row_check_text ? `<div class="warnline" id="auto-row-check" style="margin-top:6px">${esc(a.row_check_text)}</div>` : ""}
+    ${autoMsg ? `<div class="${autoMsg.ok ? "mutline" : "badline"}" style="margin-top:6px">${esc(autoMsg.text)}</div>` : ""}
+    ${lines ? `<div class="lines">${lines}</div>` : `<div class="mutline" style="margin-top:6px">${a.armed ? "Waiting for 09:31:00 ET and a final 09:30 bar on the open tape." : "Nothing armed. Arm works 09:25:00 to 09:30:45 ET; the plan then sends by itself, 1 share a pick."}</div>`}`;
+  const arm = $("auto-arm"), dis = $("auto-disarm");
+  if (arm) arm.onclick = openArm;
+  if (dis) dis.onclick = disarm;
+}
+
+async function openArm() {
+  let j;
+  try {
+    const r = await fetch("/api/opening-plan/auto?check=1", {cache: "no-store"});
+    j = await r.json();
+  } catch (e) { autoMsg = {ok: false, text: `No answer from Edge Trader (${e.message}).`}; renderAuto(); return; }
+  const t = j.dialog || {}, b = t.bounds || {}, refused = j.refusals || [];
+  const li = xs => (xs || []).map(x => `<li>${esc(x)}</li>`).join("");
+  $("ovl").innerHTML = `<div class="ovl"><div class="dlg" role="dialog" aria-label="Arm the plan">
+    <h3>Arm “${esc(t.playbook)}” for today?</h3>
+    <div class="mutline">Picks: <b>${esc((t.picks || []).join(", ") || "none")}</b> · <b>${esc(t.shares)} share each</b> ·
+      risk per pick ${t.risk == null ? "not set" : "$" + Number(t.risk).toFixed(2)} · calm flag ${t.calm == null ? "not known" : t.calm ? "calm (half size)" : "not calm (full size)"}</div>
+    <div class="k">It will</div><ul>${li(t.will)}</ul>
+    <div class="k">It will not</div><ul>${li(t.will_not)}</ul>
+    <div class="k">Bounds (start numbers, not approved by Ash; playbook.json "armed")</div>
+    <table><tr><td>Orders per pick</td><td class="n">${esc(b.orders_per_pick)}</td><td>Orders per day</td><td class="n">${esc(b.orders_per_day)}</td></tr>
+      <tr><td>Schwab calls a minute (sends)</td><td class="n">${esc(b.calls_per_minute)}</td><td>Calls per send / cancel</td><td class="n">${esc(b.calls_per_send)} / ${esc(b.calls_per_cancel)}</td></tr>
+      <tr><td>Acts from</td><td class="n">${esc(b.act_from_et)} ET</td><td>Watch ends</td><td class="n">${esc(b.watch_until_et)} ET</td></tr></table>
+    ${refused.length ? `<div class="k" style="color:var(--red)">Arm is refused now</div><ul class="badline">${li(refused)}</ul>` : ""}
+    <div class="row"><button class="btn" id="arm-no" type="button">Close</button>
+      <button class="btn arm" id="arm-yes" type="button" ${refused.length ? "disabled" : ""}>Arm with these bounds</button></div>
+  </div></div>`;
+  $("arm-no").onclick = () => { $("ovl").innerHTML = ""; };
+  $("arm-yes").onclick = async () => {
+    try {
+      const r = await fetch("/api/opening-plan/arm", {method: "POST", headers: {"Content-Type": "application/json", "X-Companion": "1"},
+                                                       body: JSON.stringify({playbook: t.playbook, bounds: b})});
+      const k = await r.json();
+      autoMsg = {ok: !!k.ok, text: k.ok ? "Armed." : (k.error || k.detail || "Refused.")};
+    } catch (e) { autoMsg = {ok: false, text: `No answer from Edge Trader (${e.message}). Check the panel before clicking again.`}; }
+    $("ovl").innerHTML = "";
+    tick();
+  };
+}
+
+async function disarm() {
+  try {
+    const r = await fetch("/api/opening-plan/disarm", {method: "POST", headers: {"Content-Type": "application/json", "X-Companion": "1"}, body: "{}"});
+    const k = await r.json();
+    autoMsg = {ok: !!k.ok, text: k.ok ? "Disarmed. Entries already at Schwab stay; each row's Cancel works." : (k.error || "Refused.")};
+  } catch (e) { autoMsg = {ok: false, text: `No answer from Edge Trader (${e.message}). Press Disarm again.`}; }
+  tick();
 }
 
 async function saveRisk() {

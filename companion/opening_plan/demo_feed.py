@@ -139,3 +139,5 @@ class DemoFeed:
         before_freeze = at.astimezone(ET).time() < FREEZE_ET
         body = preview_answer(at) if before_freeze else picks_answer(at)
         return Reading(body, at, ""), Reading(clock_answer(at, self._rv20), at, "")
+
+    peek = read                            # nothing is asked in demo, so peek and read agree
