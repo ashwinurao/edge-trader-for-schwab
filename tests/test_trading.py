@@ -1,4 +1,5 @@
 """Order ticket service with a fake Schwab client: nothing here talks to Schwab."""
+import threading
 from decimal import Decimal
 
 import pytest
@@ -368,8 +369,9 @@ BUYING_POWER = "You do not have enough available cash/buying power for this orde
 
 
 class StatusClient(FakeClient):
-    """Places with HTTP 201 and answers each order read from a script: a dict of order fields, an
-    HTTP status (int) or an exception. Fails the test if a read happens under the send lock."""
+    """The status reads' own client: answers each order read from a script (a dict of order
+    fields, an HTTP status (int) or an exception). Fails the test if a read happens under the send
+    lock. The sends keep going through the trader's own client (trader._client)."""
 
     def __init__(self, trader, *script):
         super().__init__()
@@ -388,12 +390,12 @@ class StatusClient(FakeClient):
 
 def _send_then_read(trader, monkeypatch, *script):
     """Submit one ticket, check the click answered before any read, then run the reads."""
-    trader._client = StatusClient(trader, *script)
+    trader._status_client = StatusClient(trader, *script)
     waits = []
     trader._sleep = waits.append                       # the injected sleeper: no test sleeps for real
     r = trader.submit(req())
     assert r["ok"] and r["status"] == "ACCEPTED" and r["order_id"] == 555
-    assert trader._client.asked == []                  # the click's answer waited for no read
+    assert trader._status_client.asked == []                  # the click's answer waited for no read
     assert not trader._send_lock.locked()
     for fn in trader.after_send:
         fn()
@@ -402,7 +404,7 @@ def _send_then_read(trader, monkeypatch, *script):
 
 def test_reads_after_send_wait_about_0_3_and_1_second_and_change_nothing_while_working(trader, monkeypatch):
     waits = _send_then_read(trader, monkeypatch, {"status": "WORKING"}, {"status": "WORKING"})
-    assert trader._client.asked == [555, 555]
+    assert trader._status_client.asked == [555, 555]
     # Each read is timed from the 201 (the fake sleeper does not move the clock, so each wait is the
     # whole time from the answer): about 0.3 s and 1.0 s.
     assert 0.2 < waits[0] <= 0.3 and 0.9 < waits[1] <= 1.0
@@ -411,7 +413,7 @@ def test_reads_after_send_wait_about_0_3_and_1_second_and_change_nothing_while_w
 
 def test_rejected_at_the_first_read_shows_schwabs_reason_at_once(trader, monkeypatch):
     _send_then_read(trader, monkeypatch, {"status": "REJECTED", "statusDescription": BUYING_POWER})
-    assert trader._client.asked == [555]                          # final: no second read
+    assert trader._status_client.asked == [555]                          # final: no second read
     t = trader.store.get_ticket("ticket-0001")
     assert t["status"] == "REJECTED" and t["order_id"] == 555 and t["detail"] == BUYING_POWER
     # Shown before the orders poll has the tree (orders_today is still empty).
@@ -426,7 +428,7 @@ def test_rejected_at_the_first_read_shows_schwabs_reason_at_once(trader, monkeyp
 def test_rejected_at_the_second_read(trader, monkeypatch):
     _send_then_read(trader, monkeypatch, {"status": "PENDING_ACTIVATION"},
                     {"status": "REJECTED", "statusDescription": BUYING_POWER})
-    assert trader._client.asked == [555, 555]
+    assert trader._status_client.asked == [555, 555]
     assert trader.store.get_ticket("ticket-0001")["status"] == "REJECTED"
 
 
@@ -437,7 +439,7 @@ def test_rejected_at_the_second_read(trader, monkeypatch):
 ])
 def test_a_failed_read_changes_nothing_and_the_poll_still_catches_it(trader, monkeypatch, first, second):
     _send_then_read(trader, monkeypatch, first, second)
-    assert trader._client.asked == [555, 555]
+    assert trader._status_client.asked == [555, 555]
     assert trader.store.get_ticket("ticket-0001")["status"] == "ACCEPTED"
     refused = {**_tree(555), "status": "REJECTED", "statusDescription": BUYING_POWER}
     (row,) = trader.brackets([refused], pend=[], positions={}, orders_fresh=True)
@@ -447,7 +449,7 @@ def test_a_failed_read_changes_nothing_and_the_poll_still_catches_it(trader, mon
 def test_reads_are_skipped_during_a_429_pause(trader, monkeypatch):
     trader.cooldown_left = lambda: 20.0
     _send_then_read(trader, monkeypatch)                          # an empty script: any read would fail
-    assert trader._client.asked == []
+    assert trader._status_client.asked == []
     assert trader.store.get_ticket("ticket-0001")["status"] == "ACCEPTED"
 
 
@@ -461,7 +463,7 @@ def test_reads_count_in_the_request_log(trader, monkeypatch):
 
 def test_filled_at_once_changes_nothing_and_stops_reading(trader, monkeypatch):
     _send_then_read(trader, monkeypatch, {"status": "FILLED", "filledQuantity": 170})
-    assert trader._client.asked == [555]
+    assert trader._status_client.asked == [555]
     assert trader.store.get_ticket("ticket-0001")["status"] == "ACCEPTED"
 
 
@@ -479,7 +481,7 @@ def test_a_rejected_child_order_is_not_a_rejected_entry(trader, monkeypatch):
 def test_a_late_rejection_never_overwrites_another_status(trader, monkeypatch, meanwhile):
     # reconcile() never moves an ACCEPTED ticket, but whatever moved it first wins: the read only
     # changes ACCEPTED to REJECTED (a conditional update).
-    trader._client = StatusClient(trader, {"status": "REJECTED", "statusDescription": BUYING_POWER})
+    trader._status_client = StatusClient(trader, {"status": "REJECTED", "statusDescription": BUYING_POWER})
     trader._sleep = lambda s: None
     assert trader.submit(req())["ok"]
     trader.store.update_ticket("ticket-0001", meanwhile)              # changed before the read landed
@@ -489,7 +491,7 @@ def test_a_late_rejection_never_overwrites_another_status(trader, monkeypatch, m
 
 
 def test_no_order_id_or_no_201_means_no_reads(trader, monkeypatch):
-    trader._client = StatusClient(trader)
+    trader._status_client = StatusClient(trader)
     trader._client.resp = Resp(201)                                  # no Location header
     assert trader.submit(req())["status"] == "ACCEPTED_UNTRACKED"
     trader._client.resp = Resp(400, text="invalid stop")
@@ -499,26 +501,31 @@ def test_no_order_id_or_no_201_means_no_reads(trader, monkeypatch):
 
 def test_the_reads_can_be_turned_off(trader, monkeypatch):
     monkeypatch.setattr(trader, "status_reads_after_send", ())
-    trader._client = StatusClient(trader)
+    trader._status_client = StatusClient(trader)
     assert trader.submit(req())["ok"] and trader.after_send == []
     assert trading._reads_after_send({"EDGE_TRADER_NO_EARLY_STATUS": "1"}) == ()
     assert trading._reads_after_send({}) == (0.3, 1.0)
 
 
-def test_the_reads_run_on_their_own_thread_after_the_answer(tmp_path, monkeypatch):
-    import threading
+def _threaded_trader(tmp_path, monkeypatch):
+    """A trader whose status reads run on their real thread (with an injected, instant sleeper)."""
     t = Trader(Store(tmp_path / "t.db"))
-    t._hash = "H" * 64
+    t._client, t._hash = FakeClient(), "H" * 64
     monkeypatch.setattr(trading, "market_open", lambda now=None: True)
     monkeypatch.setattr(t, "quote", lambda sym, max_age=1.0: {"bid": 338.70, "ask": 338.77})
-    t._sleep = lambda s: None                          # the real thread, without real waits
+    t._sleep = lambda s: None
     t.arm(True)
+    return t
+
+
+def test_the_reads_run_on_their_own_thread_after_the_answer(tmp_path, monkeypatch):
+    t = _threaded_trader(tmp_path, monkeypatch)
     done = threading.Event()
-    t._client = StatusClient(t, {"status": "WORKING"}, {"status": "REJECTED", "statusDescription": BUYING_POWER})
-    real = t._client.order_details
-    t._client.order_details = lambda h, o: (threading.current_thread() is not threading.main_thread()
-                                            or pytest.fail("read on the click's thread"), real(h, o),
-                                            len(t._client.asked) == 2 and done.set())[1]
+    t._status_client = StatusClient(t, {"status": "WORKING"}, {"status": "REJECTED", "statusDescription": BUYING_POWER})
+    real = t._status_client.order_details
+    t._status_client.order_details = lambda h, o: (threading.current_thread() is not threading.main_thread()
+                                                   or pytest.fail("read on the click's thread"), real(h, o),
+                                                   len(t._status_client.asked) == 2 and done.set())[1]
     assert t.submit(req())["ok"]
     assert done.wait(5)
     for _ in range(50):
@@ -526,6 +533,54 @@ def test_the_reads_run_on_their_own_thread_after_the_answer(tmp_path, monkeypatc
             break
         done.wait(0.02)
     assert t.store.get_ticket("ticket-0001")["status"] == "REJECTED"
+
+
+class OneAtATime(FakeClient):
+    """Like a schwabdev 4.0.0 Client: one request at a time per client (its _session_lock), and
+    Schwab answers order reads slowly (OpenVector measured 5 to 7 s at the open)."""
+
+    def __init__(self, slow: threading.Event):
+        super().__init__()
+        self.lock, self.slow, self.reading = threading.Lock(), slow, threading.Event()
+
+    def place_order(self, _hash, order):
+        with self.lock:
+            return super().place_order(_hash, order)
+
+    def order_details(self, _hash, oid):
+        with self.lock:
+            self.reading.set()
+            self.slow.wait(5)                          # until the test lets Schwab answer
+            return JsonResp(200, {**_tree(oid), "status": "WORKING"})
+
+
+def test_a_slow_status_read_never_delays_the_next_send(tmp_path, monkeypatch):
+    # Architect's review of PR #15: a read on the order client would hold its request lock, and the
+    # next click's place_order (under _send_lock) would wait behind it, up to the 10 s timeout.
+    t = _threaded_trader(tmp_path, monkeypatch)
+    slow = threading.Event()
+    t._client, t._status_client = OneAtATime(slow), OneAtATime(slow)
+    try:
+        assert t.submit(req())["ok"]
+        assert t._status_client.reading.wait(5) or t._client.reading.wait(0.1)   # a read is in flight
+        out = {}
+        second = threading.Thread(target=lambda: out.update(t.submit(req(ticket_id="ticket-0002", symbol="MXR"))))
+        second.start()
+        second.join(2)
+        assert not second.is_alive(), "the second send waited behind a status read"
+        assert out["ok"] and len(t._client.placed) == 2
+    finally:
+        slow.set()
+
+
+def test_the_status_reads_have_their_own_client_with_a_short_time_limit(trader, monkeypatch):
+    made = []
+    monkeypatch.setattr(trading.schwab, "make_client",
+                        lambda allowed, timeout=10: made.append((allowed, timeout)) or StatusClient(trader))
+    trader._status_client = None
+    first = trader._status_reader()
+    assert trader._status_reader() is first and first is not trader._client   # one client, kept
+    assert made == [(frozenset({"order_details"}), 1.5)]
 
 
 def _entry(status="WORKING", filled=0, effect="OPENING", instr="SELL_SHORT", strategy="TRIGGER"):

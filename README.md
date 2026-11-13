@@ -288,7 +288,9 @@ folder across, run `setup.bat` once, then `launch.bat`.
 - **A new entry can be rejected after HTTP 201.** Schwab can answer 201 and then reject the order (for
   example for buying power). The app reads the new order's status about 0.3 s and 1 s after the 201 and
   shows REJECTED with Schwab's reason within about a second; the 5 s orders poll still catches it if
-  those reads fail or are skipped during a rate-limit pause. Only Schwab's own status marks it rejected.
+  those reads fail, take over 1.5 s or are skipped during a rate-limit pause. The reads use a read-only
+  Schwab client of their own, so a slow read never holds up your next order. Only Schwab's own status
+  marks it rejected.
   `EDGE_TRADER_NO_EARLY_STATUS=1` turns the two reads off.
 - **Schwab can reject a new exit while old exits work.** On 2026-11-06 Schwab answered HTTP 201 and then
   rejected new exits on short positions as "oversold/overbought", and the old exits stayed. Long

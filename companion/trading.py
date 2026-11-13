@@ -15,7 +15,8 @@ Safety that is engineering, not coaching:
   ticket shows the new numbers.
 - Regular hours only (stops do not trigger outside them).
 - HTTP 201 is not acceptance: the new order's status is read about 0.3 s and 1 s later, off the
-  click's thread and outside the send lock, and only Schwab's own REJECTED changes the ticket.
+  click's thread, outside the send lock and on a read-only client of its own (at most 1.5 s per
+  read), and only Schwab's own REJECTED changes the ticket.
 """
 from __future__ import annotations
 
@@ -53,6 +54,11 @@ WORKED = frozenset({"WORKING", "AWAITING_STOP_CONDITION", "PENDING_REPLACE", "PE
                     "FILLED", "CANCELED", "REPLACED", "EXPIRED"})
 INDEX_ROOTS = frozenset({"SPX", "NDX", "RUT", "XSP", "VIX", "DJX", "OEX", "XND", "MRUT"})
 OCC_RE = re.compile(r"^[A-Z0-9.]{1,6} {0,5}\d{6}[CP]\d{8}$")
+
+
+# The status reads after a send wait at most this long for Schwab's answer: a slow read is dropped
+# (the 5 s orders poll still sees the order), never waited for (architect's review of PR #15).
+STATUS_READ_TIMEOUT = 1.5
 
 
 def _reads_after_send(env=os.environ) -> tuple[float, ...]:
@@ -351,6 +357,8 @@ class Trader:
         self._client = None
         self._hash: str | None = None
         self._send_lock = threading.Lock()
+        self._status_client = None          # the status reads' own client (_status_reader)
+        self._status_made = threading.Lock()
         self._quote_cache: dict[str, tuple[float, dict]] = {}
         self.spreads = SpreadBook(store) if SpreadBook else None
 
@@ -600,14 +608,24 @@ class Trader:
         """Run fn on its own thread: the click's answer never waits for it."""
         threading.Thread(target=fn, name="status-after-send", daemon=True).start()
 
+    def _status_reader(self):
+        """The status reads' own Schwab client: it may only read an order, waits at most
+        STATUS_READ_TIMEOUT for an answer, and no send ever uses it. schwabdev sends one request at
+        a time per client, so a slow read on the order client would hold up the next click's send."""
+        with self._status_made:
+            if self._status_client is None:
+                self._status_client = schwab.make_client(frozenset({"order_details"}), timeout=STATUS_READ_TIMEOUT)
+            return self._status_client
+
     def _read_after_send(self, ticket_id: str, oid: int, t0: float) -> None:
         """Read the order Schwab just answered 201 for, at status_reads_after_send seconds after the
         answer (t0, monotonic), and record Schwab's own REJECTED at once. One reader per sent ticket,
-        at most one read per delay, never under the send lock. Only the order's own top-level status
+        at most one read per delay, never under the send lock, on its own client (_status_reader),
+        each read dropped after STATUS_READ_TIMEOUT. Only the order's own top-level status
         counts; a fill, a working status, a failed or throttled read (_logged skips reads during a
         429 pause) changes nothing, and the 5 s orders poll still shows the order either way."""
         try:
-            client = self._ensure()
+            client = self._status_reader()
             for at in self.status_reads_after_send:
                 self._sleep(max(0.0, t0 + at - time.monotonic()))
                 try:
