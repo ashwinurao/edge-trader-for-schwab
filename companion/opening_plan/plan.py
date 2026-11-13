@@ -865,6 +865,14 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
                    "nothing above 1 share for it today.")
             r["cap"].update(state=bp_cap.NOT_IN_CAP, long=None, short=None, need=None, why=why,
                             text=[why] + r["cap"]["text"])
+            # Its size is not counted in the cap, so the row never shows more than 1 share.
+            sh = r.get("shares") or {}
+            if isinstance(sh.get("used"), Mapping):
+                for k in ("long", "short"):
+                    if isinstance(r.get(k), Mapping) and isinstance(r[k].get("shares"), int):
+                        r[k]["shares"] = min(1, r[k]["shares"])
+                sh["used"] = {k: min(1, n) if isinstance(n, int) else n for k, n in sh["used"].items()}
+                sh["text"] = "Not in the buying power cap: at most 1 share today."
     view["rows"] = built
     # Brief 23 item 5, display only: with no buttons nothing is sent, so every row counts as not sent
     # (plan_entries.PlanDesk.state says it with the rows really not sent yet).

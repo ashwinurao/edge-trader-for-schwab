@@ -262,6 +262,9 @@ def test_one_missing_bar_waits_until_the_latest_time_then_the_others_fix_and_fil
     assert d["cap"]["state"] == "NOT_IN_CAP" and d["cap"]["why"] == (
         "Not in the buying power cap fixed at 09:31:15 ET (no final 09:30 bar then): nothing above 1 share for it today.")
     assert d["cap"]["text"][0] == d["cap"]["why"]
+    # Not counted in the cap, so its row never shows more than 1 share.
+    assert d["shares"]["used"] == {"long": 1, "short": 1} and d["long"]["shares"] == 1
+    assert d["shares"]["text"] == "Not in the buying power cap: at most 1 share today."
 
 
 def test_a_restart_after_the_latest_time_fixes_at_once_on_the_final_picks():
@@ -507,7 +510,7 @@ def test_a_pick_not_in_the_fixed_cap_is_refused_above_one_share_and_sends_one_sh
     rig.view.latch.offer(NOW.astimezone(ET).date(), bp_cap.pool_sums([cccc], bal, None, {}, D("1.0")),
                          "09:31:15", False, names=["CCCC"])
     why = "Not in the buying power cap fixed at 09:31:15 ET (no final 09:30 bar then): nothing above 1 share for it today."
-    assert row(rig)["send"]["long"] == {**LONG, "plan_shares": 175}      # 1_share: sends as today
+    assert row(rig)["send"]["long"] == {**LONG, "plan_shares": 1}        # 1_share: sends as today, row shows 1
     rig.desk.stage = plan_size.parse_stage(0.25)
     assert row(rig)["send"]["long"] is None and row(rig)["place"]["long"] == why
     res = rig.desk.place("AAAA", "LONG", {**LONG, "shares": 43})
