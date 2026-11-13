@@ -23,6 +23,12 @@ Every send is the user's click (CONTRIBUTING rule 1):
 Brief 25 (companion/plan_side.py): Place and Flip go beside the user's own trades on the same side
 of the name and refuse on the other side, or when the side is not clear or a read is old.
 
+Brief 29 part B (companion/plan_price.py): each row side carries a price line in
+/api/opening-plan/entries ("price"), from the newest quote Edge Trader already holds (the poller's
+quotes, the last ticket or click quote, the open tape's last reading; never a new call). It says
+before the click when the price is through the level or past the side's stop, or that the price is
+old or missing. Display only: it turns no button off and lets no click through.
+
 When unsure, refuse (CONTRIBUTING rule 4): ARM off, market closed, the first minute not final,
 old data, the calm flag unknown, the name blocked by an unclear order, an entry already working,
 unclear or filled on the row, or a hold (PlanDesk.add_hold: Flat all's batch, Step 9). Nothing is retried. No lock of this file is held across a
@@ -44,7 +50,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, plan_side, plan_size, trading
+from . import break_entry, plan_price, plan_side, plan_size, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -115,17 +121,21 @@ class PlanDesk:
                  orders_fresh: Optional[Callable[[], bool]] = None, stage: Any = plan_size.DEFAULT,
                  hold: Optional[Callable[[], str]] = None,
                  positions: Optional[Callable[[], Mapping]] = None,
-                 positions_fresh: Optional[Callable[[], bool]] = None) -> None:
+                 positions_fresh: Optional[Callable[[], bool]] = None,
+                 prices: Optional[Callable[[list], Mapping]] = None) -> None:
         """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today")).
         `stage` is the playbook's size stage (companion/plan_size.py, Step 9); the default is 1 share.
         `hold` returns why no new entry may go now, or "" (see add_hold). `positions` returns the
         poller's net shares per name and `positions_fresh` whether that read is fresh
-        (Poller._fresh("account")): the side rule of brief 25 (companion/plan_side.py) reads them."""
+        (Poller._fresh("account")): the side rule of brief 25 (companion/plan_side.py) reads them.
+        `prices` gives the newest quote Edge Trader already holds per name (plan_price.Prices), for
+        the rows' price line (brief 29 part B). Display only: no click reads it."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
         self.stage = plan_size.parse_stage(stage)
         self._orders_fresh_fn = orders_fresh or (lambda: True)
         self._positions_fn = positions or (lambda: {})
         self._positions_fresh_fn = positions_fresh or (lambda: True)
+        self._prices_fn = prices or (lambda tickers: {})
         self._armed = armed or (lambda: bool(trader.armed))
         self._market_open = market_open or (lambda: trading.market_open())
         self.demo = demo
@@ -468,7 +478,9 @@ class PlanDesk:
         except Exception as e:
             out["error"] = f"Entry records could not be read ({e}). No buttons until they can."[:300]
             return out
-        for row in view.get("rows") or []:
+        rows = view.get("rows") or []
+        held = self._held_prices([str(r.get("ticker") or "").upper() for r in rows])
+        for row in rows:
             ticker = str(row.get("ticker") or "").upper()
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
@@ -480,9 +492,29 @@ class PlanDesk:
                  "cancel": self._cancel_refusal(entry, fresh),
                  "flip_to": OTHER[entry["side"]].lower() if entry["side"] in OTHER else None,
                  "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh),
-                 "manual": self._manual_line(ticker, rec, orders)}
+                 "manual": self._manual_line(ticker, rec, orders),
+                 "price": {k.lower(): self._price_line(row, k, held.get(ticker)) for k in ("LONG", "SHORT")}}
             out["rows"].append(r)
         return out
+
+    def _held_prices(self, tickers: list) -> Mapping:
+        """The newest held quote per name (plan_price.Prices). Unreadable: none (the line says so)."""
+        try:
+            return dict(self._prices_fn(tickers) or {})
+        except Exception:
+            log.exception("opening plan: held prices could not be read")
+            return {}
+
+    def _price_line(self, row: Mapping, side: str, q: Optional[Mapping]) -> Optional[dict]:
+        """Brief 29 part B: what the newest held price says about this side before the click, or
+        None while the 09:30 bar is not final or the side has no numbers. Display only: it never
+        turns a button off and never lets a click through (the click reads Schwab's quote again)."""
+        if (row.get("bar") or {}).get("state") != "FINAL":
+            return None
+        n = self._numbers(row, side)
+        if n is None:
+            return None
+        return plan_price.line(side, n["trigger"], n["stop"], q, self._now())
 
     # ---- clicks -----------------------------------------------------------------------------
 
@@ -702,13 +734,15 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         recs, orders = demo_entries()
         desk = PlanDesk(trader, view, lambda: orders, flips, now=now,
                         armed=lambda: True, market_open=lambda: True, demo=True, stage=stage,
-                        positions=lambda: dict(plan_flat.DEMO_POSITIONS))
+                        positions=lambda: dict(plan_flat.DEMO_POSITIONS),
+                        prices=plan_price.demo(now, env.get(plan_price.DEMO_ENV)))
         desk._mem = {desk._key(): recs}
     else:
         desk = PlanDesk(trader, view, poller._merged_orders, flips, now=now,
                         orders_fresh=lambda: poller._fresh("orders_today"), stage=stage,
                         positions=lambda: plan_side.account_positions(poller.account),
-                        positions_fresh=lambda: poller._fresh("account"))
+                        positions_fresh=lambda: poller._fresh("account"),
+                        prices=held_prices(poller, trader, env))
         try:
             desk.recover()
         except Exception as e:
@@ -749,6 +783,17 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
     # Step 9: Flat all and the cover watch, only with EDGE_TRADER_PLAN_FLAT=1 as well (plan_flat.py).
     plan_flat.register(app, trader, poller, guard, desk, demo=demo, env=env, now=now)
     return True
+
+
+def held_prices(poller, trader, env: Mapping[str, str] = os.environ) -> plan_price.Prices:
+    """Brief 29 part B: the quotes Edge Trader already holds, never a new call. The poller's batched
+    Schwab quotes, the last ticket or click quote, and the open tape's last reading (tape.peek:
+    only while the shadow or the armed plan asks Edge Scanner for it)."""
+    from .opening_plan import tape as tape_mod
+    url = (env.get("EDGE_SCANNER_URL") or "").strip()
+    return plan_price.Prices(poller_quotes=lambda: getattr(poller, "quotes", None) or {},
+                             click_cache=lambda: getattr(trader, "_quote_cache", None) or {},
+                             tape=lambda: tape_mod.peek(url) if url else None)
 
 
 def demo_entries() -> tuple[dict, list[dict]]:

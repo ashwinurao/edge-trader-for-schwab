@@ -136,7 +136,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Dashboard:** open positions (day trades and carried positions apart) with open P&L, live R, stop
   and target, protection (FULL, PARTIAL, NO STOP SEEN) and P&L at the stop; working orders including
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
-  STALE, DISCONNECTED) that disables every order button when data is not current.
+  STALE, DISCONNECTED) that disables every order button when data is not current. Right after a
+  start, until the first read of Schwab is in, the dashboard says "Edge Trader just started. Reading
+  Schwab." and `/api/state` already carries the `trading` block (ARM off) with `first_read_done: false`.
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
   market, ask, bid or your own limit price (Lmt), one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
@@ -147,7 +149,12 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   Schwab as one order. You type the level, the stop and optionally a cap (how far past the level the
   limit sits; blank = 0.15 x risk per share, at least 2 cents, at most 0.15% of the price). One share
   only for now (`BREAK_MAX_SHARES` in `companion/break_entry.py`). The click is refused when the price
-  is already through the level or Schwab's quote is not real-time or is over 5 seconds old.
+  is already through the level or Schwab's quote is not real-time or is over 5 seconds old. It is also
+  refused when the stop would rest on the wrong side of the market: a long whose bid is at or below its
+  stop, a short whose ask is at or above its stop. So a break entry is sent only while the price is
+  between its stop and its level, and the refusal says so, for example "The bid 752.14 is at or below
+  this entry's stop 753.44. A long break entry is sent only while the price is between its stop 753.44
+  and its level 754.44. Nothing was sent."
 - **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
   shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
   confirmation on every click) and either way you can send **no target**. The order then carries only
@@ -436,6 +443,19 @@ sends one request to Schwab when you click it; nothing is sent without a click.
   filled, nothing new is placed, the row turns red and says what to check, and the row sends nothing
   more that day. At most `max_flips_per_row` flips per row a day (3, in
   `companion/opening_plan/playbook.json`).
+
+**The price line (brief 29).** Once the 09:30 minute is final, each row side can get one short line
+under the row (`companion/plan_price.py`), for example "Long: Ask 754.50, 3 s ago: through the long
+level 754.44. A click would be refused." or "Short: Ask 42.52, 3 s ago: at or above this side's stop
+42.48. A click would be refused." It uses the click's own rule (through the level, or the bid or ask
+past the side's stop, see Break entry above) on the newest price Edge Trader already holds: the poller's
+Schwab quotes (only names with a position or a working order, every 3 s), the last ticket or click
+quote on the name, or the open tape's last reading (09:29 to 09:36 ET, only while the shadow reads it).
+No call is added for it. Inside the band there is no line. A price older than 15 s
+(`OLD_AFTER_S`, a start number) says "Price is N s old: no check before the click.", and a name with no
+held price says "No recent price: no check before the click." The line is display only: it turns no
+button off and lets no click through. The click reads Schwab's quote again, so the line and the click
+can differ.
 
 Place and Flip refuse, with the reason on the button, when entries are not armed, the market is closed,
 the 09:30 minute is not final, Edge Scanner's data is old, the calm flag is not known, an earlier order
