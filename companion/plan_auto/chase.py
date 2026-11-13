@@ -22,7 +22,9 @@ The rule (the engine's numbers, playbook.json "automatic", start numbers Ash has
 
 It acts only when: armed; this switch on; no chase yet today for the pick; nothing resting or filled
 on the row; a tape reading taken just before is usable and still past the level; the range is the
-same; Schwab's order list is fresh; the bounds allow one more order (for a rejected entry's pick,
+same; Schwab's order list is fresh; Ash's own trades on the name are not on the other side and
+read clearly (brief 25's plan_side.manual_refusal, N3: the other side leaves the pick, a side that
+is not clear waits, the same side goes); the bounds allow one more order (for a rejected entry's pick,
 checked first: without room the pick is left and the plan stays armed). This switch adds
 CHASES_PER_ROW to the pick's order bound and, with the flip switch off, takes the day's from
 armed.orders_per_day_with_chase (armed_with_chase; architect's review 3 of PR #25, must 1). PlanDesk.chase_auto and
@@ -247,8 +249,22 @@ def on_chase(lane: Lane) -> bool:
                 lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
             lane.busy("chase")                     # names the action in the busy line (review 3, ask 2)
             return True
+        if r.get("again") and r.get("this_name"):
+            # Brief 25 (N3; architect, 2026-11-13 21:31 UTC): Ash's own trades on this name show no
+            # one side (both sides, an order that is not a plain buy or sell, shares the plan cannot
+            # tell from its own). No Schwab call, no try. Only this pick waits, until the watch ends;
+            # the other picks go on this reading (Step 6's Lane.busy(..., end_step=False)). Said once
+            # on the pick's line. A pick Step 7 handed over waits through chase_wait and offers.
+            if handed:
+                lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
+            if not first:
+                # Not at Step 7's own call: its flip acted on this reading, which ends the pick's wait
+                # in the executor (_busy_over), so the wait is said from the next reading's offer, once.
+                lane.busy("chase", str(r.get("error") or why), end_step=False)
+            return first
         if r.get("again") and not r.get("quoted"):
-            # Schwab's order list was too old (ORDERS_OLD): no Schwab call, nothing counted. An old list
+            # Schwab's order list (ORDERS_OLD) or account positions (plan_side.POSITIONS_OLD, brief 25)
+            # were too old: no Schwab call, nothing counted. An old list
             # is a wait, never a send (architect's live test notes N1): Step 6's wait with the desk's
             # reason (Lane.busy(what, why), Step 6 f2748c7), so the worker waits a tick instead of
             # reading the same old list again at once. A pick Step 7 handed over waits as well.

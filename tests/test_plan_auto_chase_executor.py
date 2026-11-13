@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from companion import plan_entries, plan_flat
+from companion import plan_entries, plan_flat, trading
 from companion.opening_plan import tape as T
 from companion.plan_auto import CHASE_FLAG
 from companion.plan_auto import executor as X
@@ -527,21 +527,124 @@ def test_after_a_flip_an_old_order_list_still_showing_the_cancelled_entry_does_n
     assert rig.desk.records()["AAAA"]["kind"] == "chase" and "AAAA" not in rig.plan.left
 
 
-def test_after_a_flip_another_working_order_on_the_name_still_refuses_the_chase(fcrig):
-    rig = fcrig
+def ash_order(rig, oid, instruction):
+    """Ash's own working order on AAAA, placed by hand on the ticket or in thinkorswim (brief 25)."""
+    rig.broker.orders[oid] = {"orderId": oid, "status": "WORKING", "orderStrategyType": "SINGLE",
+                              "orderType": "LIMIT", "quantity": 100, "filledQuantity": 0,
+                              "orderLegCollection": [{"instruction": instruction, "quantity": 100,
+                                                      "instrument": {"symbol": "AAAA"}}]}
 
-    def foreign(ids):                       # a thinkorswim order on AAAA appears during the cancel
-        o = copy.deepcopy(rig.broker.orders[ids["AAAA"]])
-        o.update(orderId=999, status="WORKING")
-        rig.broker.orders[999] = o
-    ids = short_trades_during_the_cancel(rig, during=foreign)
+
+def ash_order_during_the_cancel(rig, oid, instruction):
+    return lambda ids: ash_order(rig, oid, instruction)
+
+
+def at_the_chase(rig, fn):
+    """Runs fn() once, just before the chase's own first check: after Step 7's flip asked brief 25's
+    rule about the new side (f8aa884), so only the chase's own check sees what fn() changes."""
+    real, n = rig.desk.chase_auto, []
+
+    def chase_auto(*a, **k):
+        n.append(1)
+        if len(n) == 1:
+            fn()
+        return real(*a, **k)
+    rig.desk.chase_auto = chase_auto
+    return n
+
+
+def plans_own_entries_only(rig, manual):
+    """frig's check that two entries never work for one name, counting the plan's orders only: Ash's
+    own orders on the name are his (brief 25)."""
+    def one_entry_per_name(n):
+        by_name = {}
+        for o in rig.broker.orders.values():
+            if o.get("status") in trading.LIVE and o.get("orderId") not in manual:
+                sym = o["orderLegCollection"][0]["instrument"]["symbol"]
+                by_name[sym] = by_name.get(sym, 0) + 1
+        assert max(by_name.values()) == 1, by_name
+    rig.broker.after_place = one_entry_per_name
+
+
+def test_after_a_flip_ashs_working_order_on_the_other_side_refuses_the_chase(fcrig):
+    """Brief 25 rule B (N3): Ash's own long order on AAAA appears after Step 7's own check of the new
+    side, the chase is short: the chase's check leaves the pick and nothing is sent. Before brief 25
+    any other working order refused ("One entry per name"). The flip's cancelled entry and its tree
+    never count as Ash's, even while the poller's list still shows them working
+    (test_after_a_flip_an_old_order_list_still_showing_the_cancelled_entry_...)."""
+    rig = fcrig
+    at_the_chase(rig, lambda: ash_order(rig, 999, "BUY"))
+    ids = short_trades_during_the_cancel(rig)
     run(rig, et(9, 31, 6))
     assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
     assert not [r for r in rig.sent if r.get("entry") == "chase"] and not lines(rig, "chase_send_start")
-    # Any refusal of a handed-over chase leaves the pick with what is true at Schwab (17:42 UTC).
-    assert rig.plan.left["AAAA"] == ("chase not sent: A working AAAA order is already at Schwab (order 999). "
-                                     f"One entry per name; {LEFT_HANDED}")
-    assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
+    assert rig.plan.left["AAAA"] == ("chase not sent: You have a working long order on AAAA. The plan does not "
+                                     f"take the other side of a name you trade. Nothing was sent; {LEFT_HANDED}")
+    assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE and rig.desk._chase_tries == {}
+
+
+def test_after_a_flip_beside_ashs_own_short_order_the_short_chase_goes(fcrig):
+    rig = fcrig
+    plans_own_entries_only(rig, {998})
+    ids = short_trades_during_the_cancel(rig, during=ash_order_during_the_cancel(rig, 998, "SELL_SHORT"))
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]]
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]
+    assert "AAAA" not in rig.plan.left and rig.broker.orders[998]["status"] == "WORKING"
+
+
+def both_sides(rig):
+    ash_order(rig, 996, "BUY")
+    ash_order(rig, 997, "SELL_SHORT")
+
+
+def test_after_a_flip_ash_on_both_sides_the_chase_waits_and_goes_once_it_is_clear(fcrig):
+    """Not clear (N3) at the chase's own check: a wait through chase_wait and offers, no Schwab call
+    and no try; the other picks are not held up. Once Ash's long order is gone, a later reading
+    chases."""
+    rig = fcrig
+    plans_own_entries_only(rig, {996, 997})
+    at_the_chase(rig, lambda: both_sides(rig))
+    ids = short_trades_during_the_cancel(rig)
+    calls = len(rig.broker.calls)
+    run(rig, et(9, 31, 6))
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and ("quote", "AAAA") not in rig.broker.calls[calls:]
+    assert "AAAA" not in rig.plan.left and rig.desk._chase_tries == {}
+    assert rig.desk.chase_waits()["AAAA"]["cancelled_order_id"] == ids["AAAA"]
+    (w,) = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]          # said once, the chase named
+    assert w["what"] == "chase" and w["why"].startswith("You are on both sides of AAAA")
+    rig.broker.orders[996]["status"] = "CANCELED"
+    run(rig, et(9, 31, 9))
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]
+    assert rig.desk.chase_waits() == {} and "AAAA" not in rig.plan.left
+
+
+def test_after_a_flip_ash_on_both_sides_until_the_watch_ends_sends_nothing_and_says_why(fcrig):
+    rig = fcrig
+    plans_own_entries_only(rig, {996, 997})
+    at_the_chase(rig, lambda: both_sides(rig))
+    ids = short_trades_during_the_cancel(rig)
+    run(rig, et(9, 35, 10))
+    assert rig.broker.cancelled[0] == ids["AAAA"] and not [r for r in rig.sent if r.get("entry") == "chase"]
+    assert rig.plan.left["AAAA"] == ("chase not sent: You are on both sides of AAAA (shares or working orders), so "
+                                     "the plan cannot tell which side you trade. Nothing was sent; " + LEFT_HANDED)
+    assert rig.desk._chase_tries == {}
+
+
+def test_a_rejected_entrys_chase_with_ash_on_the_other_side_leaves_the_pick(fcrig):
+    """N2 with N3: the pick whose entry Schwab rejected as already through is not chased when Ash
+    works the other side of the name by hand; the plan stays armed."""
+    rig = fcrig
+    ids = all_four_rest(rig)
+    plans_own_entries_only(rig, {995})
+    ash_order(rig, 995, "SELL_SHORT")
+    reject(rig, ids["AAAA"])
+    rig.tape.prices["AAAA"] = 42.51
+    run(rig, et(9, 31, 8))
+    assert len(rig.broker.placed) == 4 and not [r for r in rig.sent if r.get("entry") == "chase"]
+    assert rig.plan.left["AAAA"] == ("chase not sent: You have a working short order on AAAA. The plan does not "
+                                     f"take the other side of a name you trade. Nothing was sent; {C.REJECTED_LEFT}")
+    assert rig.plan.armed() and len(rejected_lines(rig, "AAAA")) == 1
 
 
 def test_after_a_flip_an_unusable_reading_gives_no_chase_and_says_nothing_rests(fcrig):

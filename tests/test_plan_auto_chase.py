@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from companion import break_entry, chase_entry, plan_entries, plan_flat, plan_size, trading
+from companion import break_entry, chase_entry, plan_entries, plan_flat, plan_side, plan_size, trading
 from companion.opening_plan import engine
 from companion.opening_plan import plan as P
 from companion.plan_auto import CHASE_FLAG, chase, handlers
@@ -54,10 +54,12 @@ class OneEntryBroker(PlanBroker):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.fail = None                    # None, an exception to raise, or a Resp to answer
+        self.manual = set()                 # ids of Ash's own orders (brief 25): not the plan's entries
 
     def place_order(self, h, order):
         sym = order["orderLegCollection"][0]["instrument"]["symbol"]
         working = [o for o in self.orders.values() if o.get("status") in trading.LIVE
+                   and o.get("orderId") not in self.manual
                    and any((leg.get("instrument") or {}).get("symbol") == sym
                            and leg.get("instruction") in ("BUY", "SELL_SHORT")
                            for leg in o.get("orderLegCollection") or [])]
@@ -211,12 +213,14 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(t, "submit", spy)
     clock = [NOW]
     fresh = [True]
+    positions, pfresh = {}, [True]          # the poller's account positions (brief 25), and their freshness
     view = Plan()
     desk = plan_entries.PlanDesk(t, view, lambda: list(t._client.orders.values()), plan_entries.max_flips(),
-                                 now=lambda: clock[0], orders_fresh=lambda: fresh[0])
+                                 now=lambda: clock[0], orders_fresh=lambda: fresh[0],
+                                 positions=lambda: dict(positions), positions_fresh=lambda: pfresh[0])
     host = Host(desk, dict(ENV))
     return SimpleNamespace(trader=t, broker=t._client, desk=desk, host=host, sent=sent, quote=quote,
-                           quotes=quotes, clock=clock, fresh=fresh, view=view)
+                           quotes=quotes, clock=clock, fresh=fresh, view=view, positions=positions, pfresh=pfresh)
 
 
 def no_id(req):
@@ -505,12 +509,79 @@ def test_disarm_between_the_checks_and_the_send_sends_nothing_and_refunds(rig):
     assert (rig.host.orders_pick, rig.host.calls) == (1, 40)
 
 
-def test_not_when_another_order_works_on_the_name(rig):
-    rig.broker.orders[700] = {"orderId": 700, "status": "WORKING", "orderStrategyType": "SINGLE",
-                              "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "AAAA"}}]}
-    rig.host.handle("would_place", tape(42.51))
+# ---- beside Ash's own trades on the name (brief 25 rule B; N3 of review 3 of PR #25) -------------
+# Ash, project thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC ("did you account
+# for me doing manual trading on the same account in parallel ...") and his card pick "Plan trades
+# beside you" (20:04:42 UTC). Before each chase order: plan_side.manual_refusal for the chase's side.
+
+def ash_order(rig, oid, instruction, symbol="AAAA", status="WORKING"):
+    rig.broker.orders[oid] = {"orderId": oid, "status": status, "orderStrategyType": "SINGLE",
+                              "orderType": "LIMIT", "quantity": 100, "filledQuantity": 0,
+                              "orderLegCollection": [{"instruction": instruction, "quantity": 100,
+                                                      "instrument": {"symbol": symbol}}]}
+    rig.broker.manual.add(oid)
+
+
+def nothing_used(rig):
+    """Nothing sent, no Schwab quote, no try, nothing left spent, the row as it was."""
     nothing_sent(rig)
-    assert "One entry per name" in rig.host.left["AAAA"]
+    assert rig.quotes == [] and rig.desk._chase_tries == {} and rec(rig) == {}
+    assert (rig.host.orders_pick, rig.host.orders_day, rig.host.calls) == (1, 4, 40)
+
+
+@pytest.mark.parametrize("how", ["order", "shares"])
+def test_beside_ashs_own_long_trade_on_the_name_the_long_chase_goes(rig, how):
+    """The same side goes (before brief 25: "One entry per name" refused any working order)."""
+    if how == "order":
+        ash_order(rig, 700, "BUY")
+    else:
+        rig.positions["AAAA"] = 100.0
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG] and rig.host.left == {}
+    assert (rec(rig)["kind"], rec(rig)["chases"]) == ("chase", 1)
+
+
+@pytest.mark.parametrize("how,text", [
+    ("order", "You have a working short order on AAAA."),
+    ("shares", "You are short 50 AAAA by hand."),
+])
+def test_ash_on_the_other_side_of_the_name_leaves_the_pick_and_sends_nothing(rig, how, text):
+    if how == "order":
+        ash_order(rig, 701, "SELL_SHORT")
+    else:
+        rig.positions["AAAA"] = -50.0
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    nothing_used(rig)
+    assert rig.host.left == {"AAAA": f"chase not sent: {text} The plan does not take the other side of a name "
+                                     "you trade. Nothing was sent."}
+    assert rig.host.busies == [] and rig.host.disarms == []
+
+
+def test_ash_on_both_sides_of_the_name_the_chase_waits_and_goes_once_it_is_clear(rig):
+    """A side that is not clear waits: no Schwab call and no try, not an action (the other picks go
+    on), said once; the next reading decides again, and once Ash's short order is gone it goes."""
+    ash_order(rig, 700, "BUY")
+    ash_order(rig, 701, "SELL_SHORT")
+    for _ in range(3):
+        assert rig.host.handle("would_place", tape(42.51)) is False     # not an action: the others go on
+    nothing_used(rig)
+    assert rig.host.left == {} and rig.host.busies == [("AAAA", "chase")] * 3 and rig.host.ends == [False] * 3
+    assert set(rig.host.waits) == {"You are on both sides of AAAA (shares or working orders), so the plan cannot "
+                                   "tell which side you trade. Nothing was sent."}      # the executor says it once
+    rig.broker.orders[701]["status"] = "CANCELED"
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
+
+
+def test_old_account_positions_the_chase_waits_like_an_old_order_list(rig):
+    rig.pfresh[0] = False
+    assert rig.host.handle("would_place", tape(42.51)) is True       # the step ends: a wait
+    nothing_used(rig)
+    assert rig.host.busies == [("AAAA", "chase")] and rig.host.waits == [plan_side.POSITIONS_OLD]
+    assert rig.host.ends == [True] and rig.host.left == {}             # no pick goes on an old account read
+    rig.pfresh[0] = True
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
 
 
 def test_not_when_the_name_is_blocked_by_an_unclear_order(rig, monkeypatch):

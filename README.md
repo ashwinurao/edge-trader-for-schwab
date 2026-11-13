@@ -824,14 +824,23 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
 - One chase per pick a day. A chased entry is never flipped and never chased again. After a flip,
   the other side may be chased once when its level has already traded: Step 7 reads the tape again
   after its confirmed cancel and hands the pick to the chase from that reading. The entry that cancel
-  ended does not count as a working order on the name, even while Schwab's order list (up to 5 s
-  old) still shows it; any other working order on the name still stops the chase. When that reading
+  ended (and its stop) is the plan's own, never yours, even while Schwab's order list (up to 5 s
+  old) still shows it working. When that reading
   is not usable, nothing is sent and the row and the panel say nothing rests. When the chase can't go
-  on that reading for a passing reason (an old order list, another order action running, an old
-  quote, the price back inside the level), the pick waits and the plan offers it to the chase again
-  on each later reading, under the same tries and retry wait as below, until the watch ends. Any
-  other reason (Flat all's hold, another working order, the tries used up) and the watch end leave
-  the pick with the reason and "nothing rests".
+  on that reading for a passing reason (an old order list, old account positions, your own trades on
+  the name not showing one side, another order action running, an old quote, the price back inside
+  the level), the pick waits and the plan offers it to the chase again on each later reading, under
+  the same tries and retry wait as below, until the watch ends. Any other reason (Flat all's hold,
+  your own trade on the other side, the tries used up) and the watch end leave the pick with the
+  reason and "nothing rests".
+- Beside your own trades (brief 25, `companion/plan_side.py`, the rule above): before each chase
+  order the plan checks your own shares and working orders on the name for the chase's side. The same
+  side, or none: the chase goes. The other side: the pick is left, nothing is sent ("You are short 50
+  T by hand. The plan does not take the other side of a name you trade. Nothing was sent."). Not
+  clear (both sides, an order that is not a plain buy or sell, shares the plan cannot tell from its
+  own): the pick waits, said once on its line, with no Schwab call and no quote try, while the other
+  picks go on; it chases on a later reading once it is clear, until the watch ends. Old account
+  positions wait like an old order list.
 - An armed entry that Schwab accepts (201) and then rejects with "The stop price must be above the
   current ask for buy stop orders and below the bid for sell stop orders." had its level passed
   between the plan's quote and Schwab's check (seen live on 2026-11-13, 4 s after the 201). Ash's
