@@ -53,6 +53,9 @@ name are refused). It needs no account and sends no telemetry.
 - **GitHub** (`api.github.com`), once a day: a check for a newer Edge Trader release. It only shows a
   notice; it never downloads or installs anything. Turn it off with `EDGE_TRADER_NO_UPDATE_CHECK=1` in `.env`.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
+- **Edge Scanner, only if you set `EDGE_SCANNER_URL`** (off by default): the Opening plan screen reads
+  Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
+  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open.
 
 ### API keys
 
@@ -94,6 +97,17 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
   orders and close.
 - **Floating windows:** small always-on-top Entry and Manage windows to keep next to your charts.
+- **Opening plan (optional, display only):** with `EDGE_SCANNER_URL` set, an "Opening plan" button
+  opens a screen with one row per OV pick of the day (ranks 1 to 4) from Edge Scanner: the 09:30 ET
+  minute's high and low (marked "so far" until the bar is final), the long entry one cent above the
+  high and the short entry one cent below the low, each with its stop at the other side, the risk per
+  share, the shares for the risk per pick you type (rounded down, inside the ticket's 10,000-share and
+  $250,000 caps), and which side the minute's close is nearer. On a calm SPY day (RV20 at or below
+  10.5) each row uses half the risk and says so; when the calm flag is not known it shows full and half
+  size side by side. A stop under 2% of daily ATR is marked, not changed. Every number shows its age, and
+  an old or failed answer from Edge Scanner shows as old, never as current. The screen has no order
+  buttons: it places, changes and cancels nothing. Its list, times and numbers are in
+  `companion/opening_plan/playbook.json`.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
 - **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
@@ -207,6 +221,12 @@ fills Edge Trader already stores (Schwab's TRADE transactions, without the accou
 is fresh. It only reads the local database and never calls Schwab. Trading Journal AI uses it to
 import trades automatically. Its requests must use an address listed in `EDGE_TRADER_HOSTS`.
 
+**Opening plan from Edge Scanner.** Set `EDGE_SCANNER_URL` in `.env` to Edge Scanner's LAN address,
+e.g. `http://192.168.1.10:8772`, and rebuild. Use the address you open Edge Scanner by: Edge Scanner
+refuses a request whose host is not in its `SCANNER_ALLOWED_HOSTS` (`scanner/local_guard.py`), so a
+Docker service name does not work. Unset (the default), there is no Opening plan button, no route and
+no request to Edge Scanner.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -227,6 +247,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `SCHWAB_ENV_FILE` | Read the keys from another app's `.env`, to share one Schwab sign-in between apps. |
 | `COMPANION_PORT` | The local port. Default `8770`. |
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
+| `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 
 ## Good to know
 
