@@ -739,30 +739,113 @@ def test_a_click_entry_on_a_row_is_left_alone(rig):
     assert rig.desk.place("CCCC", "LONG", {"trigger": "71.85", "stop": "71.20", "shares": 1})["ok"]
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
     assert placed(rig) == ["CCCC", "DDDD", "AAAA", "BBBB"]
-    assert "placed by a click" in rig.plan.left["CCCC"]
+    assert rig.plan.left["CCCC"] == plan_entries.CLICK_TAKES_ROW
     run(rig, et(9, 35, 10), start=et(9, 35, 0))
     cc = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}["CCCC"]
     assert cc not in rig.broker.cancelled                # the plan never cancels a click's entry
 
 
+# ---------------------------------------------------------------- a click takes the row for the day
+# Architect's ruling of 2026-11-13 16:17 UTC (brief 14), after the Step 8 engineer found that
+# PlanDesk._put merges keys: a click Flip of the plan's entry kept origin "auto" and the plan
+# cancelled the order Ash clicked at 09:35.
+
+def ids(rig):
+    return {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}
+
+
+def is_the_clicks(rig, ticker):
+    rec = rig.desk.records()[ticker]
+    assert rec["origin"] == "click", rec
+    assert not set(plan_entries.AUTO_KEYS) & set(rec), rec              # no automatic key left
+    assert rig.desk.auto_entry(ticker, rig.desk.records(), list(rig.broker.orders.values()))["state"] == "hand"
+    return rec
+
+
 def test_a_click_flip_of_the_plans_entry_makes_it_the_clicks(rig):
-    """Found by the Step 8 engineer (2026-11-13): PlanDesk._put merges keys, so a click Flip of the
-    plan's entry kept origin "auto" and the plan cancelled the clicked short entry at 09:35."""
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
-    old = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}["AAAA"]
+    old = ids(rig)["AAAA"]
     rig.clock.t = et(9, 32)
     r = rig.desk.flip("AAAA", {"trigger": "41.91", "stop": "42.48", "shares": 1})
     assert r["ok"], r
-    rec = rig.desk.records()["AAAA"]
-    assert rec["origin"] == "click" and rec["side"] == "SHORT" and rec["order_id"] != old
+    rec = is_the_clicks(rig, "AAAA")
+    assert rec["side"] == "SHORT" and rec["order_id"] != old and rec["flips"] == 1   # the click's counter stays
     run(rig, et(9, 32, 2))
-    assert "placed by a click" in rig.plan.left["AAAA"]
-    others = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"] if r["ticker"] != "AAAA"}
+    assert rig.plan.left["AAAA"] == plan_entries.CLICK_TAKES_ROW
+    others = {t: i for t, i in ids(rig).items() if t != "AAAA"}
     run(rig, et(9, 35, 10), start=et(9, 35, 0))
     assert rec["order_id"] not in rig.broker.cancelled              # the click's short entry rests
     assert rig.broker.cancelled == [old] + [others[t] for t in ("DDDD", "BBBB", "CCCC")]
     assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "BBBB", "CCCC"]
+
+
+def test_a_click_cancel_of_the_plans_entry_makes_the_row_the_clicks(rig):
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    old = ids(rig)["AAAA"]
+    rig.clock.t = et(9, 32)
+    assert rig.desk.cancel("AAAA")["ok"]
+    rec = is_the_clicks(rig, "AAAA")
+    assert rec["state"] == plan_entries.NONE and rig.broker.cancelled == [old]
+    run(rig, et(9, 32, 2))
+    assert rig.plan.left["AAAA"] == plan_entries.CLICK_TAKES_ROW
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "BBBB", "CCCC"]
+    assert placed(rig) == NEAREST_FIRST                               # nothing sent again on AAAA
+
+
+def test_a_click_cancel_that_schwab_does_not_confirm_still_takes_the_row(rig):
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.broker.stuck.add(ids(rig)["AAAA"])
+    rig.clock.t = et(9, 32)
+    assert not rig.desk.cancel("AAAA")["ok"]
+    is_the_clicks(rig, "AAAA")
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "BBBB", "CCCC"]
+
+
+def test_a_click_place_after_the_plans_entry_ended_makes_it_the_clicks(rig):
+    arm(rig)
+    rig.clock.t = et(9, 30, 50)
+    with rig.desk._lock:                 # the plan's entry on AAAA, already ended unfilled
+        rig.desk._put("AAAA", state=plan_entries.NONE, side="LONG", origin="auto", kind="break",
+                      sent_at="2026-11-13T14:31:00.100Z", wait_from="2026-11-13T14:31:01.000Z",
+                      wait_until="2026-11-13T14:33:01.000Z", range={"high": "42.48", "low": "41.92"},
+                      sent={"ticket_id": "t0", "trigger": "42.49", "limit": "42.55", "stop": "41.92", "shares": 1},
+                      order_id=None, text="Cancelled by the armed plan, nothing filled.")
+    rig.clock.t = et(9, 31, 0.05)
+    assert rig.desk.place("AAAA", "LONG", {"trigger": "42.49", "stop": "41.92", "shares": 1})["ok"]
+    is_the_clicks(rig, "AAAA")
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == ["AAAA", "DDDD", "BBBB", "CCCC"]           # the click's, then the plan's three
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert ids(rig)["AAAA"] not in rig.broker.cancelled
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "BBBB", "CCCC"]
+
+
+def test_each_automatic_twin_checks_the_origin_under_the_lock(rig):
+    """A click can land between the plan's reading and its request: place_auto, cancel_auto and
+    red_auto read the record under the desk's lock just before acting, and leave a click's row."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.clock.t = et(9, 32)
+    rig.desk.flip("AAAA", {"trigger": "41.91", "stop": "42.48", "shares": 1})
+    before = dict(rig.desk.records()["AAAA"])
+    calls = len(rig.broker.calls)
+    o = engine.order_for("long", Decimal("42.48"), Decimal("41.92"), Decimal(100), engine.rules_from(PB_RAW))
+    r = rig.desk.place_auto("AAAA", "LONG", o)
+    assert r["not_sent"] and r["error"] == plan_entries.CLICK_TAKES_ROW
+    c = rig.desk.cancel_auto("AAAA", "the watch end")
+    assert c["not_sent"] and "No resting entry of the armed plan" in c["error"]
+    rig.desk.red_auto("AAAA", "should not show")
+    assert rig.desk.records()["AAAA"] == before and len(rig.broker.calls) == calls
+
+
+def test_the_arm_dialog_says_a_click_takes_the_row(rig):
+    assert "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today." \
+        in rig.plan.terms()["will_not"]
 
 
 def test_the_arm_dialog_names_each_step_that_is_not_on(rig):
