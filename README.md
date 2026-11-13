@@ -700,22 +700,28 @@ before 09:35, then the four 09:35 cancels, each at its worst). The limit that bi
 but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
 Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
 wait. That is why the order list could go old while the plan works, and why the plan holds the
-poller's later reads while it works (next paragraph).
+poller's later reads during its opening burst (next paragraph).
 Since brief 26 (`companion/read_retry.py`) a quote or order read whose connection Schwab dropped before
 any answer is sent once more, so each such drop adds one call to a send or a cancel (on 2026-11-13,
 1 in 31 ticket quotes dropped). `calls_per_send` stays 5 and does not count them.
 
-From 09:30:00 ET, while armed and a send or cancel is left, the plan holds the poller's later reads
-(brief 24: `Poller.hold_later` in `companion/poller.py`, the rules in `companion/poll_budget.py`). The
+For its opening burst only, the plan holds the poller's later reads (brief 24: `Poller.hold_later` in
+`companion/poller.py`, the rules in `companion/poll_budget.py`; review 6 of fork PR #27). The hold
+starts 30 seconds before the plan may act (09:30:30 ET) and ends 60 seconds after the plan's last
+send. With no send yet it ends at the latest 150 seconds after the plan may act (09:33:30 ET), and at
+once when no pick is left to send. On a normal morning that is 09:30:30 to about 09:32:05 ET. The
 account and the order list keep their 5 second pace. Fills still come about every 15 seconds
 (`HELD_FILLS_EVERY_S`). Position marks (quotes), corrections and market hours pause, and the
 dashboard shows the marks, open P&L and live R as old. A stop the app moves itself keeps its reads:
 an Auto B/E that has not fired and a spread stop with Send still get their quotes. The plan asks for
-30 second holds and renews them every 10 seconds, never past its own end (`POLL_HOLD_SECONDS` and
-`POLL_HOLD_RENEW_SECONDS` in `companion/plan_auto/executor.py`). When nothing is left to send or
-cancel, on a disarm, or at the plan's end it stops renewing, and the last hold lapses within 30
-seconds. The hold is the poller's own memory, not a Schwab call. Before 09:30:00 ET, or without an
-Arm click, nothing is held.
+30 second holds and renews them every 10 seconds, each cut so it ends at that second and never past
+the plan's own end (`POLL_HOLD_LEAD_SECONDS`, `POLL_HOLD_AFTER_SEND_SECONDS`,
+`POLL_HOLD_NO_SEND_SECONDS`, `POLL_HOLD_SECONDS` and `POLL_HOLD_RENEW_SECONDS` in
+`companion/plan_auto/executor.py`; start numbers, not approved by Ash). One hold per arm: entries that
+only rest keep no hold, and later sends and the 09:35 cancels start none (one action is 5 to 10 calls,
+and below 30 order calls a minute the poller keeps marks at 6 seconds by itself). On a disarm or at
+the plan's end it stops renewing, and the last hold lapses within 30 seconds. The hold is the poller's
+own memory, not a Schwab call. Before 09:30:30 ET, or without an Arm click, nothing is held.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
