@@ -759,6 +759,42 @@ def test_four_sends_end_the_hold_60_s_after_the_last_and_resting_entries_and_can
     assert et(9, 32, 5.1) <= datetime.fromisoformat(end["t"]) < et(9, 32, 7)
 
 
+def release_at(rig, times):
+    """Each pick's 09:30 range stays disputed (no send) until its time; then it sends at once."""
+    for sym in times:
+        rig.tape.disputed[sym] = None
+    for sym, t in sorted(times.items(), key=lambda kv: kv[1]):
+        run(rig, t)
+        del rig.tape.disputed[sym]
+
+
+def test_sends_less_than_60_s_apart_never_keep_the_hold_past_its_latest_end(rig):
+    # Review 7: each send would move the end 60 s on (09:32:00, 09:32:50, 09:33:40, 09:34:25), but the
+    # hold never runs past act_from + POLL_HOLD_LATEST_SECONDS, 09:33:30 ET.
+    arm(rig, at=et(9, 29, 0))
+    rig.clock.t = et(9, 29, 0)
+    release_at(rig, {"DDDD": et(9, 31, 0), "AAAA": et(9, 31, 50), "BBBB": et(9, 32, 40), "CCCC": et(9, 33, 25)})
+    run(rig, et(9, 36, 0))
+    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 50), et(9, 32, 40), et(9, 33, 25)]
+    assert placed(rig) == NEAREST_FIRST
+    assert held_through(rig) == et(9, 33, 30)                     # to the second
+    assert max(t for t, _, _ in rig.holds) < et(9, 33, 30)        # nothing renewed after it
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the hold's latest end, 09:33:30 ET"
+    assert len(lines(rig, "poll_hold")) == 1
+
+
+def test_a_first_send_at_093310_ends_the_hold_at_093330_not_093410(rig):
+    arm(rig, at=et(9, 29, 0))
+    rig.clock.t = et(9, 29, 0)
+    release_at(rig, {sym: et(9, 33, 10) for sym in PICKS})
+    run(rig, et(9, 36, 0))
+    assert send_times(rig)[0] == et(9, 33, 10) and placed(rig) == NEAREST_FIRST
+    assert held_through(rig) == et(9, 33, 30)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the hold's latest end, 09:33:30 ET"
+
+
 def test_a_pick_still_to_send_does_not_keep_the_hold_past_60_s_after_the_last_send(rig):
     # CCCC's 09:30 range never becomes final: no send for it. The other three send at 09:31:00, so
     # the hold ends at 09:32:00 (review 6 item 2), not at 09:33:30 and not at the watch end.
@@ -772,9 +808,9 @@ def test_a_pick_still_to_send_does_not_keep_the_hold_past_60_s_after_the_last_se
 
 
 def test_a_late_tape_ends_the_hold_150_s_after_act_from_and_its_later_sends_call_none(rig):
-    # No send by 09:33:30 ET (act_from + POLL_HOLD_NO_SEND_SECONDS): the hold ends there. The sends
+    # No send by 09:33:30 ET (act_from + POLL_HOLD_LATEST_SECONDS): the hold ends there. The sends
     # that come when the tape is back are not announced: one hold per arm (review 6 item 3).
-    assert X.POLL_HOLD_NO_SEND_SECONDS == 150.0
+    assert X.POLL_HOLD_LATEST_SECONDS == 150.0
     arm(rig, at=et(9, 29, 0))
     rig.tape.problem = "the open tape is 40 s old"              # late after the arm's own check
     run(rig, et(9, 34, 0), start=et(9, 29, 0))

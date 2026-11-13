@@ -26,12 +26,12 @@ Each step, from armed.act_from_et (09:31:00 ET) while armed:
    not cancelled for that reason (review 4 of fork PR #27).
 
 For the opening burst only, each step also renews a short hold of the poller's later polls
-(Poller.hold_later, brief 24; `_poll_hold`; review 6 of fork PR #27): from 30 s before act_from
-(09:30:30 ET) while armed, until 60 s after the plan's last send, or with no send yet at the latest
-150 s after act_from (09:33:30 ET) while a pick may still send. The order list and account reads
-keep their pace, fills still come about every 15 s, position marks pause. One hold per arm: later
-sends and the 09:35 cancels are not announced. A disarm or the plan's end stops the renewals, and
-the last hold lapses by itself.
+(Poller.hold_later, brief 24; `_poll_hold`; reviews 6 and 7 of fork PR #27): from 30 s before
+act_from (09:30:30 ET) while armed, until 60 s after the plan's last send, or with no send yet
+while a pick may still send. Never past 150 s after act_from (09:33:30 ET), so at most 3 minutes.
+The order list and account reads keep their pace, fills still come about every 15 s, position
+marks pause. One hold per arm: later sends and the 09:35 cancels are not announced. A disarm or
+the plan's end stops the renewals, and the last hold lapses by itself.
 
 The worker never holds a lock of its own across a call to Schwab or Edge Scanner, contains every
 exception (an unexpected one disarms for the day and shows why) and never blocks the ticket, the
@@ -78,17 +78,20 @@ FAR = Decimal(10 ** 9)
 # A step that took longer than this from its first read to its handler logs one "slow_step" line
 # (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC).
 SLOW_STEP_MS = 100.0
-# Brief 24 (architect, 2026-11-13 21:53 UTC) and review 6 of fork PR #27 (22:13 UTC): for its
-# opening burst only, the plan holds the poller's LATER polls (Poller.hold_later in
-# companion/poller.py; the rules in companion/poll_budget.py) so the order list and account reads
-# keep their 5 s pace while it sends. From POLL_HOLD_LEAD_SECONDS before act_from_et, until
-# POLL_HOLD_AFTER_SEND_SECONDS after its last send; with no send yet, at the latest
-# POLL_HOLD_NO_SEND_SECONDS after act_from_et. One hold per arm (one later action is 5 to 10 calls,
-# and below 30 order calls a minute the poller keeps marks at 6 s by itself). Short holds, renewed:
-# a worker that stops lets the hold lapse by itself. Start numbers, not approved by Ash.
+# Brief 24 (architect, 2026-11-13 21:53 UTC) and reviews 6 and 7 of fork PR #27 (22:13 and
+# 22:38 UTC): for its opening burst only, the plan holds the poller's LATER polls
+# (Poller.hold_later in companion/poller.py; the rules in companion/poll_budget.py) so the order
+# list and account reads keep their 5 s pace while it sends. From POLL_HOLD_LEAD_SECONDS before
+# act_from_et, until POLL_HOLD_AFTER_SEND_SECONDS after its last send, and never past
+# POLL_HOLD_LATEST_SECONDS after act_from_et, with or without a send: sends less than 60 s apart
+# (a pick that waits on the side rule, Steps 7 and 8's flips and chases) would keep it going, and
+# Ash trades by hand in these minutes, so the pause of his marks has a fixed upper bound (review 7).
+# One hold per arm (one later action is 5 to 10 calls, and below 30 order calls a minute the poller
+# keeps marks at 6 s by itself). Short holds, renewed: a worker that stops lets the hold lapse by
+# itself. Start numbers, not approved by Ash.
 POLL_HOLD_LEAD_SECONDS = 30.0
 POLL_HOLD_AFTER_SEND_SECONDS = 60.0
-POLL_HOLD_NO_SEND_SECONDS = 150.0
+POLL_HOLD_LATEST_SECONDS = 150.0
 POLL_HOLD_SECONDS = 30.0
 POLL_HOLD_RENEW_SECONDS = 10.0
 POLL_HOLD_WHY = "the armed plan's opening sends"
@@ -438,11 +441,12 @@ class AutoPlan:
         hours; the account and order reads are never held, and fills still come every
         poll_budget.HELD_FILLS_EVERY_S) with Poller.hold_later (review 6 of fork PR #27, architect,
         2026-11-13 22:13 UTC). It starts POLL_HOLD_LEAD_SECONDS before act_from_et and ends
-        POLL_HOLD_AFTER_SEND_SECONDS after the plan's last send; with no send yet, at the latest
-        POLL_HOLD_NO_SEND_SECONDS after act_from_et while a pick may still send, at once when none
-        may. Holds of at most POLL_HOLD_SECONDS, renewed every POLL_HOLD_RENEW_SECONDS, each cut to
-        that end and to the plan's own: a worker that stops lets the hold lapse by itself. One hold
-        per arm. No Schwab call: the hold is the poller's own memory."""
+        POLL_HOLD_AFTER_SEND_SECONDS after the plan's last send; with no send yet, while a pick may
+        still send, at once when none may. It never runs past POLL_HOLD_LATEST_SECONDS after
+        act_from_et, with or without a send (review 7, 22:38 UTC). Holds of at most
+        POLL_HOLD_SECONDS, renewed every POLL_HOLD_RENEW_SECONDS, each cut to that end and to the
+        plan's own: a worker that stops lets the hold lapse by itself. One hold per arm. No Schwab
+        call: the hold is the poller's own memory."""
         if self._hold_later is None:
             return
         armed_at, until = snap.get("armed_at"), snap.get("until")
@@ -457,12 +461,15 @@ class AutoPlan:
         act_from = datetime.combine(now.astimezone(ET).date(), self.armed_rules.act_from_et, tzinfo=ET)
         if now < act_from - timedelta(seconds=POLL_HOLD_LEAD_SECONDS):
             return
+        latest = act_from + timedelta(seconds=POLL_HOLD_LATEST_SECONDS)
         if last_send is not None:
-            end, why = last_send + timedelta(seconds=POLL_HOLD_AFTER_SEND_SECONDS), \
-                f"{POLL_HOLD_AFTER_SEND_SECONDS:g} s after the plan's last send"
+            end = last_send + timedelta(seconds=POLL_HOLD_AFTER_SEND_SECONDS)
+            if end <= latest:
+                why = f"{POLL_HOLD_AFTER_SEND_SECONDS:g} s after the plan's last send"
+            else:
+                end, why = latest, f"the hold's latest end, {_et(latest)} ET"
         elif may_send:
-            end = act_from + timedelta(seconds=POLL_HOLD_NO_SEND_SECONDS)
-            why = f"no send by {_et(end)} ET"
+            end, why = latest, f"no send by {_et(latest)} ET"
         else:
             end, why = None, "no pick left to send"
         if end is None or now >= end:

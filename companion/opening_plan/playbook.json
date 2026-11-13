@@ -181,7 +181,7 @@
     },
     "calls_per_minute": {
       "value": 40,
-      "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC). The limit that binds is the poller's own MAX_PER_MIN 70 (companion/poller.py _throttle), not Schwab's 120: Edge Trader's order calls count there and never wait, so the poller's reads wait (live test 2026-11-13: 76 and 78 calls in a minute, poller reads up to 14.8 s late). Since brief 24 (PR #33) the armed plan holds the poller's later polls for its opening burst only, from 09:30:30 ET to 60 s after its last send (review 6 of fork PR #27; companion/plan_auto/executor.py _poll_hold)"
+      "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC). The limit that binds is the poller's own MAX_PER_MIN 70 (companion/poller.py _throttle), not Schwab's 120: Edge Trader's order calls count there and never wait, so the poller's reads wait (live test 2026-11-13: 76 and 78 calls in a minute, poller reads up to 14.8 s late). Since brief 24 (PR #33) the armed plan holds the poller's later polls for its opening burst only, from 09:30:30 ET to 60 s after its last send and never past 09:33:30 ET (reviews 6 and 7 of fork PR #27; companion/plan_auto/executor.py _poll_hold)"
     },
     "calls_per_send": {
       "value": 5,
