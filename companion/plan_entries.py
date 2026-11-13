@@ -929,7 +929,7 @@ class PlanDesk:
         cancel goes through Trader.cancel_entry, which reads the order back until Schwab says
         CANCELED with nothing filled. Only then `recheck()` runs, with no lock held (it may read the
         tape and reserve the send's bounds): ("", "") to go on, or (why, code) with code
-        "disarmed", "traded" or another word. Then the click's checks run again on a fresh order
+        "disarmed", "watch" (the fast watch ended during the cancel), "traded" or another word. Then the click's checks run again on a fresh order
         list, Step 2's final row in `view` must agree with the tape (as place_auto; None or {} means no
         row check, and the desk never asks Edge Scanner here), and Trader.submit sends.
 
@@ -941,16 +941,18 @@ class PlanDesk:
         free, recheck() and the checks run again before the send.
 
         Returns {"ok", "ticker", "side", "kind", "stage", "code", "error", "red", "unclear",
-        "throttled", "filled", "again", "busy", "cancel_not_sent", "not_sent", "cancel", "send", "times"}.
+        "throttled", "filled", "again", "busy", "cancel_not_sent", "not_sent", "cancel", "send",
+        "cancelled_order_id", "times"}.
         stage: "refused" (nothing reached Schwab), "cancel" (the cancel did not confirm: the row is
         red), "recheck" (cancelled, nothing placed), "send" (Trader.submit answered, in "send";
-        `not_sent` when it refused before any request left)."""
+        `not_sent` when it refused before any request left). `cancelled_order_id` is the order the
+        confirmed cancel ended, and None until Schwab has said CANCELED with nothing filled."""
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
         times = dict(times or {})
         out = {"ok": False, "ticker": ticker, "side": side, "kind": kind, "stage": "refused", "code": "",
                "error": "", "red": False, "unclear": False, "throttled": False, "filled": False,
                "again": False, "busy": False, "cancel_not_sent": False, "not_sent": False, "cancel": None, "send": None,
-               "times": times}
+               "cancelled_order_id": None, "times": times}
 
         def done(**kw) -> dict:
             out.update(kw)
@@ -1039,6 +1041,9 @@ class PlanDesk:
             return done(stage="cancel", error=text, red=True, filled=filled, throttled=throttled,
                         unclear=throttled or not clear)
         stamp("cancel_confirmed")
+        # The id the confirmed cancel ended. A chase handed this flip (Step 8) skips only that id in
+        # its check for other working orders on the name (architect's Step 8 review, 17:07 UTC).
+        out["cancelled_order_id"] = oid
         # Confirmed: Schwab says CANCELED with nothing filled; nothing rests. The send half may meet
         # Trader's lock held by another order action (a click, a Flat all): Trader would refuse the
         # send. Then the flip waits for it here, one `wait()` (a tick) at a time, with one row line
@@ -1106,7 +1111,7 @@ class PlanDesk:
                 if why:
                     text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
                             f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
-                            if code in ("traded", "busy") else
+                            if code in ("traded", "busy", "watch") else
                             f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
                     self._put(ticker, state=NONE, order_id=None, text=text)
                     return done(stage="recheck", code=code, error=text)

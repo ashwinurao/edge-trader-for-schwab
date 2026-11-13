@@ -44,7 +44,12 @@ When unsure, stop acting (brief 14 rule 3): an unclear cancel or a 429 turns the
 disarms (a 429 for the day); a fill during the cancel turns the row red and the plan leaves the
 pick (any fill ends flips); no answer to the place freezes the pick and disarms; a 4xx is never
 retried. When the new side's trigger has already traded after the cancel, nothing is placed here:
-Step 8's chase may take it (handlers.PAST_TRIGGER), else the row says nothing rests.
+Step 8's chase may take it (handlers.PAST_TRIGGER), else the row says nothing rests. The chase gets
+a new lane: a new tape reading taken after the confirmed cancel, so its entry is the cancelled
+("ended") one, and the decision carries `cancelled_order_id`, the one id the chase may skip in its
+check for other working orders on the name (architect's Step 8 review, 2026-11-13 17:07 UTC; names
+agreed with the Step 8 thread). An unusable new reading hands nothing over, and a chase that does
+not go leaves the pick with a sentence that says nothing rests.
 """
 from __future__ import annotations
 
@@ -230,6 +235,40 @@ def _why_not(kind: str, entry: Mapping, pick: Optional[Mapping], usable: bool, w
     return "", o
 
 
+
+def _watch_over(lane: Lane) -> bool:
+    """The desk's clock is at or past the fast watch's end (armed.watch_until_et, ET): no new entry."""
+    return lane.desk._now().astimezone(ET).time() >= lane.armed_rules.watch_until_et
+
+
+def _hand_to_chase(lane: Lane, side: str, r: Mapping) -> bool:
+    """After a confirmed cancel the new side's trigger had already traded: offer it to Step 8's chase.
+
+    The row is NONE and nothing was spent for the place. The lane the flip was given holds the
+    reading from before the cancel, when the entry was still working, so the chase gets a new lane
+    on a new reading (architect's Step 8 review, 2026-11-13 17:07 UTC). The decision keeps the
+    flip's own keys (its "side" is the new side) and adds the id the confirmed cancel ended.
+    """
+    try:
+        pick, ok, why = lane.reread()
+    except Exception as e:
+        pick, ok, why = None, False, f"the tape could not be read ({type(e).__name__})"
+    if pick is None or not ok:
+        lane.leave(f"cancelled by the armed plan; the {side} trigger has already traded, nothing rests "
+                   f"(the new tape reading is not usable: {why or 'no reading'})")
+        return True
+    hand = Lane(lane.host, {**lane.decision, "cancelled_order_id": r.get("cancelled_order_id")}, pick,
+                lane.reading, view=lane.view)
+    took = hand.delegate(PAST_TRIGGER)
+    if took is None:
+        lane.leave(f"cancelled by the armed plan; the {side} trigger has already traded, nothing rests "
+                   "(the chase step is not on)")
+    elif not took:
+        # The chase's own line says why it did not go; this one says what is true at Schwab.
+        lane.leave(f"cancelled by the armed plan; the {side} trigger has already traded and the chase did "
+                   "not go, nothing rests")
+    return True
+
 def _swap(lane: Lane, kind: str) -> bool:
     """One flip or re-level for this pick. True when it reached Schwab (the executor reads again)."""
     d, ticker, entry = lane.decision, lane.ticker, lane.entry
@@ -299,8 +338,14 @@ def _swap(lane: Lane, kind: str) -> bool:
         return why, code
 
     def look() -> tuple[str, str]:
-        """One look: still armed, a new usable reading, the same range, the new side's trigger not
-        yet traded, and the send's bounds reserved."""
+        """One look: the fast watch not over, still armed, a new usable reading, the same range, the
+        new side's trigger not yet traded, and the send's bounds reserved."""
+        if _watch_over(lane):
+            # First, before the reread (architect's review 1 of Step 7, 2026-11-13 17:14 UTC, must 2):
+            # the executor filters decisions only at the start of a step, and lane.armed() stays True
+            # for armed.end_grace_seconds after the watch end so the 09:35 cancels can run. A flip
+            # whose cancel confirms after 09:35:00 places nothing and hands nothing to the chase.
+            return "the fast watch ended during the cancel", "watch"
         if not lane.armed():
             return "the plan was disarmed before the new side was placed", "disarmed"
         p2, ok2, why2 = lane.reread()
@@ -331,7 +376,7 @@ def _swap(lane: Lane, kind: str) -> bool:
         the fast watch ends (no flip after it, Step 6's executor)."""
         if not lane.armed():
             return "the plan was disarmed while another order action ran"
-        if lane.desk._now().astimezone(ET).time() >= lane.armed_rules.watch_until_et:
+        if _watch_over(lane):
             return "the fast watch ended while another order action ran"
         if not told["busy"]:
             told["busy"] = True
@@ -374,13 +419,7 @@ def _swap(lane: Lane, kind: str) -> bool:
         return True
     if stage == "recheck":
         if r.get("code") == "traded" and kind == "flip":
-            # Agreed with Step 8 (2026-11-13): the row is NONE, nothing was spent for the place.
-            took = lane.delegate(PAST_TRIGGER)
-            if took is not None:
-                return True
-            lane.leave(f"cancelled by the armed plan; the {side} trigger has already traded, nothing rests "
-                       "(the chase step is not on)")
-            return True
+            return _hand_to_chase(lane, side, r)
         lane.leave(str(r.get("error") or f"the {what} placed nothing"))
         return True
     send = r.get("send") or {}

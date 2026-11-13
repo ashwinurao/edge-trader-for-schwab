@@ -90,6 +90,7 @@ class Host:
         self.left = {"orders_pick": 5, "orders_day": 20, "calls_minute": 40}
         self.said, self.gone, self.disarms, self.logs, self.keys = [], [], [], [], set()
         self.busied = []
+        self.orders = lambda: []        # the order list reread() gives auto_entry (the fixture sets it)
 
     def armed(self):
         self.trace.append(("armed",))
@@ -97,7 +98,11 @@ class Host:
 
     def reread(self, ticker):
         self.trace.append(("reread",))
-        return self.tape.pop(0) if len(self.tape) > 1 else self.tape[0]
+        pick, ok, why = self.tape.pop(0) if len(self.tape) > 1 else self.tape[0]
+        if pick is not None and "entry" not in pick:
+            # As the executor's reread does: the pick's real entry at the time of the look.
+            pick = {**pick, "entry": self.desk.auto_entry(ticker, self.desk.records(), self.orders())}
+        return pick, ok, why
 
     def bounds_left(self, ticker):
         return dict(self.left)
@@ -186,8 +191,10 @@ def r(tmp_path, monkeypatch):
     desk = plan_entries.PlanDesk(t, view, lambda: list(t._client.orders.values()), plan_entries.max_flips(),
                                  now=lambda: NOW)
     t._client.desk = desk
+    host = Host(desk, t._client.calls)
+    host.orders = lambda: list(t._client.orders.values())
     return SimpleNamespace(trader=t, broker=t._client, view=view, desk=desk, sent=sent, quote=quote,
-                           host=Host(desk, t._client.calls), state=None)
+                           host=host, state=None)
 
 
 def place_long(r):
@@ -274,6 +281,7 @@ def test_the_log_line_has_each_time_of_the_flip(r):
     assert list(line["times"]) == ["reading", "decision", "cancel_start", "cancel_answered", "cancel_confirmed",
                                    "recheck_done", "send_start", "answered"]
     assert line["stage"] == "send" and line["ok"] and line["side"] == "SHORT" and line["new_order_id"]
+    assert line["cancelled_order_id"] == r.broker.cancelled[-1]
     # No account number, token or order body in the line.
     assert not {"cancel", "send"} & set(line) and "H" * 64 not in json.dumps(line, default=str)
 
@@ -312,6 +320,7 @@ def test_cancel_not_confirmed_places_nothing_turns_red_and_disarms(r):
     assert r.host.disarms == [("the AAAA flip cancel was not confirmed", False)]
     assert r.host.gone and r.host.left["orders_pick"] == 5
     assert entry(r)["state"] == "red"
+    assert flip_log(r)["cancelled_order_id"] is None      # no cancel confirmed: no id for a chase
 
 
 def test_a_fill_during_the_cancel_places_nothing_and_turns_red(r):
@@ -328,7 +337,7 @@ def test_a_fill_during_the_cancel_places_nothing_and_turns_red(r):
     assert got["state"] == plan_entries.RED and "filled before the cancel" in got["text"]
     # A fill is a clear answer: the plan leaves the pick (any fill ends flips) but stays armed.
     assert r.host.disarms == [] and r.host.gone
-    assert flip_log(r)["filled"] is True
+    assert flip_log(r)["filled"] is True and flip_log(r)["cancelled_order_id"] is None
 
 
 # ---------------------------------------------------------------- nothing placed, not red
@@ -364,18 +373,87 @@ def test_the_other_sides_trigger_already_traded(r):
                            "(the chase step is not on)"]
 
 
-def test_the_other_sides_trigger_already_traded_hands_over_to_the_chase(r):
-    # Agreed with Step 8 (2026-11-13): the row is NONE, then handlers.PAST_TRIGGER gets the lane.
-    place_long(r)
-    seen = []
+def use_chase(registry, chase):
+    """Puts a stand-in in place of Step 8's chase. Step 8's branch registers on_chase for
+    PAST_TRIGGER in default_registry(), so drop it first: these tests run on both branches."""
+    registry._by_kind.pop(handlers.PAST_TRIGGER, None)
+    registry.register(handlers.PAST_TRIGGER, chase)
 
-    def chase(lane):
-        seen.append((lane.decision["side"], rec(r)["state"]))
-        return True
-    r.host.registry.register(handlers.PAST_TRIGGER, chase)
-    assert run(r, tape=[(tape_pick(42.10), True, ""), (tape_pick(41.90), True, "")]) is True
-    assert seen == [("short", plan_entries.NONE)] and r.host.gone == []
-    assert r.host.left["orders_pick"] == 5
+
+def chase_gets(r, answer, tape=None):
+    """Registers a stand-in for Step 8's chase that records the lane it is handed and answers
+    `answer` (a callable, given the lane). Runs the flip on the long entry: the new reading after
+    the cancel shows a trade through the short trigger. Returns (the flip's lane, the handed lanes)."""
+    handed = []
+
+    def chase(ln):
+        handed.append((ln, rec(r)["state"]))
+        return answer(ln)
+    use_chase(r.host.registry, chase)
+    ln = lane(r)
+    r.host.tape = list(tape or [(tape_pick(42.10), True, ""), (tape_pick(41.90), True, ""),
+                                (tape_pick(41.89), True, "")])
+    assert flip.on_flip(ln) is True
+    return ln, handed
+
+
+def test_the_other_sides_trigger_already_traded_hands_over_to_the_chase(r):
+    # Architect's Step 8 review, 2026-11-13 17:07 UTC, names agreed with the Step 8 thread: the
+    # chase gets a NEW lane, read after the confirmed cancel, and the id that cancel ended.
+    oid = place_long(r)
+    ln, handed = chase_gets(r, lambda h: True)
+    ((h, state),) = handed
+    assert state == plan_entries.NONE and r.host.gone == []
+    assert ln.entry["state"] == "working"             # the flip's lane: read while the long rested
+    assert h is not ln and h.entry["state"] == "ended" and h.entry["side"] == "long"
+    assert h.pick["last"] == 41.89                    # the look taken after the cancel
+    assert h.decision["side"] == "short" and h.decision["kind"] == "would_flip"
+    assert h.decision["cancelled_order_id"] == oid and "cancelled_order_id" not in ln.decision
+    assert h.view is ln.view and h.reading is ln.reading and h.ticker == "AAAA"
+    assert r.host.left["orders_pick"] == 5            # nothing was spent for the place
+
+
+def test_a_chase_that_does_not_go_leaves_the_pick_saying_nothing_rests(r):
+    place_long(r)
+    _, handed = chase_gets(r, lambda h: False)
+    assert len(handed) == 1 and len(r.broker.placed) == 1
+    assert r.host.gone == ["cancelled by the armed plan; the short trigger has already traded and the chase "
+                           "did not go, nothing rests"]
+
+
+def test_a_busy_chase_keeps_the_pick_for_the_next_tick(r):
+    # Step 8 answers True after lane.busy("send"): the executor waits a tick and reads again.
+    place_long(r)
+    _, handed = chase_gets(r, lambda h: h.busy("send") or True)
+    assert len(handed) == 1 and r.host.busied == ["send"] and r.host.gone == []
+
+
+@pytest.mark.parametrize("look, why", [
+    ((None, False, "the open tape answered nothing"), "the open tape answered nothing"),
+    ((tape_pick(41.89, age=9.0), False, "the tape is 9 s old"), "the tape is 9 s old"),
+    ((None, True, ""), "no reading"),
+], ids=["none", "not-usable", "empty"])
+def test_no_hand_over_when_the_look_after_the_cancel_is_not_usable(r, look, why):
+    place_long(r)
+    _, handed = chase_gets(r, lambda h: True, tape=[(tape_pick(42.10), True, ""), (tape_pick(41.90), True, ""),
+                                                    look])
+    assert handed == [] and len(r.broker.placed) == 1 and rec(r)["state"] == plan_entries.NONE
+    assert r.host.gone == [f"cancelled by the armed plan; the short trigger has already traded, nothing rests "
+                           f"(the new tape reading is not usable: {why})"]
+
+
+def test_the_flip_answer_names_the_cancelled_order_only_once_the_cancel_is_confirmed(r, monkeypatch):
+    oid = place_long(r)
+    o = engine.order_for("short", Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
+    traded = lambda: ("the short trigger has already traded", "traded")
+    held = [True]
+    real_busy = r.desk.trader_busy
+    monkeypatch.setattr(r.desk, "trader_busy", lambda: held[0] or real_busy())
+    busy = r.desk.flip_auto("AAAA", "SHORT", o, limit=3, recheck=traded)
+    assert busy["busy"] and busy["cancelled_order_id"] is None and r.broker.cancelled == []
+    held[0] = False
+    got = r.desk.flip_auto("AAAA", "SHORT", o, limit=3, recheck=traded)
+    assert got["stage"] == "recheck" and got["code"] == "traded" and got["cancelled_order_id"] == oid
 
 
 # ---------------------------------------------------------------- must NOT flip
@@ -804,11 +882,13 @@ def test_a_disarm_while_looking_again_places_nothing(r, monkeypatch):
                               "side was placed.")
 
 
-@pytest.mark.parametrize("bad, code", [
-    ((tape_pick(42.10, high=42.60), True, ""), "range changed"),
-    ((tape_pick(41.90), True, ""), "has already traded"),
+@pytest.mark.parametrize("bad, code, looks", [
+    ((tape_pick(42.10, high=42.60), True, ""), "range changed", 2),
+    # The third look is the new lane handed to the chase (architect's Step 8 review, 17:07 UTC),
+    # not a second look of the recheck.
+    ((tape_pick(41.90), True, ""), "has already traded", 3),
 ], ids=["range", "traded"])
-def test_after_the_cancel_any_other_answer_ends_at_once(r, monkeypatch, bad, code):
+def test_after_the_cancel_any_other_answer_ends_at_once(r, monkeypatch, bad, code, looks):
     place_long(r)
     ticking(r, monkeypatch)
     reads = []
@@ -816,7 +896,7 @@ def test_after_the_cancel_any_other_answer_ends_at_once(r, monkeypatch, bad, cod
     r.host.reread = lambda t: reads.append(1) or real_reread(t)
     assert run(r, tape=[FRESH, bad]) is True
     assert len(r.broker.placed) == 1 and code in rec(r)["text"]
-    assert len(reads) == 2 and "flip_look_again" not in [c for c, _ in r.host.said]
+    assert len(reads) == looks and "flip_look_again" not in [c for c, _ in r.host.said]
 
 
 def test_a_send_refused_by_traders_lock_after_the_look_waits_and_goes_once(r, monkeypatch):
@@ -1623,6 +1703,125 @@ def test_executor_a_busy_lock_after_the_flips_cancel_waits_then_places(frig, mon
     assert frig.tape.reads > reads                                       # the send half read the tape again
     got = frig.desk.records()["AAAA"]
     assert got["side"] == "SHORT" and got["state"] == plan_entries.SENT and max(frig.working) == 1
+
+
+def test_executor_hands_the_chase_a_lane_read_after_the_flips_cancel(frig, monkeypatch):
+    # Architect's Step 8 review, 2026-11-13 17:07 UTC: the price runs through the short trigger
+    # 41.91 while the long is being cancelled. The chase gets a lane from a NEW reading of Step 6's
+    # executor (the entry the engine sees is "ended", not "working"), Step 2's view of the step,
+    # and the id the confirmed cancel ended. A chase that does not go leaves the pick.
+    ids = aaaa_past_its_flip_line(frig)
+    real_cancel = frig.trader.cancel_entry
+
+    def cancel_then_run(oid):
+        got = real_cancel(oid)
+        frig.tape.prices["AAAA"] = 41.90
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel_then_run)
+    handed, flips = [], []
+    real_flip = frig.plan.registry.get(flip.FLIP, frig.plan.env)
+
+    def flip_seen(ln):
+        flips.append(ln)
+        return real_flip(ln)
+    frig.plan.registry._by_kind.pop(flip.FLIP)
+    frig.plan.registry.register(flip.FLIP, flip_seen)
+    use_chase(frig.plan.registry, lambda ln: handed.append(ln) or False)
+    run_plan(frig, et(9, 31, 8))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
+    (h,) = handed
+    (ln,) = flips
+    assert ln.entry["state"] == "working" and ln.pick["last"] == 42.14
+    assert h is not ln and h.entry["state"] == "ended" and h.pick["last"] == 41.9
+    assert h.decision["cancelled_order_id"] == ids["AAAA"] and h.decision["side"] == "short"
+    assert h.view is ln.view and h.host is frig.plan
+    assert frig.desk.records()["AAAA"]["state"] == plan_entries.NONE
+    assert note(frig) == ("cancelled by the armed plan; the short trigger has already traded and the chase did "
+                          "not go, nothing rests")
+    assert [x["why"] for x in plan_lines(frig, "leave") if x["ticker"] == "AAAA"] == [note(frig)]
+
+
+# ---------------------------------------------------------------- the fast watch ends during the cancel
+# Architect's review 1 of Step 7 (2026-11-13 17:14 UTC, must 2): the executor filters decisions at the
+# start of a step only, and lane.armed() stays True for armed.end_grace_seconds after 09:35:00 so the
+# 09:35 cancels can run. A flip or re-level whose cancel confirms at or after the watch end places
+# nothing and hands nothing to the chase; the pick is left.
+
+WATCH_ENDED = "Cancelled the long entry by the armed plan; the fast watch ended during the cancel, so nothing rests."
+
+
+def cancel_confirms_at(frig, monkeypatch, at, then=None):
+    """The flip's or re-level's cancel answers confirmed when the fake clock reads `at` (the step
+    starts at 09:34:58). Returns the clock time of each look the lane takes."""
+    real_cancel = frig.trader.cancel_entry
+
+    def cancel(oid):
+        got = real_cancel(oid)
+        assert frig.clock.t <= at
+        frig.clock.t = at
+        if then:
+            then()
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel)
+    looks, real_reread = [], frig.plan.reread
+    monkeypatch.setattr(frig.plan, "reread", lambda t: looks.append(frig.clock.t) or real_reread(t))
+    return looks
+
+
+def relevel_ready(frig):
+    ids = all_four_rest(frig)
+    frig.tape.ranges["AAAA"] = (42.60, 41.92)         # the 09:30 bar: high 12 cents up
+    frig.view.bars["AAAA"] = (42.60, 41.92, 42.40)
+    frig.tape.prices["AAAA"] = 42.40
+    return ids
+
+
+@pytest.mark.parametrize("ready", [aaaa_past_its_flip_line, relevel_ready], ids=["flip", "relevel"])
+def test_a_cancel_confirmed_after_the_watch_end_places_nothing(frig, monkeypatch, ready):
+    ids = ready(frig)
+    handed = []
+    use_chase(frig.plan.registry, lambda ln: handed.append(ln) or True)
+    # The price also runs through the short trigger: without the watch rule a flip would hand over.
+    looks = cancel_confirms_at(frig, monkeypatch, et(9, 35, 0.2),
+                               then=lambda: frig.tape.prices.update(AAAA=41.90))
+    run_plan(frig, et(9, 35, 0.3), start=et(9, 34, 58))
+    assert frig.broker.cancelled[0] == ids["AAAA"] and len(frig.broker.placed) == 4 and handed == []
+    assert looks == [et(9, 34, 58)]                   # the look before the cancel; none after it
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and got["text"] == WATCH_ENDED
+    assert note(frig) == WATCH_ENDED
+    assert [x["why"] for x in plan_lines(frig, "leave") if x["ticker"] == "AAAA"] == [WATCH_ENDED]
+    (line,) = [x for x in plan_lines(frig) if x["event"].endswith("_auto") and x["ticker"] == "AAAA"
+               and x.get("stage") == "recheck"]
+    assert line["code"] == "watch" and line["cancelled_order_id"] == ids["AAAA"]
+
+
+@pytest.mark.parametrize("ready, instruction", [(aaaa_past_its_flip_line, "SELL_SHORT"), (relevel_ready, "BUY")],
+                         ids=["flip", "relevel"])
+def test_a_cancel_confirmed_just_before_the_watch_end_places(frig, monkeypatch, ready, instruction):
+    ids = ready(frig)
+    cancel_confirms_at(frig, monkeypatch, et(9, 34, 59.9))
+    run_plan(frig, et(9, 34, 59.95), start=et(9, 34, 58))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5
+    last = frig.broker.placed[-1]
+    assert last["orderLegCollection"][0]["instrument"]["symbol"] == "AAAA"
+    assert last["orderLegCollection"][0]["instruction"] == instruction
+    assert frig.desk.records()["AAAA"]["state"] == plan_entries.SENT
+
+
+def test_the_second_look_that_runs_past_the_watch_end_stops_there(frig, monkeypatch):
+    # The cancel confirms at 09:34:59.6 with the tape down: looks at 59.6 and 59.85 find nothing
+    # usable, and the third, at 09:35:00.1, stops before reading the tape.
+    ids = aaaa_past_its_flip_line(frig)
+    looks = cancel_confirms_at(frig, monkeypatch, et(9, 34, 59.6),
+                               then=lambda: setattr(frig.tape, "problem", "the open tape answered nothing"))
+    run_plan(frig, et(9, 35, 0.15), start=et(9, 34, 58))
+    assert frig.broker.cancelled[0] == ids["AAAA"] and len(frig.broker.placed) == 4
+    assert looks == [et(9, 34, 58), et(9, 34, 59.6), et(9, 34, 59.85)]
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and got["text"] == WATCH_ENDED and note(frig) == WATCH_ENDED
+    said = [x for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == "flip_look_again"]
+    assert len(said) == 1
 
 
 def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):
