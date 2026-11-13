@@ -889,7 +889,10 @@ class PlanDesk:
         Answers Trader.submit's dict, plus `not_sent` when no request left. Then `again` says the
         reason passes (Trader's lock, an old quote, the price back inside the level, an old order
         list): the row is put back exactly as it was and the pick may try on a later reading, at most
-        `quote_tries` times after a quote (playbook.json armed.chase_quote_tries). Otherwise the row keeps "Not sent" and the plan leaves
+        `quote_tries` times after a quote (playbook.json armed.chase_quote_tries). `busy` says
+        Trader's lock was held (by a click): nothing was written or spent, and the worker waits a
+        tick (review 1 of Step 6). `view` is the executor's cached view; None or {} skips the row
+        check, never a GET. Otherwise the row keeps "Not sent" and the plan leaves
         it. `quoted` says Schwab's quote was read (one call)."""
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
         log = log or (lambda event, **kw: None)
@@ -897,13 +900,17 @@ class PlanDesk:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
         if side not in OTHER:
             return self._refuse(ticker, "Pick long or short.", not_sent=True)
+        # Architect's review 1 of Step 6 (2026-11-13 16:45 UTC): a busy Trader lock is not an action.
+        # Checked before any record or log line, so a click holding the lock costs the row nothing:
+        # no SENDING record, no chase and no quote try used. A hint only: Trader.submit still refuses
+        # on a race (below).
+        if self.trader_busy():
+            return self._refuse(ticker, TRADER_BUSY, not_sent=True, busy=True, again=True)
         orders = self._orders()
         fresh = self._orders_fresh()
-        if view is None:
-            try:
-                view = self._view()
-            except Exception:
-                view = None
+        # No fallback to self._view(): in the armed path that is Edge Scanner's picks GET (review 1,
+        # must 2). The executor hands its cached view; None or {} means no row check (logged once
+        # by the executor).
         with self._lock:
             try:
                 recs = self._load()
@@ -953,7 +960,8 @@ class PlanDesk:
             answer_at=self._now().isoformat(timespec="milliseconds"))
         if self.trader.store.get_ticket(req["ticket_id"]) is None:
             # Trader.submit refused before recording the intent: no request left (CONTRIBUTING rule 4).
-            again = bool(r.get("again")) or str(r.get("error") or "").startswith(TRADER_BUSY)
+            busy = str(r.get("error") or "").startswith(TRADER_BUSY)     # lost the race for Trader's lock
+            again = bool(r.get("again")) or busy
             if again:
                 with self._lock:
                     recs = self._load()
@@ -962,10 +970,10 @@ class PlanDesk:
                     else:
                         recs[ticker] = prior
                     self._save(recs)
-                    if r.get("quoted"):
+                    if r.get("quoted") and not busy:
                         k = self._key() + ticker
                         self._chase_tries[k] = self._chase_tries.get(k, 0) + 1
-            return {**r, "not_sent": True, "again": again, "quoted": bool(r.get("quoted"))}
+            return {**r, "not_sent": True, "again": again, "quoted": bool(r.get("quoted")), "busy": busy}
         return r
 
     @staticmethod

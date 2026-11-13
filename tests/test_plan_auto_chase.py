@@ -82,7 +82,7 @@ class Host:
         self.armed_rules = ARMED
         self.registry = handlers.default_registry()
         self.armed_seq = None               # a list of answers for armed(), then True
-        self.disarms, self.logs, self.said, self.left, self.reds = [], [], [], {}, {}
+        self.disarms, self.logs, self.said, self.left, self.reds, self.busies = [], [], [], {}, {}, []
         self.orders_pick, self.orders_day, self.calls = 1, 4, 40
         self.reads = []                     # queued answers for reread(); else the lane's own pick again
         self.seen = set()
@@ -143,6 +143,9 @@ class Host:
 
     def forget(self, key):
         self.seen.discard(key)
+
+    def busy(self, ticker, what):
+        self.busies.append((ticker, what))
 
     # ---- helpers for the tests: one decision, or one engine step --------------------------------
 
@@ -524,6 +527,38 @@ def test_quote_refusals_are_tried_at_most_three_times_a_day(rig):
     assert len(rig.quotes) == tries                     # no fourth quote: refused at the desk
     assert "3 times today (armed.chase_quote_tries in playbook.json)" in rig.host.left["AAAA"]
     assert len(rig.sent) == tries and rig.broker.placed == [] and rig.trader.store.open_tickets() == []
+
+
+# ---- Trader's lock held by a click (architect's review 1 of Step 6, 2026-11-13 16:45 UTC) -------
+
+def test_a_held_trader_lock_writes_nothing_and_uses_no_chase_or_try(rig):
+    rig.trader._send_lock.acquire()                     # a click's send is running on the ticket
+    try:
+        for _ in range(ARMED.chase_quote_tries + 1):     # more tries than the quote tries: none used
+            assert rig.host.handle("would_place", tape(42.51)) is True
+    finally:
+        rig.trader._send_lock.release()
+    assert rig.host.busies == [("AAAA", "send")] * (ARMED.chase_quote_tries + 1)
+    nothing_sent(rig)
+    assert rig.quotes == [] and rec(rig) == {} and rig.desk.records() == {}
+    assert (rig.host.orders_pick, rig.host.calls) == (1, 40) and rig.host.left == {}
+    assert rig.host.handle("would_place", tape(42.51)) is True     # released: the chase goes
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG] and rec(rig)["chases"] == 1
+
+
+def test_losing_the_race_for_trader_lock_puts_the_row_back_and_uses_no_try(rig, monkeypatch):
+    """trader_busy() is a hint: the lock can be taken between it and Trader.submit. Then submit
+    refuses before any request ("Another submission is in progress"): the row is put back exactly,
+    no quote was read and no try is used."""
+    monkeypatch.setattr(rig.desk, "trader_busy", lambda: False)
+    rig.trader._send_lock.acquire()
+    try:
+        assert rig.host.handle("would_place", tape(42.51)) is True
+    finally:
+        rig.trader._send_lock.release()
+    assert rig.host.busies == [("AAAA", "send")] and rig.quotes == [] and rig.desk.records() == {}
+    assert rig.desk._chase_tries == {} and (rig.host.orders_pick, rig.host.calls) == (1, 40)
+    assert rig.broker.placed == []
 
 
 # ---- after a flip (brief 17) -------------------------------------------------------------------

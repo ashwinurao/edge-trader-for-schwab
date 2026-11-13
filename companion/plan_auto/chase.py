@@ -136,6 +136,12 @@ def on_chase(lane: Lane) -> bool:
     if r.get("not_sent"):
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))
+        if r.get("busy"):
+            # Trader's lock is held (a click): not an action. The step ends, no other pick tries on
+            # this reading, the worker waits a tick and the next reading decides again (architect's
+            # review 1 of Step 6, 2026-11-13 16:45 UTC). Said once per pick by the executor.
+            lane.busy("send")
+            return True
         if not r.get("again"):
             lane.leave(f"chase not sent: {r.get('error')}")
         else:
