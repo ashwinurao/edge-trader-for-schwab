@@ -110,7 +110,8 @@ def _jsonable(v: Any) -> Any:
 class AutoPlan:
     """The armed plan: arming, the worker thread, the handlers' host and the panel's state.
 
-    `tape.read()` gives brief 15's reading; `usable(reading)` -> (bool, why). `view()` is the
+    `tape.read()` gives brief 15's reading (companion/opening_plan/tape.py EsTape); `usable(reading,
+    now)` -> (bool, why) is tape.usable with the playbook's tape rules. `view()` is the
     Opening plan's view (Step 2), `orders()` the poller's top-level orders, `orders_fresh()` and
     `cooldown_left()` the poller's. Tests pass fakes and a fake clock (`now`).
     """
@@ -163,7 +164,7 @@ class AutoPlan:
     def reread(self, ticker: str) -> tuple[Optional[dict], bool, str]:
         now = self._now()
         reading, ok, why = self._read(now)
-        er = self._engine_reading(reading, ok, now)
+        er = self._engine_reading(reading, ok, now, why)
         pick = next((p for p in er["picks"] if p["symbol"] == ticker), None)
         if ok and pick is None:
             ok, why = False, f"{ticker} is not on the tape"
@@ -292,7 +293,7 @@ class AutoPlan:
         if self.tape is None:
             return None, False, "the open tape (brief 15) is not in this build"
         reading = self.tape.read()
-        ok, why = self._usable(reading)
+        ok, why = self._usable(reading, now)
         if ok:
             newest = None
             for p in _get(reading, "picks") or []:
@@ -306,9 +307,10 @@ class AutoPlan:
                                   "so nothing price-based is done")
         return reading, bool(ok), str(why or "")
 
-    def _engine_reading(self, reading: Any, ok: bool, now: datetime) -> dict:
-        """The engine's reading: the tape's picks (without a price when unusable), the frozen risk
-        and calm flag, and each pick's real entry."""
+    def _engine_reading(self, reading: Any, ok: bool, now: datetime, why: str = "") -> dict:
+        """The engine's reading: the tape's picks (on hold, without a price, when the tape is not
+        usable: only time-based cancels can come), the frozen risk and calm flag, and each pick's
+        real entry."""
         received = _when(_get(reading, "received")) if reading is not None else None
         received = received or now
         if ok:
@@ -317,8 +319,9 @@ class AutoPlan:
                 if not sym:
                     continue
                 with self._lock:
-                    self.known[sym] = {k: _get(p, k) for k in ("rank", "last", "last_at", "fresh_at", "high",
-                                                               "low", "final", "from", "range_changed")}
+                    self.known[sym] = {k: _get(p, k) for k in ("rank", "last", "last_at", "fresh_at", "bid", "ask",
+                                                               "quote_at", "high", "low", "final", "from",
+                                                               "range_changed")}
         recs = self.desk.records()
         orders = self._orders()
         picks = []
@@ -330,11 +333,8 @@ class AutoPlan:
         for sym, kp in known.items():
             p = {"symbol": sym, **kp, "received": received}
             if sym not in seen:
-                p.update(last=None, last_at=None, fresh_at=None)      # no price-based action on it
-            if p.get("fresh_at") is not None and p.get("last_at") is not None:
-                # Brief 15: a thin name with a fresh quote is not stale. Until engine.py reads
-                # fresh_at itself, the price's age is the newer of the two.
-                p["last_at"] = max(_when(p["last_at"]) or received, _when(p["fresh_at"]) or received)
+                # No price-based action on it (brief 16 item 2); engine.py treats `hold` as stale.
+                p.update(last=None, last_at=None, fresh_at=None, hold=f"no price-based action: {why or 'not on the tape'}")
             entry = self.desk.auto_entry(sym, recs, orders)
             p["entry"] = self._for_engine(sym, entry, left)
             picks.append(p)
@@ -418,7 +418,7 @@ class AutoPlan:
         reading, ok, why = self._read(now)
         if not ok:
             self.say("*", "tape", f"no price-based action: {why}")
-        er = self._engine_reading(reading, ok, now)
+        er = self._engine_reading(reading, ok, now, why)
         if not self.arming.is_armed(self._now()):
             return False                        # _engine_reading found an unclear entry
         with self._lock:
@@ -449,9 +449,7 @@ class AutoPlan:
 
     def safe_step(self) -> bool:
         try:
-            acted = self.step()
-            self.problem = ""
-            return acted
+            return self.step()
         except Exception as e:
             problem = f"{type(e).__name__}: {e}"[:300]
             if problem != self.problem:
@@ -525,7 +523,7 @@ class AutoPlan:
                 f"{break_entry.BREAK_MAX_SHARES} share, its stop attached.",
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
-                "that has not filled, and wait for Schwab to confirm."]
+                "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env)
         will_not = ["Flip, chase, exit, move a stop or resend." if kinds == ["would_place", "would_cancel"]
                     else "Exit, move a stop or resend.",
                     "Send when the price is already at or past the trigger: that pick is left to you.",
@@ -569,7 +567,7 @@ class AutoPlan:
                "picks": [{"ticker": t, "decision": (n.get("decision") or {}), "action": n.get("action"),
                           "note": n.get("note") or "", "left": left.get(t, "")} for t, n in sorted(notes.items()) if t != "*"],
                "tape_note": (notes.get("*") or {}).get("note") or "",
-               "resting": resting,
+               "resting": sorted(resting),
                "resting_text": (f"{len(resting)} plan entr{'y' if len(resting) == 1 else 'ies'} still rest at Schwab "
                                 f"({', '.join(resting)}). The armed plan does nothing more: each row's Cancel works."
                                 if resting and not armed else "")}
@@ -593,6 +591,7 @@ class AutoPlan:
         with self._lock:
             self.risk, self.calm = facts.risk, facts.calm
             self.state, self.left, self.notes, self.known = None, {}, {}, {}
+            self.problem = ""
         self.arming.arm(now, terms)
         self.log("arm", None, risk=facts.risk, calm=facts.calm, picks=terms["picks"], bounds=terms["bounds"],
                  handlers=terms["handlers"])
@@ -608,6 +607,37 @@ class AutoPlan:
         return {"ok": True, **self.panel()}
 
 
+def fill_demo(plan: AutoPlan) -> None:
+    """`--demo` only: the panel armed at 09:25:30 ET with invented decisions, so the screen shows each
+    state. AAAA's resting entry (Step 4's demo record) reads as sent by the armed plan; BBBB is red;
+    CCCC waits for its bar; DDDD was left (price past the trigger). Nothing reaches Schwab."""
+    now = plan._now()
+    day = now.astimezone(ET).date()
+    armed_at = datetime.combine(day, plan.armed_rules.arm_from_et, tzinfo=ET) + timedelta(seconds=30)
+    view = plan._safe_view()
+    plan.arming.arm(armed_at, plan.terms(view))
+    plan.risk, plan.calm = Decimal("100"), True
+    try:
+        recs = plan.desk._mem[plan.desk._key()]
+        recs["AAAA"].update(origin="auto", kind="break", sent_at=_iso(armed_at + timedelta(seconds=330)))
+        recs["BBBB"].update(origin="auto", kind="break")
+    except Exception:
+        pass
+    at = lambda s: (datetime.combine(day, plan.armed_rules.act_from_et, tzinfo=ET) + timedelta(seconds=s)).strftime("%H:%M:%S")
+    plan.notes = {
+        "AAAA": {"decision": {"kind": "would_place", "why": "long: the last trade 42.37 is nearer the high",
+                              "at_et": at(0.1)},
+                 "action": {"event": "send_answer", "ok": True, "status": "ACCEPTED", "at_et": at(0.6)}},
+        "BBBB": {"decision": {"kind": "would_cancel", "why": "no pullback to the limit", "at_et": at(4)}},
+        "CCCC": {"decision": {"kind": "no_action", "why": "the first minute is not final yet", "at_et": at(1)}},
+        "DDDD": {"decision": {"kind": "would_place", "why": "short: the last trade is nearer the low", "at_et": at(0.2)}}}
+    plan.left = {"BBBB": "The armed plan's cancel was not confirmed: Schwab still shows PENDING_CANCEL. "
+                         "Check the BBBB order and position in thinkorswim.",
+                 "DDDD": "the price is past the trigger; the chase step is not on; left to you"}
+    plan.orders_day, plan.orders_pick = 2, Counter({"AAAA": 1, "BBBB": 1})
+    plan.sends.append((plan._mono(), 2 * plan.armed_rules.calls_per_send))
+
+
 def _tape_parts(url: str, playbook: Mapping):
     """Brief 15's tape and its usable test, when that module is in this build; else (None, None)."""
     try:
@@ -615,9 +645,9 @@ def _tape_parts(url: str, playbook: Mapping):
     except ImportError:
         return None, None
     try:
-        t = tape_mod.EsTape(url, playbook)
-        rules = getattr(tape_mod, "rules_from", lambda pb: pb)(playbook)
-        return t, (lambda reading: tape_mod.usable(reading, rules))
+        rules = tape_mod.rules_from(playbook)
+        # The app's one EsTape per address: the shadow and the armed plan share one GET pace.
+        return tape_mod.shared(url, rules), (lambda reading, now: tape_mod.usable(reading, rules, now=now))
     except Exception:
         log.exception("armed plan: the open tape could not be set up")
         return None, None
@@ -640,7 +670,7 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         playbook = json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
         if tape is None and not demo:
             tape, usable = _tape_parts((env.get("EDGE_SCANNER_URL") or "").strip(), playbook)
-        plan = AutoPlan(desk, trader, playbook, tape, usable or (lambda r: (False, "no tape")),
+        plan = AutoPlan(desk, trader, playbook, tape, usable or (lambda r, now: (False, "no tape")),
                         app.state.opening_plan_view, poller._merged_orders,
                         (lambda: True) if demo else (lambda: poller._fresh("orders_today")),
                         poller.cooldown_left, env=env, now=now, out_dir=out_dir, demo=demo)
@@ -649,7 +679,6 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         log.error("armed plan is off: %s", e)
         return None
     if demo:
-        from .demo import fill_demo
         fill_demo(plan)
 
     @app.get("/api/opening-plan/auto")
