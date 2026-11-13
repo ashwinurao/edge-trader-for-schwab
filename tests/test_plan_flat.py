@@ -309,8 +309,8 @@ def test_a_list_that_differs_sends_nothing(fr):
     assert "list changed" in fr.flat.run(shown)["error"] and mutating(fr) == []
 
 
+# ARM off is no longer a batch refusal (brief 27): see the "Flat all with ARM off" tests below.
 @pytest.mark.parametrize("knob,text", [
-    ("arm", "ARM is off"),
     ("market", "market is closed"),
     ("orders", "order list is old"),
     ("positions", "positions are old"),
@@ -321,9 +321,7 @@ def test_each_batch_refusal_sends_nothing(fr, monkeypatch, knob, text):
     fr.broker.fill_entry(a)
     items = fr.flat.items()
     fr.broker.calls.clear()
-    if knob == "arm":
-        fr.trader.arm(False)
-    elif knob == "market":
+    if knob == "market":
         monkeypatch.setattr(trading, "market_open", lambda now=None: False)
     elif knob == "orders":
         fr.fresh[0] = False
@@ -499,12 +497,13 @@ def test_before_batch_runs_first_before_the_list_is_rebuilt(fr, monkeypatch):
     assert r["ok"] and order[:2] == ["before", "list"]
 
 
-def test_before_batch_runs_even_when_the_batch_is_refused(fr):
+def test_before_batch_runs_even_when_the_batch_is_refused(fr, monkeypatch):
+    # Refused for the market: since brief 27 ARM off no longer refuses a batch.
     called = []
     fr.flat.before_batch = lambda: called.append(1)
-    fr.trader.arm(False)
+    monkeypatch.setattr(trading, "market_open", lambda now=None: False)
     r = fr.flat.run([])
-    assert not r["ok"] and "ARM is off" in r["error"] and called == [1]
+    assert not r["ok"] and "market is closed" in r["error"] and called == [1]
 
 
 def test_a_before_batch_that_raises_does_not_stop_the_batch(fr, caplog):
@@ -555,7 +554,9 @@ def test_an_etf_position_closes_like_shares(fr):
     assert r["ok"] and fr.broker.pos["AAAA"] == 0
 
 
-def test_arm_turning_off_during_the_batch_stops_the_rest(fr):
+def test_arm_turning_off_during_the_batch_does_not_stop_the_rest(fr):
+    # Brief 27: Flat all needs no ARM, so a disarm mid-batch (Step 6 wires its Disarm to
+    # before_batch) does not leave the plan's shares open.
     a, b_ = place(fr, "AAAA"), place(fr, "BBBB")
     fr.broker.fill_entry(a)
     real = fr.desk.cancel
@@ -566,8 +567,81 @@ def test_arm_turning_off_during_the_batch_stops_the_rest(fr):
         return out
     fr.desk.cancel = cancel_then_disarm
     r = fr.flat.run(expected(fr.flat.items()))
-    res = {x["ticker"]: (x["result"], x["text"]) for x in r["batch"]["rows"]}
-    assert res["BBBB"][0] == "done" and res["AAAA"] == ("not_sent", "Not sent: ARM turned off during the batch.")
+    res = {x["ticker"]: x["result"] for x in r["batch"]["rows"]}
+    assert r["ok"] and res["BBBB"] == "done" and res["AAAA"] == "done"
+    assert fr.broker.pos["AAAA"] == 0 and not fr.trader.armed
+
+
+# ---------------------------------------------------------------- Flat all with ARM off (brief 27)
+# Ash's go: "3 yes" (project thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC) to
+# "Should Flat all work with ARM off? (yes, it only removes risk)". Live 2026-11-13 19:52:15 UTC, right
+# after a restart (which turns ARM off), Flat all refused a resting CBRS entry for ARM.
+
+def test_arm_off_after_a_restart_flat_all_cancels_the_resting_entry(fr):
+    b_ = place(fr, "BBBB")
+    fr.trader.arm(False)                                   # a restart turns ARM off
+    st = fr.flat.state()
+    assert st["refusal"] == ""
+    assert by_ticker(st["items"])["BBBB"]["action"] == "cancel"
+    fr.broker.calls.clear()
+    r = fr.flat.run(expected(st["items"]))
+    assert r["ok"], r
+    assert mutating(fr) == [("cancel", b_)]
+    assert {x["ticker"]: x["result"] for x in r["batch"]["rows"]}["BBBB"] == "done"
+    assert not fr.trader.armed                             # Flat all never turns ARM on
+
+
+def test_arm_off_flat_all_closes_a_filled_plan_share(fr):
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    fr.trader.arm(False)
+    items = fr.flat.items()
+    assert by_ticker(items)["AAAA"]["action"] == "close"
+    r = fr.flat.run(expected(items))
+    assert r["ok"], r
+    assert fr.broker.pos["AAAA"] == 0 and not fr.trader.armed
+
+
+def test_arm_off_and_the_market_closed_refuses_for_the_market(fr, monkeypatch):
+    place(fr, "BBBB")
+    items = fr.flat.items()
+    fr.trader.arm(False)
+    monkeypatch.setattr(trading, "market_open", lambda now=None: False)
+    fr.broker.calls.clear()
+    r = fr.flat.run(expected(items))
+    assert not r["ok"] and r["error"] == "The market is closed (9:30 to 16:00 ET). Nothing was sent."
+    assert fr.flat.state()["refusal"] == r["error"]
+    assert mutating(fr) == []
+
+
+def test_arm_off_place_and_flip_still_refuse_for_arm(fr):
+    place(fr, "BBBB")
+    fr.trader.arm(False)
+    n = len(fr.broker.placed)
+    fr.broker.calls.clear()
+    p = fr.desk.place("AAAA", "LONG", LONG)
+    f = fr.desk.flip("BBBB", SHORT)
+    assert not p["ok"] and "ARM is off" in p["error"]
+    assert not f["ok"] and "ARM is off" in f["error"]
+    assert len(fr.broker.placed) == n and mutating(fr) == []
+
+
+def test_arm_off_the_hold_still_refuses_new_entries_during_a_batch(fr):
+    a, b_ = place(fr, "AAAA"), place(fr, "BBBB")
+    fr.broker.fill_entry(a)
+    fr.trader.arm(False)
+    items = fr.flat.items()
+    gate = threading.Event()
+    fr.broker.gate = gate
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("batch", fr.flat.run(expected(items))))
+    th.start()
+    wait_for_gate(fr)
+    p = fr.desk.place("CCCC", "LONG", LONG)
+    gate.set()
+    th.join(5)
+    assert not p["ok"] and p["error"] == plan_flat.HOLD
+    assert out["batch"]["ok"] and not fr.trader.armed
 
 
 def test_the_button_stands_out_from_two_minutes_before_the_flat_time(fr):
