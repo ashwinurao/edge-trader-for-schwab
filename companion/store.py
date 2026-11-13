@@ -172,11 +172,15 @@ class Store:
         return True
 
     def update_ticket(self, ticket_id: str, status: str, order_id: int | None = None,
-                      detail: str | None = None) -> None:
+                      detail: str | None = None, only_from: str | None = None) -> bool:
+        """With only_from, change it only if it still has that status (an atomic claim, as in
+        set_auto_be). True if a row changed."""
         with self._lock, self._con:
-            self._con.execute(
+            cur = self._con.execute(
                 "update tickets set status=?, order_id=coalesce(?, order_id), detail=?, updated=? "
-                "where ticket_id=?", (status, order_id, detail, now_iso(), ticket_id))
+                "where ticket_id=?" + (" and status=?" if only_from else ""),
+                (status, order_id, detail, now_iso(), ticket_id) + ((only_from,) if only_from else ()))
+        return cur.rowcount == 1
 
     def tickets_since(self, iso_utc: str) -> list[dict]:
         with self._lock:

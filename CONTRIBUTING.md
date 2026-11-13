@@ -22,7 +22,8 @@ These decide most review questions:
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working
    exits may be rejected as oversold with the old exits still working (seen 2026-11-06 on shorts,
-   Ash's approval is in that PR): HTTP 201 does not mean accepted, so read the order's status.
+   Ash's approval is in that PR): HTTP 201 does not mean accepted, so read the order's status. A new
+   entry's status is read about 0.3 s and 1 s after its 201 (`Trader._read_after_send`).
 3. **An incomplete view never looks complete.** P&L carries its coverage (matched, estimated,
    unresolved, stale); unknown is never shown as zero; a stale connection disables order buttons.
 4. **When unsure, refuse.** An order with an unclear outcome blocks further orders for that symbol
