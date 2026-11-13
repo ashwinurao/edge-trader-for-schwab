@@ -429,6 +429,10 @@ FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if 
 # EDGE_TRADER_BREAK_ENTRY=1 and the plan on.
 from . import plan_entries as _plan_entries
 _plan_entries.register(app, trader, poller, _guard, demo=DEMO)
+# The armed plan (Step 6): only with EDGE_TRADER_PLAN_AUTO=1 and the switches before it; it sends
+# nothing until Ash's Arm click on the Opening plan page (companion/plan_auto).
+from .plan_auto import executor as _plan_auto
+_plan_auto.register(app, trader, poller, _guard, demo=DEMO)
 
 
 @app.post("/api/position/resolve_close")

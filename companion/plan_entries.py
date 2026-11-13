@@ -776,7 +776,8 @@ class PlanDesk:
         if not rec:
             return {"state": "none"}
         base = {"origin": rec.get("origin"), "kind": rec.get("kind") or "break", "side": str(rec.get("side") or "").lower(),
-                "order_id": rec.get("order_id"), "flips": int(rec.get("flips") or 0), "sent_at": rec.get("sent_at"),
+                "order_id": rec.get("order_id"), "flips": int(rec.get("flips") or 0),
+                "relevels": int(rec.get("relevels") or 0), "sent_at": rec.get("sent_at"),
                 "wait_from": rec.get("wait_from"), "high": (rec.get("range") or {}).get("high"),
                 "low": (rec.get("range") or {}).get("low"), "text": rec.get("text") or ""}
         if rec.get("origin") != "auto":

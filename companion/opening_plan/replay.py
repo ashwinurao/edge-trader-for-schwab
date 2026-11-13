@@ -7,16 +7,21 @@ no order code (tests/test_opening_plan_shadow.py checks the imports).
 
 The file format is Edge Scanner's scanner/open_recorder.py (line format v1, fork PR #41): one JSON
 line per request, with `t0`/`t1` (UTC, just before and after the request). `start` names the day's
-top picks in rank order and the reference (SPY); `snapshot` gives per ticker the latest trade with
-its own time and the day bar, which before 09:31 ET is the first minute so far; `bars` gives the
-09:30 ET bar of each ticker that has one.
+top picks in rank order and the reference (SPY); `snapshot` gives per ticker the latest trade and
+quote with their own times, the latest minute bar and the day bar; `bars` gives the 09:30 ET bar
+of each ticker that has one.
 
-How a reading is built from it (the engine's input):
+How a reading is built from it (brief 15): the lines go through tape.LineTape, which builds the
+same answer Edge Scanner's open tape serves (scanner/open_tape.py), and tape.reading_from turns it
+into the engine's reading with the same rules the live reader uses:
 - received = the line's `t1`, the moment the answer was in hand.
-- last price and its time = the snapshot's latest trade. A bars line keeps the last trade seen.
-- the range = the day bar of the latest snapshot whose latest trade is stamped before 09:31:00
-  ET (so it holds the 09:30 minute's trades only). It is final when a trade stamped 09:31:00 or
-  later is seen, or when the 09:30 bar comes (then the bar's high and low replace it).
+- last price and its time = the snapshot's latest trade; `fresh_at` = the newer of the trade's
+  and the quote's own times. A bars line keeps the last snapshot.
+- the range = ONLY a 09:30 bar stamped 09:30:00 ET of the day: the snapshot's minute bar once it
+  is that bar, or the bars line's bar. Either one makes it final. Never the day bar: on
+  2026-11-13 it was the PRIOR day's until 09:31:00.65 ET, and this replay used to size every
+  would-be order from yesterday's high and low. A bars bar more than a cent away from the range
+  in use replaces it, and the line's range says `changed`.
 - ranks = the order of `start`'s tickers (the recorder keeps the rank order, not the numbers).
 - risk per pick and the calm flag are not in the file: --risk and --calm give them.
 Failed request lines are skipped. Decisions go to --out (default stdout) as JSON lines, each with
@@ -33,12 +38,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
-from . import engine
+from . import engine, tape
 
 PLAYBOOK_FILE = Path(__file__).resolve().parent / "playbook.json"
-BAR_END_ET = time(9, 31)
-BY_TRADE = "trade at or after 09:31"
-BY_BAR = "09:30 bar"
 
 
 def _time(text: Any) -> Optional[datetime]:
@@ -53,49 +55,24 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def readings(lines: Iterator[str], risk: Optional[Decimal], calm: Optional[bool]) -> Iterator[tuple[dict, dict]]:
-    """(engine reading, {ticker: range}) for each usable snapshot or bars line, in file order."""
-    tickers: list[str] = []
-    seen: dict[str, dict] = {}
+def readings(lines: Iterator[str], risk: Optional[Decimal], calm: Optional[bool],
+             bar_start_et: time = tape.BAR_ET) -> Iterator[tuple[dict, dict]]:
+    """(engine reading, {ticker: range}) for each ok snapshot or bars line, in file order."""
+    lt = tape.LineTape(bar_start_et)
     for raw in lines:
         if not raw.strip():
             continue
         rec = json.loads(raw)
-        kind = rec.get("kind")
-        if kind == "start":
-            ref = rec.get("reference")
-            tickers = [t for t in rec.get("tickers") or [] if t != ref]
-            seen = {t: {"last": None, "last_at": None, "high": None, "low": None, "final": False, "from": None}
-                    for t in tickers}
-            continue
         received = _time(rec.get("t1"))
-        if kind not in ("snapshot", "bars") or not rec.get("ok") or received is None or not tickers:
+        if received is None and rec.get("kind") != "start":
             continue
-        if kind == "snapshot":
-            for t, snap in (rec.get("symbols") or {}).items():
-                if t not in seen or not isinstance(snap, Mapping):
-                    continue
-                s, trade, day = seen[t], snap.get("trade") or {}, snap.get("day") or {}
-                trade_at = _time(trade.get("t"))
-                if trade_at is None or trade.get("p") is None:
-                    continue
-                s["last"], s["last_at"] = trade["p"], trade_at
-                bar_end = datetime.combine(trade_at.astimezone(engine.ET).date(), BAR_END_ET, tzinfo=engine.ET)
-                if trade_at < bar_end:
-                    if not s["final"] and day.get("h") is not None and day.get("l") is not None:
-                        s["high"], s["low"] = day["h"], day["l"]
-                elif not s["final"]:
-                    s["final"], s["from"] = True, BY_TRADE
-        else:
-            for t, bar in (rec.get("bars") or {}).items():
-                if t in seen and isinstance(bar, Mapping) and bar.get("h") is not None and bar.get("l") is not None:
-                    seen[t].update(high=bar["h"], low=bar["l"], final=True, **{"from": BY_BAR})
-        picks = [{"symbol": t, "rank": i + 1, **{k: seen[t][k] for k in ("last", "last_at", "high", "low", "final")}}
-                 for i, t in enumerate(tickers)]
-        ranges = {t: {"high": seen[t]["high"], "low": seen[t]["low"], "final": seen[t]["final"],
-                      "from": seen[t]["from"]} for t in tickers}
-        yield {"received": received, "risk": risk, "calm": calm, "picks": picks,
-               "no_picks_why": "the recorder file names no picks"}, ranges
+        if not lt.take(rec) or not lt.tickers:
+            continue
+        reading = tape.reading_from(lt.body(received), received, bar_start_et)
+        reading.update(risk=risk, calm=calm)
+        if not reading["picks"]:
+            reading["no_picks_why"] = reading["no_picks_why"] or "the recorder file names no picks"
+        yield reading, {p["symbol"]: tape.range_of(p) for p in reading["picks"]}
 
 
 def replay(path: Path, playbook: Mapping, risk: Optional[Decimal], calm: Optional[bool]) -> list[dict]:
@@ -103,7 +80,7 @@ def replay(path: Path, playbook: Mapping, risk: Optional[Decimal], calm: Optiona
     rules = engine.rules_from(playbook)
     state, rows = None, []
     with open(path, encoding="utf-8") as fh:
-        for reading, ranges in readings(fh, risk, calm):
+        for reading, ranges in readings(fh, risk, calm, rules.bar_start_et):
             state, decisions = engine.decide(state, reading, rules)
             for d in decisions:
                 rows.append({"t": iso(reading["received"]), **d, "range": ranges.get(d.get("symbol"))})
