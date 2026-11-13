@@ -83,6 +83,7 @@ class Host:
         self.registry = handlers.default_registry()
         self.armed_seq = None               # a list of answers for armed(), then True
         self.disarms, self.logs, self.said, self.left, self.reds, self.busies = [], [], [], {}, {}, []
+        self.waits = []                     # the reason of each busy() (Step 6's Lane.busy(what, why))
         self.orders_pick, self.orders_day, self.calls = 1, 4, 40
         self.reads = []                     # queued answers for reread(); else the lane's own pick again
         self.seen = set()
@@ -144,8 +145,9 @@ class Host:
     def forget(self, key):
         self.seen.discard(key)
 
-    def busy(self, ticker, what):
+    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY):
         self.busies.append((ticker, what))
+        self.waits.append(why)
 
     # ---- helpers for the tests: one decision, or one engine step --------------------------------
 
@@ -449,15 +451,14 @@ def test_not_when_the_range_changed_since_the_decision(rig):
 
 def test_not_on_an_old_order_list_and_it_waits(rig):
     """An old order list is a wait (architect's live test notes N1, 2026-11-13): nothing is sent or
-    spent, the pick is not left, and the handler says it did not act, so the worker waits a tick
-    instead of stepping again at once on the same old list. The next fresh reading sends it."""
+    spent, the pick is not left, and the worker waits a tick (Step 6's Lane.busy with the desk's
+    reason) instead of stepping again at once on the same old list. The next fresh reading sends it."""
     rig.fresh[0] = False
-    assert rig.host.handle("would_place", tape(42.51)) is False      # not an action: no Schwab call
+    assert rig.host.handle("would_place", tape(42.51)) is True       # the step ends: a wait
     nothing_sent(rig)
     assert rig.quotes == [] and rig.host.left == {} and (rig.host.orders_pick, rig.host.calls) == (1, 40)
     assert rec(rig) == {} and rig.desk._chase_tries == {}            # the row is as it was, no try used
-    assert rig.host.said[-1][1:] == ("chase_not_sent", "chase not sent on this reading: "
-                                     + plan_entries.ORDERS_OLD.rstrip("."))
+    assert rig.host.busies == [("AAAA", "send")] and rig.host.waits == [plan_entries.ORDERS_OLD]
     rig.fresh[0] = True
     assert rig.host.handle("would_place", tape(42.51)) is True
     assert [no_id(r) for r in rig.sent] == [CHASE_LONG]

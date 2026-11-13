@@ -218,14 +218,20 @@ def on_chase(lane: Lane) -> bool:
                 lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
             lane.busy("send")
             return True
+        if r.get("again") and not r.get("quoted"):
+            # Schwab's order list was too old (ORDERS_OLD): no Schwab call, nothing counted. An old list
+            # is a wait, never a send (architect's live test notes N1): Step 6's wait with the desk's
+            # reason (Lane.busy(what, why), Step 6 f2748c7), so the worker waits a tick instead of
+            # reading the same old list again at once. A pick Step 7 handed over waits as well.
+            if handed:
+                lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
+            lane.busy("send", str(r.get("error") or why))
+            return True
         if r.get("again"):
-            # A passing reason: an old order list (no Schwab call; N1: a wait, never a send), an old
-            # quote or the price back inside at Schwab's quote (one call, a try counted).
-            took = wait("chase_not_sent", f"chase not sent on this reading: {why}", why)
-            # After a quote it was an action, so the worker steps again at once (the retry wait spaces
-            # the next try); without one, nothing happened and the worker waits a tick, so an old
-            # list is not read again in a tight loop.
-            return True if r.get("quoted") else took
+            # An old quote or the price back inside at Schwab's quote: one call, a try counted. It was
+            # an action, so the worker steps again at once and the retry wait spaces the next try.
+            wait("chase_not_sent", f"chase not sent on this reading: {why}", why)
+            return True
         lane.desk.drop_chase_wait(ticker)
         if handed:
             # Not a passing reason: nothing rests, since the flip's cancel was confirmed

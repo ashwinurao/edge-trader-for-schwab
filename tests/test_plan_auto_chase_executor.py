@@ -670,7 +670,8 @@ def test_after_a_flip_an_old_order_list_waits_and_the_next_fresh_reading_chases(
     assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]
     assert rig.broker.calls[calls:].count(("quote", "AAAA")) == 1           # no quote on the old list
     assert "AAAA" not in rig.plan.left and rig.desk.chase_waits() == {}
-    assert any(plan_entries.ORDERS_OLD.rstrip(".") in json.dumps(x) for x in lines(rig) if x.get("ticker") == "AAAA")
+    (w,) = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]          # Step 6's wait line, once
+    assert (w["what"], w["why"]) == ("send", plan_entries.ORDERS_OLD)
 
 
 def test_after_a_flip_an_old_order_list_until_the_watch_ends_sends_nothing_and_says_why(fcrig):
@@ -680,6 +681,7 @@ def test_after_a_flip_an_old_order_list_until_the_watch_ends_sends_nothing_and_s
     calls = len(rig.broker.calls)
     run(rig, et(9, 35, 10))
     assert rig.broker.cancelled[0] == ids["AAAA"] and len(tries) > 10
+    assert [x["why"] for x in lines(rig, "wait") if x["ticker"] == "AAAA"] == [plan_entries.ORDERS_OLD]
     assert not [r for r in rig.sent if r.get("entry") == "chase"] and not lines(rig, "chase_send_start")
     assert ("quote", "AAAA") not in rig.broker.calls[calls:]
     left = rig.plan.left["AAAA"]
