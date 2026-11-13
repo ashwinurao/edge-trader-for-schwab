@@ -304,14 +304,15 @@ e.g. `would_place 4`.
 | Field | Meaning |
 | --- | --- |
 | `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
-| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_cancel` or `no_action`. |
+| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_relevel` (Step 7: the 09:30 bar moved the range by more than one cent), `would_cancel` or `no_action`. |
 | `symbol`, `why` | The pick, and the reason in words. |
-| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `relevel_refused`, `relevel_traded` (the new range's trigger has already traded, so the entry stays), `range_after_fill`, `after_watch`, `no_range` or `no_picks`. |
 | `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
 | `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
 | `fill` | On `would_fill`: the trade price seen inside the order's band. |
 | `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
 | `range` | The first minute's high and low, whether it was final, and what made it final (`trade at or after 09:31` or `09:30 bar`). |
+| `range_from`, `range_to`, `relevels` | On `would_relevel`, `relevel_refused`, `relevel_traded` and `range_after_fill`: the range the entry was built on, the new one, and the re-levels so far. |
 
 A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
 with no `would_place` line never got an order, and its last `no_action` says why.
@@ -370,6 +371,39 @@ If Edge Trader restarts while a click is running, the next start settles the row
 If `companion/opening_plan/playbook.json` cannot be read or has no `buttons.max_flips_per_row`, the
 buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
 
+**Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
+as the armed plan's own switches (`EDGE_TRADER_PLAN_AUTO=1`, Step 6), the armed plan may move its own
+resting entry without a click (`companion/plan_auto/flip.py`). Without it, the armed plan says once
+"would_flip is not on" and the entry stays.
+- **Flip.** A trade reaches the flip line (60% of the way from the entry's level to the other side,
+  `automatic.flip_line`) while the entry rests unfilled and its trigger has not traded. The plan takes a
+  new reading of Edge Scanner's open tape; if it still shows that, it cancels the entry through the
+  dashboard's Cancel entry path, which reads the order back until Schwab confirms CANCELED with nothing
+  filled. Only then it checks again: the plan is still armed, another new tape reading is usable and
+  the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh and
+  shows no other working order on the name, and the plan row agrees with the tape. Then it places the
+  other side's break entry from the tape's range: the same risk, shares from that side's own risk per
+  share, 1 share at this stage.
+- **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
+  from the range the entry was built on, while the entry rests unfilled and its trigger has not
+  traded. The plan cancels the entry the same way and places the same side from the new range, at most
+  once per pick a day (`armed.relevels_per_pick`). After a fill nothing moves (the plan never moves a
+  stop): the decision log says "the range changed after the fill" with both ranges.
+- Flips count per row per day together with the Flip button's, at most `automatic.max_flips` (3). A
+  chased entry (Step 8) and an entry placed by a click are never flipped. The plan tries to cancel any
+  one order at most once.
+- When the cancel is not confirmed, or Schwab answers 429, nothing new is placed, the row turns red and
+  the plan disarms (for the day on a 429). A fill during the cancel turns the row red, and the plan
+  leaves that pick. When the plan was disarmed between the cancel and the place, or the other side's
+  trigger has already traded, nothing is placed and the row says nothing rests. No answer to the new
+  entry blocks the name, as for any unclear order, and disarms the plan. A 4xx is never retried.
+- The armed plan's log has one line per flip or re-level with its times: the reading, the decision,
+  the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer.
+- Not confirmed at Schwab: how fast a cancel of a resting stop-limit entry shows CANCELED. The cancel
+  reads the order back up to ten times, 0.25 s apart. At 0.4 s a Schwab call, a flip takes about
+  2.25 s from the start of the cancel to Schwab's answer to the new entry; a cancel that never confirms
+  gives up after about 7.3 s (`tests/test_plan_auto_flip.py`).
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -397,6 +431,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO_FLIP` | `1`, together with the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`), lets the armed plan flip and re-level its own resting entry. Off by default. |
 
 ## Good to know
 
