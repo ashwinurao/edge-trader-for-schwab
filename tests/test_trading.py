@@ -218,6 +218,79 @@ def test_timeout_is_unknown_and_blocks_new_tickets(trader):
     assert trader.submit(req(ticket_id="ticket-0002"))["ok"]
 
 
+def _seed_ticket(trader, ticket_id, symbol, status):
+    """A ticket left in `status` on `symbol`, as a lost answer or a crash would leave it."""
+    assert trader.store.insert_ticket({"ticket_id": ticket_id, "symbol": symbol, "side": "LONG", "qty": 5,
+                                       "limit": "1.00", "stop": "", "target": "", "risk": 0.0, "request": {}})
+    if status != "SENDING":
+        trader.store.update_ticket(ticket_id, status)
+
+
+@pytest.mark.parametrize("status", ["SENDING", "UNKNOWN", "ACCEPTED_UNTRACKED"])
+def test_an_unclear_ticket_blocks_its_own_symbol_only(trader, status):
+    # CONTRIBUTING rule 4: an unclear outcome blocks further orders for that symbol, not every symbol
+    # (Ash's go, 2026-11-13 12:59 UTC, project thread "Review OV picks desk architecture").
+    _seed_ticket(trader, "ticket-0aaa", "MXR", status)
+    r = trader.submit(req())                                        # BRVO: another symbol
+    assert r["ok"], r
+    r = trader.submit(req(ticket_id="ticket-0002", symbol="MXR"))
+    assert not r["ok"] and r["blocked_by"] == "ticket-0aaa" and len(trader._client.placed) == 1
+    assert r["error"] == "Previous order (MXR 5) is not confirmed yet. Check thinkorswim, then press Resolve."
+    trader.resolve("ticket-0aaa")
+    assert trader.submit(req(ticket_id="ticket-0003", symbol="MXR"))["ok"]
+
+
+def test_an_unknown_send_blocks_the_same_symbol_and_is_never_resent(trader):
+    trader._client.exc = TimeoutError("read timed out")
+    assert trader.submit(req())["status"] == "UNKNOWN"              # BRVO, no answer
+    trader._client.exc = None
+    again = trader.submit(req())                                    # the same ticket clicked again
+    assert again["duplicate"] and again["status"] == "UNKNOWN" and not again["ok"]
+    r = trader.submit(req(ticket_id="ticket-0002"))                 # a new BRVO ticket
+    assert not r["ok"] and r["blocked_by"] == "ticket-0001"
+    assert trader.submit(req(ticket_id="ticket-0003", symbol="MXR"))["ok"]
+    assert len(trader._client.placed) == 2                          # the unknown one was never resent
+
+
+@pytest.mark.parametrize("unclear, new", [
+    ("BRVO  261120C00340000", "BRVO"),                    # an unclear option blocks its stock
+    ("BRVO", "BRVO  261120P00330000"),                    # an unclear stock blocks its options
+    ("BRVO  261120C00340000", "BRVO  261218P00300000"),   # and every other contract on it
+    ("SPXW  261120C06000000", "SPX   261218C06000000"),   # SPXW / SPXP are SPX
+    ("AAPL1 261120C00200000", "AAPL"),                    # an adjusted root is its underlying
+])
+def test_an_option_counts_as_its_underlying(trader, unclear, new):
+    # The wider block of the two choices (same contract or same underlying): when unsure, refuse.
+    _seed_ticket(trader, "ticket-0aaa", unclear, "UNKNOWN")
+    r = trader.submit(req(ticket_id="ticket-0002", symbol=new))
+    assert not r["ok"] and r["blocked_by"] == "ticket-0aaa" and trader._client.placed == []
+
+
+@pytest.mark.parametrize("unclear, new", [
+    ("BRVO  261120C00340000", "MXR"),
+    ("BRV", "BRVO"),                                      # a prefix is another name
+    ("SPXW  261120C06000000", "SPY"),
+])
+def test_other_names_go_through_an_unclear_option(trader, unclear, new):
+    _seed_ticket(trader, "ticket-0aaa", unclear, "UNKNOWN")
+    assert trader.submit(req(ticket_id="ticket-0002", symbol=new))["ok"]
+
+
+def test_status_names_what_is_blocked_and_the_page_still_lists_every_unclear_ticket(trader):
+    _seed_ticket(trader, "ticket-0aaa", "MXR", "UNKNOWN")
+    _seed_ticket(trader, "ticket-0bbb", "SPXW  261120C06000000", "ACCEPTED_UNTRACKED")
+    st = trader.status()
+    assert st["blocked"] is True
+    assert st["blocked_names"] == ["MXR", "SPX", "SPXP", "SPXW"]   # the page matches an option's root
+    assert trader.submit(req())["ok"]                               # BRVO is free
+    rows = {r["ticket_id"]: r for r in trader.brackets([], pend=[], positions={}, orders_fresh=True)}
+    assert rows["ticket-0aaa"]["protection"] == rows["ticket-0bbb"]["protection"] == "UNKNOWN"
+    trader.resolve("ticket-0aaa")
+    trader.resolve("ticket-0bbb")
+    st = trader.status()
+    assert st["blocked"] is False and st["blocked_names"] == []
+
+
 def test_error_after_sending_is_reported_as_unknown(trader):
     trader._client.resp = None   # place_order "succeeds" but handling the answer then fails
     r = trader.submit(req())

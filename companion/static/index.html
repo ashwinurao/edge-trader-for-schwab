@@ -1583,14 +1583,19 @@ function renderTicket() {
   const current = p && p.ok && p.key === keyOf(ticketReq());
   const sent = T.sentKey && T.sentKey === T.intentKey;
   const open = lastState?.trading?.market_open;
-  const blocked = lastState?.trading?.blocked;
+  // An unclear ticket blocks only its own name (trading._name: the stock, or an option's OCC root
+  // without an adjusted digit; status() spells out SPXW / SPXP). Without the list, block all.
+  const nm = String((current ? p.symbol : ticketReq().symbol) || "").toUpperCase().trim().replace(/^\$/, "");
+  const bname = nm.length > 15 ? (nm.slice(0, 6).trim().replace(/\d+$/, "") || nm.slice(0, 6).trim()) : nm;
+  const names = lastState?.trading?.blocked_names;
+  const blocked = names ? names.includes(bname) : lastState?.trading?.blocked;
   go.className = "btn " + (T.side === "SHORT" ? "sell" : "buy");
   go.textContent = sent ? "Sent. Change the ticket for a new trade"
     : current ? (p.asset === "OPTION" ? `${p.side === "LONG" ? "Buy to open" : "Sell to open"} ${qty(p.qty)} ${optName(p.symbol).replace(/ \d+ \w{3} \d\d /, " ")}`
                 : `Place trade · ${p.side === "LONG" ? "Buy" : "Short"} ${qty(p.qty)} ${p.symbol}`) : "Place trade";
   const live = HEALTH === "live";
   go.disabled = !(current && !sent && T.armed && open && !blocked && !T.busy && live);
-  go.title = !live ? "Waiting for live data" : !T.armed ? "Arm entries first" : !open ? "Regular hours only" : blocked ? "Resolve the unconfirmed order first" : "";
+  go.title = !live ? "Waiting for live data" : !T.armed ? "Arm entries first" : !open ? "Regular hours only" : blocked ? `Resolve the unconfirmed ${bname} order first` : "";
   // Unfilled entries for the order just sent or the ticket's symbol: cancel them right here
   // (same button and server checks as Pending orders).
   const tsym = ticketReq().symbol;
