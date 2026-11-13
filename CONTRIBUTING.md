@@ -17,7 +17,11 @@ These decide most review questions:
    "Send when hit", ticked per spread stop (upstream v1.3.0, `companion/spreads/spread_stop.py`;
    allowed in this fork by Ash on 2026-11-09, fork PR #12): when the app-watched stop fires, the app
    sends that spread's close once, only while it runs, never retried. Any other change that would act
-   without a click will not be merged.
+   without a click will not be merged. No order request (place, replace, cancel, preview) is ever
+   tried again. Only two reads of the order path are: the click's quote and a read of one order are
+   sent once more, at once, when Schwab drops the connection before any answer (reset, aborted,
+   refused), never after a timeout or an HTTP answer and never during a 429 pause
+   (`companion/read_retry.py`, brief 26, Ash's go 2026-11-13 20:01 UTC). The poller never tries again.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working

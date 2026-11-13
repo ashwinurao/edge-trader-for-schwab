@@ -203,7 +203,11 @@ def make_client(allowed: frozenset[str] = _ALLOWED, timeout: float = 10) -> Read
     )
     # schwabdev retries 429/5xx three times with backoff inside one call. That hides
     # requests from the budget and blocks the poller, and a retried POST could place an
-    # order twice. No automatic retries anywhere.
+    # order twice. So the session never retries anything, and no order request is ever
+    # tried again. One exception, in our own code and by endpoint name so no POST can
+    # inherit it: the click's quote and a read of one order are sent once more when the
+    # connection dropped before any answer (brief 26, companion/read_retry.py; Ash's go,
+    # thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC).
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
     inner._session.mount("https://", HTTPAdapter(max_retries=Retry(total=0, raise_on_status=False)))
