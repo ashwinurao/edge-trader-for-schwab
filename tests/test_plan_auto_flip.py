@@ -666,21 +666,104 @@ def test_a_send_refused_before_any_request_gives_the_order_back(r):
 
 def test_click_flips_and_automatic_flips_share_one_count(r):
     place_long(r)
-    assert r.desk.flip("AAAA", SHORT_EXPECTED)["ok"]                       # 1: Ash's click
-    assert rec(r)["flips"] == 1 and rec(r)["origin"] == "auto"
+    assert run(r) is True                                                   # 1: the plan, to short
+    assert (rec(r)["flips"], rec(r)["side"], rec(r)["origin"]) == (1, "SHORT", "auto")
     r.quote.update(bid=42.29, ask=42.31)
     assert run(r, last=42.30) is True                                       # 2: the plan, back to long
     assert (rec(r)["flips"], rec(r)["side"]) == (2, "LONG")
     r.quote.update(bid=42.09, ask=42.11)
-    assert run(r, last=42.10) is True                                       # 3: the plan, to short
-    assert (rec(r)["flips"], rec(r)["side"]) == (3, "SHORT")
+    assert r.desk.flip("AAAA", SHORT_EXPECTED)["ok"]                        # 3: Ash's click, to short
+    assert (rec(r)["flips"], rec(r)["origin"]) == (3, "click")
     placed = len(r.broker.placed)
-    r.quote.update(bid=42.29, ask=42.31)
-    _, _, out = decide(r, 42.30)
-    assert not [d for d in out if d["kind"] == "would_flip"]               # the engine stops at 3
     got = r.desk.flip("AAAA", {"trigger": "42.49", "stop": "41.92", "shares": 1})
-    assert not got["ok"] and "3 of 3 flips" in got["error"]                 # and so does the click
+    assert not got["ok"] and "3 of 3 flips" in got["error"]                 # the click's count is the plan's
     assert len(r.broker.placed) == placed
+
+
+# ---------------------------------------------------------------- a click takes the row (architect, 2026-11-13 16:17 UTC)
+
+def flip_decision(r, last=42.30, side="short"):
+    """A would_flip decision as the engine said it before the click (the click lands after the reading)."""
+    o = engine.order_for(side, Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
+    return {"symbol": "AAAA", "kind": "would_flip", "side": side, "trigger": float(o["trigger"]),
+            "stop": float(o["stop"]), "flips": 1}
+
+
+def on_second_reread(r, fn):
+    """Runs `fn` when the handler takes its second new reading: after the confirmed cancel,
+    before the send half (flip.py recheck)."""
+    real, n = r.host.reread, {"i": 0}
+
+    def reread(ticker):
+        n["i"] += 1
+        if n["i"] == 2:
+            fn()
+        return real(ticker)
+    r.host.reread = reread
+
+
+def test_no_automatic_flip_or_relevel_after_a_click_flip(r):
+    place_long(r)
+    assert r.desk.flip("AAAA", SHORT_EXPECTED)["ok"]                        # Ash flips the plan's entry
+    assert rec(r)["origin"] == "click" and entry(r)["state"] == "hand"
+    calls = len(r.broker.calls)
+    r.quote.update(bid=42.29, ask=42.31)
+    _, _, out = decide(r, 42.30)                                            # past the short's flip line
+    assert not [d for d in out if d["kind"] in ("would_flip", "would_relevel")]
+    # A decision from a reading before the click: the handler and the desk both refuse it.
+    pick = tape_pick(42.30, entry=entry(r))
+    assert flip.on_flip(handlers.Lane(r.host, {**flip_decision(r, side="long")}, pick, {})) is False
+    o = engine.order_for("long", Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
+    got = r.desk.flip_auto("AAAA", "LONG", o, kind="flip", limit=3)
+    assert got["stage"] == "refused" and "placed by a click" in got["error"]
+    got = r.desk.flip_auto("AAAA", "SHORT", engine.order_for("short", Decimal("42.60"), Decimal("41.92"),
+                                                              Decimal(100), RULES), kind="relevel", limit=1)
+    assert got["stage"] == "refused" and "placed by a click" in got["error"]
+    assert len(r.broker.calls) == calls and rec(r)["origin"] == "click"
+
+
+def test_no_automatic_flip_or_relevel_after_a_click_cancel(r):
+    oid = place_long(r)
+    assert r.desk.cancel("AAAA")["ok"]                                       # Ash cancels the plan's entry
+    assert oid in r.broker.cancelled and entry(r)["state"] != "working"
+    calls = len(r.broker.calls)
+    _, _, out = decide(r, 42.10)
+    assert not [d for d in out if d["kind"] in ("would_flip", "would_relevel", "would_place")]
+    pick = tape_pick(42.10, entry=entry(r))
+    assert flip.on_flip(handlers.Lane(r.host, flip_decision(r), pick, {})) is False
+    o = engine.order_for("short", Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
+    for kind in ("flip", "relevel"):
+        got = r.desk.flip_auto("AAAA", "SHORT" if kind == "flip" else "LONG", o, kind=kind, limit=3)
+        assert got["stage"] == "refused"
+    assert len(r.broker.calls) == calls and len(r.broker.placed) == 1
+
+
+def test_a_click_on_the_row_during_the_flip_is_refused(r):
+    place_long(r)
+    tried = []
+    on_second_reread(r, lambda: tried.extend([
+        r.desk.place("AAAA", "LONG", {"trigger": "42.49", "stop": "41.92", "shares": 1}),
+        r.desk.flip("AAAA", SHORT_EXPECTED), r.desk.cancel("AAAA")]))
+    assert run(r) is True
+    assert [t["ok"] for t in tried] == [False, False, False]
+    assert all("still running" in t["error"] for t in tried)
+    assert rec(r)["side"] == "SHORT" and rec(r)["origin"] == "auto"         # the flip finished
+
+
+def test_a_row_a_click_took_between_the_cancel_and_the_send_gets_no_send(r):
+    # The row is FLIPPING for the whole flip, so a click on it is refused (test above). Were the
+    # record to become the click's anyway, the send half checks it under the desk's lock.
+    place_long(r)
+
+    def click_took_it():
+        with r.desk._lock:
+            r.desk._put("AAAA", state=plan_entries.NONE, origin="click", order_id=None, text="a click")
+    on_second_reread(r, click_took_it)
+    assert run(r) is True
+    assert len(r.broker.placed) == 1 and len(r.broker.cancelled) == 1       # cancelled, nothing placed
+    assert rec(r)["origin"] == "click" and rec(r)["text"] == "a click"      # the click's record untouched
+    assert r.host.gone and "a click took the AAAA row" in r.host.gone[-1]
+    assert ("refund", 1, 4) in r.broker.calls and r.host.is_armed
 
 
 # ---------------------------------------------------------------- restart
@@ -1138,3 +1221,25 @@ def test_demo_shows_the_flip_only_with_its_switch(rig, tmp_path, flip_on):  # no
     assert aaaa["auto_text"] == ("Flipped by the armed plan (1 of 3)." if flip_on else "")
     assert st["bounds"]["orders_per_pick"] == (5 if flip_on else 1)
     assert any(w.startswith("Flip (") for w in plan.terms()["will"]) is flip_on
+
+
+def test_executor_no_flip_or_relevel_after_a_click_flip(frig):
+    ids = all_four_rest(frig)
+    assert frig.desk.flip("AAAA", SHORT_EXPECTED)["ok"]                     # Ash flips the plan's long
+    placed = len(frig.broker.placed)
+    frig.tape.prices["AAAA"] = 42.30                                         # past the short's flip line 42.256
+    frig.tape.ranges["AAAA"] = (42.60, 41.92)                                # and a moved range
+    frig.view.bars["AAAA"] = (42.60, 41.92, 42.30)
+    run_plan(frig, et(9, 31, 8))
+    assert len(frig.broker.placed) == placed and frig.broker.cancelled == [ids["AAAA"]]
+    assert "placed by a click" in frig.plan.left["AAAA"]
+    assert frig.desk.records()["AAAA"]["origin"] == "click"
+
+
+def test_executor_no_flip_after_a_click_cancel(frig):
+    ids = all_four_rest(frig)
+    assert frig.desk.cancel("AAAA")["ok"]                                    # Ash cancels the plan's long
+    frig.tape.prices["AAAA"] = 42.14                                         # past the long's old flip line
+    frig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    run_plan(frig, et(9, 31, 8))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4

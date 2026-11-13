@@ -1017,6 +1017,15 @@ class PlanDesk:
         except Exception:
             view = None
         with self._lock:
+            now_rec = self._load().get(ticker) or {}
+            if now_rec.get("origin") != "auto" or now_rec.get("state") != FLIPPING:
+                # A click took the row between the cancel and here (architect's ruling, 2026-11-13
+                # 16:17 UTC: a click takes the row for the day), or the row changed some other way.
+                # Nothing is placed and nothing of that record is touched.
+                why = (f"a click took the {ticker} row" if now_rec.get("origin") != "auto"
+                       else f"the {ticker} row changed during the cancel (now {now_rec.get('state') or 'NONE'})")
+                return done(stage="recheck", code="click" if now_rec.get("origin") != "auto" else "row",
+                            error=f"cancelled by the armed plan; {why}, so the plan placed nothing and leaves it")
             if not why:
                 try:
                     blocked = self._blocked_names()

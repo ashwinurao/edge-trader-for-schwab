@@ -527,7 +527,7 @@ class AutoPlan:
                 f"{break_entry.BREAK_MAX_SHARES} share, its stop attached.",
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
-                "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env)
+                "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env, self.rules)
         # Name each step that is not on (Step 8 engineer, 2026-11-13: with only the chase on, the
         # old line dropped "flip" too).
         off = [w for w, kind in (("flip", "would_flip"), ("chase", PAST_TRIGGER)) if kind not in kinds]
