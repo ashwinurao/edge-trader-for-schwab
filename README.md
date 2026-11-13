@@ -94,11 +94,13 @@ name are refused). It needs no account and sends no telemetry.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews Break orders, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
-  weekdays, from `companion/open_probe.json` (default 09:26:30 to 09:40:00). Every 5 seconds it asks one
-  quote for the day's Opening plan symbols (ranks 1 to 4, at most 6) plus SPY. At 09:27:00, 09:27:30,
+  weekdays, from `companion/open_probe.json` (default 09:05:00 to 09:07:30, 09:15:00 to 09:17:30 and
+  09:26:30 to 09:40:00). Every 5 seconds it asks one quote for the day's Opening plan symbols (ranks 1 to 4,
+  at most 6; before the 09:25 freeze, the plan's preview picks) plus SPY. At 09:05:30, 09:06:00, 09:06:30
+  and 09:07:00, again at 09:15:30, 09:16:00, 09:16:30 and 09:17:00, and at 09:27:00, 09:27:30,
   09:28:00, 09:28:30, 09:29:30, 09:30:02, 09:31:02, 09:32:00, 09:33:00 and 09:35:00 it previews a long and a
   short Break order for one pick, the next in rank order each time, so ranks 1 to 4 are covered both sides
-  before the open and again after it (SPY when there are no picks). Long: trigger = ask + the larger of
+  twice before the freeze, once before the open and again after it (SPY when there are no picks). Long: trigger = ask + the larger of
   5 cents and 0.2%, stop = trigger - 1% of the price. Short (`SELL_SHORT`): trigger = bid - the same step,
   stop = trigger + 1%. Each order is built at 1 share by the ticket's own builders (the Break entry stays
   capped at 1 share), then a copy with 100 shares in every leg (`preview_shares`) is previewed, so Schwab's
@@ -109,18 +111,24 @@ name are refused). It needs no account and sends no telemetry.
   hard-to-borrow or not-shortable answer is there word for word; on a refused preview the texts of its
   message and errors; `keys`, the dotted key names of Schwab's answer (names only, never a value; a key
   that looks like an account number or hash shows as `{id}`); the order value and the projected commission
-  and fees with the path each was read from; and the requirement rates `bp_rate` and `af_rate` =
-  (the account's buying power or available funds before, minus Schwab's projected value) / the order
-  value, with the two fields each came from. The "before" value is the account read the app already makes
+  and fees with the path each was read from; and the requirement rates `bp_rate`, `af_rate` and
+  `dt_rate` = (the account's buying power, available funds or day-trading buying power before, minus
+  Schwab's projected buying power, available funds or intraday buying power) / the order value, with the
+  two fields each came from. The "before" value is the account read the app already makes
   every 5 seconds; older than 30 seconds gives no rate and says why. A pairing is taken only when its rate is
   from -0.05 to 5 (an opening order never adds buying power); otherwise the next balance is tried, and when
   none fits the line says "negative" or "above 5" for each, never the number. In every text it writes from
   Schwab, a number after a `$` and any number of 4 or more digits becomes `{n}`, so a "not enough buying
   power" text never carries a balance; "100%" or "12.5" stay. **No balance, equity or buying power in
   dollars is ever written**, and nothing else from the answer (it holds the account number). No retries:
-  any 429, or the app's own 429 pause, stops it for the rest of the window. About 182 Schwab requests per
-  default window (162 quote calls and 20 previews in 13.5 minutes), on the same Schwab app limit as
-  everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
+  any 429, or the app's own 429 pause, stops it for the rest of the window. About 182 Schwab requests in
+  the 09:26:30 window (162 quote calls and 20 previews in 13.5 minutes) and about 38 in each window before
+  the freeze (30 quote calls and 8 previews in 2.5 minutes), on the same Schwab app limit as everything
+  else. Each preview's rates also go to the Opening plan's rate store (`companion/preview_rates.py`, in
+  memory, for today only): per name and side, the highest rate whose `af_rate` on the same preview is from
+  0.24 to 1.10 (a trade of yours between the balance read and the preview bends a rate; a bent one is
+  dropped, and the highest of the rest sizes smaller, never larger), with its ET time, Schwab's status word
+  and texts. A restart empties it; it is not read back from `data/netlog/`. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
   window (09:25:30 ET by default). When that gives no picks it reads again every 15 seconds (one request to
   Edge Scanner on your LAN, never to Schwab) until the picks come or 09:29:00 ET, then starts the rotation at
   rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`). Picks that come
@@ -204,8 +212,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   day's ranks 1 to 4 instead: ticker, ATR and the pre-market high, low and last price as Edge Scanner
   gives them, re-ranked each minute as the preview changes, and marked in the header and on every row
   "Preview, not locked. Picks freeze at 09:25 ET." A preview row has no 09:30 minute, no levels, no
-  shares and no buttons, and nothing that places an order, the shadow log or the opening probe reads it
-  as a pick. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
+  shares and no buttons, and nothing that places an order or the shadow log reads it as a pick. The
+  opening probe previews its names (no order) only to learn each name's margin rate before the freeze. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
   or for another day. The header's **Buying power** line shows Schwab's day-trading buying power, buying
   power and equity from the account read Edge Trader already makes every 5 seconds, with the time read.
   Missing, or older than 30 seconds, it says "not known", never a zero; with `--private` it is hidden. It

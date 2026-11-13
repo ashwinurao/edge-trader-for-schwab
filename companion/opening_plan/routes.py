@@ -9,6 +9,9 @@ they read current_view().
 The header's buying power line (brief 21) reads the poller's last account answer through the
 `snapshot` getter app.py passes in (the same state /api/state serves): no new call, and hidden
 with --private as the dashboard hides the account value.
+
+`rates` is the opening probe's store of today's margin rates (companion/preview_rates.py, brief
+23): view["preview_rates"] carries them, ratios and Schwab's texts only, never a dollar amount.
 """
 from __future__ import annotations
 
@@ -59,11 +62,13 @@ def account_reading(snapshot: Optional[Callable[[], Mapping]], private: bool) ->
 
 def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
              now: Optional[Callable[[], datetime]] = None, get: Get = http_get,
-             snapshot: Optional[Callable[[], Mapping]] = None, private: bool = False) -> list[str]:
+             snapshot: Optional[Callable[[], Mapping]] = None, private: bool = False,
+             rates=None) -> list[str]:
     """Add the Opening plan's page and endpoints; returns the page scripts the dashboard should load.
 
     `now` returns an aware time (tests pass a fake); `get` makes the GET (tests pass a fake);
-    `snapshot` returns the poller's state for the buying power line; `private` hides that line.
+    `snapshot` returns the poller's state for the buying power line; `private` hides that line;
+    `rates` is the probe's preview_rates.PreviewRates (None: no rates).
     """
     url = (env.get(ENV_VAR) or "").strip()
     if not url and not demo:
@@ -111,6 +116,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
             view = build_view(picks.body, picks.ok_at, picks.error, clock.body, clock.ok_at, clock.error,
                               stored_risk(store), at, pb, account=account)
         view["demo"] = demo and not url
+        view["preview_rates"] = rates.today(at) if rates is not None else {}
         return view
 
     # A plain def: FastAPI runs it in a worker thread, so a slow Edge Scanner never blocks the server.
@@ -122,6 +128,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     # so a click is checked against the server's own latest row, never the page's numbers.
     app.state.opening_plan_view = current_view
     app.state.opening_plan_now = now
+    app.state.preview_rates = rates
 
     @app.post("/api/opening-plan/risk")
     async def opening_plan_risk(request: Request):

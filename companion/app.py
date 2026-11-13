@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, break_entry, fills_feed, netlog, open_probe
+from . import __version__, break_entry, fills_feed, netlog, open_probe, preview_rates
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -68,6 +68,7 @@ poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
 signin = SignIn(on_done=poller.wake)
+PREVIEW_RATES = preview_rates.PreviewRates()   # brief 23: the probe's rates, kept for the Opening plan
 if DEMO:      # the ticket plans on invented quotes and an invented option chain; nothing reaches Schwab
     from . import demo as _demo
     trader.quote, trader.expirations, trader.chain = _demo.demo_quote, _demo.demo_expirations, _demo.demo_chain
@@ -79,7 +80,7 @@ async def lifespan(_app: FastAPI):
     # The network record (netlog.py): its threads, a start note and the event-loop lag task.
     lag_task = netlog.start(f"Edge Trader {__version__} started{' in DEMO mode' if DEMO else ''}")
     poller.start()
-    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller))  # briefs 09 and 21, off by default
+    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add)  # briefs 09, 21, 23, off by default
     if not DEMO:
         import threading
         from . import update_check
@@ -423,7 +424,7 @@ try:
     from .opening_plan import routes as _plan_routes
 except ImportError:
     _plan_routes = None
-FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO, snapshot=poller.snapshot, private=PRIVATE) if _plan_routes else []
+FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO, snapshot=poller.snapshot, private=PRIVATE, rates=PREVIEW_RATES) if _plan_routes else []
 FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
 # Place / Cancel / Flip on the plan rows (Step 4): only with EDGE_TRADER_PLAN_BUTTONS=1,
 # EDGE_TRADER_BREAK_ENTRY=1 and the plan on.
