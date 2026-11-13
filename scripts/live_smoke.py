@@ -1413,6 +1413,13 @@ def fill_by_ticket(r: Run, t: str, side: str, stop_away=None, tries: int = 4):
     t_sent = time.monotonic()
     for attempt in range(1, tries + 1):
         q = r.quote(t)
+        # A quiet pick's quote can be seconds old and Edge Trader refuses a click on one older than
+        # 5 s (seen 19:08 and 19:39 UTC on CBRS): read again, up to 8 s, for a fresher one.
+        for _ in range(8):
+            if (q.get("quote_age_s") or 0) <= 2.0:
+                break
+            time.sleep(1)
+            q = r.quote(t)
         r.note("QUOTE", **q)
         trig = d2(q["ask"]) + near if side == "LONG" else d2(q["bid"]) - near
         # The stop: --stop-away, or 0.6% of the price when that is more (a pick moves more than SPY).
@@ -1422,11 +1429,16 @@ def fill_by_ticket(r: Run, t: str, side: str, stop_away=None, tries: int = 4):
         ans, _ = r.submit(req, f"{t} {side} fill, try {attempt}")
         err = str(ans.get("error") or "")
         if ans.get("ok") is not True:
-            if attempt < tries and ("already through" in err or "must be below the bid" in err
-                                    or "must be above the ask" in err or any(x in err for x in TRANSIENT)):
+            if ("already through" in err or "must be below the bid" in err
+                    or "must be above the ask" in err or any(x in err for x in TRANSIENT)):
+                # A refusal for the price or the quote sent nothing: ask again, and on the last try
+                # end as "no fill" (the 19:39 UTC run stopped here on "quote is 5.2 s old").
                 r.note("REFUSED_AT_THE_CLICK", attempt=attempt, error=ans.get("error"))
-                time.sleep(2)
-                continue
+                got = None
+                if attempt < tries:
+                    time.sleep(2)
+                    continue
+                break
             r.must(f"{t}: Schwab accepted the break entry", False, got=r.pick(ans))
         oid = ans["order_id"]
         t_sent = time.monotonic()
@@ -1509,7 +1521,7 @@ def sc_held_click(r: Run) -> None:
     # A pick with a wide spread may not trade through a level a few cents away: long first, then short.
     for side in ([r.a.side.upper()] if r.a.side else ["LONG", "SHORT"]):
         sign = 1 if side == "LONG" else -1
-        got = fill_by_ticket(r, t, side, tries=3)
+        got = fill_by_ticket(r, t, side, tries=4)
         if got:
             break
     if not got or got["gone"]:
@@ -1986,6 +1998,14 @@ def sc_cleanup(r: Run) -> None:
     own_ids = {o["order_id"] for o in mine}
     rs = r.mem.get("restart") or {}
     keep = None if rs.get("one_go") else rs.get("order_id")   # left resting on purpose by restart_before
+    if keep and rs.get("ticker") and not any(
+            keep in (o["order_id"], o["group_id"]) for o in r.orders(rs["ticker"], st)):
+        # The entry left for a restart no longer works (cancelled or ended): forget it, so a later
+        # cleanup does not go on naming it (seen 19:39 UTC, for an order cancelled at 19:27).
+        r.note("RESTART_ENTRY_GONE", order_id=keep, ticker=rs.get("ticker"))
+        r.mem.pop("restart", None)
+        r._save_mem()
+        keep = None
     if keep:
         own_ids.discard(keep)
         r.note("LEFT_FOR_RESTART", order_id=keep, ticker=(r.mem.get("restart") or {}).get("ticker"),
