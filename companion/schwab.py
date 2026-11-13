@@ -207,4 +207,8 @@ def make_client(allowed: frozenset[str] = _ALLOWED, timeout: float = 10) -> Read
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
     inner._session.mount("https://", HTTPAdapter(max_retries=Retry(total=0, raise_on_status=False)))
+    # Time on the wire of every answer, per attempt, in data/netlog/ (netlog.py). A record
+    # only: it never changes or delays a request.
+    from . import netlog
+    netlog.attach(inner._session)
     return ReadOnlyClient(inner, allowed)

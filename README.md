@@ -46,6 +46,10 @@ name are refused). It needs no account and sends no telemetry.
 - Everything the app records: positions, orders, fills, the action log and your settings, in `data/companion.db`.
   Your fills (without the account number) can be read at `/api/fills` by apps that reach Edge Trader's
   address, such as Trading Journal AI on the same server (see "Running on a home server").
+- A timing record of Schwab's answers in `data/netlog/YYYY-MM-DD.jsonl` (UTC date): one line per answer with
+  the time, the method, the path with account and order ids removed, the status, the time on the wire and
+  Schwab's own clock. No tokens, account numbers or order details. Nothing in the app reads it back
+  (`companion/netlog.py`).
 
 ### What leaves your computer
 
@@ -55,7 +59,8 @@ name are refused). It needs no account and sends no telemetry.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
 - **Edge Scanner, only if you set `EDGE_SCANNER_URL`** (off by default): the Opening plan screen reads
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
-  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open.
+  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
+  and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
 
 ### API keys
 
@@ -73,6 +78,12 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
+- **Break entry (test stage, off by default):** with `EDGE_TRADER_BREAK_ENTRY=1` the ticket gets a
+  Break button: a stop-limit entry at a break level with its stop attached, so entry and stop rest at
+  Schwab as one order. You type the level, the stop and optionally a cap (how far past the level the
+  limit sits; blank = 0.15 x risk per share, at least 2 cents, at most 0.15% of the price). One share
+  only for now (`BREAK_MAX_SHARES` in `companion/break_entry.py`). The click is refused when the price
+  is already through the level or Schwab's quote is not real-time or is over 5 seconds old.
 - **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
   shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
   confirmation on every click) and either way you can send **no target**. The order then carries only
@@ -106,7 +117,7 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   10.5) each row uses half the risk and says so; when the calm flag is not known it shows full and half
   size side by side. A stop under 2% of daily ATR is marked, not changed. Every number shows its age, and
   an old or failed answer from Edge Scanner shows as old, never as current. Without
-  `EDGE_TRADER_BREAK_ENTRY=1` the screen has no order buttons: it places, changes and cancels nothing
+  `EDGE_TRADER_PLAN_BUTTONS=1` and `EDGE_TRADER_BREAK_ENTRY=1` the screen has no order buttons: it places, changes and cancels nothing
   (with it, see "Place, Cancel and Flip on the plan rows" below). Its list, times and numbers are in
   `companion/opening_plan/playbook.json`.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
@@ -229,9 +240,60 @@ refuses a request whose host is not in its `SCANNER_ALLOWED_HOSTS` (`scanner/loc
 Docker service name does not work. Unset (the default), there is no Opening plan button, no route and
 no request to Edge Scanner.
 
-**Place, Cancel and Flip on the plan rows (off by default).** With `EDGE_TRADER_BREAK_ENTRY=1` as well,
-each Opening plan row gets four buttons (`companion/plan_entries.py`). Each sends one request to
-Schwab when you click it; nothing is sent without a click.
+**Shadow log of the automatic plan (Step 5, sends nothing).** With the Opening plan on, set
+`EDGE_TRADER_SHADOW=1` in `.env` and rebuild. On weekdays from 09:29 to 09:36 ET a background thread
+reads the plan's Edge Scanner feed every half second and writes what an automatic OR1 plan WOULD do,
+one JSON line per decision, to `data/opening_plan/shadow/YYYY-MM-DD.jsonl`: the side nearer the last
+trade, a stop-limit entry one cent past the 09:30 minute's level with its limit capped, the stop at the
+other side and the shares; a fill (an estimate), a flip to the other side, a cancel, or no action and
+why (for example "price is 1.2 s old"). It has no button and no route, places, changes and cancels
+nothing, and imports no order code. Its numbers are in `companion/opening_plan/playbook.json` under
+`automatic`, each a start number not approved yet. Edge Scanner's picks route has no price after
+09:31, so the live log mostly shows the first decision and then old prices. For the full picture, replay
+Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
+
+    python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
+
+`--risk` is the risk per pick in dollars before the calm half. `--calm` is `yes` when SPY RV20 was at
+or below 10.5 that day (Edge Scanner's top-bar badge is red), `no` above it, or `unknown`, which
+places nothing. Without `--out` the lines go to the screen. A count by kind goes to the error stream,
+e.g. `would_place 4`.
+
+**Reading the replay output.** Each line is one decision about one pick, in time order:
+
+| Field | Meaning |
+| --- | --- |
+| `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
+| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_cancel` or `no_action`. |
+| `symbol`, `why` | The pick, and the reason in words. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
+| `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
+| `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
+| `fill` | On `would_fill`: the trade price seen inside the order's band. |
+| `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
+| `range` | The first minute's high and low, whether it was final, and what made it final (`trade at or after 09:31` or `09:30 bar`). |
+
+A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
+with no `would_place` line never got an order, and its last `no_action` says why.
+
+A worked example (made-up ticker and prices, from the test file in `tests/test_opening_plan_shadow.py`):
+
+    {"t": "2026-11-13T14:31:00.200000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 49.8 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 49.8, "price_age_s": 0.1, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "trade at or after 09:31"}}
+
+At 09:31:00.2 ET the first trade stamped 09:31 had arrived, so the first minute (high 50.00, low
+49.00) was final. The last trade, 49.80, was 0.1 s old: fresh enough to act on. It was 0.20 from the
+high and 0.80 from the low, so the plan goes long. The trigger is one cent above the high (50.01) and
+the stop is the low (49.00), so the risk per share is 1.01. The cap is 0.15 x 1.01 = 0.15, but at most
+0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is 50.08. $101 at risk on a day that is not
+calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40 before a fill (60% of the way to the low)
+would flip it to the short side. In the same file, the next line after it says `stale_price`
+("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
+`would_fill` at 50.04, a trade inside 50.01 to 50.08.
+
+**Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
+and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
+(`companion/plan_entries.py`). Without both, there are no buttons and no button routes. Each button
+sends one request to Schwab when you click it; nothing is sent without a click.
 - **Place long break / Place short break** sends the break entry (a stop-limit entry with its stop
   attached, `companion/break_entry.py`) for that pick: trigger one cent past the 09:30 ET minute, stop at
   the other side, built from the server's own latest row, never from the page's prices. The page sends
@@ -267,9 +329,11 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `SCHWAB_ENV_FILE` | Read the keys from another app's `.env`, to share one Schwab sign-in between apps. |
 | `COMPANION_PORT` | The local port. Default `8770`. |
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
+| `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
-| `EDGE_TRADER_BREAK_ENTRY` | `1` turns on the break entry and, with `EDGE_SCANNER_URL`, the Place / Cancel / Flip buttons on the Opening plan rows. Unset: off. |
+| `EDGE_TRADER_NETLOG` | `0` turns off the timing record of Schwab's answers in `data/netlog/`. On by default. |
+| `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
 
 ## Good to know
 

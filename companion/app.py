@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, fills_feed
+from . import __version__, break_entry, fills_feed
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -145,7 +145,8 @@ def state():
     if PRIVATE:
         snap = private_view(snap)
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO, "server": SERVER,
-                         "signin": signin.status(), "version": __version__, "features": FEATURES}, headers={"Cache-Control": "no-store"})
+                         "signin": signin.status(), "version": __version__, "features": FEATURES,
+                         "break_entry": {"on": break_entry.enabled(), "max_shares": break_entry.BREAK_MAX_SHARES}}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/fills")

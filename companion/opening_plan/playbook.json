@@ -35,5 +35,64 @@
     "timeout_seconds": 1.5,
     "stale_after_seconds": 6,
     "clock_old_after_seconds": 300
+  },
+  "automatic": {
+    "_about": "Step 5, shadow: what the automatic OR1 plan WOULD do (companion/opening_plan/engine.py). Nothing here sends, changes or cancels an order. Every number is a start number from the design (project memory ov-fast-open-design and ov-entries-failure-rules, 2026-11-13) that Ash has not approved; the tick study and shadow mornings are meant to set them.",
+    "range_final_wait_seconds": {
+      "value": 3,
+      "note": "start number, not approved by Ash"
+    },
+    "cap_r": {
+      "value": 0.15,
+      "note": "start number, not approved by Ash"
+    },
+    "cap_min": {
+      "value": 0.02,
+      "note": "start number, not approved by Ash"
+    },
+    "cap_max_pct_of_price": {
+      "value": 0.15,
+      "note": "start number, not approved by Ash"
+    },
+    "pullback_wait_seconds": {
+      "value": 120,
+      "note": "start number, not approved by Ash"
+    },
+    "flip_line": {
+      "value": 0.6,
+      "note": "start number, not approved by Ash"
+    },
+    "max_flips": {
+      "value": 3,
+      "note": "start number, not approved by Ash"
+    },
+    "watch_until_et": {
+      "value": "09:35",
+      "note": "start number, not approved by Ash"
+    },
+    "stale_after_seconds": {
+      "value": 0.5,
+      "note": "start number, not approved by Ash"
+    },
+    "max_shares": {
+      "value": 10000,
+      "note": "the ticket's cap, companion/bracket.py MAX_SHARES; tests/test_opening_plan_shadow.py checks they match"
+    },
+    "max_notional": {
+      "value": 250000,
+      "note": "the ticket's cap, companion/bracket.py MAX_NOTIONAL; tests/test_opening_plan_shadow.py checks they match"
+    },
+    "shadow_from_et": {
+      "value": "09:29",
+      "note": "live shadow window start, as Edge Scanner's opening recorder (scanner/open_recorder.py FROM_ET)"
+    },
+    "shadow_until_et": {
+      "value": "09:36",
+      "note": "live shadow window end, as Edge Scanner's opening recorder (scanner/open_recorder.py UNTIL_ET)"
+    },
+    "shadow_every_seconds": {
+      "value": 0.5,
+      "note": "how often the live shadow reads Step 2's feed; the feed itself asks Edge Scanner at most every feed.picks_every_seconds"
+    }
   }
 }
