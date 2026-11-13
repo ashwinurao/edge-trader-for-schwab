@@ -538,3 +538,76 @@ def test_no_balance_reaches_the_log_through_a_chase(fcrig):
     for n in BAL.values():
         for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
             assert form not in text
+
+
+# After a flip no later reading decides for the pick: the row is NONE, auto_entry says "ended" and the
+# engine's pick is DONE. So a chase handed over by a flip and refused for a passing reason has no next
+# try, and leaves the pick with a true sentence (architect, 2026-11-13 17:23 UTC).
+LEFT_HANDED = "the plan's entry was cancelled and nothing rests"
+
+
+def test_after_a_flip_a_stale_quote_leaves_the_pick_with_a_true_sentence(fcrig, monkeypatch):
+    rig = fcrig
+    real_quote = rig.trader.quote
+
+    def quote(sym, max_age=1.0):
+        q = real_quote(sym, max_age)
+        old = sym == "AAAA" and bool(rig.broker.cancelled)        # old only after the flip's cancel
+        return {**q, "quote_time": q["quote_time"] - 60_000} if old else q
+    monkeypatch.setattr(rig.trader, "quote", quote)
+    ids = short_trades_during_the_cancel(rig)
+    calls = len(rig.broker.calls)
+    run(rig, et(9, 31, 8))
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert rig.broker.calls[calls:].count(("quote", "AAAA")) == 1                  # one try only
+    left = rig.plan.left["AAAA"]
+    assert left.startswith("chase not sent: Schwab's quote is ") and left.endswith(LEFT_HANDED)
+    assert {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}["AAAA"] == left
+    assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
+
+
+def test_after_a_flip_a_busy_order_lock_leaves_the_pick_since_no_reading_comes_back(fcrig):
+    """A click takes Trader's lock between the flip's look and the chase. Nothing reached Schwab, but
+    after the flip no later decision comes for AAAA, so waiting a tick would leave the panel saying
+    "tries again" for a try that never comes: the pick is left, and no chase goes after the release."""
+    rig = fcrig
+    ids = short_trades_during_the_cancel(rig)
+    calls = len(rig.broker.calls)
+    real_read, after = rig.tape.read, []
+
+    def read():
+        if rig.broker.cancelled:
+            after.append(1)
+            if len(after) == 2:             # the hand-over's reread: a click takes the lock now
+                rig.trader._send_lock.acquire()
+            elif len(after) == 6 and rig.trader._send_lock.locked():
+                rig.trader._send_lock.release()
+        return real_read()
+    rig.tape.read = read
+    run(rig, et(9, 31, 8))
+    assert not rig.trader._send_lock.locked()
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and ("quote", "AAAA") not in rig.broker.calls[calls:]
+    left = rig.plan.left["AAAA"]
+    assert left.startswith("chase not sent: Another order action is running") and left.endswith(LEFT_HANDED)
+    assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
+
+
+def test_the_retry_wait_does_not_hold_up_a_chase_handed_over_by_a_flip(fcrig):
+    """armed.chase_retry_seconds spaces the tries of a chase from on_place only: a hand-over has no
+    later try to space."""
+    rig = fcrig
+    ids = short_trades_during_the_cancel(rig)
+    with rig.desk._lock:
+        rig.desk._chase_tried_at[rig.desk._key() + "AAAA"] = et(9, 31, 0.1)
+    real_cancel = rig.broker.cancel_order
+
+    def cancel(h, oid):                     # an on_place try a moment before would still be waiting
+        out = real_cancel(h, oid)
+        with rig.desk._lock:
+            rig.desk._chase_tried_at[rig.desk._key() + "AAAA"] = rig.clock.now()
+        return out
+    rig.broker.cancel_order = cancel
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]]
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]

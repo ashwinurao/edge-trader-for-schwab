@@ -613,7 +613,9 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   after its confirmed cancel and hands the pick to the chase from that reading. The entry that cancel
   ended does not count as a working order on the name, even while Schwab's order list (up to 5 s
   old) still shows it; any other working order on the name still stops the chase. When that reading
-  is not usable, nothing is sent and the row and the panel say nothing rests.
+  is not usable, nothing is sent and the row and the panel say nothing rests. No later reading
+  decides for that pick, so when this chase does not go (an old quote, the price back inside the
+  level, another order action running), the pick is left with the reason and nothing rests.
 - Just before the send the plan reads the tape again: the reading must be usable, still at or past
   the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
   entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
