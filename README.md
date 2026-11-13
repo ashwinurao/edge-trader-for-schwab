@@ -370,15 +370,16 @@ day's file, 2026-11-13, says no).
 | Field | Meaning |
 | --- | --- |
 | `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
-| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_cancel` or `no_action`. |
+| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_relevel` (Step 7: the 09:30 bar moved the range by more than one cent), `would_cancel` or `no_action`. |
 | `symbol`, `why` | The pick, and the reason in words. |
-| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `range_disputed`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `range_disputed`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `relevel_refused`, `relevel_traded` (the new range's trigger has already traded, so the entry stays), `range_after_fill`, `after_watch`, `no_range` or `no_picks`. |
 | `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
 | `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
 | `fill` | On `would_fill`: the trade price seen inside the order's band. |
 | `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
 | `fresh_age_s` | How old the newer of that trade and its quote was at `t`: the age the plan judges freshness by. |
 | `range` | The first minute's high and low, whether it was final, and where it came from (`snapshot minute bar` or `09:30 bar`, the bars request); `changed` with the old and new range when the bars request moved it; `disputed` with the snapshot's versions while they disagree and the bars request has not answered. |
+| `range_from`, `range_to`, `relevels` | On `would_relevel`, `relevel_refused`, `relevel_traded` and `range_after_fill`: the range the entry was built on, the new one, and the re-levels so far. |
 
 A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
 with no `would_place` line never got an order, and its last `no_action` says why.
@@ -460,8 +461,8 @@ again before each send. It cancels a plan entry that has not filled in two cases
 but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
 log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
 waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never exits, moves a stop or
-resends, and flips or chases only with that step's own switch. Without the capped chase (below), a
-pick whose price is already at or past its trigger is left to you.
+resends, and flips or chases only with that step's own switch (below). Without the capped chase
+(below), a pick whose price is already at or past its trigger is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
 Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
@@ -508,6 +509,63 @@ start and its answer with their times. A step that took over 100 ms before its a
 `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
 or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
+
+**Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
+as the armed plan's switches above, the armed plan may also move its own resting entry without a
+click (`companion/plan_auto/flip.py`). Without it, the armed plan says once "flip is not on: the entry
+stays" (or "re-level is not on") and the entry stays.
+- **Flip.** A trade reaches the flip line (60% of the way from the entry's level to the other side,
+  `automatic.flip_line`) while the entry rests unfilled and its trigger has not traded. The plan takes a
+  new reading of Edge Scanner's open tape; if it still shows that, it cancels the entry through the
+  dashboard's Cancel entry path, which reads the order back until Schwab confirms CANCELED with nothing
+  filled. Only then it checks again: the plan is still armed, another new tape reading is usable and
+  the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh and
+  shows no other working order on the name, and the plan row agrees with the tape (Step 2's row from
+  the feed's last answer; the plan never asks Edge Scanner for it, and without one the row check is
+  skipped as for the armed send). Then it places the other side's break entry from the tape's range:
+  the same risk, shares from that side's own risk per share, 1 share at this stage. The row says
+  "Flipped by the armed plan (1 of 3)." while that entry rests.
+- **After the cancel, one entry to place.** When the new tape reading is unusable or its price stale,
+  the plan reads again a tick (`armed.every_seconds`, 0.25 s) later, for at most
+  `armed.swap_recheck_seconds` (1.5 s, a start number Ash has not approved), then gives up with nothing
+  resting and says how long it looked. Any other answer (disarmed, the range changed or disputed, the
+  new trigger traded, a bound, a click) ends at once.
+- **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
+  from the range the entry was built on, while the entry rests unfilled and its trigger has not
+  traded. The plan cancels the entry the same way and places the same side from the new range, at most
+  once per pick a day (`armed.relevels_per_pick`). The row says "Re-levelled by the armed plan: the
+  range is now 42.60 / 41.92." After a fill nothing moves (the plan never moves a stop): the armed plan
+  panel's line for that pick says "the range changed after the fill" with both ranges.
+- Flips count per row per day together with the Flip button's, at most `automatic.max_flips` (3). A
+  chased entry (Step 8) and an entry placed by a click are never flipped. The plan tries to cancel any
+  one order at most once.
+- Bounds with this switch on (brief 17 item 5): orders per pick become 1 + `automatic.max_flips` +
+  `armed.relevels_per_pick` (5), and orders per day `armed.orders_per_day_with_flips` (8, a start number
+  Ash has not approved). The Arm dialog shows them and what flips and re-levels may do. A flip's cancel
+  is never refused by the calls bound; its send counts like any send. When no order, or not enough
+  Schwab calls this minute (`armed.calls_per_send`), is left for the new entry, nothing is cancelled and
+  the entry stays as it is. When the 09:30 range moved since the entry was built, only a re-level moves
+  it; with no re-level left the panel says the entry stays.
+- **Another order action running** (a click, a ticket send, Flat all) holds the dashboard's one order
+  lock. Before the cancel the flip tries nothing: no record, one `busy` line, and the next reading
+  decides again. After the confirmed cancel nothing rests, so the flip waits for the lock a tick at a
+  time; the row says "The armed plan cancelled the long entry. It places the short when the order
+  action in progress ends." and the panel says so once. When the lock is free it checks the tape and the
+  row again before the send. It stops waiting, with nothing resting, at a disarm or the end of the fast
+  watch. The other way round: while the plan's own cancel and send run (about 2.25 s at 0.4 s a Schwab
+  call, up to about 7.3 s when Schwab never shows CANCELED), a click on the ticket or a plan row answers
+  "Another submission is in progress." or "Another order action is in progress." and sends nothing.
+- When the cancel is not confirmed, or Schwab answers 429, nothing new is placed, the row turns red and
+  the plan disarms (for the day on a 429). A fill during the cancel turns the row red, and the plan
+  leaves that pick. When the plan was disarmed between the cancel and the place, or the other side's
+  trigger has already traded, nothing is placed and the row says nothing rests. No answer to the new
+  entry blocks the name, as for any unclear order, and disarms the plan. A 4xx is never retried.
+- The armed plan's log has one line per flip or re-level with its times: the reading, the decision,
+  the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer.
+- Not confirmed at Schwab: how fast a cancel of a resting stop-limit entry shows CANCELED. The cancel
+  reads the order back up to ten times, 0.25 s apart. At 0.4 s a Schwab call, a flip takes about
+  2.25 s from the start of the cancel to Schwab's answer to the new entry; a cancel that never confirms
+  gives up after about 7.3 s (`tests/test_plan_auto_flip.py`).
 
 **Capped chase by the armed plan (Step 8, off by default; not merged until Ash's go).** With
 `EDGE_TRADER_PLAN_AUTO_CHASE=1` on top of the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`,
@@ -577,6 +635,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
 | `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, or at 09:35 ET). Off by default. |
+| `EDGE_TRADER_PLAN_AUTO_FLIP` | `1`, together with the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`), lets the armed plan flip and re-level its own resting entry. Off by default. |
 | `EDGE_TRADER_PLAN_AUTO_CHASE` | `1`, together with `EDGE_TRADER_PLAN_AUTO=1` and the switches it needs, lets the armed plan chase a pick that already traded through its level: one limit entry at the capped price with its stop, once per pick a day. Off by default. |
 
 ## Good to know
