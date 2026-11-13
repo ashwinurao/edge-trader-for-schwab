@@ -85,7 +85,7 @@
   .dlg table { min-width: 0; margin: 10px 0 12px; }
   .dlg td { padding: 7px 8px; }
   .dlg .act { font: 600 13px var(--sans); white-space: nowrap; }
-  .dlg .act.cancel, .dlg .act.close { color: var(--amber); }
+  .dlg .act.cancel, .dlg .act.close, .dlg .act.close_plan, .dlg .act.cancel_stop { color: var(--amber); }
   .dlg .act.refuse { color: var(--red); }
   .dlg .act.nothing { color: var(--muted); }
   .dlg .row-btns { display: flex; gap: 10px; justify-content: flex-end; }
@@ -143,8 +143,9 @@
 <div id="ovl"></div>
 <div class="dlg-bg" id="flat-dlg"><div class="dlg" role="dialog" aria-modal="true" aria-labelledby="flat-h">
   <h2 id="flat-h">Flat all: end the plan's trades</h2>
-  <div class="mut msg">Cancels first, then closes, one row at a time in rank order, each through the dashboard's own Cancel entry and
-    Close paths. Nothing is retried. The server builds this list again and sends nothing if it differs.</div>
+  <div class="mut msg">Cancels first, then closes, one row at a time in rank order: an unfilled entry through the dashboard's own Cancel
+    entry path, the plan's shares by one replace of the plan's own stop, which leaves your own shares and orders alone. Nothing is
+    retried. The server builds this list again and sends nothing if it differs.</div>
   <div id="flat-list"></div>
   <div class="row-btns"><button class="btn" type="button" id="flat-back">Back</button>
     <button class="btn go" type="button" id="flat-go">Confirm Flat all</button></div>
@@ -166,7 +167,8 @@ let auto = null, autoOff = false, autoMsg = null;
 // Flat all and the cover watch (companion/plan_flat.py, Step 9): only when the server has them
 // (EDGE_TRADER_PLAN_FLAT=1 with the plan buttons); a 404 means no Flat all button and no cover lines.
 let flat = null, flatOff = false, flatShown = null, flatBusy = false, flatSaid = null;
-const STEP = {cancel: "cancel the unfilled entry", close: "close", nothing: "nothing", refuse: "refused"};
+const STEP = {cancel: "cancel the unfilled entry", close: "close", nothing: "nothing", refuse: "refused",
+  cancel_stop: "cancel the plan's stop"};                // brief 25: close_plan is worded in flatList
 const clicking = {}, said = {};
 const STALE_MS = 6000;   // the page's own check: no answer from Edge Trader for 6 s marks the view old
 
@@ -216,6 +218,8 @@ function notes(r) {
     if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);
     // The armed plan's chase (Step 8): its limit, cap and, while it rests, until when it waits.
     if (st.auto_text) out.push(`<div class="mutline">${esc(st.auto_text)}</div>`);
+    // Brief 25 rule F: the user's own shares or working orders on the name, beside the plan's.
+    if (e.manual) out.push(`<div class="mutline">${esc(e.manual)}</div>`);
   }
   const cv = coverOf(r.ticker);
   if (cv && cv.red) out.push(`<div class="badline">${esc(cv.text)}<button class="ob stop" data-act="add-stop" data-t="${esc(r.ticker)}"
@@ -330,9 +334,10 @@ function flatButton() {
 
 function flatList() {
   const items = flatShown || [];
-  const work = items.filter(x => x.action === "cancel" || x.action === "close").length;
+  const work = items.filter(x => ["cancel", "close", "close_plan", "cancel_stop"].includes(x.action)).length;
   const rows = items.map(x => `<tr><td class="n">${esc(x.rank ?? "–")}</td><td><span class="tk">${esc(x.ticker)}</span></td>
-    <td class="act ${esc(x.action)}">${x.action === "close" ? `close ${sh(x.shares)} sh at the market` : esc(STEP[x.action] || x.action)}</td>
+    <td class="act ${esc(x.action)}">${x.action === "close" ? `close ${sh(x.shares)} sh at the market` :
+      x.action === "close_plan" ? `close the plan's ${sh(x.shares)} sh at the market` : esc(STEP[x.action] || x.action)}</td>
     <td class="mut msg">${esc(x.text)}</td></tr>`).join("");
   const why = flat.refusal || flat.error || (work ? "" : "Nothing to cancel or close.");
   $("flat-list").innerHTML = `<table><tbody>${rows || `<tr><td class="mut">No plan rows.</td></tr>`}</tbody></table>${

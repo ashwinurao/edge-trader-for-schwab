@@ -216,8 +216,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   the screen only, never in a log.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
-- **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
-  further orders for that symbol (an option counts as its underlying, so it also blocks the stock and
+- **Safety rails:** no order is ever retried automatically (only a quote or an order read whose
+  connection Schwab dropped before answering is sent once more, `companion/read_retry.py`); an order
+  with an unclear outcome blocks further orders for that symbol (an option counts as its underlying, so it also blocks the stock and
   its other contracts) until Schwab confirms it or you press Resolve; other symbols can still be
   traded; the app never opens Schwab's streamer, so it never disconnects another app that uses it.
 
@@ -437,7 +438,7 @@ sends one request to Schwab when you click it; nothing is sent without a click.
 - **Cancel** cancels the row's resting, unfilled entry through the dashboard's own Cancel entry path.
 - **Flip** cancels the resting entry, waits until Schwab confirms it CANCELED with nothing filled, and
   only then places the other side. Just before that send it checks again that Schwab's order list is
-  fresh and shows no other working order on the name. If the cancel is not confirmed or anything
+  fresh and that you are not on the other side of the name (below). If the cancel is not confirmed or anything
   filled, nothing new is placed, the row turns red and says what to check, and the row sends nothing
   more that day. At most `max_flips_per_row` flips per row a day (3, in
   `companion/opening_plan/playbook.json`).
@@ -449,6 +450,28 @@ on the name is unclear, or the row already has an entry that is working, unclear
 They also refuse when Schwab's order list is old, meaning the last read failed or is older than three
 polling intervals: "Schwab's order list is old. Nothing is sent until it is fresh." A banner says so.
 Cancel still works on a sent entry.
+
+**The plan trades beside your own trades on the same name** (brief 25, `companion/plan_side.py`;
+Ash's card pick "Plan trades beside you", project thread "Review OV picks desk architecture",
+2026-11-13 20:04:42 UTC). You may trade a plan name by hand on the same account, on the ticket or in
+thinkorswim. Schwab nets each name, so your shares and the plan's are one position; the plan's own
+stop (the stop attached to its entry) is what tells its shares from yours.
+- **Same side, or not in the name:** Place and Flip go. Your own working orders and shares on the same
+  side no longer refuse ("One entry per name" until brief 25). Buy and sell orders count as the long
+  side, sell-short and buy-to-cover orders as the short side.
+- **Other side:** Place and Flip refuse before anything is sent, Flip before its cancel: "You are short
+  50 T by hand. The plan does not take the other side of a name you trade. Nothing was sent." (or "You
+  have a working short order on T.").
+- **Not clear:** your orders or shares on both sides, an order that is not a plain buy or sell, the plan
+  no longer able to tell its shares from yours, or Schwab's positions or order list old: refused.
+- The row says when you are in the name: "You also hold 100 T by hand", "You are also short 50 T by
+  hand" or "You also have a working order on T".
+- The row's own rules stay: one plan entry per row a day, the flip limit, ARM, the quote checks.
+
+The plan's shares are its entry's filled quantity for as long as its own stop works: the stop attached
+to the entry, followed through a replacement (an edit in thinkorswim), or a stop Add stop created for
+the row. When that stop filled, the plan's shares are gone. When it is gone without a fill, the plan can
+no longer tell its shares from yours and says so.
 
 A red row keeps Place and Flip off for the day. When Schwab's order list shows the row's entry, a line
 under the red text gives its status (for example "Resting at Schwab (WORKING), nothing filled."). Cancel works on it only while the order list is fresh and shows
@@ -489,31 +512,54 @@ by the clock: every order is your click.
   from the poller); any difference refuses the whole batch and sends nothing: "The list changed since
   the page showed it. Nothing was sent. Look again."
 - Then it works one row at a time in rank order: all cancels first, then the closes, through the
-  dashboard's own Cancel entry and Close paths, each under their own one-at-a-time lock, never
-  retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
+  dashboard's own Cancel entry path and the plan's own close of its shares (below), each under
+  Trader's one-at-a-time lock, never retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
   thinkorswim). A refused or unclear row does not stop the others. A 429 from Schwab, or the app's
   429 pause, stops the batch: the rows not reached say "Not sent: Schwab is throttling". The last
   batch of the day stays on the screen, with one line per row.
-- It closes only what the plan's own entries opened: the row's entry filled today, the account is on
-  the same side and holds no more shares of that name than the entry filled. A larger or opposite
-  position is refused for that row ("Close it on the dashboard"). So is an entry that is partly filled
-  and still working.
-- It refuses when entries are not armed, the market is closed, Schwab's order list or positions are
-  old, Schwab is throttling, or a batch is already running. A name blocked by an unclear order is
-  refused for that row only.
+- It closes only the plan's own shares (brief 25, `companion/plan_close.py`), whatever you hold beside
+  them. For a row whose entry filled today:
+  - the plan's stop works and the account holds the plan's shares or more on that side: one PUT
+    replaces the plan's stop with a market order for the plan's quantity, the same one-PUT shape as the
+    dashboard's Close. Nothing else on the name is cancelled or changed, and nothing is cleaned up
+    after it: "Close the plan's 1 share at the market. Your other 100 stay." Unlike the dashboard's
+    Close, a plan close no longer cancels other working orders on the name, so your own orders survive;
+  - the plan's stop filled: nothing ("the plan's stop sold its 1 share");
+  - the account holds none and the plan's stop still works: cancel that stop, read back until Schwab
+    says CANCELED. Only on a positions read taken at least `flat.positions_after_fill_seconds` (10 s, a
+    start number Ash has not approved) after the entry's fill, because the order list and the positions
+    are read at different moments; otherwise "The plan's entry filled N s ago and the account read is
+    older. Open Flat all again in a few seconds.";
+  - the plan's stop is gone without a fill and shares are held: refused, "The plan's stop is not
+    working any more, so the plan cannot tell its share from yours. Close it on the dashboard or in
+    thinkorswim.";
+  - fewer shares than the plan filled while its stop works, the other side, or anything not clear:
+    refused for that row. So is an entry that is partly filled and still working.
+  A row with no plan entry says "No plan entry today" and, when shares are held, that they are not
+  from the plan. An unclear answer to the PUT or to the stop's cancel turns the row red and blocks the
+  name until you press Resolve, as an unclear close does.
+- It refuses when the market is closed, Schwab's order list or positions are old, Schwab is
+  throttling, or a batch is already running. A name blocked by an unclear order is refused for that
+  row only.
+- It works with ARM off, and never turns ARM on. Its cancels and closes only remove risk, like the
+  dashboard's own Cancel entry and Close, which need no ARM either. A restart turns ARM off, so after a
+  restart Flat all still cancels a resting entry. ARM turning off during a batch does not stop it.
+  Place and Flip still need ARM.
 - While a batch runs, no new plan entry goes: Place and Flip refuse with "Flat all is running: no new
   entries until it ends. Nothing was sent." Cancel still works. So Flat all never says "done" while a
   new order rests. A batch first disarms the armed plan (Step 6, below), before it builds its list,
   and its hold refuses the armed plan's sends as well.
 - From 2 minutes before the playbook's flat time (`exit.flat_et`, 10:00 ET) the button turns red and
   says the flat time.
-- **Cover watch:** for each plan row that holds shares, the dashboard's own stop protection of the
-  row's ticket (PROTECTED, PARTIAL, NO_STOP). Shares without a working stop for longer than
+- **Cover watch:** for each plan row that holds shares, the plan's own shares against the plan's own
+  stop (brief 25): your shares beside them never turn a plan row red, and Add stop never sends a stop
+  for them (it refuses when you hold more than the plan's shares). Shares without a working stop for longer than
   `cover.grace_seconds` (3 s, a start number Ash has not approved) turn the row red: "N of M shares
   have no stop", with one **Add stop** button. The click sends a stop for those shares at the row's
   stop price (the stop its entry was sent with) through the dashboard's own Set stop path, with that
   path's refusals; it needs entries armed. That path creates a stop only when the position has none,
-  so a row whose position is partly covered stays red and says to set the rest in thinkorswim.
+  so a row whose position is partly covered stays red and says to set the rest in thinkorswim. The stop
+  Add stop creates becomes the row's own plan stop.
   Nothing is added automatically. The grace counts only while the Opening plan page is open: the
   server measures it when the page asks (every 2 s), so with the page closed no row turns red.
 
@@ -579,11 +625,20 @@ An old order list is a wait in the same way: one failed read of Schwab's order l
 for 15 seconds (3 times the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in
 `companion/poller.py`). The plan sends and cancels nothing on it, the pick's line says "Schwab's order
 list is old. Nothing is sent until it is fresh." (or "…cancels nothing…" for a cancel), and it tries
-again on each reading until the list is fresh or the watch ends. On 2026-11-13, while order calls ran,
-the poller read the order list only every 12 to 19 seconds.
+again on each reading until the list is fresh or the watch ends. If the 09:35 cancels are still
+waiting when the arm ends (45 seconds after 09:35), the plan disarms with "the end of the fast watch
+passed; N entries were not cancelled because Schwab's order list was old", and the red banner lists
+them. On 2026-11-13, while order calls ran, the poller read the order list only every 12 to 19 seconds.
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
+On a name you also trade by hand, the plan follows the side rule above (brief 25): it sends beside
+your shares and working orders on the same side. On the other side it sends nothing and leaves that
+pick to you for the day, with Place's words ("You are short 50 T by hand. The plan does not take the
+other side of a name you trade. Nothing was sent."). When your side is not clear (both sides, an
+order that is not a plain buy or sell, the plan unable to tell its shares from yours) that pick waits:
+it is looked at again on each reading until the watch ends, and the other picks go on. Schwab's
+positions old (no good account read for 15 seconds) is a wait for every pick, like an old order list.
 A **Flat all** click disarms the plan first, before Flat all builds its list ("the Flat all click").
 After it the plan sends and cancels nothing: Flat all's own list does the cancels. A send the plan had
 already started lands; its row says "A click on this row is still running" in that batch, and a second
@@ -617,12 +672,17 @@ before 09:35, then the four 09:35 cancels, each at its worst). The limit that bi
 but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
 Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
 wait. That is why the order list can go old while the plan works; brief 24 changes the poller.
+Since brief 26 (`companion/read_retry.py`) a quote or order read whose connection Schwab dropped before
+any answer is sent once more, so each such drop adds one call to a send or a cancel (on 2026-11-13,
+1 in 31 ticket quotes dropped). `calls_per_send` stays 5 and does not count them.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
 start and its answer with their times. A step that took over 100 ms before its action adds a
-`slow_step` line. A busy order lock adds one `busy` line per pick, and a skipped row check one
-`row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
+`slow_step` line. A busy order lock adds one `busy` line per pick; an old order list or account read,
+or a side that is not clear, one `wait` line; and the pick's action after either a `wait_over` line
+with how long it waited (`waited_s`). A skipped
+row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
 or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
 
@@ -635,10 +695,11 @@ stays" (or "re-level is not on") and the entry stays.
   new reading of Edge Scanner's open tape; if it still shows that, it cancels the entry through the
   dashboard's Cancel entry path, which reads the order back until Schwab confirms CANCELED with nothing
   filled. Only then it checks again: the plan is still armed, another new tape reading is usable and
-  the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh and
-  shows no other working order on the name, and the plan row agrees with the tape (Step 2's row from
-  the feed's last answer; the plan never asks Edge Scanner for it, and without one the row check is
-  skipped as for the armed send). Then it places the other side's break entry from the tape's range:
+  the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh,
+  your own trades on the name are not on the other side (below), and the plan row agrees with the
+  tape (Step 2's row from the feed's last answer; the plan never asks Edge Scanner for it, and
+  without one the row check is skipped as for the armed send). Then it places the other side's break
+  entry from the tape's range:
   the same risk, shares from that side's own risk per share, 1 share at this stage. The row says
   "Flipped by the armed plan (1 of 3)." while that entry rests.
 - **After the cancel, one entry to place.** When the new tape reading is unusable or its price stale,
@@ -654,8 +715,8 @@ stays" (or "re-level is not on") and the entry stays.
   nothing rests."
 - While a flip or re-level runs, the plan does nothing for the other picks: another pick's entry, or
   its 09:35 cancel, waits until the flip ends (about 2.25 s at 0.4 s a Schwab call, up to 7.3 s for an
-  unconfirmed cancel, and longer while it waits for the order lock or a fresh order list, at most until
-  the fast watch ends).
+  unconfirmed cancel, and longer while it waits for the order lock, a fresh order list or your side of
+  the name, at most until the fast watch ends).
 - **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
   from the range the entry was built on, while the entry rests unfilled and its trigger has not
   traded. The plan cancels the entry the same way and places the same side from the new range, at most
@@ -681,12 +742,31 @@ stays" (or "re-level is not on") and the entry stays.
   again." When the list is fresh it checks everything again and places. At a disarm or the end of the
   fast watch it stops with nothing resting: "Cancelled the long entry by the armed plan; the fast watch
   ended while Schwab's order list was old, so nothing rests."
+- **Your own trades on the name** (brief 25, the same rule as Place and Flip above; the architect's
+  rule for this step, 2026-11-13 21:31 UTC). The plan asks which side you are on for the NEW entry's
+  side twice: before the cancel and again just before the send. Same side, or not in the name: it goes,
+  beside your shares and orders, and never touches them. Other side, before the cancel: nothing is
+  cancelled or written, the entry stays, the plan keeps its one try to cancel that order, and the panel
+  says once "You are long 100 T by hand. The plan does not take the other side of a name you trade.
+  Nothing was sent." Other side after the cancel (you traded during it): nothing is placed and the row
+  says "Cancelled the long entry by the armed plan. Did not place the short: You are long 100 T by
+  hand. ..." Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
+  Schwab's positions old), before the cancel: the entry stays and the next reading decides again. For
+  old positions no pick acts on that reading, as for an old order list; for a name that is not clear
+  only that pick waits, so the other picks go on. Not clear after the cancel: the same wait as for an old
+  order list, a tick at a time, until it is clear (then everything is checked again), the plan is
+  disarmed or the fast watch ends ("... the fast watch ended while your side of T was not clear, so
+  nothing rests.").
 - **Schwab calls.** A flip or a re-level is one cancel (3 calls usually: a read, the cancel, a
   read-back; 12 at worst) and one send (4 usually: the quote, the order, two status reads; 5 at worst),
   so 7 usually and 17 at worst. Waiting costs no call. With four picks the bounds allow at most 8 sends
   and 8 cancels a day: if all fell in one minute, 56 calls usually and 136 at worst. Four entries then four
-  flips or re-levels in one minute are 44 usually and 88 at worst. Edge Trader as a whole keeps to 70
-  calls a minute (`companion/poller.py` `MAX_PER_MIN`), so the poller's own reads wait.
+  flips or re-levels in one minute are 44 usually and 88 at worst. A send that Schwab's 5-second quote
+  rule refuses made one call (the quote), but the plan's calls bound gives all of its reservation back.
+  The poller holds its own reads to 70 a minute (`companion/poller.py` `MAX_PER_MIN`) and counts the
+  order calls in that minute, but order calls never wait: only the poller's reads do. So Edge Trader
+  can pass 70 (the live test of 2026-11-13 counted 76 and 78 in a minute), and the 136 worst case
+  would pass Schwab's 120 a minute; a 429 disarms the plan for the day.
 - **Another order action running** (a click, a ticket send, Flat all) holds the dashboard's one order
   lock. Before the cancel the flip tries nothing: no record, one `busy` line, and the next reading
   decides again. After the confirmed cancel nothing rests, so the flip waits for the lock a tick at a

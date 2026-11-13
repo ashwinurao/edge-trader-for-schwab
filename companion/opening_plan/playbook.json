@@ -47,6 +47,13 @@
   "exit": {
     "flat_et": "10:00"
   },
+  "flat": {
+    "_about": "Brief 25 Flat all (companion/plan_flat.py), only with EDGE_TRADER_PLAN_FLAT=1. When the account holds none of a name whose plan stop still works, Flat all lists \"cancel the plan's stop\" only if Schwab's positions were read at least this long after the plan entry's fill: the order list and the positions are read at different moments, and a read from before the fill would show none (architect's ruling, 2026-11-13 20:30 UTC). Otherwise the row is refused until a newer read.",
+    "positions_after_fill_seconds": {
+      "value": 10,
+      "note": "start number, not approved by Ash"
+    }
+  },
   "cover": {
     "_about": "Step 9 partial-fill cover watch (companion/plan_flat.py, brief 19 Part C), only with EDGE_TRADER_PLAN_FLAT=1. A plan row whose shares have no working stop for longer than this turns red with an Add stop button (the user's click). Display only: nothing is sent by the clock.",
     "grace_seconds": {
