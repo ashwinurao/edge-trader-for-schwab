@@ -122,7 +122,9 @@ name are refused). It needs no account and sends no telemetry.
   everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
   window (09:25:30 ET by default). When that gives no picks it reads again every 15 seconds (one request to
   Edge Scanner on your LAN, never to Schwab) until the picks come or 09:29:00 ET, then starts the rotation at
-  rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`).
+  rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`). Picks that come
+  inside the window are quoted at once; picks that come before it wait for the window start, so Schwab is
+  never asked outside the window.
 
 ### API keys
 
