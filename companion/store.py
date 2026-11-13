@@ -194,7 +194,8 @@ class Store:
         return rows
 
     def open_tickets(self) -> list[dict]:
-        """Tickets whose outcome or Schwab order id is not known: they block new submissions."""
+        """Tickets whose outcome or Schwab order id is not known: each blocks new submissions on
+        its own name (Trader.submit, trading._name)."""
         with self._lock:
             cur = self._con.execute(
                 "select ticket_id, created, symbol, side, qty, status from tickets "

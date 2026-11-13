@@ -401,7 +401,14 @@ try:
     from .spreads import routes as _feature_routes
 except ImportError:
     _feature_routes = None
-FEATURES = _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
+# The Opening plan (display only, off unless EDGE_SCANNER_URL is set) registers first: its fixed
+# /features/openingplan.js must come before the spreads' /features/{name}.js.
+try:
+    from .opening_plan import routes as _plan_routes
+except ImportError:
+    _plan_routes = None
+FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO) if _plan_routes else []
+FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
 
 
 @app.post("/api/position/resolve_close")

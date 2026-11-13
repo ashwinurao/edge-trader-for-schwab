@@ -1,0 +1,35 @@
+{
+  "_about": "The Opening plan's one settings file (companion/opening_plan). Every list, time and number of the playbook is here, so a later playbook is a new file, not new code. Display only: nothing here places an order. See companion/opening_plan/__init__.py for where each number comes from.",
+  "name": "OV OR1 shares",
+  "list": {
+    "source": "ov_picks",
+    "rank_from": 1,
+    "rank_to": 4
+  },
+  "level": {
+    "bar_start_et": "09:30",
+    "bar_minutes": 1
+  },
+  "entry": {
+    "offset": 0.01,
+    "stop": "other_side",
+    "min_stop_atr": 0.02
+  },
+  "size": {
+    "calm_rv20_max": 10.5,
+    "calm_multiplier": 0.5,
+    "rv20_through_max_days": 4
+  },
+  "exit": {
+    "flat_et": "10:00"
+  },
+  "feed": {
+    "picks_path": "/api/v2/ov-picks",
+    "clock_path": "/api/v2/clock",
+    "picks_every_seconds": 2,
+    "clock_every_seconds": 60,
+    "timeout_seconds": 1.5,
+    "stale_after_seconds": 6,
+    "clock_old_after_seconds": 300
+  }
+}
