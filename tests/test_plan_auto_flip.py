@@ -673,8 +673,8 @@ BOTH_SIDES = ("You are on both sides of AAAA (shares or working orders), so the 
 
 
 def by_hand(x, positions=None, fresh=True, orders=()):
-    """Ash's own trades: the poller's net shares per name, whether that read is fresh, and working
-    orders of his own on the broker (left out of the strict brokers' one-entry check)."""
+    """Ash's own trades: the poller's net shares per name, whether that read is fresh, and Ash's own
+    working orders on the broker (left out of the strict brokers' one-entry check)."""
     hand = getattr(x, "hand", None)
     if hand is None:
         hand = x.hand = {}
@@ -765,7 +765,7 @@ def test_before_the_cancel_old_positions_are_a_wait_for_the_next_reading(r, kind
 
 @pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
 def test_before_the_cancel_a_side_not_clear_waits_for_this_pick_only(r, kind):
-    # Ash holds AAAA long and works a short order on it: the plan cannot tell his side. A wait of
+    # Ash holds AAAA long and works a short order on it: the plan cannot tell Ash's side. A wait of
     # this pick only, as Step 6's armed send (lane.busy with end_step=False): the next reading
     # decides again and the other picks go on. Nothing sent, written or logged; the one cancel is
     # not used.
@@ -790,8 +790,8 @@ def test_before_the_cancel_a_side_not_clear_waits_for_this_pick_only(r, kind):
 
 @pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
 def test_your_own_trades_on_the_new_side_do_not_stop_it(r, kind):
-    # Ash holds the NEW side by hand with his own stop working: the plan goes beside him (brief 25,
-    # rule B), and his order is never touched.
+    # Ash holds the NEW side by hand with Ash's own stop working: the plan goes beside those trades
+    # (brief 25, rule B), and Ash's order is never touched.
     oid = place_long(r)
     if kind == "would_flip":
         by_hand(r, {"AAAA": -100}, orders=[own_order(77, "BUY_TO_COVER")])
