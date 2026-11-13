@@ -745,6 +745,39 @@ def test_a_click_entry_on_a_row_is_left_alone(rig):
     assert cc not in rig.broker.cancelled                # the plan never cancels a click's entry
 
 
+def test_a_click_flip_of_the_plans_entry_makes_it_the_clicks(rig):
+    """Found by the Step 8 engineer (2026-11-13): PlanDesk._put merges keys, so a click Flip of the
+    plan's entry kept origin "auto" and the plan cancelled the clicked short entry at 09:35."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    old = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}["AAAA"]
+    rig.clock.t = et(9, 32)
+    r = rig.desk.flip("AAAA", {"trigger": "41.91", "stop": "42.48", "shares": 1})
+    assert r["ok"], r
+    rec = rig.desk.records()["AAAA"]
+    assert rec["origin"] == "click" and rec["side"] == "SHORT" and rec["order_id"] != old
+    run(rig, et(9, 32, 2))
+    assert "placed by a click" in rig.plan.left["AAAA"]
+    others = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"] if r["ticker"] != "AAAA"}
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert rec["order_id"] not in rig.broker.cancelled              # the click's short entry rests
+    assert rig.broker.cancelled == [old] + [others[t] for t in ("DDDD", "BBBB", "CCCC")]
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "BBBB", "CCCC"]
+
+
+def test_the_arm_dialog_names_each_step_that_is_not_on(rig):
+    """Step 8 engineer, 2026-11-13: with only the chase on, the dialog must still say it won't flip."""
+    def first_line(*kinds):
+        rig.plan.registry = H.Registry()
+        for k in ("would_place", "would_cancel") + kinds:
+            rig.plan.registry.register(k, lambda lane, d: None)
+        return rig.plan.terms()["will_not"][0]
+    assert first_line() == "Flip, chase, exit, move a stop or resend."
+    assert first_line(H.PAST_TRIGGER) == "Flip, exit, move a stop or resend."
+    assert first_line("would_flip") == "Chase, exit, move a stop or resend."
+    assert first_line("would_flip", H.PAST_TRIGGER) == "Exit, move a stop or resend."
+
+
 def test_no_flip_handler_says_so_once(rig):
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))

@@ -434,7 +434,11 @@ class PlanDesk:
             req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"])
         except ValueError as e:
             return None, f"Could not build the order: {e}"
+        # origin "click": _put merges keys, so without it a click after an armed-plan entry on this
+        # row (a click Flip, or Place after the plan's cancel) kept origin "auto", and the plan
+        # cancelled the click's entry at 09:35 (found by the Step 8 engineer, 2026-11-13).
         self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
+                  origin="click", sent=None, sent_at=None, wait_from=None,
                   text=f"Sending the {side.lower()} break entry." if not flip_from else
                   f"Cancelled the {flip_from.lower()} entry; sending the {side.lower()} break entry.")
         log.warning("OPENING PLAN %s %s break: trigger %s stop %s, %s sh (plan %s)", side, ticker,

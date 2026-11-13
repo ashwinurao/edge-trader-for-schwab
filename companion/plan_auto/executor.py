@@ -43,7 +43,7 @@ from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
-from .handlers import Lane, Registry, default_registry
+from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
 
 log = logging.getLogger("companion.plan_auto")
 
@@ -524,8 +524,11 @@ class AutoPlan:
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
                 "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env)
-        will_not = ["Flip, chase, exit, move a stop or resend." if kinds == ["would_place", "would_cancel"]
-                    else "Exit, move a stop or resend.",
+        # Name each step that is not on (Step 8 engineer, 2026-11-13: with only the chase on, the
+        # old line dropped "flip" too).
+        off = [w for w, kind in (("flip", "would_flip"), ("chase", PAST_TRIGGER)) if kind not in kinds]
+        not_line = ", ".join(off + ["exit", "move a stop or resend."])
+        will_not = [not_line[:1].upper() + not_line[1:],
                     "Send when the price is already at or past the trigger: that pick is left to you.",
                     "Act on an old or late tape, an old order list, an unclear order, or after any disarm.",
                     "Survive a restart: arming is in memory only."]
