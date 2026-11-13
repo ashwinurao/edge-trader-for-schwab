@@ -3,12 +3,14 @@
 Expected payloads are written out by hand: ABCD long, break level 50.00, stop 49.00. Default
 cap = 0.15 x 1.00 = 0.15, at most 0.15% x 50.00 = 0.075, rounded down to 0.07: limit 50.07.
 """
-import time
+import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from companion import break_entry, trading
+from companion.bracket import bracket_order, plan
 from companion.break_entry import BREAK_MAX_SHARES, build_request, default_cap
 from companion.store import Store
 from companion.trading import Trader
@@ -321,3 +323,31 @@ def test_an_unknown_break_reconciles_only_to_its_own_level(trader):
     assert trader.store.get_ticket("ticket-long-0001")["status"] == "UNKNOWN"
     trader.reconcile([other_level, {**sent, "orderId": 71, "status": "WORKING", "enteredTime": at}])
     assert trader.store.get_ticket("ticket-long-0001")["order_id"] == 71
+
+
+# ---- every existing entry type builds the same Schwab order as before this change ---------------
+
+GOLDEN = Path(__file__).parent / "data" / "bracket_orders_cb7026a.json"
+
+
+@pytest.mark.parametrize("case", json.loads(GOLDEN.read_text()), ids=lambda c: c["name"])
+def test_existing_entries_build_the_same_order_as_before(case, monkeypatch):
+    # The expected orders were written by bracket.py at cb7026a (main before Step 3) from the same
+    # inputs: mid, market, cross, ask, bid, limit, two targets, trail, Auto B/E, no target, no stop,
+    # an option. The flag is irrelevant to them; it is unset here to show the plain build.
+    monkeypatch.delenv("EDGE_TRADER_BREAK_ENTRY", raising=False)
+    p = plan(**case["plan"])
+    assert p.ok and p.entry != "break"
+    assert bracket_order(p) == case["order"]
+
+
+def test_old_tickets_still_match_their_orders():
+    # The matching tuple gained the entry's stopPrice so an UNKNOWN break ticket matches only an
+    # order at its own level. Every other entry has no stopPrice on either side (None == None), so a
+    # ticket stored before this change still matches the order Schwab reports for it.
+    case = json.loads(GOLDEN.read_text())[0]
+    sent = case["order"]                                         # as stored in tickets.request
+    live = {**sent, "orderId": 77, "status": "WORKING", "quantity": 147}
+    assert Trader._shape(sent) is not None and Trader._shape(live) == Trader._shape(sent)
+    assert Trader._shape(sent)[0][-1] is None
+    assert Trader._matches(live, {"request": sent})
