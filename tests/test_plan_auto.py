@@ -956,6 +956,47 @@ def test_the_panel_shows_a_skipped_row_check_while_armed_and_drops_it_when_it_is
     assert '${a.row_check_text ? `<div class="warnline" id="auto-row-check"' in page
 
 
+# Made-up balances (brief 21: never real values in a test).
+BAL = {"equity": 81234.57, "buyingPower": 162469.14, "dayTradingBuyingPower": 324938.28}
+
+
+def test_no_balance_reaches_the_armed_plans_log(rig):
+    """Brief 21's hard rule (architect, 2026-11-13 17:12 UTC): since main 9f15270 (#30) Step 2's view
+    carries buying power in dollars. The worker keeps the view in memory only: no line it logs, from
+    the Arm click through sends, a red row, a skipped row check, the 09:35 cancels and the disarm,
+    holds one of those numbers."""
+    def with_balances():
+        v = rig.view()
+        v["buying_power"] = P.buying_power({"balances": BAL, "ok_at": rig.clock.now()}, rig.clock.now())
+        return v
+    assert with_balances()["buying_power"]["equity"] == 81234.57          # the view does carry them
+    rig.plan._view = rig.plan._row_view = with_balances
+    rig.view.bars["BBBB"] = (20.50, 19.95, 20.10)                          # BBBB's row turns red
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.plan._row_view = lambda: {**with_balances(), "stale": True}
+    run(rig, et(9, 31, 5))
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    events = {x["event"] for x in lines(rig)}
+    assert {"arm", "decision", "send_start", "send_answer", "leave", "row_check_skipped", "cancel_start",
+            "cancel_answer", "disarm"} <= events
+    text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
+    for n in BAL.values():
+        for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
+            assert form not in text
+
+
+def test_the_preview_before_the_freeze_skips_the_row_check(rig):
+    """Main 9f15270 (#30): before 09:25 ET Step 2's view is PREVIEW, never OK, with no rows. The row
+    check treats any state but OK as skipped, and says why once."""
+    arm(rig)
+    rig.plan._row_view = lambda: {**rig.view(), "state": P.PREVIEW, "rows": [], "message": P.PREVIEW_TEXT}
+    rig.clock.t = et(9, 31, 0.1)
+    assert rig.plan._row_check_view() == {}
+    skipped = lines(rig, "row_check_skipped")
+    assert len(skipped) == 1 and skipped[0]["why"].startswith(P.PREVIEW_TEXT)
+
+
 def test_the_arm_dialog_says_how_the_row_check_works(rig):
     assert ("Before each send: check the pick's row against the last OV picks answer this page or the shadow log "
             "fetched. With none from the last 6 s, send on the open tape alone and say so on this panel."

@@ -691,3 +691,25 @@ def test_a_red_row_from_a_fill_during_the_flip_does_not_offer_cancel(rig):
 def test_the_page_shows_the_order_under_the_red_text():
     page = (plan_entries.Path(plan_entries.__file__).parent / "opening_plan" / "static" / "opening_plan.html").read_text()
     assert 'if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);' in page
+
+
+# ---------------------------------------------------------------- the preview (brief 21, PR B)
+
+def test_a_preview_row_never_gets_a_button_or_a_send(rig):
+    """From 09:00 to 09:25 ET the plan shows Edge Scanner's preview (plan.PREVIEW). Its rows are
+    never plan rows: no buttons, and Place and Flip refuse before anything reaches the broker."""
+    at = datetime(2026, 11, 13, 9, 10, 20, tzinfo=ET).astimezone(timezone.utc)
+    body = {"set_up": True, "reason_code": "", "reason": "",
+            "day": {"has_picks": False, "reason": "No OV picks for 2026-11-13 yet.", "trading_date": "2026-11-13"},
+            "preview": {"has_preview": True, "trading_date": "2026-11-13", "as_of": "2026-11-13T14:10:00Z",
+                        "previewed_at": "2026-11-13T14:10:04Z", "shadow": False,
+                        "picks": [pick(1, "AAAA", 42.48, 41.92, 42.37), pick(2, "CCCC", 71.84, 71.20, 71.31)]}}
+    rig.desk._view = lambda: P.build_view(body, at, "", None, None, "", P.parse_risk(100), at, PB)
+    v = rig.desk._view()
+    assert v["state"] == P.PREVIEW and v["rows"] == [] and len(v["preview"]["rows"]) == 2
+    assert rig.desk.state()["rows"] == []
+    for side, expected in (("LONG", LONG), ("SHORT", SHORT)):
+        r = rig.desk.place("AAAA", side, expected)
+        assert not r["ok"] and r["error"] == "Preview, not locked. Picks freeze at 09:25 ET."
+    assert not rig.desk.flip("AAAA", LONG)["ok"]
+    assert rig.sent == [] and rig.broker.calls == [] and rig.broker.placed == []

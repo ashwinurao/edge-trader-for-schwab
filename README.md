@@ -127,7 +127,9 @@ name are refused). It needs no account and sends no telemetry.
   everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
   window (09:25:30 ET by default). When that gives no picks it reads again every 15 seconds (one request to
   Edge Scanner on your LAN, never to Schwab) until the picks come or 09:29:00 ET, then starts the rotation at
-  rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`).
+  rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`). Picks that come
+  inside the window are quoted at once; picks that come before it wait for the window start, so Schwab is
+  never asked outside the window.
 
 ### API keys
 
@@ -188,6 +190,17 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   `EDGE_TRADER_PLAN_BUTTONS=1` and `EDGE_TRADER_BREAK_ENTRY=1` the screen has no order buttons: it places, changes and cancels nothing
   (with it, see "Place, Cancel and Flip on the plan rows" below). Its list, times and numbers are in
   `companion/opening_plan/playbook.json`.
+  From 09:00 ET until the picks freeze at 09:25 ET, the screen shows Edge Scanner's preview of the
+  day's ranks 1 to 4 instead: ticker, ATR and the pre-market high, low and last price as Edge Scanner
+  gives them, re-ranked each minute as the preview changes, and marked in the header and on every row
+  "Preview, not locked. Picks freeze at 09:25 ET." A preview row has no 09:30 minute, no levels, no
+  shares and no buttons, and nothing that places an order, the shadow log or the opening probe reads it
+  as a pick. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
+  or for another day. The header's **Buying power** line shows Schwab's day-trading buying power, buying
+  power and equity from the account read Edge Trader already makes every 5 seconds, with the time read.
+  Missing, or older than 30 seconds, it says "not known", never a zero; with `--private` it is hidden. It
+  is on the screen only, never in a log. `--demo` shows invented numbers; set `EDGE_TRADER_PLAN_DEMO_ET`
+  (e.g. `09:10:00`) to start the demo clock at that time of day and see the preview.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
 - **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
@@ -528,8 +541,16 @@ stays" (or "re-level is not on") and the entry stays.
 - **After the cancel, one entry to place.** When the new tape reading is unusable or its price stale,
   the plan reads again a tick (`armed.every_seconds`, 0.25 s) later, for at most
   `armed.swap_recheck_seconds` (1.5 s, a start number Ash has not approved), then gives up with nothing
-  resting and says how long it looked. Any other answer (disarmed, the range changed or disputed, the
-  new trigger traded, a bound, a click) ends at once.
+  resting and says how long it looked. Any other answer (disarmed, the fast watch over, the range
+  changed or disputed, the new trigger traded, a bound, a click) ends at once.
+- **The fast watch ends during the cancel.** The plan decides only before 09:35:00 ET, but a flip or
+  re-level that starts just before it confirms its cancel later (about 1.45 s, up to 7.3 s). Every look
+  after the cancel first checks the desk's clock: at or past the watch end
+  (`armed.watch_until_et`), nothing is placed, nothing goes to the chase, and the plan leaves the pick.
+  The row says "Cancelled the long entry by the armed plan; the fast watch ended during the cancel, so
+  nothing rests."
+- While a flip or re-level runs, the plan does nothing for the other picks: another pick's entry, or
+  its 09:35 cancel, waits until the flip ends (about 2.25 s at 0.4 s a Schwab call, up to 7.3 s).
 - **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
   from the range the entry was built on, while the entry rests unfilled and its trigger has not
   traded. The plan cancels the entry the same way and places the same side from the new range, at most
@@ -558,7 +579,11 @@ stays" (or "re-level is not on") and the entry stays.
 - When the cancel is not confirmed, or Schwab answers 429, nothing new is placed, the row turns red and
   the plan disarms (for the day on a 429). A fill during the cancel turns the row red, and the plan
   leaves that pick. When the plan was disarmed between the cancel and the place, or the other side's
-  trigger has already traded, nothing is placed and the row says nothing rests. No answer to the new
+  trigger has already traded, nothing is placed and the row says nothing rests. In the second case,
+  with Step 8's chase switch on (`EDGE_TRADER_PLAN_AUTO_CHASE=1`), the chase may take the pick: it gets
+  a new tape reading taken after the cancel and the id of the cancelled order, the one order it may
+  ignore on the name. When that reading is unusable, or the chase does not go, the plan leaves the
+  pick and its panel line says nothing rests. No answer to the new
   entry blocks the name, as for any unclear order, and disarms the plan. A 4xx is never retried.
 - The armed plan's log has one line per flip or re-level with its times: the reading, the decision,
   the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer.
@@ -640,6 +665,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
 | `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
+| `EDGE_TRADER_PLAN_DEMO_ET` | `--demo` only: the time of day (ET, e.g. `09:10:00`) the demo clock starts at, so the Opening plan shows the 09:00 to 09:25 preview. Default: 09:31:05. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 | `EDGE_TRADER_NETLOG` | `0` turns off the network record in `data/netlog/` (answers, calls, waits, routes, refusals, lag) and its threads. On by default. |
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
