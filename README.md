@@ -66,7 +66,8 @@ name are refused). It needs no account and sends no telemetry.
   bodies, order prices or sizes. Nothing in the app reads it back to decide anything. About 40 MB a day
   while the app runs (most of it the poller's account and order reads, all day), plus about 1 MB for each
   hour a position or working order is quoted and about 1.4 MB for each hour the Opening plan page reads
-  Edge Scanner. Nothing deletes it yet.
+  Edge Scanner. The shadow log's open-tape reads add about 0.65 MB a day (two `call` and `answer` lines
+  a second from 09:29 to 09:36 ET, about 790 bytes a read). Nothing deletes it yet.
   `GET /api/netlog/summary` shows, from memory, each vendor and endpoint's count, errors and p50/p95/max
   times for the last 5 minutes and since 09:25 ET, the calls in flight, the pause and the last lag line.
 - Warnings and errors in `data/logs/edge-trader-YYYY-MM-DD.log` (UTC date). `data/companion.log` already
@@ -84,6 +85,9 @@ name are refused). It needs no account and sends no telemetry.
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
   (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
   and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
+  The shadow log also reads Edge Scanner's open tape (`GET /api/v2/ov-picks/open-tape`, at most every
+  0.25 seconds with a 0.5 second time limit, from 09:29 to 09:36 ET only; Edge Scanner answers from
+  memory and asks Alpaca for nothing more).
   Each read carries `X-Edge-App: edge-trader` and the call's id in `X-Edge-Req`, so Edge Scanner's own
   record can name it.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
@@ -282,15 +286,20 @@ no request to Edge Scanner.
 
 **Shadow log of the automatic plan (Step 5, sends nothing).** With the Opening plan on, set
 `EDGE_TRADER_SHADOW=1` in `.env` and rebuild. On weekdays from 09:29 to 09:36 ET a background thread
-reads the plan's Edge Scanner feed every half second and writes what an automatic OR1 plan WOULD do,
+reads Edge Scanner's open tape every half second (below) and writes what an automatic OR1 plan WOULD do,
 one JSON line per decision, to `data/opening_plan/shadow/YYYY-MM-DD.jsonl`: the side nearer the last
 trade, a stop-limit entry one cent past the 09:30 minute's level with its limit capped, the stop at the
 other side and the shares; a fill (an estimate), a flip to the other side, a cancel, or no action and
 why (for example "price is 1.2 s old"). It has no button and no route, places, changes and cancels
 nothing, and imports no order code. Its numbers are in `companion/opening_plan/playbook.json` under
-`automatic`, each a start number not approved yet. Edge Scanner's picks route has no price after
-09:31, so the live log mostly shows the first decision and then old prices. For the full picture, replay
-Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
+`automatic`, each a start number not approved yet. Each line says its `source`. With `tape` it carries
+`tape_seq`, `tape_age_s` (Edge Scanner's newest snapshot to the answer), `feed_age` (SPY's newest trade
+or quote to the answer), `tape_usable` and `tape_why`; when the tape is not usable the plan acts on no
+price, as the armed plan would not. When the tape has a problem (no answer, a failed or late read, no
+picks for today) the shadow falls back to the picks route, `source` is `picks feed` and `tape_problem`
+says why; that route has no price after 09:31, so the fallback mostly shows the first decision and then
+old prices. To run the plan over a whole morning again, replay Edge Scanner's opening-recorder file
+(`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
 
     python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
 
@@ -298,6 +307,27 @@ Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in E
 or below 10.5 that day (Edge Scanner's top-bar badge is red), `no` above it, or `unknown`, which
 places nothing. Without `--out` the lines go to the screen. A count by kind goes to the error stream,
 e.g. `would_place 4`.
+
+**The open tape (brief 15).** Edge Scanner's opening recorder asks Alpaca for the top picks' and
+SPY's snapshots twice a second from 09:29 to 09:36 ET, and its open tape serves the newest one from
+memory. `companion/opening_plan/tape.py` holds the rules that turn it into the plan's reading, for the
+shadow, the replay and later the armed plan:
+
+- The first minute's range comes ONLY from a 09:30 bar stamped 09:30:00 ET of the same day: the
+  snapshot's minute bar once it is that bar, or Edge Scanner's 09:30 bars request. Either one makes it
+  final. Never from the day bar: on 2026-11-13 it was the PRIOR day's until 09:31:00.65 ET, and the
+  replay used to size every would-be order from yesterday's high and low. A trade stamped 09:31 no
+  longer makes a range final.
+- When the bars request's bar differs from the range in use by more than one cent, its values replace
+  it, and the range says `changed` with both.
+- A price is fresh by the newer of its trade's and its quote's own times (`fresh_at`): on 2026-11-13 a
+  thin name's last trade was often 0.5 to 4 s old while its quote was current.
+- The reading is not usable when Edge Scanner's newest snapshot is older than 1.0 s, or SPY's newest
+  trade or quote is more than 1.5 s behind the answer. These and the 0.25 s read pace and 0.5 s time
+  limit are in `playbook.json` under `tape`, each a start number not approved yet.
+
+Not confirmed: whether the snapshot's minute bar can change after it first shows the 09:30 bar (one
+day's file, 2026-11-13, says no).
 
 **Reading the replay output.** Each line is one decision about one pick, in time order:
 
@@ -311,24 +341,25 @@ e.g. `would_place 4`.
 | `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
 | `fill` | On `would_fill`: the trade price seen inside the order's band. |
 | `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
-| `range` | The first minute's high and low, whether it was final, and what made it final (`trade at or after 09:31` or `09:30 bar`). |
+| `fresh_age_s` | How old the newer of that trade and its quote was at `t`: the age the plan judges freshness by. |
+| `range` | The first minute's high and low, whether it was final, and where it came from (`snapshot minute bar` or `09:30 bar`, the bars request); `changed` with the old and new range when the bars request moved it. |
 
 A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
 with no `would_place` line never got an order, and its last `no_action` says why.
 
 A worked example (made-up ticker and prices, from the test file in `tests/test_opening_plan_shadow.py`):
 
-    {"t": "2026-11-13T14:31:00.200000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 49.8 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 49.8, "price_age_s": 0.1, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "trade at or after 09:31"}}
+    {"t": "2026-11-13T14:31:05.100000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 50.04 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 50.04, "price_age_s": 0.05, "fresh_age_s": 0.05, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "09:30 bar"}}
 
-At 09:31:00.2 ET the first trade stamped 09:31 had arrived, so the first minute (high 50.00, low
-49.00) was final. The last trade, 49.80, was 0.1 s old: fresh enough to act on. It was 0.20 from the
-high and 0.80 from the low, so the plan goes long. The trigger is one cent above the high (50.01) and
-the stop is the low (49.00), so the risk per share is 1.01. The cap is 0.15 x 1.01 = 0.15, but at most
-0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is 50.08. $101 at risk on a day that is not
-calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40 before a fill (60% of the way to the low)
-would flip it to the short side. In the same file, the next line after it says `stale_price`
-("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
-`would_fill` at 50.04, a trade inside 50.01 to 50.08.
+That file has no snapshot minute bar, so there is no range (`no_range`) until the 09:30 bar comes from
+the bars request at 09:31:01.1 ET (high 50.00, low 49.00). The last trade then was from 09:31:00.1, 1.0 s
+old, so that line says `stale_price` ("newest trade or quote is 1.0 s old"). At 09:31:05.1 a trade at
+50.04 is 0.05 s old: fresh enough to act on. It is above the high, so the plan goes long. The trigger
+is one cent above the high (50.01) and the stop is the low (49.00), so the risk per share is 1.01. The
+cap is 0.15 x 1.01 = 0.15, but at most 0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is
+50.08. $101 at risk on a day that is not calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40
+before a fill (60% of the way to the low) would flip it to the short side. 50.04 is already inside
+50.01 to 50.08, so the next line is `would_fill` at 50.04.
 
 **Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
 and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
