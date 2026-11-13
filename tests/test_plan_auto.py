@@ -202,9 +202,10 @@ def rig(tmp_path, monkeypatch):
     desk = plan_entries.PlanDesk(t, view, orders, plan_entries.max_flips(), now=clock.now,
                                  orders_fresh=lambda: knobs["fresh"], positions=lambda: knobs["positions"],
                                  positions_fresh=lambda: knobs["pfresh"])
+    holds = []                             # the poller's hold_later calls (brief 24): (time, seconds, why)
     plan = X.AutoPlan(desk, t, PB_RAW, tape, lambda r, now: T.usable(r, TAPE_RULES, now=now), view, orders,
                       lambda: knobs["fresh"], lambda: knobs["cooldown"], env=ENV, now=clock.now,
-                      out_dir=tmp_path / "auto")
+                      out_dir=tmp_path / "auto", hold_later=lambda sec, why: holds.append((clock.now(), sec, why)))
     plan._mono = clock.mono
     broker.locks = [plan._lock, desk._lock, plan.arming._lock]
 
@@ -213,6 +214,7 @@ def rig(tmp_path, monkeypatch):
     r = Rig()
     r.clock, r.trader, r.broker, r.tape, r.view, r.desk, r.plan, r.sent, r.knobs, r.tmp = \
         clock, t, broker, tape, view, desk, plan, sent, knobs, tmp_path
+    r.holds = holds
     return r
 
 
@@ -611,10 +613,14 @@ def test_the_plan_leaves_a_pick_on_the_other_side_of_ashs_trades(rig, setup, tex
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
     assert placed(rig) == ["DDDD", "BBBB", "CCCC"] and touched(rig, "AAAA") == []
-    assert rig.plan.left["AAAA"] == f"not sent: {text}"
-    assert [x["why"] for x in lines(rig, "leave") if x["ticker"] == "AAAA"] == [f"not sent: {text}"]
+    assert rig.plan.left["AAAA"] == f"not sent: {text}"         # the page shows the side rule's words
+    # The log keeps the side rule's code, never Ash's own share count (architect, 2026-11-13 21:53 UTC).
+    assert [(x["why"], x["side_rule"], x["side"]) for x in lines(rig, "leave") if x["ticker"] == "AAAA"] == [
+        ("not sent: the side rule said other_side", "other_side", "long")]
+    assert "by hand" not in (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
     p = rig.plan.panel()
     assert p["used"]["orders_day"] == 3                         # nothing spent on AAAA
+    assert next(x for x in p["picks"] if x["ticker"] == "AAAA")["left"] == f"not sent: {text}"
     # Left for the day: once Ash is out of the name the plan still sends nothing for AAAA.
     rig.knobs["positions"] = {}
     rig.broker.orders.pop(7, None)
@@ -644,8 +650,9 @@ def test_a_side_that_is_not_clear_waits_while_the_other_picks_go(rig, setup, tex
     assert placed(rig) == ["DDDD", "BBBB", "CCCC"] and touched(rig, "AAAA") == []
     assert "AAAA" not in rig.plan.left
     waits = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]
-    assert len(waits) == 1 and text in waits[0]["why"] and waits[0]["why"].endswith("Nothing was sent.")
-    assert waits[0]["what"] == "send"
+    assert len(waits) == 1 and waits[0]["why"] == "the side rule said not_clear" and waits[0]["what"] == "send"
+    assert (waits[0]["side_rule"], waits[0]["side"]) == ("not_clear", "long")
+    assert "by hand" not in (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
     p = rig.plan.panel()
     assert p["used"]["orders_day"] == 3
     assert text in next(x["note"] for x in p["picks"] if x["ticker"] == "AAAA")
@@ -655,7 +662,8 @@ def test_a_side_that_is_not_clear_waits_while_the_other_picks_go(rig, setup, tex
     assert placed(rig) == ["DDDD", "BBBB", "CCCC", "AAAA"]
     assert without_id(rig.sent[-1]) == want_req("AAAA")
     (over,) = [x for x in lines(rig, "wait_over") if x["ticker"] == "AAAA"]
-    assert over["what"] == "send" and text in over["why"] and 2.5 <= over["waited_s"] <= 3.25
+    assert over["what"] == "send" and over["why"] == "the side rule said not_clear" and 2.5 <= over["waited_s"] <= 3.25
+    assert (over["side_rule"], over["side"]) == ("not_clear", "long")
 
 
 def test_a_side_that_stays_unclear_until_the_watch_ends_sends_nothing_for_that_pick(rig):
@@ -683,6 +691,193 @@ def test_an_old_account_read_is_a_wait_for_every_pick(rig):
     run(rig, et(9, 31, 5))
     assert placed(rig) == ["DDDD", "AAAA", "BBBB", "CCCC"]
     assert [x["ticker"] for x in lines(rig, "wait_over")] == ["DDDD"]
+
+
+def test_the_side_rule_never_puts_ashs_share_count_in_the_log(rig):
+    # The other side with his shares (the words name 50) and with his order: the page shows the words,
+    # the plan's log only the code and the ticker.
+    rig.knobs["positions"] = {"AAAA": -50.0}
+    by_hand(rig, 7, "BUY", "BBBB", qty=250)
+    arm(rig)
+    run(rig, et(9, 36, 0), start=et(9, 31, 0.1))
+    text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
+    assert "by hand" not in text and "50 AAAA" not in text and "working long order" not in text
+    assert {x["ticker"]: (x["why"], x["side_rule"], x["side"]) for x in lines(rig, "leave")} == {
+        "AAAA": ("not sent: the side rule said other_side", "other_side", "long"),
+        "BBBB": ("not sent: the side rule said other_side", "other_side", "short")}
+    assert rig.plan.left["AAAA"] == f"not sent: You are short 50 AAAA by hand. {OTHER_SIDE}"
+
+
+# ---------------------------------------------------------------- the poller's hold (brief 24, review 6)
+
+def held_through(rig):
+    """When the last hold the plan asked for ends."""
+    return max(t + timedelta(seconds=sec) for t, sec, _ in rig.holds)
+
+
+def send_times(rig):
+    return [datetime.fromisoformat(x["t"]) for x in lines(rig, "send_start")]
+
+
+def test_no_poller_hold_without_an_arm(rig):
+    run(rig, et(9, 32, 0), start=et(9, 29, 0))
+    assert rig.holds == [] and lines(rig, "poll_hold") == []
+
+
+def test_the_hold_starts_30_s_before_act_from_not_at_the_arm_click_and_sends_nothing(rig):
+    assert rig.plan.armed_rules.act_from_et == dtime(9, 31) and X.POLL_HOLD_LEAD_SECONDS == 30.0
+    arm(rig, at=et(9, 29, 0))
+    run(rig, et(9, 30, 30), start=et(9, 29, 0))
+    assert rig.holds == []                                       # armed, but before 09:30:30 ET
+    run(rig, et(9, 30, 59))
+    assert [t for t, _, _ in rig.holds] == [et(9, 30, 30), et(9, 30, 40), et(9, 30, 50)]
+    assert {(sec, why) for _, sec, why in rig.holds} == {(30.0, X.POLL_HOLD_WHY)}
+    assert rig.broker.calls == []                                # the hold is no Schwab call
+    assert [x["seconds"] for x in lines(rig, "poll_hold")] == [30.0]
+
+
+def test_four_sends_end_the_hold_60_s_after_the_last_and_resting_entries_and_cancels_call_none(rig):
+    # Review 6 item 6: four sends from 09:31:00 to 09:31:05.1 (0.85 s a Schwab call). The entries
+    # then rest until the 09:35 cancels: neither renews the hold nor starts another.
+    rig.broker.delay = 0.85
+    arm(rig, at=et(9, 29, 0))
+    run(rig, et(9, 36, 0), start=et(9, 29, 0))
+    assert placed(rig) == NEAREST_FIRST and len(rig.broker.cancelled) == 4
+    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 1.7), et(9, 31, 3.4), et(9, 31, 5.1)]
+    assert rig.holds[0][0] == et(9, 30, 30)
+    assert held_through(rig) == et(9, 32, 5.1)                    # cut to the second: 60 s after the last send
+    assert max(t for t, _, _ in rig.holds) < et(9, 32, 5.1)       # nothing renewed after it
+    times = [t for t, _, _ in rig.holds]
+    for (t1, s1, _), t2 in zip(rig.holds, times[1:]):
+        assert t2 < t1 + timedelta(seconds=s1)                   # no gap between two holds
+        assert X.POLL_HOLD_RENEW_SECONDS <= (t2 - t1).total_seconds() < X.POLL_HOLD_RENEW_SECONDS + 2
+    first_cancel = min(datetime.fromisoformat(x["t"]) for x in lines(rig, "cancel_start"))
+    assert first_cancel >= et(9, 35, 0) and not [t for t, _, _ in rig.holds if t >= et(9, 32, 5.1)]
+    assert len(lines(rig, "poll_hold")) == 1                      # one hold for the arm
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "60 s after the plan's last send"
+    assert et(9, 32, 5.1) <= datetime.fromisoformat(end["t"]) < et(9, 32, 7)
+
+
+def release_at(rig, times):
+    """Each pick's 09:30 range stays disputed (no send) until its time; then it sends at once."""
+    for sym in times:
+        rig.tape.disputed[sym] = None
+    for sym, t in sorted(times.items(), key=lambda kv: kv[1]):
+        run(rig, t)
+        del rig.tape.disputed[sym]
+
+
+def test_sends_less_than_60_s_apart_never_keep_the_hold_past_its_latest_end(rig):
+    # Review 7: each send would move the end 60 s on (09:32:00, 09:32:50, 09:33:40, 09:34:25), but the
+    # hold never runs past act_from + POLL_HOLD_LATEST_SECONDS, 09:33:30 ET.
+    arm(rig, at=et(9, 29, 0))
+    rig.clock.t = et(9, 29, 0)
+    release_at(rig, {"DDDD": et(9, 31, 0), "AAAA": et(9, 31, 50), "BBBB": et(9, 32, 40), "CCCC": et(9, 33, 25)})
+    run(rig, et(9, 36, 0))
+    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 50), et(9, 32, 40), et(9, 33, 25)]
+    assert placed(rig) == NEAREST_FIRST
+    assert held_through(rig) == et(9, 33, 30)                     # to the second
+    assert max(t for t, _, _ in rig.holds) < et(9, 33, 30)        # nothing renewed after it
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the hold's latest end, 09:33:30 ET"
+    assert len(lines(rig, "poll_hold")) == 1
+
+
+def test_a_first_send_at_093310_ends_the_hold_at_093330_not_093410(rig):
+    arm(rig, at=et(9, 29, 0))
+    rig.clock.t = et(9, 29, 0)
+    release_at(rig, {sym: et(9, 33, 10) for sym in PICKS})
+    run(rig, et(9, 36, 0))
+    assert send_times(rig)[0] == et(9, 33, 10) and placed(rig) == NEAREST_FIRST
+    assert held_through(rig) == et(9, 33, 30)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the hold's latest end, 09:33:30 ET"
+
+
+def test_a_pick_still_to_send_does_not_keep_the_hold_past_60_s_after_the_last_send(rig):
+    # CCCC's 09:30 range never becomes final: no send for it. The other three send at 09:31:00, so
+    # the hold ends at 09:32:00 (review 6 item 2), not at 09:33:30 and not at the watch end.
+    rig.tape.disputed["CCCC"] = None
+    arm(rig, at=et(9, 29, 0))
+    run(rig, et(9, 36, 0), start=et(9, 29, 0))
+    assert placed(rig) == ["DDDD", "AAAA", "BBBB"] and len(rig.broker.cancelled) == 3
+    assert held_through(rig) == et(9, 32, 0)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "60 s after the plan's last send"
+
+
+def test_a_late_tape_ends_the_hold_150_s_after_act_from_and_its_later_sends_call_none(rig):
+    # No send by 09:33:30 ET (act_from + POLL_HOLD_LATEST_SECONDS): the hold ends there. The sends
+    # that come when the tape is back are not announced: one hold per arm (review 6 item 3).
+    assert X.POLL_HOLD_LATEST_SECONDS == 150.0
+    arm(rig, at=et(9, 29, 0))
+    rig.tape.problem = "the open tape is 40 s old"              # late after the arm's own check
+    run(rig, et(9, 34, 0), start=et(9, 29, 0))
+    assert rig.broker.placed == [] and held_through(rig) == et(9, 33, 30)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "no send by 09:33:30 ET"
+    n = len(rig.holds)
+    rig.tape.problem = ""
+    run(rig, et(9, 36, 0))
+    assert placed(rig) == NEAREST_FIRST and min(send_times(rig)) >= et(9, 34, 0)
+    assert len(rig.holds) == n and len(lines(rig, "poll_hold")) == 1
+
+
+def test_one_hold_per_arm_and_the_next_arm_holds_again(rig):
+    # Review 6 item 3, the bookkeeping: the hold's state belongs to one arm (its armed_at), so the next
+    # morning's arm holds again with no send of its own yet. Driven on _poll_hold itself.
+    p, nxt = rig.plan, timedelta(days=1)
+    first = {"armed_at": et(9, 29, 0), "until": et(9, 35, 45)}
+    rig.clock.t = et(9, 30, 30)
+    p._poll_hold(rig.clock.now(), first)
+    rig.clock.t = et(9, 31, 0)
+    p.log("send_start", "DDDD")
+    for t in (et(9, 32, 0), et(9, 32, 30)):
+        rig.clock.t = t
+        p._poll_hold(t, first)
+    assert rig.holds == [(et(9, 30, 30), 30.0, X.POLL_HOLD_WHY)]  # ended at 09:32:00, nothing after
+    second = {"armed_at": et(9, 29, 0) + nxt, "until": et(9, 35, 45) + nxt}
+    rig.clock.t = et(9, 30, 30) + nxt
+    p._poll_hold(rig.clock.now(), second)
+    assert rig.holds[1:] == [(et(9, 30, 30) + nxt, 30.0, X.POLL_HOLD_WHY)]
+
+
+def test_no_pick_left_to_send_ends_the_hold_at_once(rig):
+    # Every pick already past its trigger at 09:31: all left, nothing to send.
+    for sym, price in (("AAAA", 42.60), ("BBBB", 19.90), ("CCCC", 72.00), ("DDDD", 9.90)):
+        rig.tape.prices[sym] = price
+    arm(rig, at=et(9, 29, 0))
+    run(rig, et(9, 33, 0), start=et(9, 29, 0))
+    assert rig.broker.placed == [] and sorted(rig.plan.left) == sorted(PICKS)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "no pick left to send" and datetime.fromisoformat(end["t"]) < et(9, 31, 1)
+    assert max(t for t, _, _ in rig.holds) <= et(9, 31, 0)
+    assert held_through(rig) <= et(9, 31, 30)
+
+
+def test_a_disarm_ends_the_renewals(rig):
+    arm(rig, at=et(9, 29, 0))
+    run(rig, et(9, 31, 3), start=et(9, 29, 0))
+    rig.plan.click_disarm()
+    n = len(rig.holds)
+    run(rig, et(9, 33, 0))
+    assert len(rig.holds) == n and max(t for t, _, _ in rig.holds) < et(9, 31, 3)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the plan is not armed"
+
+
+def test_the_hold_never_runs_past_the_plans_own_end(rig):
+    # An arm that ends at 09:31:45, before 60 s after the sends: each hold is cut to the plan's end,
+    # and the renewals stop with it.
+    arm(rig, at=et(9, 29, 0))
+    rig.plan.arming.until = et(9, 31, 45)
+    run(rig, et(9, 33, 0), start=et(9, 29, 0))
+    assert placed(rig) == NEAREST_FIRST
+    assert all(t + timedelta(seconds=sec) <= et(9, 31, 45) for t, sec, _ in rig.holds)
+    assert held_through(rig) == et(9, 31, 45)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the plan is not armed" and datetime.fromisoformat(end["t"]) >= et(9, 31, 45)
 
 
 @pytest.mark.parametrize("price", [42.49, 42.60])
@@ -1923,6 +2118,10 @@ class AppPoller:
 
     def __init__(self, rig):
         self.rig, self.account, self.terminal = rig, {"securitiesAccount": {"positions": []}}, set()
+        self.holds = []
+
+    def hold_later(self, seconds, why):
+        self.holds.append((self.rig.clock.now(), seconds, why))
 
     def _merged_orders(self):
         return list(self.rig.broker.orders.values())
@@ -1949,9 +2148,17 @@ def app_registers(rig, env, between=None):
     plan = X.register(app, rig.trader, poller, lambda r: None, env=env, tape=rig.tape,
                       usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
     plan._mono = rig.clock.mono
-    rig.plan, rig.desk = plan, app.state.opening_plan_desk
+    rig.plan, rig.desk, rig.app_poller = plan, app.state.opening_plan_desk, poller
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     return app
+
+
+def test_through_app_pys_registers_the_plan_holds_the_pollers_later_polls(rig):
+    """executor.register hands the plan the poller's own hold_later (brief 24, PR #33)."""
+    app_registers(rig, ENV)
+    arm(rig, at=et(9, 29, 0))
+    run(rig, et(9, 30, 31), start=et(9, 29, 0))
+    assert rig.app_poller.holds == [(et(9, 30, 30), 30.0, X.POLL_HOLD_WHY)]
 
 
 def test_through_app_pys_registers_a_flat_all_click_disarms_the_plan(rig):
