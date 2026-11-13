@@ -112,6 +112,7 @@ class Plan:
     ticks: str = EQUITY
     size_mode: str = "risk"               # risk: qty from risk / stop distance; qty: the user's number
     has_target: bool = True               # False: no target is sent (add one later from the position)
+    trigger: Decimal = Decimal(0)         # entry "break": the stop-limit's stop price (break_entry.py)
 
     @property
     def has_stop(self) -> bool:
@@ -161,7 +162,7 @@ class Plan:
             "trail_start": f(self.trail_start) if self.trail_start else None, "warnings": self.warnings,
             "be_trigger": f(self.be_trigger) if self.be_trigger else None,
             "asset": self.asset, "multiplier": float(self.multiplier), "unit_risk": float(self.unit_risk),
-            "ticks": self.ticks,
+            "ticks": self.ticks, "trigger": f(self.trigger) if self.trigger else None,
             "size_mode": self.size_mode, "has_stop": self.has_stop, "has_target": self.has_target,
             "target_r": float(self._r_of(self.target)) if self.target and self.per_share else None,
             "target1_r": float(self._r_of(self.target1)) if self.target1 and self.per_share else None,
@@ -552,7 +553,8 @@ def bracket_order(p: Plan, exit_duration: str = "DAY") -> dict:
         exits = []
     order = {
         "orderStrategyType": "TRIGGER" if exits else "SINGLE",
-        "orderType": "MARKET" if p.market else "LIMIT",
+        # A break entry (break_entry.py, Step 3) is a STOP_LIMIT parent with the same children.
+        "orderType": "MARKET" if p.market else ("STOP_LIMIT" if p.entry == "break" else "LIMIT"),
         "session": "NORMAL",
         "duration": "DAY",
         "orderLegCollection": leg(entry_instr, p.qty),
@@ -561,4 +563,6 @@ def bracket_order(p: Plan, exit_duration: str = "DAY") -> dict:
         order["childOrderStrategies"] = exits
     if not p.market:
         order["price"] = p.f(p.limit)
+    if p.entry == "break":
+        order["stopPrice"] = p.f(p.trigger)
     return order
