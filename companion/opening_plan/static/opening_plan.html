@@ -74,6 +74,9 @@
   .bp { font: 500 12.5px var(--sans); color: var(--muted); }
   .bp b { font: 600 13px var(--mono); color: var(--text); }
   table.preview td { background: repeating-linear-gradient(135deg, transparent 0 10px, rgba(214,165,43,.05) 10px 20px); }
+  .tag.est { background: var(--blue-bg); color: var(--blue); margin-right: 4px; }
+  td.est { min-width: 190px; }
+  td.est b { font: 600 14px var(--mono); }
 </style>
 </head>
 <body>
@@ -116,7 +119,7 @@ function shares(r) {
   const s = r.shares || {};
   const pair = p => p == null ? "–" : (p.long === p.short ? sh(p.long) : `L ${sh(p.long)} · S ${sh(p.short)}`);
   if (s.state === "SET_RISK") return `<span class="mut">set risk</span>`;
-  if (s.state === "NO_LEVELS") return `<span class="mut">–</span>`;
+  if (s.state === "NO_LEVELS") return r.estimate ? estimateCell(r.estimate) : `<span class="mut">–</span>`;
   if (s.state === "CALM_UNKNOWN")
     return `full ${pair(s.full)}<span class="sub">half ${pair(s.half)} · calm not known</span>`;
   const tag = s.state === "CALM" ? `<span class="sub">half size: calm day</span>` : `<span class="sub">full size</span>`;
@@ -156,6 +159,8 @@ function notes(r) {
   }
   if (b.state !== "FINAL" && b.state !== "SO_FAR" && b.text) out.push(`<div class="${b.state === "BAD" ? "badline" : "mutline"}">${esc(b.text)}</div>`);
   for (const k of ["long", "short"]) if (r[k] && r[k].capped) out.push(`<div class="badline">${k === "long" ? "Long" : "Short"} shares ${esc(r[k].capped)}.</div>`);
+  // Brief 22: display only; the row's shares are not changed.
+  if (r.buying_power_note) out.push(`<div class="warnline">${esc(r.buying_power_note.text)} The shares are not changed.</div>`);
   if (r.under_min_stop) {
     const pct = r.long && r.long.stop_atr_pct != null ? `${r.long.stop_atr_pct}% of ATR` : "under the minimum";
     out.push(`<div class="warnline">Stop is ${esc(pct)}, under the research's 2% minimum. The research would use stop
@@ -229,7 +234,7 @@ function row(r) {
     ${side(r, "long", "long")}
     ${side(r, "short", "short")}
     <td class="n">${px(r.rps)}</td>
-    <td class="n">${shares(r)}</td>
+    <td class="n${r.estimate ? " est" : ""}">${shares(r)}</td>
     <td>${near}${b.state === "SO_FAR" ? `<span class="sub">${b.unconfirmed ? "from the unconfirmed close" : "from the close so far"}</span>` : ""}</td>
     ${entries ? ordersCell(r) : ""}
   </tr>${n}`;
@@ -244,6 +249,33 @@ function buyingPower(b) {
     · equity <b>${usd(b.equity)}</b> · read ${esc(b.read_at_et)} ET, ${ago(b.age_s)}`;
 }
 
+// Estimated shares before the 09:30 minute (brief 22): never a size and always marked "estimate".
+// The headline is the smaller of the estimate and what buying power allows, and says which decided.
+function estSet(x, label) {
+  if (!x) return "–";
+  const pre = label ? `<span class="mut">${label}</span> ` : "";
+  const range = x.fewer != null && x.more != null ? `usually ${sh(x.fewer)} to ${sh(x.more)}` : "";
+  const capped = x.capped ? esc(x.capped) : "";
+  if (x.limited_by === "buying_power")
+    return `${pre}<b>${sh(x.headline)}</b> <span class="tag sofar">limited by buying power</span>
+      <span class="sub">${["estimate about " + sh(x.about), range, capped].filter(Boolean).join(" · ")}</span>`;
+  const sub = [range, capped].filter(Boolean).join(" · ");
+  return `${pre}about <b>${sh(x.about)}</b>${sub ? `<span class="sub">${sub}</span>` : ""}`;
+}
+
+function estimateCell(e) {
+  if (!e) return `<span class="mut">–</span>`;
+  const m = e.bp_max || {};
+  const bp = m.state === "OK" ? `buying power allows ${sh(m.shares)}` : m.state === "HIDDEN" ? "buying power hidden" : "buying power not known";
+  const bpLine = `<span class="sub" title="${esc(m.text)}">${bp}</span>`;
+  if (e.state === "OFF") return `<span class="mut">–</span>${bpLine}`;
+  if (e.state === "MISSING") return `<span class="tag est">estimate</span><span class="mut">none</span><span class="sub">${esc(e.text)}</span>${bpLine}`;
+  const body = e.state === "CALM_UNKNOWN"
+    ? `${estSet(e.full, "full")}<div style="margin-top:4px">${estSet(e.half, "half")}</div><span class="sub">calm not known</span>`
+    : `${estSet(e.used)}<span class="sub">${e.state === "CALM" ? "half size: calm day" : "full size"}</span>`;
+  return `<span class="tag est">estimate</span>${body}${bpLine}`;
+}
+
 // Edge Scanner's preview from 09:00 ET until the 09:25 freeze: names and pre-market levels only.
 // No 09:30 minute, no levels, no shares and no buttons: every row says it is not locked.
 function previewRow(r) {
@@ -254,6 +286,7 @@ function previewRow(r) {
     <td class="n">${px(r.pm_high)}</td>
     <td class="n">${px(r.pm_low)}</td>
     <td class="n">${px(r.last)}</td>
+    <td class="n est">${estimateCell(r.estimate)}</td>
     <td><span class="tag sofar">Preview, not locked</span><span class="sub">Picks freeze at 09:25 ET.</span></td>
   </tr>`;
 }
@@ -294,6 +327,8 @@ function render(v, browserStale) {
   if (pv) banners.push(`<div class="banner warn"><b>${esc(v.message)}</b> OV's ranked list as of ${esc(pv.as_of_et.slice(0, 5))} ET from Edge Scanner. It changes each minute; the plan's levels, shares and buttons wait for the frozen picks and the 09:30 minute.</div>`);
   else if (v.state !== "OK" && v.state !== "STALE" && v.message) banners.push(`<div class="banner ${v.state === "NO_ANSWER" || v.state === "NOT_SET_UP" ? "bad" : "info"}">${esc(v.message)}</div>`);
   for (const n of v.notes || []) banners.push(`<div class="banner ${n.startsWith("Old data") ? "bad" : "warn"}">${esc(n)}</div>`);
+  // Brief 22: what every estimate on the screen assumes, said once.
+  if (v.estimate && (pv ? pv.rows : v.rows).some(r => r.estimate)) banners.push(`<div class="banner info">${esc(v.estimate.text)}</div>`);
   if (c.calm == null && c.text && v.rows.length) banners.push(`<div class="banner warn">${esc(c.text)}</div>`);
   if (entries && entries.error) banners.push(`<div class="banner bad">${esc(entries.error)}</div>`);
   if (entries && entries.orders_old) banners.push(`<div class="banner bad">${esc(entries.orders_old)} Cancel still works.</div>`);
@@ -301,7 +336,7 @@ function render(v, browserStale) {
   if (pv) {
     $("wrap").innerHTML = !pv.rows.length ? `<div class="empty">No preview rows.</div>`
       : `<table class="preview${old ? " stale" : ""}"><thead><tr>
-      <th>#</th><th>Ticker</th><th>ATR</th><th>PM high</th><th>PM low</th><th>Last</th><th>Status</th>
+      <th>#</th><th>Ticker</th><th>ATR</th><th>PM high</th><th>PM low</th><th>Last</th><th>Est. shares</th><th>Status</th>
       </tr></thead><tbody>${pv.rows.map(previewRow).join("")}</tbody></table>`;
   } else if (!v.rows.length) { $("wrap").innerHTML = `<div class="empty">No plan rows.</div>`; }
   else {
