@@ -19,9 +19,10 @@ every line has ts (UTC, milliseconds), kind and app. Kinds written here:
 - call: one per call as our code sees it, written when it ends: asked (when our code decided to
   call), wait_ms (asked until the first request left) with its parts wait_pause_ms (our 429 pause),
   wait_throttle_ms (the poller's limiter) and wait_client_ms (the rest: mostly schwabdev's lock and
-  token check), wire_ms, between_ms (between attempts: 0, nothing retries), after_ms (answer headers
+  token check), wire_ms, between_ms (between answered attempts), after_ms (answer headers
   to the client returning: the body download), total_ms. With an answer, wait + wire + between +
-  after = total, as in Edge Scanner's file; with none, the split is None. Then attempts, http, ok,
+  after = total, as in Edge Scanner's file; with none, the split is None. Then attempts (2 when a
+  read whose connection dropped was tried once more, brief 26, with that drop in first_error), http, ok,
   error (a class: timeout_connect, timeout_read, tls, dns, refused, reset,
   http_429, http_4xx, http_5xx, other), error_text (200 characters, ids removed), items, data_ts
   and data_age_ms (quotes only: Schwab's newest quoteTime/tradeTime), purpose, req.
@@ -409,6 +410,7 @@ class _Null:
     def returned(self, *_a, **_k): pass
     def skip(self, *_a, **_k): pass
     def failed(self, *_a, **_k): pass
+    def retried(self, *_a, **_k): pass
     def data(self, *_a, **_k): pass
 
 
@@ -440,6 +442,8 @@ class _Call:
         self.items = None
         self.data_ts = None
         self.skipped = None
+        self.retries = 0          # attempts that got no answer and were tried again (brief 26)
+        self.first_error = None   # the first of those attempts' error class
         self.reported = 0         # how many INFLIGHT_AT ages already have a line
         self.tokens = _token_marks(clients)
 
@@ -474,6 +478,15 @@ class _Call:
                 self.http = code
             self.error = classify(exc)
             self.error_text = shape_text(f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+
+    def retried(self, exc) -> None:
+        """An attempt got no answer and the call tries once more (brief 26, read_retry.py)."""
+        try:
+            self.retries += 1
+            if self.first_error is None:
+                self.first_error = classify(exc)
         except Exception:
             pass
 
@@ -568,8 +581,9 @@ def _finish(c: _Call, exc) -> None:
     parts = {f"wait_{k}_ms": round(v, 1) for k, v in c.waits.items()}
     # Split as Edge Scanner's scanner/netlog.py does (one format, architect review 2026-11-13), when
     # an answer came: wait (asked until the first request left) + wire (sum over attempts) + between
-    # (gaps between attempts: 0 here, nothing retries) + after (last answer's headers until the client
-    # returned: the body download) = total. wait_client_ms is wait minus our own pause and throttle:
+    # (gaps between answered attempts; a read tried again after a dropped connection, brief 26,
+    # has one answer, and its dropped attempt is inside wait) + after (last answer's headers until
+    # the client returned: the body download) = total. wait_client_ms is wait minus our own pause and throttle:
     # schwabdev's lock and token check. No answer: wait and the split are unknown (None).
     wait = between = after = client = None
     if c.first_out is not None:
@@ -586,8 +600,11 @@ def _finish(c: _Call, exc) -> None:
            "wait_client_ms": _r1(client),
            "wire_ms": round(c.wire_ms, 1) if c.attempts else None,
            "between_ms": _r1(between), "after_ms": _r1(after),
-           "total_ms": _ms(back - c.t0), "attempts": c.attempts, "http": c.http,
-           "ok": c.error is None, "error": c.error, "error_text": c.error_text, "items": c.items,
+           "total_ms": _ms(back - c.t0),
+           # attempts: answers seen; with a read tried again (brief 26) at least retries + 1.
+           "attempts": max(c.attempts, c.retries + 1) if c.retries else c.attempts, "http": c.http,
+           "ok": c.error is None, "error": c.error, "error_text": c.error_text, "first_error": c.first_error,
+           "items": c.items,
            "data_ts": (datetime.fromtimestamp(c.data_ts / 1000, timezone.utc).isoformat(timespec="milliseconds")
                        if c.data_ts else None),
            "data_age_ms": (round(c.last_in_wall - c.data_ts) if c.data_ts and c.last_in_wall else None),
