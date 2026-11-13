@@ -167,7 +167,7 @@ class AutoPlan:
         self.sends: deque = deque()             # (monotonic seconds, calls) of the plan's sends
         self.onces: set = set()
         self.last_reading: dict = {}
-        self.busy_picks: dict[str, str] = {}   # ticker -> "send" or "cancel" while Trader's lock is busy
+        self.busy_picks: dict[str, tuple] = {}  # ticker -> (what, why) while it waits (Trader's lock, an old list)
         self._busy_step = False
         self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
         self.row_check_why = ""                 # the same in words, for the panel
@@ -319,25 +319,28 @@ class AutoPlan:
         with self._lock:
             self.onces.discard(key)
 
-    def busy(self, ticker: str, what: str) -> None:
-        """Trader's order lock was busy, so nothing reached Schwab. Not an action: the step ends,
-        no other pick tries on that reading and the worker waits one tick (architect's review 1 of
-        fork PR #27, 2026-11-13 16:45 UTC). Said once per pick while it lasts, not once per try."""
+    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY) -> None:
+        """Nothing reached Schwab and the pick tries again on a later reading: Trader's order lock was
+        busy (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC), or Schwab's order list was
+        old (an old list is a wait: live-test notes N1, 2026-11-13 20:12 UTC). Not an action: the
+        step ends, no other pick tries on that reading and the worker waits one tick. Said once per
+        pick while the same reason lasts, not once per try: a "busy" line for the lock, "wait" else."""
         with self._lock:
             self._busy_step = True
-            first = ticker not in self.busy_picks
-            self.busy_picks[ticker] = what
+            first = self.busy_picks.get(ticker) != (what, why)
+            self.busy_picks[ticker] = (what, why)
             if first:
-                self.notes.setdefault(ticker, {})["note"] = plan_entries.TRADER_BUSY
+                self.notes.setdefault(ticker, {})["note"] = why
         if first:
-            self.log("busy", ticker, what=what, why=plan_entries.TRADER_BUSY)
+            self.log("busy" if why == plan_entries.TRADER_BUSY else "wait", ticker, what=what, why=why)
 
     def _busy_over(self, ticker: str) -> None:
         with self._lock:
-            if self.busy_picks.pop(ticker, None) is None:
+            got = self.busy_picks.pop(ticker, None)
+            if got is None:
                 return
             n = self.notes.setdefault(ticker, {})
-            if n.get("note") == plan_entries.TRADER_BUSY:
+            if n.get("note") == got[1]:
                 n["note"] = ""
 
     # ---- one step -----------------------------------------------------------------------------
@@ -445,8 +448,9 @@ class AutoPlan:
                 return "the dashboard's ARM went off", False
             if (self._cooldown() or 0) > 0:
                 return "Schwab's 429 pause is on", True
-            if not self._orders_fresh():
-                return "Schwab's order list went old", False
+            # An old order list no longer disarms: it is a wait. The desk's twins refuse with `again`
+            # and the pick tries on a later reading until the watch ends (live-test notes N1: on
+            # 2026-11-13 the poller read orders_today every 12 to 19 s while order calls ran).
         except Exception as e:
             return f"the plan could not check the account state ({type(e).__name__})", False
         return "", False
@@ -658,7 +662,8 @@ class AutoPlan:
         not_line = ", ".join(off + ["exit", "move a stop or resend."])
         will_not = [not_line[:1].upper() + not_line[1:],
                     "Send when the price is already at or past the trigger: that pick is left to you.",
-                    "Act on an old or late tape, an old order list, an unclear order, or after any disarm.",
+                    "Act on an old or late tape, an old order list (it waits until the list is fresh), an unclear "
+                    "order, or after any disarm.",
                     "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",
                     f"Send more than {break_entry.BREAK_MAX_SHARES} share: the size stage is for your clicks only.",
                     "Act after a Flat all click: the click disarms it first, and Flat all does the cancels.",

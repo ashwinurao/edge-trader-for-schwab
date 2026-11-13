@@ -73,6 +73,8 @@ DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
 # Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
 # other working order on this name" from the poller's order list, so it never sends on an old one.
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
+# The armed plan's cancel twin waits on an old list too (architect's live-test notes N1, 2026-11-13).
+ORDERS_OLD_AUTO_CANCEL = "Schwab's order list is old. The armed plan cancels nothing until it is fresh."
 ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
                      "Use the dashboard or thinkorswim.")
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
@@ -749,7 +751,10 @@ class PlanDesk:
             entry = self._entry_state(rec, orders)
             why = self._auto_refusal(ticker, rec, entry, orders, blocked, fresh)
             if why:
-                return self._refuse(ticker, why, not_sent=True)
+                # An old order list is a wait, not a refusal for the day: `again` (not `busy`), so the
+                # pick tries on a later reading until the watch ends; nothing is ever sent on an old
+                # list (architect's live-test notes N1, 2026-11-13 20:12 UTC).
+                return self._refuse(ticker, why, not_sent=True, again=why == ORDERS_OLD)
             shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
             if shares < 1:
                 return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
@@ -800,6 +805,9 @@ class PlanDesk:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
         if self.trader_busy():
             return self._refuse(ticker, TRADER_BUSY, not_sent=True, busy=True)
+        if not self._orders_fresh():
+            # The plan acts on no old list, cancels included: a wait, tried on a later reading (N1).
+            return self._refuse(ticker, ORDERS_OLD_AUTO_CANCEL, not_sent=True, again=True)
         with self._lock:
             try:
                 rec = self._load().get(ticker) or {}

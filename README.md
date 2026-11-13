@@ -573,6 +573,12 @@ the check is skipped and the sends go on the tape alone. While armed, the Armed 
 Keep the Opening plan screen open, or the shadow log on, while armed.
 When a click, a ticket send or Flat all is using Edge Trader's one order lock, the plan sends and
 cancels nothing: it waits 0.25 s, reads the tape again and tries then. The pick's line says so once.
+An old order list is a wait in the same way: one failed read of Schwab's order list, or no good read
+for 15 seconds (3 times the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in
+`companion/poller.py`). The plan sends and cancels nothing on it, the pick's line says "Schwab's order
+list is old. Nothing is sent until it is fresh." (or "…cancels nothing…" for a cancel), and it tries
+again on each reading until the list is fresh or the watch ends. On 2026-11-13, while order calls ran,
+the poller read the order list only every 12 to 19 seconds.
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
@@ -587,13 +593,11 @@ It does nothing price-based on an old or late tape reading, on a range that is n
 today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
 **Disarm** click (one click, checked before every send and cancel); a **Flat all** click; an unclear
 Schwab answer (that pick is left and the row follows its ticket, as after a click); a cancel Schwab does
-not confirm (the row turns red); a reached bound; ARM turned off on the dashboard; an old order list;
-or an unexpected error.
-An old order list means one failed read of Schwab's order list, or no good read for 15 seconds (3 times
-the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in `companion/poller.py`). Such a
-disarm is not for the day, but the Arm window has closed by then, so the plan is over for that morning.
-A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
-pick and is never retried. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+not confirm (the row turns red); a reached bound; ARM turned off on the dashboard; or an unexpected
+error. A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
+pick and is never retried, and so does an entry Schwab rejects after accepting it (on 2026-11-13 a
+REJECTED came 4.0 s after the 201: "The stop price must be above the current ask…"); the row shows
+Schwab's reason. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
 up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
 at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
@@ -605,9 +609,12 @@ approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pi
 case of 5 calls (usually 4: the quote, the POST and two status reads; 5 when an earlier close on the
 name still has an open status), so at most 8 sends in any 60 s. A cancel is never refused by it: it can
 take up to 12 calls (`Trader.cancel_entry` reads, cancels and reads back up to ten times) and is tried
-once per order. Not measured live: the worst minute is 7 sends and 3 flip cancels, 71 calls, which with
-the poller's 32 to 50 a minute is 103 to 121 against Schwab's 120. That top needs every cancel to use
-all ten read-backs and every send to find an open close.
+once per order. With four picks the plan makes at most 4 sends and 4 cancels a day: 16 to 20 calls for
+the sends, 12 to 48 for the cancels, at most 68 in one minute (sends held back by an old list until just
+before 09:35, then the four 09:35 cancels, each at its worst). The limit that binds is not Schwab's 120
+but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
+Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
+wait. That is why the order list can go old while the plan works; brief 24 changes the poller.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
