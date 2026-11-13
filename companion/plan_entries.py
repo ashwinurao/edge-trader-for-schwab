@@ -1151,14 +1151,25 @@ class PlanDesk:
         out = {"ok": False, "ticker": ticker, "side": side, "kind": kind, "stage": "refused", "code": "",
                "error": "", "red": False, "unclear": False, "throttled": False, "filled": False,
                "again": False, "busy": False, "this_name": False, "cancel_not_sent": False, "not_sent": False,
-               "cancel": None, "send": None, "cancelled_order_id": None, "times": times}
+               "cancel": None, "send": None, "cancelled_order_id": None, "times": times, "log_fields": None}
+
+        def side_fields(code: str, why: str = "") -> dict:
+            # What the plan's log keeps of the side rule's answer, as Step 6's place_auto (8f6b68c): the
+            # code and the new side, never plan_side's words (they can name the user's own shares).
+            return {"why": why or f"the side rule said {code}", "side_rule": code, "side": side.lower()}
 
         def done(**kw) -> dict:
             out.update(kw)
             if log is not None:
                 try:
                     # The lane's log names the ticker itself; no order body goes in (brief 14 rule 9).
-                    log(f"{kind}_auto", **{k: v for k, v in out.items() if k not in ("ticker", "cancel", "send")},
+                    # With `log_fields`, its `why` goes in place of `error`: the side rule's words can name
+                    # the user's own shares (architect, 2026-11-13 21:59 and 22:55 UTC).
+                    fields = {k: v for k, v in out.items() if k not in ("ticker", "cancel", "send", "log_fields")}
+                    lf = out.get("log_fields")
+                    if lf:
+                        fields.update(error=lf["why"], side_rule=lf.get("side_rule"))
+                    log(f"{kind}_auto", **fields,
                         cancel_status=(out["cancel"] or {}).get("status"),
                         send_status=(out["send"] or {}).get("status"),
                         new_order_id=(out["send"] or {}).get("order_id"))
@@ -1219,7 +1230,8 @@ class PlanDesk:
                 word = {ORDERS_OLD: "orders_old", plan_side.POSITIONS_OLD: "positions_old"}.get(s_text, "not_clear")
                 out.update(code="other_side" if s_code == plan_side.OTHER_SIDE else word, error=s_text,
                            again=s_code == plan_side.NOT_CLEAR,
-                           this_name=s_code == plan_side.NOT_CLEAR and word == "not_clear")
+                           this_name=s_code == plan_side.NOT_CLEAR and word == "not_clear",
+                           log_fields=None if word != "not_clear" else side_fields(s_code))
                 return out
             try:
                 shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
@@ -1378,21 +1390,18 @@ class PlanDesk:
                                           "thinkorswim for it today.")
                         return done(stage="recheck", code="disagree", error=text, red=True)
                 if why:
-                    log_text = ""
-                    if code == "other_side":
-                        # The row (the page) shows plan_side's full text; the plan's log carries the code,
-                        # the ticker and the side word, never the user's share count (architect,
-                        # 2026-11-13 21:59 UTC).
-                        log_text = (f"Cancelled the {old.lower()} entry by the armed plan. Did not place the "
-                                    f"{side.lower()}: other_side, you trade {ticker} on the {OTHER[side].lower()} "
-                                    "side by hand.")
                     text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
                             f"Cancelled by the armed plan, nothing rests. {why}" if code == "held" else
                             f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
                             if code in ("traded", "busy", "watch", "orders_old", "not_clear") else
                             f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
                     self._put(ticker, state=NONE, order_id=None, text=text)
-                    return done(stage="recheck", code=code, error=log_text or text)
+                    # The row (the page) and the answer's `error` keep the words; the plan's log and its
+                    # leave line keep `log_fields` (architect, 2026-11-13 21:59 and 22:55 UTC).
+                    lf = (side_fields("other_side", f"cancelled the {old.lower()} entry; the {side.lower()} was "
+                                                    "not placed: the side rule said other_side")
+                          if code == "other_side" else side_fields("not_clear", text) if code == "not_clear" else None)
+                    return done(stage="recheck", code=code, error=text, log_fields=lf)
                 stamp("send_start")
                 self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
                           kind="break", range=dict(rng) if rng else rec.get("range"), sent_at=times["send_start"],
@@ -1402,8 +1411,23 @@ class PlanDesk:
                           text=f"The armed plan cancelled the {old.lower()} entry; sending the {side.lower()} break entry.")
             _log.warning("OPENING PLAN armed %s %s %s break: trigger %s limit %s stop %s, %s sh", what, side, ticker,
                          req["trigger"], req["limit"], req["stop"], shares)
+            # The same send_start and send_answer lines as place_auto: the executor's poller hold reads
+            # the plan's last send from send_start (Step 6, 8f6b68c), so a flip's send inside the hold
+            # moves its end, never past its latest end (architect, 2026-11-13 22:55 UTC).
+            if log is not None:
+                try:
+                    log("send_start", side=side.lower(), kind=kind, trigger=req["trigger"], limit=req["limit"],
+                        stop=req["stop"], shares=shares, plan_shares=int(o["shares"]), ticket_id=req["ticket_id"])
+                except Exception:
+                    _log.exception("could not log the armed plan's %s send", kind)
             r = self._send(ticker, side, req)
             stamp("answered")
+            if log is not None:
+                try:
+                    log("send_answer", kind=kind, ok=bool(r.get("ok")), status=r.get("status"),
+                        order_id=r.get("order_id"), ticket_id=req["ticket_id"])
+                except Exception:
+                    _log.exception("could not log the armed plan's %s answer", kind)
             not_sent = self.trader.store.get_ticket(req["ticket_id"]) is None
             if not_sent and str(r.get("error") or "").startswith("Another submission is in progress"):
                 # Trader's lock was taken between trader_busy() and the send: no request left and no

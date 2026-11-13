@@ -729,7 +729,9 @@ an Auto B/E that has not fired and a spread stop with Send still get their quote
 the plan's own end (`POLL_HOLD_LEAD_SECONDS`, `POLL_HOLD_AFTER_SEND_SECONDS`,
 `POLL_HOLD_LATEST_SECONDS`, `POLL_HOLD_SECONDS` and `POLL_HOLD_RENEW_SECONDS` in
 `companion/plan_auto/executor.py`; start numbers, not approved by Ash). One hold per arm: entries that
-only rest keep no hold, and later sends and the 09:35 cancels start none (one action is 5 to 10 calls,
+only rest keep no hold. A later send inside the hold, a Step 7 flip's or re-level's too, moves its end to
+60 seconds after that send, still never past 09:33:30 ET. Sends after the hold ended and the 09:35
+cancels start none (one action is 5 to 10 calls,
 and below 30 order calls a minute the poller keeps marks at 6 seconds by itself). On a disarm or at
 the plan's end it stops renewing, and the last hold lapses within 30 seconds. The hold is the poller's
 own memory, not a Schwab call. Before 09:30:30 ET, or without an Arm click, nothing is held.
@@ -807,11 +809,12 @@ stays" (or "re-level is not on") and the entry stays.
   side twice: before the cancel and again just before the send. Same side, or not in the name: it goes,
   beside your shares and orders, and never touches them. Other side, before the cancel: nothing is
   cancelled or written, the entry stays, the plan keeps its one try to cancel that order, and the panel
-  says once "other_side: you trade T on the long side by hand; the plan does not take the other side of
-  a name you trade, so the long entry stays". Other side after the cancel (you traded during it):
-  nothing is placed and the row says "Cancelled the long entry by the armed plan. Did not place the
-  short: You are long 100 T by hand. ..." The plan's log (`data/opening_plan/auto/`) carries the side
-  rule's code, the name and the side, never your share count; only the row shows the full text. Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
+  says once "the side rule said other_side: you are on the long side of T, and the plan does not take
+  the other side of a name you trade, so the long entry stays". Other side after the cancel (you traded
+  during it): nothing is placed and the row and the panel say "Cancelled the long entry by the armed
+  plan. Did not place the short: You are long 100 T by hand. ..." The plan's log
+  (`data/opening_plan/auto/`) keeps the side rule's code (`side_rule`), the name and the side, never
+  your share count or "by hand", as Step 6's armed send does; the page keeps the words. Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
   Schwab's positions old), before the cancel: the entry stays and the next reading decides again. For
   old positions no pick acts on that reading, as for an old order list; for a name that is not clear
   only that pick waits, so the other picks go on. Not clear after the cancel: the same wait as for an old
@@ -857,7 +860,11 @@ stays" (or "re-level is not on") and the entry stays.
   pick and its panel line says nothing rests. No answer to the new
   entry blocks the name, as for any unclear order, and disarms the plan. A 4xx is never retried.
 - The armed plan's log has one line per flip or re-level with its times: the reading, the decision,
-  the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer.
+  the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer. The send
+  writes the same `send_start` and `send_answer` lines as Step 6's sends, so a flip or re-level sent
+  inside the poller hold moves the hold's end to 60 seconds after it, never past 09:33:30 ET (Step 6's
+  hold above). A flip after the hold ended starts no hold of its own. Its `wait`, `wait_over`, `leave`
+  and `flip_auto` lines keep the side rule's code (`side_rule`) and the side, never your share count.
 - Not confirmed at Schwab: how fast a cancel of a resting stop-limit entry shows CANCELED. The cancel
   reads the order back up to ten times, 0.25 s apart. At 0.4 s a Schwab call, a flip takes about
   2.25 s from the start of the cancel to Schwab's answer to the new entry; a cancel that never confirms

@@ -677,16 +677,22 @@ OTHER_SIDE_TAIL = " The plan does not take the other side of a name you trade. N
 
 
 def other_side_line(theirs):
-    """The plan's line for the other side before the cancel. It is logged, so it carries plan_side's
-    code, the ticker and the side word, never Ash's share count (architect, 2026-11-13 21:59 UTC)."""
-    return (f"other_side: you trade AAAA on the {theirs} side by hand; the plan does not take the other side of a "
-            "name you trade, so the long entry stays")
+    """The plan's line for the other side before the cancel. It is logged (a note), so it carries
+    plan_side's code, the ticker and the side word, never Ash's share count (architect, 2026-11-13
+    21:59 and 22:55 UTC)."""
+    return (f"the side rule said other_side: you are on the {theirs} side of AAAA, and the plan does not take the "
+            "other side of a name you trade, so the long entry stays")
+
+
+# plan_side's words that name Ash's own trades. None may reach the plan's log; the page keeps them.
+OWN_WORDS = ("by hand", "100 AAAA", "working long order", "working short order", "both sides")
 
 
 def no_share_count(lines):
-    """No line of the plan's log carries Ash's share count (100 shares by hand in these tests)."""
+    """No line of the plan's log carries Ash's own trades (100 shares by hand in these tests)."""
     text = json.dumps(lines, default=str)
-    assert "100 AAAA" not in text and "by hand." not in text.replace("side by hand.", "")
+    for words in OWN_WORDS:
+        assert words not in text, words
 BOTH_SIDES = ("You are on both sides of AAAA (shares or working orders), so the plan cannot tell which side "
               "you trade. Nothing was sent.")
 
@@ -800,8 +806,10 @@ def test_before_the_cancel_a_side_not_clear_waits_for_this_pick_only(r, kind):
         assert run(r, kind, **args) is False             # not an action, and the step goes on
     nothing_at_schwab(r)
     assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.said == []
-    assert r.host.busied == [kind[len("would_"):]] * 3 and r.host.busy_why == [BOTH_SIDES] * 3
+    assert r.host.busied == [kind[len("would_"):]] * 3 and r.host.busy_why == [BOTH_SIDES] * 3   # the panel
     assert r.host.busy_ends == [False] * 3
+    new = "short" if kind == "would_flip" else "long"
+    assert r.host.busy_logged == [{"why": "the side rule said not_clear", "side_rule": "not_clear", "side": new}] * 3
     r.desk._save = real_save
     r.broker.orders[77]["status"] = "CANCELED"
     by_hand(r, {})
@@ -868,15 +876,15 @@ def test_after_the_cancel_your_other_side_places_nothing_and_leaves_the_pick(r, 
     want = f"Cancelled the long entry by the armed plan. Did not place the {new}: {what}{OTHER_SIDE_TAIL}"
     got = rec(r)
     assert (got["state"], got["order_id"], got["text"]) == (plan_entries.NONE, None, want)   # the page: in full
-    theirs = "long" if new == "short" else "short"
-    logged = (f"Cancelled the long entry by the armed plan. Did not place the {new}: other_side, you trade AAAA on "
-              f"the {theirs} side by hand.")
-    assert r.host.gone == [logged] and r.host.disarms == []
-    no_share_count([r.host.gone, r.host.logs])
+    assert r.host.gone == [want] and r.host.disarms == []           # the panel keeps the words too
+    logged = {"why": f"cancelled the long entry; the {new} was not placed: the side rule said other_side",
+              "side_rule": "other_side", "side": new}
+    assert r.host.gone_logged == [logged]                           # the log's leave line keeps these
+    no_share_count([r.host.gone_logged, r.host.logs])
     assert r.host.left == left                       # the send's reservation, if made, went back
     (line,) = [f for e, t, f in r.host.logs if e == f"{kind[len('would_'):]}_auto"]
     assert (line["stage"], line["code"], line["cancelled_order_id"]) == ("recheck", "other_side", oid)
-    assert line["error"] == logged and line["side"] == new.upper()
+    assert (line["error"], line["side_rule"], line["side"]) == (logged["why"], "other_side", new.upper())
 
 
 @pytest.mark.parametrize("when", ["cancel", "recheck"])
@@ -1143,7 +1151,9 @@ def test_a_busy_order_line_after_the_cancel_waits_then_places(r, monkeypatch):
     assert rec(r)["text"] == "Flipped by the armed plan (1 of 3)."
     line = flip_log(r)
     assert line["ok"] and {"busy_from", "busy_until"} <= set(line["times"])
-    assert [e for e, t, f in r.host.logs] == ["flip_auto"]      # one log line for the whole flip
+    # One flip_auto line for the whole flip, and the send's own send_start and send_answer, as
+    # place_auto's (the poller hold reads the last send from send_start; Step 6, 8f6b68c).
+    assert [e for e, t, f in r.host.logs] == ["send_start", "send_answer", "flip_auto"]
 
 
 def test_the_wait_after_the_cancel_stops_when_the_plan_is_disarmed(r, monkeypatch):
@@ -1838,9 +1848,11 @@ FLIP_ON = {**AUTO_ENV, FLIP_FLAG: "1"}
 def frig(rig):  # noqa: F811
     """Step 6's rig with this step's switch on: the same desk, broker, tape and clock."""
     orders = lambda: list(rig.broker.orders.values())
+    # The poller's hold as Step 6's rig records it (rig.holds): the flips' sends move its end (8f6b68c).
     plan = X.AutoPlan(rig.desk, rig.trader, PB_RAW, rig.tape, lambda rd, now: T.usable(rd, TAPE_RULES, now=now),
                       rig.view, orders, lambda: rig.knobs["fresh"], lambda: rig.knobs["cooldown"], env=FLIP_ON,
-                      now=rig.clock.now, out_dir=rig.tmp / "auto")
+                      now=rig.clock.now, out_dir=rig.tmp / "auto",
+                      hold_later=lambda sec, why: rig.holds.append((rig.clock.now(), sec, why)))
     plan._mono = rig.clock.mono
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     working = []
@@ -2526,8 +2538,9 @@ def test_executor_a_side_not_clear_on_one_name_lets_the_other_picks_go_on(frig):
     run_plan(frig, et(9, 31, 9))
     assert frig.broker.cancelled == [ids["BBBB"]] and len(frig.broker.placed) == 5 and max(frig.working) == 1
     assert frig.broker.placed[-1]["orderLegCollection"][0]["instrument"]["symbol"] == "BBBB"
-    waits = [(x["what"], x["why"]) for x in plan_lines(frig, "wait") if x["ticker"] == "AAAA"]
-    assert waits == [("flip", BOTH_SIDES)] and note(frig) == BOTH_SIDES        # said once
+    waits = [(x["what"], x["why"], x["side_rule"], x["side"]) for x in plan_lines(frig, "wait") if x["ticker"] == "AAAA"]
+    assert waits == [("flip", "the side rule said not_clear", "not_clear", "short")]   # logged once
+    assert note(frig) == BOTH_SIDES                                                     # the panel's words
     assert not [x for x in plan_lines(frig, "busy") if x["ticker"] == "AAAA"]
     assert frig.broker.orders[77]["status"] == "WORKING"
 
@@ -2558,6 +2571,110 @@ def test_executor_a_side_not_clear_after_the_cancel_until_the_watch_end_sends_no
                and x.get("stage") == "recheck"]
     assert line["code"] == "not_clear" and line["cancelled_order_id"] == ids["AAAA"]
     assert {"not_clear_from"} <= set(line["times"])
+    assert line["side_rule"] == "not_clear"
+    no_share_count(day_log(frig))
+
+
+def day_log(frig):
+    """The armed plan's own log of the day, as written to disk (<out_dir>/<ET date>.jsonl)."""
+    return "\n".join(p.read_text(encoding="utf-8") for p in sorted((frig.tmp / "auto").glob("*.jsonl")))
+
+
+def test_executor_the_days_log_never_names_your_own_trades(frig, monkeypatch):
+    # Architect, 2026-11-13 22:55 UTC: every line the flip writes (note, wait, wait_over, leave,
+    # flip_auto) keeps the side rule's code and the side, never Ash's shares or "by hand", as Step 6's
+    # armed send (8f6b68c). The panel keeps plan_side's words.
+    ids = aaaa_past_its_flip_line(frig)
+    by_hand(frig, {"AAAA": 100})                                          # the other side of the short
+    run_plan(frig, et(9, 31, 6))
+    by_hand(frig, {"AAAA": 100}, orders=[own_order(77, "SELL_SHORT")])    # both sides: not clear
+    run_plan(frig, et(9, 31, 9))
+    frig.broker.orders[77]["status"] = "CANCELED"
+    by_hand(frig, {})
+    real_cancel = frig.trader.cancel_entry
+
+    def cancel(oid):
+        got = real_cancel(oid)
+        by_hand(frig, {"AAAA": 100})                                      # long again during the cancel
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel)
+    run_plan(frig, et(9, 31, 12))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
+    text = day_log(frig)
+    mine = [x for x in map(json.loads, text.splitlines()) if x.get("ticker") == "AAAA"]
+    assert {"note", "wait", "wait_over", "flip_auto", "leave"} <= {x["event"] for x in mine}
+    for words in OWN_WORDS:
+        assert words not in text, words
+    rule = {x["event"]: x.get("side_rule") for x in mine if x["event"] in ("wait", "wait_over", "leave", "flip_auto")}
+    assert rule == {"wait": "not_clear", "wait_over": "not_clear", "leave": "other_side", "flip_auto": "other_side"}
+    assert note(frig) == ("Cancelled the long entry by the armed plan. Did not place the short: You are long 100 AAAA "
+                          "by hand." + OTHER_SIDE_TAIL)                                  # the panel: the words
+
+
+# ---------------------------------------------------------------- the poller's hold (Step 6, 8f6b68c)
+# One hold per arm, from 09:30:30 ET to 60 s after the plan's last send_start line, never past
+# 09:33:30 ET (reviews 6 and 7 of fork PR #27). A flip or re-level logs send_start like the armed
+# send, so it needs no hold of its own (architect, 2026-11-13 22:55 UTC).
+
+from test_plan_auto import held_through, send_times  # noqa: E402
+
+
+def flip_sends(r):
+    return [datetime.fromisoformat(x["t"]) for x in plan_lines(r, "send_start") if x.get("kind") == "flip"]
+
+
+def aaaa_trades_at(r, t, price):
+    """Quiet until `t`, then AAAA's last trade (and Step 2's row) at `price`, and 2 s on."""
+    run_plan(r, t)
+    r.tape.prices["AAAA"] = price
+    r.view.bars["AAAA"] = (42.48, 41.92, price)
+    run_plan(r, t + timedelta(seconds=2))
+
+
+def test_a_flips_send_inside_the_hold_moves_its_end_to_60_s_after_it(frig):
+    ids = all_four_rest(frig)
+    last_entry = max(send_times(frig))
+    aaaa_trades_at(frig, et(9, 31, 40), 42.14)                # past AAAA's flip line 42.144
+    (flip_at,) = flip_sends(frig)
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5
+    assert last_entry + timedelta(seconds=30) < flip_at < last_entry + timedelta(seconds=60)
+    run_plan(frig, et(9, 34, 0))
+    assert held_through(frig) == flip_at + timedelta(seconds=60)          # to the second
+    assert max(t for t, _, _ in frig.holds) < flip_at + timedelta(seconds=60)   # nothing renewed after it
+    assert len(plan_lines(frig, "poll_hold")) == 1
+    (end,) = plan_lines(frig, "poll_hold_end")
+    assert end["why"] == "60 s after the plan's last send"
+
+
+def test_flips_less_than_60_s_apart_never_keep_the_hold_past_0933_30(frig):
+    # Each flip would move the end 60 s on (09:32:51, 09:33:41, 09:34:26); the hold's latest end is
+    # 09:33:30 ET (act_from + POLL_HOLD_LATEST_SECONDS).
+    all_four_rest(frig)
+    aaaa_trades_at(frig, et(9, 31, 50), 42.14)                # long to short
+    aaaa_trades_at(frig, et(9, 32, 40), 42.26)                # short to long: past the short's flip line 42.256
+    aaaa_trades_at(frig, et(9, 33, 25), 42.14)                # long to short, the third flip
+    sends = flip_sends(frig)
+    assert len(sends) == 3 and et(9, 33, 25) <= sends[-1] < et(9, 33, 30)
+    assert frig.desk.records()["AAAA"]["flips"] == 3
+    run_plan(frig, et(9, 34, 30))
+    assert held_through(frig) == et(9, 33, 30)
+    assert max(t for t, _, _ in frig.holds) < et(9, 33, 30)
+    (end,) = plan_lines(frig, "poll_hold_end")
+    assert end["why"] == "the hold's latest end, 09:33:30 ET"
+    assert len(plan_lines(frig, "poll_hold")) == 1
+
+
+def test_a_flip_after_the_hold_ended_calls_no_hold(frig):
+    ids = all_four_rest(frig)
+    run_plan(frig, et(9, 32, 30))
+    (end,) = plan_lines(frig, "poll_hold_end")                # 60 s after the last entry's send
+    assert end["why"] == "60 s after the plan's last send"
+    n = len(frig.holds)
+    aaaa_trades_at(frig, et(9, 33, 0), 42.14)
+    assert len(flip_sends(frig)) == 1 and frig.broker.cancelled == [ids["AAAA"]]
+    run_plan(frig, et(9, 34, 0))
+    assert len(frig.holds) == n                                # one hold per arm: the flip calls none
+    assert len(plan_lines(frig, "poll_hold")) == 1 and len(plan_lines(frig, "poll_hold_end")) == 1
 
 
 def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):

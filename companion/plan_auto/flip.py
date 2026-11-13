@@ -51,6 +51,13 @@ name (lane.busy with end_step=False), of every pick when Schwab's positions are 
 them, as an old list); after the cancel a wait a tick at a time, as for an old list, until it is
 clear, the plan is disarmed or the fast watch ends.
 
+The plan's log (architect, 2026-11-13 21:59 and 22:55 UTC): the side rule's lines (wait, wait_over,
+leave, flip_auto) keep its code (`side_rule`), the ticker and the side, as Step 6's log_fields
+(8f6b68c), never plan_side's words, which can name your own shares; the panel and the row keep the
+words. The send writes Step 6's send_start and send_answer lines, so the executor's poller hold
+counts a flip's send: inside the hold it moves the end to 60 s after the send, never past its
+latest end (09:33:30 ET); after the hold ended a flip starts none.
+
 Schwab's order list old (architect's notes on the live test, 2026-11-13 20:12 UTC, N1): the
 poller holds itself to 70 calls a minute (poller.MAX_PER_MIN) and Trader's order calls count in the
 same window, so with the plan's calls the list was read only every 12 to 19 s live. Nothing is ever
@@ -466,14 +473,14 @@ def _swap(lane: Lane, kind: str) -> bool:
             # the pick's line says it once. The next reading decides again. The line is logged too, so it
             # carries plan_side's code, the ticker and the side word, never your share count (architect,
             # 21:59 UTC).
-            lane.say(f"{kind}_other_side", f"other_side: you trade {ticker} on the {OTHER[side]} side by hand; the "
-                                           "plan does not take the other side of a name you trade, so the "
-                                           f"{old_side} entry stays")
+            lane.say(f"{kind}_other_side", f"the side rule said other_side: you are on the {OTHER[side]} side of "
+                                           f"{ticker}, and the plan does not take the other side of a name you "
+                                           f"trade, so the {old_side} entry stays")
             return False
         if r.get("again") and r.get("this_name"):
             # Brief 25: your side on this name is not clear. A wait of this pick only, as Step 6's
             # on_place (2ca2073): the other picks go on this reading, since it may last.
-            lane.busy(kind, str(r.get("error") or ""), end_step=False)
+            lane.busy(kind, str(r.get("error") or ""), end_step=False, logged=r.get("log_fields"))
             return False
         if r.get("cancel_not_sent") and keys:
             lane.host.forget(keys[-1])            # Trader's lock was busy: nothing reached Schwab
@@ -498,7 +505,9 @@ def _swap(lane: Lane, kind: str) -> bool:
     if stage == "recheck":
         if r.get("code") == "traded" and kind == "flip":
             return _hand_to_chase(lane, side, r)
-        lane.leave(str(r.get("error") or f"the {what} placed nothing"))
+        # The panel keeps the desk's words; the log keeps `log_fields` when the side rule ended it (its
+        # words can name your own shares; architect, 2026-11-13 22:55 UTC).
+        lane.leave(str(r.get("error") or f"the {what} placed nothing"), logged=r.get("log_fields"))
         return True
     send = r.get("send") or {}
     if r.get("not_sent"):
