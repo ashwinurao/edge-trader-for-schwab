@@ -703,8 +703,11 @@ click, a pick that has already traded at or past its level when the plan would p
 instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_entry.py`):
 - The order is the ticket's own limit entry with its stop attached, not a new order shape: BUY (SELL
   SHORT) LIMIT at the level plus (minus) the cap, the stop at the other side of the 09:30 range,
-  1 share (`BREAK_MAX_SHARES`). The cap is 0.15 x the risk per share, at least 2 cents, at most
-  0.15% of the price, rounded down to the cent (`companion/opening_plan/playbook.json` "automatic";
+  1 share (`BREAK_MAX_SHARES`) at any size stage: Step 9's `size.stage` sizes the clicks' entries
+  only, the armed plan arms only at `"1_share"`, and `companion/chase_entry.py` refuses more than
+  `BREAK_MAX_SHARES` even inside a plan entry's size cap. The cap is 0.15 x the risk per share, at
+  least 2 cents, at most 0.15% of the price, rounded down to the cent
+  (`companion/opening_plan/playbook.json` "automatic";
   `companion/chase_entry.py` refuses any cap above that rule). Shares come from the trigger to the
   stop, so a fill at the cap loses up to the risk per share plus the cap: 1.15 x the Risk per pick,
   more when the 2 cent floor decides (1.2 x at 10 cents a share of risk). A break entry has the same worst
@@ -719,7 +722,8 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   old) still shows it; any other working order on the name still stops the chase. When that reading
   is not usable, nothing is sent and the row and the panel say nothing rests. No later reading
   decides for that pick, so when this chase does not go (an old quote, the price back inside the
-  level, another order action running), the pick is left with the reason and nothing rests.
+  level, another order action running, Flat all's hold), the pick is left with the reason and
+  nothing rests.
 - Just before the send the plan reads the tape again: the reading must be usable, still at or past
   the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
   entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
@@ -728,9 +732,12 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   least `armed.chase_retry_seconds` (1.0 s) after the last refused one (both start numbers in
   `companion/opening_plan/playbook.json`). Until then the plan reads no quote for that pick and
   spends nothing; the panel says so once.
-- While a click (or Flat all) holds Edge Trader's order lock, the chase writes nothing and uses
-  neither its one chase nor a quote try; the plan tries on its next reading, which must still be past
-  the level. The row check uses the plan's cached Step 2 view, never a new request to Edge Scanner,
+- While a click holds Edge Trader's order lock, the chase writes nothing and uses neither its one
+  chase nor a quote try; the plan tries on its next reading, which must still be past the level.
+  While Flat all runs, its hold refuses every new entry, the chase too, before any quote or record:
+  the pick is left with Flat all's reason, also after a flip's hand-over. Flat all turns its hold on
+  first and then disarms the plan (`companion/plan_flat.py`). A hold that cannot be read refuses the
+  same way. The row check uses the plan's cached Step 2 view, never a new request to Edge Scanner,
   and is skipped for a chase exactly as for a break entry while the panel says "Row check off".
 - Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
   a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name

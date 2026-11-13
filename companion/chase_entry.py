@@ -138,6 +138,8 @@ def _check_request(req: dict) -> tuple[str, Decimal, Decimal, Decimal, Decimal, 
                 f"at most {break_entry.CAP_MAX_PCT * 100}% of the price)")
     if lim != limit_for(side, trig, cap):
         return f"limit {fmt(lim)} is not the level {'plus' if long else 'minus'} the cap ({fmt(limit_for(side, trig, cap))})"
+    # BREAK_MAX_SHARES itself, never break_entry.max_shares(): Step 9's size stage (plan_cap) is for
+    # the clicks' entries, and the chase stays at 1 share at any stage (architect, 2026-11-13 17:42 UTC).
     if qty > break_entry.BREAK_MAX_SHARES:
         return (f"Chase entries are capped at {break_entry.BREAK_MAX_SHARES} share for now "
                 "(BREAK_MAX_SHARES in companion/break_entry.py)")

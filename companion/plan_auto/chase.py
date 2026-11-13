@@ -159,11 +159,12 @@ def on_chase(lane: Lane) -> bool:
     if r.get("not_sent"):
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))
-        if handed and (r.get("again") or r.get("busy")):
+        if handed:
             # After Step 7's flip no later reading decides for this pick: the row is NONE, auto_entry
-            # says "ended" and the engine's pick is DONE. A passing refusal (an old quote, the price
-            # back inside, an old order list) or a busy lock has no next try, so the pick is left with
-            # a true sentence (architect, 2026-11-13 17:23 UTC; tests in test_plan_auto_chase_executor).
+            # says "ended" and the engine's pick is DONE. Any refusal, a passing one (an old quote,
+            # the price back inside, an old order list), a busy lock or Flat all's hold, has no next
+            # try, so the pick is left with a true sentence (architect, 2026-11-13 17:23 and 17:42 UTC;
+            # tests in test_plan_auto_chase_executor).
             lane.leave(f"chase not sent: {str(r.get('error') or 'refused').rstrip('.')}; {HANDED_LEFT}")
             return True
         if r.get("busy"):

@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from companion import break_entry, plan_entries, trading
+from companion import break_entry, chase_entry, plan_entries, plan_flat, plan_size, trading
 from companion.opening_plan import engine
 from companion.opening_plan import plan as P
 from companion.plan_auto import CHASE_FLAG, chase, handlers
@@ -605,6 +605,90 @@ def test_losing_the_race_for_trader_lock_puts_the_row_back_and_uses_no_try(rig, 
     assert rig.host.busies == [("AAAA", "send")] and rig.quotes == [] and rig.desk.records() == {}
     assert rig.desk._chase_tries == {} and (rig.host.orders_pick, rig.host.calls) == (1, 40)
     assert rig.broker.placed == []
+
+
+# ---- Flat all's hold (Step 9, companion/plan_flat.py; architect, 2026-11-13 17:42 UTC) -----------
+# PlanFlat adds its hold to the desk (desk.add_hold) and turns it on for the length of its batch,
+# before it calls before_batch (Step 6's Disarm). These cases stand in that hold on the real desk.
+
+def test_flat_alls_hold_refuses_the_chase_before_the_quote_and_leaves_the_pick(rig):
+    rig.desk.add_hold(lambda: plan_flat.HOLD)
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    nothing_sent(rig)
+    assert rig.quotes == [] and rig.desk.records() == {} and rig.desk._chase_tries == {}
+    assert rig.host.left == {"AAAA": f"chase not sent: {plan_flat.HOLD}"} and rig.host.busies == []
+    assert (rig.host.orders_pick, rig.host.calls) == (1, 40)        # nothing reached Schwab: all refunded
+
+
+def test_the_hold_is_the_reason_while_its_batch_holds_traders_lock(rig):
+    """Flat all's closes go through Trader, which takes its send lock. The pick is told about the
+    hold, not asked to wait a tick for a click that is not there."""
+    rig.desk.add_hold(lambda: plan_flat.HOLD)
+    rig.trader._send_lock.acquire()
+    try:
+        assert rig.host.handle("would_place", tape(42.51)) is True
+    finally:
+        rig.trader._send_lock.release()
+    assert rig.host.busies == [] and rig.host.left == {"AAAA": f"chase not sent: {plan_flat.HOLD}"}
+    nothing_sent(rig)
+
+
+def test_a_hold_that_starts_after_the_first_look_still_refuses_under_the_desks_lock(rig, monkeypatch):
+    """chase_auto looks at the hold before Trader's lock, and _chase_refusal again under the desk's
+    lock: a batch that starts in between still stops the chase."""
+    started = []
+    rig.desk.add_hold(lambda: plan_flat.HOLD if started else "")
+    monkeypatch.setattr(rig.desk, "trader_busy", lambda: started.append(1) or False)   # the batch starts
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert started and rig.host.left == {"AAAA": f"chase not sent: {plan_flat.HOLD}"}
+    nothing_sent(rig)
+    assert rig.quotes == [] and rig.desk.records() == {}
+
+
+def test_a_hold_that_cannot_be_read_refuses_the_chase(rig):
+    def unreadable():
+        raise RuntimeError("flat state unreadable")
+    rig.desk.add_hold(unreadable)
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    nothing_sent(rig)
+    assert rig.host.left == {"AAAA": "chase not sent: Could not check whether new entries are held "
+                                     "(flat state unreadable). Nothing was sent."}
+
+
+def test_after_the_batch_the_chase_goes_again(rig):
+    running = [True]
+    rig.desk.add_hold(lambda: plan_flat.HOLD if running[0] else "")
+    assert rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"),
+                               quote_tries=3)["error"] == plan_flat.HOLD
+    running[0] = False
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
+
+
+# ---- 1 share at any size stage (architect, 2026-11-13 17:42 UTC) --------------------------------
+# Step 9's size stage is for the clicks' entries. The armed plan arms only at "1_share" (Step 6), and
+# the chase itself stays at break_entry.BREAK_MAX_SHARES whatever the stage.
+
+def test_the_chase_sends_1_share_at_a_higher_size_stage(rig):
+    rig.desk.stage = plan_size.parse_stage(0.25)
+    assert plan_size.shares(175, rig.desk.stage)[0] == 43             # what a click would send
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    (req,) = rig.sent
+    assert no_id(req) == CHASE_LONG and req["qty"] == 1
+    assert rec(rig)["sent"]["shares"] == 1
+    assert entry_order(rig)["orderLegCollection"][0]["quantity"] == 1
+
+
+def test_a_chase_of_2_shares_is_refused_inside_a_size_stages_cap(rig):
+    """break_entry.plan_cap lets a plan's break entry past BREAK_MAX_SHARES. chase_entry checks
+    BREAK_MAX_SHARES itself, so no cap set around a send lets a chase past 1 share."""
+    req = {**CHASE_LONG, "qty": 2, "expected_qty": 2, "ticket_id": "chase-2-shares"}
+    with break_entry.plan_cap(5):
+        assert break_entry.max_shares() == 5
+        r = rig.trader.submit(req)
+    assert r["ok"] is False and r["error"] == ("Chase entries are capped at 1 share for now "
+                                               "(BREAK_MAX_SHARES in companion/break_entry.py). Nothing was sent.")
+    assert rig.quotes == [] and rig.broker.placed == []
 
 
 # ---- after a flip (brief 17) -------------------------------------------------------------------

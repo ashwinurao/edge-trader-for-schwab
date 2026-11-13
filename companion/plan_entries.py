@@ -1238,10 +1238,15 @@ class PlanDesk:
                        cancelled_order_id: Any = None) -> str:
         """Why the plan can't chase this row now, or "" when it can. Like _auto_refusal, except that
         a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once.
+        A hold comes first (Flat all's batch, Step 9; a hold that cannot be read refuses), as in
+        _auto_refusal: the chase does not go through _send_refusal (architect, 2026-11-13 17:42 UTC).
         `cancelled_order_id`: the entry the plan's own flip cancelled, confirmed by Trader.cancel_entry
         (CANCELED, nothing filled). The poller's list, up to 5 s old, may still show it working; only
         that one id is not counted as a working order on the name (architect's review 1 of PR #25,
         2026-11-13 17:08 UTC). Any other working order still refuses."""
+        held = self.held()
+        if held:
+            return held
         if rec and rec.get("origin") != "auto":
             return CLICK_TAKES_ROW                   # a click takes the row for the day (brief 14)
         state = entry["state"]
@@ -1315,6 +1320,12 @@ class PlanDesk:
         # Checked before any record or log line, so a click holding the lock costs the row nothing:
         # no SENDING record, no chase and no quote try used. A hint only: Trader.submit still refuses
         # on a race (below).
+        # Flat all's hold before the lock: its batch may hold Trader's lock, and the reason is the
+        # hold, not a click to wait for (architect, 2026-11-13 17:42 UTC). Checked again under the
+        # desk's lock in _chase_refusal, for a batch that starts in between.
+        held = self.held()
+        if held:
+            return self._refuse(ticker, held, not_sent=True, held=True)
         if self.trader_busy():
             return self._refuse(ticker, TRADER_BUSY, not_sent=True, busy=True, again=True)
         orders = self._orders()

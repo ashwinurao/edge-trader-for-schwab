@@ -13,7 +13,7 @@ from datetime import timedelta
 
 import pytest
 
-from companion import plan_entries
+from companion import plan_entries, plan_flat
 from companion.plan_auto import CHASE_FLAG
 from companion.plan_auto import chase as C
 from companion.plan_auto import handlers as H
@@ -402,6 +402,10 @@ CHASE_SHORT = {"symbol": "AAAA", "side": "SHORT", "entry": "chase", "trigger": "
                "limit": "41.85", "stop": "42.48", "size_mode": "qty", "qty": 1, "risk": 0, "r": 0, "targets": 0,
                "stop_type": "fixed", "expected_limit": "41.85", "expected_qty": 1, "expected_target": 0}
 LEFT_TRADED = "cancelled by the armed plan; the short trigger has already traded, nothing rests"
+# After a flip no later reading decides for the pick: the row is NONE, auto_entry says "ended" and the
+# engine's pick is DONE. So a chase handed over by a flip and refused for any reason has no next try,
+# and leaves the pick with a true sentence (architect, 2026-11-13 17:23 and 17:42 UTC).
+LEFT_HANDED = "the plan's entry was cancelled and nothing rests"
 
 
 @pytest.fixture
@@ -482,7 +486,9 @@ def test_after_a_flip_another_working_order_on_the_name_still_refuses_the_chase(
     run(rig, et(9, 31, 6))
     assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
     assert not [r for r in rig.sent if r.get("entry") == "chase"] and not lines(rig, "chase_send_start")
-    assert "A working AAAA order is already at Schwab (order 999). One entry per name." in rig.plan.left["AAAA"]
+    # Any refusal of a handed-over chase leaves the pick with what is true at Schwab (17:42 UTC).
+    assert rig.plan.left["AAAA"] == ("chase not sent: A working AAAA order is already at Schwab (order 999). "
+                                     f"One entry per name; {LEFT_HANDED}")
     assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
 
 
@@ -518,32 +524,42 @@ def test_after_a_flip_with_the_chase_switch_off_step_7s_sentence_stays(frig):  #
     assert not lines(rig, "chase_decision")
 
 
-def test_no_balance_reaches_the_log_through_a_chase(fcrig):
-    """Step 6's rule since main 9f15270 (#30): the view carries buying power in dollars, and no armed
-    plan log line may hold one. The chase logs its decision, its send and Schwab's answer, after a
-    flip's hand-over too, from the tape reading and the request only."""
-    from test_plan_auto import BAL, P
+@pytest.mark.parametrize("path", ["on_place", "flip"])
+def test_no_balance_reaches_the_log_through_a_chase(fcrig, path):
+    """Step 6's rule since main 9f15270 (#30): the view carries buying power in dollars, and since
+    670191f (#31) each row carries an estimate and a buying power note derived from it (made-up
+    numbers here, test_plan_auto.EST and BP_NOTE). No armed plan log line may hold one. The chase logs
+    its decision, its send and Schwab's answer from the tape reading and the request only, for a pick
+    already past its trigger and after a flip's hand-over (architect, 2026-11-13 17:42 UTC)."""
+    from test_plan_auto import BAL, BP_NOTE, EST, EST_NUMBERS, P
     rig = fcrig
 
     def with_balances():
         v = rig.view()
         v["buying_power"] = P.buying_power({"balances": BAL, "ok_at": rig.clock.now()}, rig.clock.now())
+        v["estimate"] = P.estimate_header(P.load_playbook())
+        v["rows"] = [{**r, "estimate": copy.deepcopy(EST), "buying_power_note": dict(BP_NOTE)} for r in v["rows"]]
         return v
-    assert with_balances()["buying_power"]["equity"] == 81234.57
+    v = with_balances()
+    assert v["buying_power"]["equity"] == 81234.57                         # the view does carry them
+    assert all(r["estimate"]["bp_max"]["shares"] == 73191 and r["buying_power_note"]["long"] == 61247
+               for r in v["rows"]) and len(v["rows"]) == 4
     rig.plan._view = rig.plan._row_view = with_balances
-    short_trades_during_the_cancel(rig)
-    run(rig, et(9, 31, 6))
-    assert {"flip_auto", "chase_decision", "chase_send_start", "chase_send_answer"} <= {x["event"] for x in lines(rig)}
+    if path == "flip":
+        short_trades_during_the_cancel(rig)
+        run(rig, et(9, 31, 6))
+        assert "flip_auto" in {x["event"] for x in lines(rig)}
+    else:
+        arm(rig)
+        rig.tape.prices["AAAA"] = 42.51                     # past 42.49, inside the cap 42.55
+        run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert {"chase_decision", "chase_send_start", "chase_send_answer"} <= {x["event"] for x in lines(rig)}
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == \
+        [CHASE_SHORT if path == "flip" else CHASE_AAAA]
     text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
-    for n in BAL.values():
+    for n in tuple(BAL.values()) + EST_NUMBERS:
         for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
             assert form not in text
-
-
-# After a flip no later reading decides for the pick: the row is NONE, auto_entry says "ended" and the
-# engine's pick is DONE. So a chase handed over by a flip and refused for a passing reason has no next
-# try, and leaves the pick with a true sentence (architect, 2026-11-13 17:23 UTC).
-LEFT_HANDED = "the plan's entry was cancelled and nothing rests"
 
 
 def test_after_a_flip_a_stale_quote_leaves_the_pick_with_a_true_sentence(fcrig, monkeypatch):
@@ -590,6 +606,34 @@ def test_after_a_flip_a_busy_order_lock_leaves_the_pick_since_no_reading_comes_b
     assert not [r for r in rig.sent if r.get("entry") == "chase"] and ("quote", "AAAA") not in rig.broker.calls[calls:]
     left = rig.plan.left["AAAA"]
     assert left.startswith("chase not sent: Another order action is running") and left.endswith(LEFT_HANDED)
+    assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
+
+
+def test_after_a_flip_flat_alls_hold_leaves_the_pick_and_no_chase_goes(fcrig):
+    """Flat all turns its hold on, then disarms the plan (companion/plan_flat.py: the hold, then
+    before_batch). A batch that starts between the flip's look and the chase stops the handed-over
+    chase too, and the pick says what is true at Schwab (architect, 2026-11-13 17:42 UTC). A stand-in
+    hold on the real desk, as PlanFlat adds its own."""
+    rig = fcrig
+    ids = short_trades_during_the_cancel(rig)
+    calls = len(rig.broker.calls)
+    running, real_read, after = [], rig.tape.read, []
+    rig.desk.add_hold(lambda: plan_flat.HOLD if running else "")
+
+    def read():
+        if rig.broker.cancelled:
+            after.append(1)
+            if len(after) == 2:             # the hand-over's reread: Flat all's batch starts now
+                running.append(1)
+        return real_read()
+    rig.tape.read = read
+    run(rig, et(9, 31, 8))
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and ("quote", "AAAA") not in rig.broker.calls[calls:]
+    assert not lines(rig, "chase_send_start")
+    left = rig.plan.left["AAAA"]
+    assert left == f"chase not sent: {plan_flat.HOLD.rstrip('.')}; {LEFT_HANDED}"
+    assert {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}["AAAA"] == left
     assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
 
 
