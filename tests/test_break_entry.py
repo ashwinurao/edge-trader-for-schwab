@@ -327,7 +327,7 @@ def test_an_unknown_break_reconciles_only_to_its_own_level(trader):
 
 # ---- every existing entry type builds the same Schwab order as before this change ---------------
 
-GOLDEN = Path(__file__).parent / "data" / "bracket_orders_cb7026a.json"
+GOLDEN = Path(__file__).parent / "golden" / "bracket_orders_cb7026a.json"
 
 
 @pytest.mark.parametrize("case", json.loads(GOLDEN.read_text()), ids=lambda c: c["name"])
