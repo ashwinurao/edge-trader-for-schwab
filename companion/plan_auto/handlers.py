@@ -33,9 +33,12 @@ What a Lane gives a handler (names fixed with Step 7's thread, 2026-11-13):
 - once(key) -> True the first time this key is seen today (one automatic cancel per order id).
 
 The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces brief 16's counts):
-- A send counts its worst case, armed.calls_per_send = 4: the quote in break_entry.prepare, the
-  POST, and the two status reads after a 201 (fork PR #15). armed.calls_per_minute (start 40)
-  counts sends only and refuses sends only: spend(orders=1, calls=calls_per_send) before each.
+- A send counts its worst case, armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC). The
+  usual send is 4: the quote in break_entry.prepare, the POST, and the two status reads after a
+  201 (fork PR #15). It is 5 when an earlier close or partial on the name still has an open status:
+  Trader._blocked -> _unresolved_close reads that order once. armed.calls_per_minute (start 40)
+  counts sends only and refuses sends only: spend(orders=1, calls=calls_per_send) before each, so
+  at most 8 sends in any 60 s.
 - A cancel is never refused by the calls bound, whatever its reason. Its worst case is
   armed.calls_per_cancel = 12 (Trader.cancel_entry: one read, the cancel, up to ten read-backs),
   logged with it. Its bound is structural: one automatic cancel attempt per order id, never
@@ -43,6 +46,10 @@ The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces
 - Cancels and sends go one at a time, nearest to the trigger first, each after a Disarm check.
 - A flip (Step 7) is a cancel (never refused) then a send (checked). When the send half is
   refused, the pick ends with no order and says why.
+- The worst minute, not measured live: 7 sends (35) and 3 flip cancels (36) is 71 calls by the
+  plan; with the poller's 32-50 a minute that is 103-121 against Schwab's 120. The top passes 120,
+  and needs every cancel to use all ten read-backs and every send to find an unresolved close. A
+  429 disarms for the day. The real numbers come from the netlog on the first 1-share day.
 tests/test_plan_auto.py pins both worst cases against break_entry.prepare and Trader.cancel_entry.
 
 Step 6 registers would_place and would_cancel (default_registry). A decision kind with no handler

@@ -503,10 +503,16 @@ def test_a_bound_reached_disarms(rig, monkeypatch):
 
 def test_the_calls_bound_refuses_sends(rig):
     arm(rig)
-    rig.plan.armed_rules = A.ArmedRules(**{**rig.plan.armed_rules.__dict__, "calls_per_minute": 8})
+    rig.plan.armed_rules = A.ArmedRules(**{**rig.plan.armed_rules.__dict__, "calls_per_minute": 10})
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
-    assert placed(rig) == ["DDDD", "AAAA"]               # 4 calls each
-    assert "Schwab calls a minute by the plan (8) reached" in rig.plan.panel()["disarmed"]["why"]
+    assert placed(rig) == ["DDDD", "AAAA"]               # 5 calls each, counted at the worst case
+    assert "Schwab calls a minute by the plan (10) reached" in rig.plan.panel()["disarmed"]["why"]
+
+
+def test_the_start_bound_allows_8_sends_a_minute():
+    rules = A.armed_rules_from(PB_RAW)
+    assert (rules.calls_per_minute, rules.calls_per_send) == (40, 5)
+    assert rules.calls_per_minute // rules.calls_per_send == 8
 
 
 def test_step2_row_disagreeing_with_the_tape_turns_the_row_red(rig):
@@ -748,8 +754,8 @@ def test_the_log_has_no_bodies_or_account_numbers(rig):
 
 # ---------------------------------------------------------------- the calls the bound counts
 
-def test_a_send_is_4_schwab_calls_in_the_code(rig):
-    """armed.calls_per_send = 4: the quote in break_entry.prepare, the POST, and the two status
+def test_a_usual_send_is_4_schwab_calls_in_the_code(rig):
+    """The usual send is 4 calls: the quote in break_entry.prepare, the POST, and the two status
     reads after a 201 (fork PR #15). Fails if break_entry.prepare or Trader.submit changes its count."""
     rig.broker.calls.clear()
     spawned = []
@@ -759,7 +765,36 @@ def test_a_send_is_4_schwab_calls_in_the_code(rig):
     assert r["ok"], r
     assert [c[0] for c in rig.broker.calls] == ["quote", "place"]
     assert len(spawned) == 1 and len(rig.trader.status_reads_after_send) == 2
-    assert 2 + len(trading._reads_after_send({})) == rig.plan.armed_rules.calls_per_send == 4
+    assert 2 + len(trading._reads_after_send({})) == 4
+
+
+def test_a_send_is_at_most_5_schwab_calls_in_the_code(rig):
+    """armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC): when an earlier close on the name
+    still has an open status, Trader._blocked -> _unresolved_close reads that order once before the
+    POST. Fails if break_entry.prepare, Trader._blocked or Trader.submit changes its count."""
+    rig.broker.orders[777] = {"orderId": 777, "status": "FILLED"}       # Schwab now says the close is final
+    rig.trader.store.log_action("close", "AAAA", 777, "WORKING")        # our record still says open
+    rig.broker.calls.clear()
+    spawned = []
+    rig.trader._spawn = spawned.append
+    rig.clock.t = et(9, 31, 1)
+    r = rig.trader.submit(break_entry.build_request("AAAA", "LONG", "42.49", "41.92", 1))
+    assert r["ok"], r
+    assert [c[0] for c in rig.broker.calls] == ["quote", "read", "place"]
+    assert len(spawned) == 1 and len(rig.trader.status_reads_after_send) == 2
+    assert 3 + len(trading._reads_after_send({})) == rig.plan.armed_rules.calls_per_send == 5
+
+
+def test_an_open_close_still_open_at_schwab_refuses_the_send_after_2_calls(rig):
+    """The same read, when Schwab still shows the close working: the send is refused before the POST
+    (Trader._blocked), so it spends 2 calls, under the 5 counted."""
+    rig.broker.orders[778] = {"orderId": 778, "status": "WORKING"}
+    rig.trader.store.log_action("close", "AAAA", 778, "WORKING")
+    rig.broker.calls.clear()
+    rig.clock.t = et(9, 31, 1)
+    r = rig.trader.submit(break_entry.build_request("AAAA", "LONG", "42.49", "41.92", 1))
+    assert not r["ok"] and "open outcome" in r["error"], r
+    assert [c[0] for c in rig.broker.calls] == ["quote", "read"]
 
 
 def test_a_cancel_is_at_most_12_schwab_calls_in_the_code(rig):

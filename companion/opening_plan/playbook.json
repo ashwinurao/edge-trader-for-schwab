@@ -146,8 +146,8 @@
       "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC); with the poller's 32-50 a minute it stays under Schwab's 120"
     },
     "calls_per_send": {
-      "value": 4,
-      "note": "the code's worst case: the quote in break_entry.prepare, the POST, two status reads after a 201 (fork PR #15); tests/test_plan_auto.py pins it"
+      "value": 5,
+      "note": "the code's worst case (architect, 2026-11-13 16:02 UTC): 4 usual (the quote in break_entry.prepare, the POST, two status reads after a 201, fork PR #15), 5 when an earlier close or partial on the name still has an open status (Trader._blocked -> _unresolved_close reads that order once); tests/test_plan_auto.py pins both"
     },
     "calls_per_cancel": {
       "value": 12,
