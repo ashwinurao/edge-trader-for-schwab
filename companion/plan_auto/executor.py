@@ -43,7 +43,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import break_entry, plan_entries, plan_size
+from .. import break_entry, plan_entries, plan_flat, plan_size
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
@@ -67,6 +67,11 @@ FAR = Decimal(10 ** 9)
 # (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC).
 SLOW_STEP_MS = 100.0
 FLAT_ALL_CLICK = "the Flat all click"
+# Flat all is switched on but register found nothing to wire (architect's review 3 of fork PR #27,
+# 2026-11-13 18:01 UTC): a Flat all click would not disarm the plan, so the plan does not arm.
+FLAT_UNWIRED = (f"Flat all is on ({plan_flat.FLAT_FLAG}=1), but the armed plan found no Flat all to wire its "
+                "Disarm to, so a Flat all click would not disarm it. The plan does not arm. See Edge Trader's "
+                "log at start.")
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -171,6 +176,7 @@ class AutoPlan:
         self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
         self.row_check_why = ""                 # the same in words, for the panel
         self.problem = ""
+        self.flat_unwired = ""                 # FLAT_UNWIRED when register could not wire Flat all
         self._mono = _time.monotonic
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -625,7 +631,8 @@ class AutoPlan:
         except Exception:
             dashboard_arm, fresh = False, False
         try:
-            stage = getattr(self.desk, "stage", plan_size.ONE_SHARE)
+            # Strict: a desk without a readable stage refuses Arm (architect's review 3, 18:01 UTC).
+            stage = self.desk.stage
             size_stage = "" if stage == plan_size.ONE_SHARE else plan_size.label(stage)
         except Exception as e:
             size_stage = f"not readable ({type(e).__name__})"
@@ -634,7 +641,7 @@ class AutoPlan:
                      bounds_now=self.armed_rules.bounds(), dashboard_arm=dashboard_arm, risk=risk,
                      calm=calm if isinstance(calm, bool) else None, picks_today=picks_today, orders_fresh=fresh,
                      open_rows=open_rows, tape=tape, blocked_today=self.arming.blocked_today(now),
-                     size_stage=size_stage), view
+                     size_stage=size_stage, flat_unwired=self.flat_unwired), view
 
     def terms(self, view: Optional[Mapping] = None) -> dict:
         """What the Arm dialog lists: exactly what the plan will and will not do, and the bounds."""
@@ -856,7 +863,8 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
 
     # Step 9's Flat all (companion/plan_flat.py) calls before_batch first, before it builds its
     # list: the plan disarms, so no automatic send or cancel starts once Flat all is clicked, and
-    # Flat all's own list does the cancels (architect, 2026-11-13 17:42 UTC).
+    # Flat all's own list does the cancels (architect, 2026-11-13 17:42 UTC). plan_entries.register
+    # puts it on app.state before this runs (companion/app.py).
     flat = getattr(app.state, "opening_plan_flat", None)
     if flat is not None:
         before = getattr(flat, "before_batch", None)
@@ -866,6 +874,11 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
             if before is not None:
                 before()
         flat.before_batch = before_batch
+    elif plan_flat.enabled(env):
+        # Switched on, but not there to wire (registered in another order, renamed, or off by a bad
+        # setting): never a plan that a Flat all click might not stop. Arm is refused in words.
+        plan.flat_unwired = FLAT_UNWIRED
+        log.error("armed plan: %s", FLAT_UNWIRED)
     app.state.opening_plan_auto = plan
     if start and not demo:
         plan.start()

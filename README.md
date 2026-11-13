@@ -549,7 +549,9 @@ with every reason listed, when: it is not a market day or outside that window; A
 dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
 or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
 answer; the bounds or the playbook changed since the dialog showed them; the plan was disarmed for
-the day; or the size stage (`size.stage`, above) is not 1 share. The armed plan sends 1 share whatever
+the day; the size stage (`size.stage`, above) is not 1 share or cannot be read; or Flat all is on
+(`EDGE_TRADER_PLAN_FLAT=1`) but the armed plan found no Flat all to wire its Disarm to, so a Flat all
+click would not disarm it (Edge Trader's log says so at start). The armed plan sends 1 share whatever
 the stage: the stage is for your clicks only, so Arm is refused at any other stage ("The size stage is
 25%. The armed plan sends 1 share only, so it arms only at the 1-share stage").
 
