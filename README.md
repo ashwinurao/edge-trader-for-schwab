@@ -433,7 +433,9 @@ waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never 
 own switch is on, below), chases, exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it.
-A filled entry is yours to manage, as with a click.
+A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
+that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
+your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
 
 It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
 today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
