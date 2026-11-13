@@ -59,7 +59,8 @@ name are refused). It needs no account and sends no telemetry.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
 - **Edge Scanner, only if you set `EDGE_SCANNER_URL`** (off by default): the Opening plan screen reads
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
-  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open.
+  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
+  and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -70,7 +71,8 @@ name are refused). It needs no account and sends no telemetry.
   `kind: "probe"` lines to `data/netlog/`: Schwab's quote and trade times and their age when the answer
   arrived, bid, ask, last, the wire time, and for a preview only the status word, the texts of Schwab's
   rejects, warns, alerts, accepts and reviews (rule name and message), and on a refused preview the texts
-  of its message and errors (never the rest of the answer, which holds the account number). No retries: any 429, or the app's own 429 pause, stops it for the rest of the window. About 150
+  of its message and errors (never the rest of the answer, which holds the account number). No retries:
+  any 429, or the app's own 429 pause, stops it for the rest of the window. About 150
   Schwab requests per default window (144 quote calls and 6 previews in 12 minutes), on the same Schwab app
   limit as everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner once, a minute
   before each window (`companion/open_probe.py`).
@@ -251,6 +253,56 @@ e.g. `http://192.168.1.10:8772`, and rebuild. Use the address you open Edge Scan
 refuses a request whose host is not in its `SCANNER_ALLOWED_HOSTS` (`scanner/local_guard.py`), so a
 Docker service name does not work. Unset (the default), there is no Opening plan button, no route and
 no request to Edge Scanner.
+
+**Shadow log of the automatic plan (Step 5, sends nothing).** With the Opening plan on, set
+`EDGE_TRADER_SHADOW=1` in `.env` and rebuild. On weekdays from 09:29 to 09:36 ET a background thread
+reads the plan's Edge Scanner feed every half second and writes what an automatic OR1 plan WOULD do,
+one JSON line per decision, to `data/opening_plan/shadow/YYYY-MM-DD.jsonl`: the side nearer the last
+trade, a stop-limit entry one cent past the 09:30 minute's level with its limit capped, the stop at the
+other side and the shares; a fill (an estimate), a flip to the other side, a cancel, or no action and
+why (for example "price is 1.2 s old"). It has no button and no route, places, changes and cancels
+nothing, and imports no order code. Its numbers are in `companion/opening_plan/playbook.json` under
+`automatic`, each a start number not approved yet. Edge Scanner's picks route has no price after
+09:31, so the live log mostly shows the first decision and then old prices. For the full picture, replay
+Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
+
+    python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
+
+`--risk` is the risk per pick in dollars before the calm half. `--calm` is `yes` when SPY RV20 was at
+or below 10.5 that day (Edge Scanner's top-bar badge is red), `no` above it, or `unknown`, which
+places nothing. Without `--out` the lines go to the screen. A count by kind goes to the error stream,
+e.g. `would_place 4`.
+
+**Reading the replay output.** Each line is one decision about one pick, in time order:
+
+| Field | Meaning |
+| --- | --- |
+| `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
+| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_cancel` or `no_action`. |
+| `symbol`, `why` | The pick, and the reason in words. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
+| `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
+| `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
+| `fill` | On `would_fill`: the trade price seen inside the order's band. |
+| `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
+| `range` | The first minute's high and low, whether it was final, and what made it final (`trade at or after 09:31` or `09:30 bar`). |
+
+A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
+with no `would_place` line never got an order, and its last `no_action` says why.
+
+A worked example (made-up ticker and prices, from the test file in `tests/test_opening_plan_shadow.py`):
+
+    {"t": "2026-11-13T14:31:00.200000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 49.8 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 49.8, "price_age_s": 0.1, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "trade at or after 09:31"}}
+
+At 09:31:00.2 ET the first trade stamped 09:31 had arrived, so the first minute (high 50.00, low
+49.00) was final. The last trade, 49.80, was 0.1 s old: fresh enough to act on. It was 0.20 from the
+high and 0.80 from the low, so the plan goes long. The trigger is one cent above the high (50.01) and
+the stop is the low (49.00), so the risk per share is 1.01. The cap is 0.15 x 1.01 = 0.15, but at most
+0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is 50.08. $101 at risk on a day that is not
+calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40 before a fill (60% of the way to the low)
+would flip it to the short side. In the same file, the next line after it says `stale_price`
+("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
+`would_fill` at 50.04, a trade inside 50.01 to 50.08.
 
 ## Updating to a new release
 
