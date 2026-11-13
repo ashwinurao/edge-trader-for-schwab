@@ -9,12 +9,20 @@ dicts that say what an order WOULD be (tests/test_opening_plan_shadow.py checks 
 
 A reading is what was known at one moment (`received`, an aware time): the risk per pick, the calm
 flag, and per pick its rank, the last trade price and that trade's own time (`last`, `last_at`),
-the first minute's high and low so far and whether that range is final (`final`: the 09:30 bar).
+optionally `fresh_at` (the newer of the trade's and the quote's own times, from the open tape,
+companion/opening_plan/tape.py), the first minute's high and low and whether that range is final
+(`final`: the reading says it is the 09:30 bar), optionally `range_disputed` (the snapshot's
+versions of the 09:30 bar disagree and the bars request has not answered: no new order, and a
+working entry waits for the bars bar) and optionally `hold` (a reason no price-based action may
+use this reading, e.g. the tape is not usable).
 
 The logic (design: project memory ov-fast-open-design and ov-entries-failure-rules; every number
 in playbook.json "automatic", each a start number Ash has not approved):
-- The range is final by DATA time: the 09:30 bar, or a trade stamped at or after 09:31:00 ET.
-  It waits at most range_final_wait_seconds past 09:31:00, then leaves the pick alone today.
+- The range is final only when the reading says so (`final`: the 09:30 bar). Brief 15 dropped
+  "a trade stamped 09:31 or later makes it final": on 2026-11-13 it made yesterday's day bar
+  final. It waits at most range_final_wait_seconds past 09:31:00, then leaves the pick alone today.
+  A disputed range (`range_disputed`) is not final: no new order, the same deadline, and a working
+  entry neither fills nor flips until the bars request settles it (its time-based cancels run).
 - Side = the level nearer to the last trade. Entry = stop-limit: trigger one offset past the
   level, limit = trigger + cap, stop at the other side. cap = cap_r x risk per share, at most
   cap_max_pct_of_price % of the trigger, at least cap_min (the floor wins when they cross:
@@ -26,7 +34,9 @@ in playbook.json "automatic", each a start number Ash has not approved):
 - While unfilled and not yet triggered, a trade at or past the flip line (flip_line of the way
   from this side's level to the other) would flip to the other side; at most max_flips. Any
   (estimated) fill ends flips. The fast watch ends at watch_until_et: unfilled orders would cancel.
-- A price older than stale_after_seconds: no action on it, ever. Time-based cancels still happen.
+- A price older than stale_after_seconds: no action on it, ever. Its age is from `fresh_at` when
+  the reading has it (a thin name with a fresh quote is not stale), else from `last_at`. A pick
+  with `hold` is treated the same. Time-based cancels still happen.
 
 Fills are estimates: a snapshot shows the latest trade only, so a fill counts when a seen trade
 is inside the order's price band; trades between two readings are not seen.
@@ -63,6 +73,11 @@ EVEN = "even"
 NO_SHARES = "no_shares"
 AFTER_WATCH = "after_watch"
 FLIP_REFUSED = "flip_refused"
+RANGE_DISPUTED = "range_disputed"
+DISPUTED_WHY = ("the snapshot's 09:30 bar changed by more than a cent; no order until the bars "
+                "request's 09:30 bar settles it")
+DISPUTED_WORKING_WHY = ("the snapshot's 09:30 bar changed by more than a cent; the working entry "
+                        "waits for the bars request's 09:30 bar")
 
 
 @dataclass(frozen=True)
@@ -205,6 +220,14 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
     last, last_at = _dec(pick.get("last")), pick.get("last_at")
     age = (now - last_at).total_seconds() if isinstance(last_at, datetime) else None
     seen = {"price": _f(last), "price_age_s": None if age is None else round(age, 3)}
+    # Brief 15: with the open tape, freshness is the newer of the trade's and the quote's times.
+    fresh_at = pick.get("fresh_at")
+    by_quote = isinstance(fresh_at, datetime)
+    if by_quote:
+        age = (now - fresh_at).total_seconds()
+        seen["fresh_age_s"] = round(age, 3)
+    hold = pick.get("hold")
+    disputed = bool(pick.get("range_disputed"))
 
     if ps["state"] == WORKING:
         o = ps["order"]
@@ -220,8 +243,11 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
                 _act(st, out, sym, "would_cancel", f"no pullback to the limit {o['limit']} in "
                      f"{rules.pullback_wait_seconds:g} s", side=o["side"], **seen)
                 return
-        if last is None or age is None or age > rules.stale_after_seconds:
-            _say(st, out, sym, STALE, _stale_why(age), now, seen)
+        if disputed:
+            _say(st, out, sym, RANGE_DISPUTED, DISPUTED_WORKING_WHY, now, seen)
+            return
+        if hold or last is None or age is None or age > rules.stale_after_seconds:
+            _say(st, out, sym, STALE, hold or _stale_why(age, by_quote), now, seen)
             return
         _on_price(st, out, sym, ps, last, now, rules, seen)
         return
@@ -232,17 +258,26 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
         _say(st, out, sym, AFTER_WATCH, f"the fast watch ended at {rules.watch_until_et:%H:%M} ET "
              "before an entry; no order today", now, seen)
         return
+    bar_end = datetime.combine(day, rules.bar_start_et, tzinfo=ET) + timedelta(minutes=1)
+    if disputed:
+        # A disputed range is not final, so the same deadline applies (review 1 of brief 15).
+        if (now - bar_end).total_seconds() >= rules.range_final_wait_seconds:
+            ps["state"] = DONE
+            _say(st, out, sym, RANGE_NOT_FINAL, f"range not final {rules.range_final_wait_seconds:g} s "
+                 "after 09:31:00 ET (the snapshot's 09:30 bar versions disagree and no bars-request "
+                 "bar settled them); no order today", now, seen)
+        else:
+            _say(st, out, sym, RANGE_DISPUTED, DISPUTED_WHY, now, seen)
+        return
     high, low = _dec(pick.get("high")), _dec(pick.get("low"))
     if high is None or low is None:
         _say(st, out, sym, NO_RANGE, "no first-minute range yet", now, seen)
         return
-    bar_end = datetime.combine(day, rules.bar_start_et, tzinfo=ET) + timedelta(minutes=1)
-    final = bool(pick.get("final")) or (isinstance(last_at, datetime) and last_at >= bar_end)
-    if not final:
+    if not pick.get("final"):
         if (now - bar_end).total_seconds() >= rules.range_final_wait_seconds:
             ps["state"] = DONE
             _say(st, out, sym, RANGE_NOT_FINAL, f"range not final {rules.range_final_wait_seconds:g} s "
-                 "after 09:31:00 ET (no trade stamped 09:31 or later, no 09:30 bar); no order today", now, seen)
+                 "after 09:31:00 ET (no 09:30 bar); no order today", now, seen)
         else:
             _say(st, out, sym, WAITING_RANGE, "the first minute is not final yet", now, seen)
         return
@@ -259,8 +294,8 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
     if risk is None or risk <= 0:
         _say(st, out, sym, NO_RISK, "no risk per pick is set", now, seen)
         return
-    if last is None or age is None or age > rules.stale_after_seconds:
-        _say(st, out, sym, STALE, _stale_why(age), now, seen)
+    if hold or last is None or age is None or age > rules.stale_after_seconds:
+        _say(st, out, sym, STALE, hold or _stale_why(age, by_quote), now, seen)
         return
     up, down = high - last, last - low
     if up == down:
@@ -282,8 +317,10 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
     _on_price(st, out, sym, ps, last, now, rules, seen)
 
 
-def _stale_why(age: Optional[float]) -> str:
-    return "no last trade time" if age is None else f"price is {age:.1f} s old"
+def _stale_why(age: Optional[float], by_quote: bool = False) -> str:
+    if age is None:
+        return "no last trade time"
+    return f"newest trade or quote is {age:.1f} s old" if by_quote else f"price is {age:.1f} s old"
 
 
 def _on_price(st: dict, out: list, sym: str, ps: dict, last: Decimal, now: datetime, rules: Rules,

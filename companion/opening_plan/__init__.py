@@ -14,4 +14,6 @@ Where the numbers in playbook.json come from:
 - 60 s clock spacing: RV20 changes once a day (Edge Scanner's 03:30 ET refresh).
 - 1.5 s time limit, 6 s stale, 300 s old clock, RV20 through at most 4 days back: this PR's
   start values (a weekend plus a Monday holiday is 4 days).
+- tape: 0.25 s read pace, 0.5 s time limit, 1.0 s stale, 1.5 s feed late: brief 15's start numbers,
+  from the first measured open (2026-11-13); each says why in playbook.json (tape.py reads them).
 """
