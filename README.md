@@ -908,8 +908,11 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   T by hand. The plan does not take the other side of a name you trade. Nothing was sent."). Not
   clear (both sides, an order that is not a plain buy or sell, shares the plan cannot tell from its
   own): the pick waits, said once on its line, with no Schwab call and no quote try, while the other
-  picks go on; it chases on a later reading once it is clear, until the watch ends. Old account
-  positions wait like an old order list.
+  picks go on; it chases on a later reading once it is clear, until the watch ends. A side rule
+  that cannot be read is not clear: when unsure, the plan sends nothing and waits. Old account
+  positions wait like an old order list. The plan's log keeps the side rule's code (`side_rule`) and
+  the side in the chase's `wait`, `wait_over` and `leave` lines, never your share count or the words
+  on the page, as Step 6's armed send does.
 - An armed entry that Schwab accepts (201) and then rejects with "The stop price must be above the
   current ask for buy stop orders and below the bid for sell stop orders." had its level passed
   between the plan's quote and Schwab's check (seen live on 2026-11-13, 4 s after the 201). Ash's
@@ -946,7 +949,10 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   blocked until you press Resolve.
 - The row says "Chased by the armed plan: limit X, cap Y." and, while it rests, until when it waits.
   The plan's log (`data/opening_plan/auto/`) has the level, the cap, the last trade and its age, the
-  limit sent and the times (reading, decision, send, answer).
+  limit sent and the times (reading, decision, send, answer). The send writes Step 6's `send_start`
+  and `send_answer` lines with `kind` "chase", so a chase sent inside the poller hold moves the hold's
+  end to 60 seconds after it, never past 09:33:30 ET (Step 6's hold above). A chase after the hold
+  ended starts no hold of its own.
 - The Arm dialog lists the chase under "It will" only while its switch is on, and then no longer says
   that a pick past its trigger is left to you.
 - A click takes the row for the day. A click Flip on a resting chase cancels the chase, waits for

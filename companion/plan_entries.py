@@ -1471,52 +1471,53 @@ class PlanDesk:
 
     def _chase_refusal(self, ticker: str, side: str, rec: Mapping, entry: Mapping, orders: list[dict],
                        blocked: Optional[set], fresh: bool, quote_tries: int,
-                       cancelled_order_id: Any = None) -> tuple[str, str]:
-        """Why the plan can't chase this row now, as _auto_refusal's (why, wait): ("", "") when it
-        can; `wait` "" for a refusal (the plan leaves the pick), WAIT_ALL when no pick may go on this
-        reading (an old order list or account read) and WAIT_NAME when only this name waits (the
-        user's side on it is not clear). Like _auto_refusal, except that a row whose plan entry
-        ended unfilled (a flip cancelled it, brief 17) may be chased, once.
+                       cancelled_order_id: Any = None) -> tuple[str, str, str]:
+        """Why the plan can't chase this row now, as _auto_refusal's (why, wait, side): ("", "", "")
+        when it can; `wait` "" for a refusal (the plan leaves the pick), WAIT_ALL when no pick may go
+        on this reading (an old order list or account read) and WAIT_NAME when only this name waits
+        (the user's side on it is not clear); `side` is plan_side's code when the side rule answered,
+        else "" (Step 6 d77a859: the log keeps the code, never the words). Like _auto_refusal, except
+        that a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once.
         A hold comes first (Flat all's batch, Step 9; a hold that cannot be read refuses), as in
         _auto_refusal: the chase does not go through _send_refusal (architect, 2026-11-13 17:42 UTC).
         The user's own trades on the name: brief 25's rule B (_chase_beside), in place of "one entry
         per name" (architect, 2026-11-13 21:31 UTC, N3 of review 3 of PR #25)."""
         held = self.held()
         if held:
-            return held, ""
+            return held, "", ""
         if rec and rec.get("origin") != "auto":
-            return CLICK_TAKES_ROW, ""               # a click takes the row for the day (brief 14)
+            return CLICK_TAKES_ROW, "", ""           # a click takes the row for the day (brief 14)
         state = entry["state"]
         if state in BUSY:
-            return f"{ticker}: an action on this row is still running.", ""
+            return f"{ticker}: an action on this row is still running.", "", ""
         if state == RED:
-            return rec.get("red_why") or f"{ticker} is stopped for today.", ""
+            return rec.get("red_why") or f"{ticker} is stopped for today.", "", ""
         if state == UNKNOWN:
-            return f"{ticker}: the last entry's outcome is not confirmed. Check thinkorswim, then press Resolve.", ""
+            return f"{ticker}: the last entry's outcome is not confirmed. Check thinkorswim, then press Resolve.", "", ""
         if state == SENT and not entry["done"]:
-            return f"{ticker} already has an entry today (resting or filled).", ""
+            return f"{ticker} already has an entry today (resting or filled).", "", ""
         if int(rec.get("chases") or 0) >= CHASES_PER_ROW:
-            return f"{ticker} was already chased today (one chase per pick per day).", ""
+            return f"{ticker} was already chased today (one chase per pick per day).", "", ""
         if self._chase_tries.get(self._key() + ticker, 0) >= quote_tries:
             return (f"{ticker}: the chase was refused at the send {quote_tries} times today "
-                    "(armed.chase_quote_tries in playbook.json). The armed plan leaves it."), ""
+                    "(armed.chase_quote_tries in playbook.json). The armed plan leaves it."), "", ""
         if not self._armed():
-            return "ARM is off on the dashboard.", ""
+            return "ARM is off on the dashboard.", "", ""
         if not self._market_open():
-            return "The market is closed.", ""
+            return "The market is closed.", "", ""
         if not fresh:
-            return ORDERS_OLD, WAIT_ALL
+            return ORDERS_OLD, WAIT_ALL, ""
         if blocked is None:
             return ("An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the "
-                    "dashboard."), ""
+                    "dashboard."), "", ""
         if ticker in blocked:
-            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve.", ""
+            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve.", "", ""
         code, text = self._chase_beside(ticker, side, rec, orders, fresh, cancelled_order_id)
         if code == plan_side.OK:
-            return "", ""
+            return "", "", ""
         if code == plan_side.OTHER_SIDE:
-            return text, ""
-        return text, WAIT_ALL if text in (plan_side.ORDERS_OLD, plan_side.POSITIONS_OLD) else WAIT_NAME
+            return text, "", code
+        return text, WAIT_ALL if text in (plan_side.ORDERS_OLD, plan_side.POSITIONS_OLD) else WAIT_NAME, code
 
     def _chase_beside(self, ticker: str, side: str, rec: Mapping, orders: list[dict], fresh: bool,
                       cancelled_order_id: Any = None) -> tuple[str, str]:
@@ -1538,14 +1539,18 @@ class PlanDesk:
         except Exception as e:
             return plan_side.NOT_CLEAR, f"Could not read your {ticker} position and orders ({e}). Nothing was sent."[:300]
 
-    def chase_wait(self, ticker: str, side: str, cancelled_order_id: Any, why: str) -> None:
+    def chase_wait(self, ticker: str, side: str, cancelled_order_id: Any, why: str,
+                   log_fields: Optional[Mapping] = None) -> None:
         """A chase Step 7's flip handed over could not go on its reading for a passing reason: it
         waits, and the plan offers the pick to the chase again on each later reading until the watch
-        ends (companion/plan_auto/chase.py offers; architect's live test notes, N1 and N4)."""
+        ends (companion/plan_auto/chase.py offers; architect's live test notes, N1 and N4). `why` is
+        the page's words; `log_fields`, when given, is what the plan's log keeps in their place (the
+        side rule's code and side, Step 6 d77a859)."""
         ticker = str(ticker or "").upper().strip()
         with self._lock:
             self._chase_waits[self._key() + ticker] = {"side": str(side or "").lower(),
-                                                      "cancelled_order_id": cancelled_order_id, "why": str(why)}
+                                                      "cancelled_order_id": cancelled_order_id, "why": str(why),
+                                                      "log_fields": dict(log_fields) if log_fields else None}
 
     def chase_waits(self) -> dict:
         """Today's waiting chases, by ticker (a copy)."""
@@ -1597,7 +1602,8 @@ class PlanDesk:
         it. `quoted` says Schwab's quote was read (one call). `cancelled_order_id`: after Step 7's
         flip, the entry its confirmed cancel ended (see _chase_beside). `this_name` with `again`:
         only this name waits, since the user's side on it is not clear (brief 25, N3), as
-        place_auto's answer (Step 6)."""
+        place_auto's answer (Step 6). `side_rule` and `log_fields` on a side-rule refusal, as
+        place_auto's (Step 6 d77a859): the log keeps `log_fields`, never `error`'s words."""
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
         log = log or (lambda event, **kw: None)
         if self.demo:
@@ -1631,12 +1637,18 @@ class PlanDesk:
             prior = json.loads(json.dumps(recs[ticker])) if ticker in recs else None
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why, wait = self._chase_refusal(ticker, side, rec, entry, orders, blocked, fresh, int(quote_tries),
-                                            cancelled_order_id=cancelled_order_id)
+            why, wait, side_rule = self._chase_refusal(ticker, side, rec, entry, orders, blocked, fresh,
+                                                       int(quote_tries), cancelled_order_id=cancelled_order_id)
             if why:
                 # A wait (an old order list or account read; the user's side on this name not clear,
                 # `this_name`, N3) costs no Schwab call and no try, as place_auto's (Step 6).
-                return self._refuse(ticker, why, not_sent=True, again=bool(wait), this_name=wait == WAIT_NAME)
+                # `log_fields` as place_auto's (Step 6 d77a859; architect's review 4 of PR #25,
+                # 2026-11-13 22:20 UTC): plan_side's words can name the shares the user holds by hand,
+                # so the plan's log gets the side rule's code and the side. The page keeps the words.
+                logged = None if not side_rule or why in (ORDERS_OLD, plan_side.POSITIONS_OLD) else \
+                    {"why": f"the side rule said {side_rule}", "side_rule": side_rule, "side": side.lower()}
+                return self._refuse(ticker, why, not_sent=True, again=bool(wait), this_name=wait == WAIT_NAME,
+                                    side_rule=side_rule, log_fields=logged)
             shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
             if shares < 1:
                 return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
@@ -1661,14 +1673,18 @@ class PlanDesk:
                       sent={"ticket_id": req["ticket_id"], "trigger": req["trigger"], "limit": req["limit"],
                             "stop": req["stop"], "shares": shares, "cap": req["cap"]},
                       text=f"Sending the {side.lower()} chase: limit {req['limit']}, cap {req['cap']} (armed plan).")
-        log("chase_send_start", side=side.lower(), trigger=req["trigger"], cap=req["cap"], limit=req["limit"],
+        # Step 6's send_start and send_answer lines with kind "chase", as Step 7's flip (715f048): the
+        # executor's poller hold reads the plan's last send from send_start (Step 6, 8f6b68c), so a
+        # chase inside the hold moves its end to 60 s after the send, never past its latest end
+        # (architect, 2026-11-13 23:30 UTC).
+        log("send_start", kind="chase", side=side.lower(), trigger=req["trigger"], cap=req["cap"], limit=req["limit"],
             stop=req["stop"], shares=shares, plan_shares=int(o["shares"]), ticket_id=req["ticket_id"],
             send_at=sent_at)
         logging.getLogger("companion.plan_auto").warning(
             "ARMED PLAN %s %s chase: trigger %s cap %s limit %s stop %s, %s sh", side, ticker, req["trigger"],
             req["cap"], req["limit"], req["stop"], shares)
         r = self._send(ticker, side, req)
-        log("chase_send_answer", ok=bool(r.get("ok")), status=r.get("status"), order_id=r.get("order_id"),
+        log("send_answer", kind="chase", ok=bool(r.get("ok")), status=r.get("status"), order_id=r.get("order_id"),
             ticket_id=req["ticket_id"], error=str(r.get("error") or "")[:300] or None,
             answer_at=self._now().isoformat(timespec="milliseconds"))
         if self.trader.store.get_ticket(req["ticket_id"]) is None:

@@ -51,6 +51,13 @@ view is the feed's last answer. So a step costs 0 calls when it waits on an old 
 1 when Schwab's quote refuses it, 4 (5 at worst) when it sends; its pullback cancel is Step 6's
 on_cancel, 12 at worst. Those calls count in the poller's own 70 a minute (companion/poller.py
 _throttle; architect's live test notes N1).
+
+The log (architect, 2026-11-13 22:20 and 23:30 UTC): the send writes Step 6's send_start and
+send_answer lines with kind "chase", so the executor's hold of the poller's later reads runs to 60 s
+after a chase sent inside it, never past its latest end (Step 6, 8f6b68c). The wait, wait_over and
+leave lines of a side-rule refusal keep its code and the side (PlanDesk.chase_auto's log_fields,
+left_fields), never plan_side's words, which can name the shares Ash holds by hand; the page keeps the
+words. A side rule that cannot be read is not clear: nothing is sent and the pick waits.
 """
 from __future__ import annotations
 
@@ -240,6 +247,10 @@ def on_chase(lane: Lane) -> bool:
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))
         why = str(r.get("error") or "refused").rstrip(".")
+        # The page keeps the desk's words; the plan's log keeps `log_fields` when the desk gives them
+        # (the side rule's code and side: its words can name the shares Ash holds by hand; Step 6
+        # d77a859, architect's review 4 of PR #25, 2026-11-13 22:20 UTC).
+        logged = r.get("log_fields")
         if r.get("busy"):
             # Trader's lock is held (a click, or "Another submission is in progress."): not an action.
             # The step ends, no other pick tries on this reading, the worker waits a tick and the next
@@ -256,11 +267,11 @@ def on_chase(lane: Lane) -> bool:
             # the other picks go on this reading (Step 6's Lane.busy(..., end_step=False)). Said once
             # on the pick's line. A pick Step 7 handed over waits through chase_wait and offers.
             if handed:
-                lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
+                lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why, log_fields=logged)
             if not first:
                 # Not at Step 7's own call: its flip acted on this reading, which ends the pick's wait
                 # in the executor (_busy_over), so the wait is said from the next reading's offer, once.
-                lane.busy("chase", str(r.get("error") or why), end_step=False)
+                lane.busy("chase", str(r.get("error") or why), end_step=False, logged=logged)
             return first
         if r.get("again") and not r.get("quoted"):
             # Schwab's order list (ORDERS_OLD) or account positions (plan_side.POSITIONS_OLD, brief 25)
@@ -281,11 +292,11 @@ def on_chase(lane: Lane) -> bool:
         if handed:
             # Not a passing reason: nothing rests, since the flip's cancel was confirmed
             # (architect, 2026-11-13 17:23 and 17:42 UTC).
-            lane.leave(f"chase not sent: {why}; {HANDED_LEFT}")
+            lane.leave(f"chase not sent: {why}; {HANDED_LEFT}", logged=left_fields(logged, f"; {HANDED_LEFT}"))
         elif rejected:
-            lane.leave(f"chase not sent: {why}; {REJECTED_LEFT}")
+            lane.leave(f"chase not sent: {why}; {REJECTED_LEFT}", logged=left_fields(logged, f"; {REJECTED_LEFT}"))
         else:
-            lane.leave(f"chase not sent: {r.get('error')}")
+            lane.leave(f"chase not sent: {r.get('error')}", logged=left_fields(logged))
         return True
     lane.desk.drop_chase_wait(ticker)
     outcome(lane, r, "chase")
@@ -293,6 +304,16 @@ def on_chase(lane: Lane) -> bool:
         lane.say("chased", f"chased: limit {o['limit']}, cap {o['cap']}" +
                  ("" if inside else f"; past the cap, it rests and waits {wait_s:g} s for a pullback"))
     return True
+
+
+def left_fields(logged: Optional[Mapping], tail: str = "") -> Optional[dict]:
+    """The leave line's log fields for a side-rule refusal: the same sentence shape as the page's
+    ("chase not sent: <why><tail>"), with the side rule's code in place of its words (Step 6
+    d77a859). None when the desk gave no `log_fields`: the log then keeps the words, which name no
+    share count."""
+    if not logged:
+        return None
+    return {**logged, "why": f"chase not sent: {str(logged.get('why') or '').rstrip('.')}{tail}"}
 
 
 def rejected_through(o: Mapping) -> bool:
@@ -372,7 +393,8 @@ def offers(host: Any, picks: Mapping, left: Mapping, watch_over: bool) -> list:
             continue
         if watch_over:
             desk.drop_chase_wait(sym)
-            host.leave(sym, f"chase not sent: {str(w.get('why') or 'no chase').rstrip('.')}; {HANDED_LEFT}")
+            host.leave(sym, f"chase not sent: {str(w.get('why') or 'no chase').rstrip('.')}; {HANDED_LEFT}",
+                       logged=left_fields(w.get("log_fields"), f"; {HANDED_LEFT}"))
             continue
         d = _offer(host, picks.get(sym), sym, w.get("side") or "", cancelled_order_id=w.get("cancelled_order_id"),
                    why="the chase after the flip waits for this reading")

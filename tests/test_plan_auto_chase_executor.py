@@ -19,8 +19,8 @@ from companion.plan_auto import CHASE_FLAG
 from companion.plan_auto import executor as X
 from companion.plan_auto import chase as C
 from companion.plan_auto import handlers as H
-from test_plan_auto import (ENV, NEAREST_FIRST, PB_RAW, PICKS, TAPE_RULES, _hold_lock, _spy, arm, et,  # noqa: F401
-                            lines, placed, rig, run, want_req, without_id)                 # (rig: Step 6's fixture)
+from test_plan_auto import (ENV, NEAREST_FIRST, PB_RAW, PICKS, TAPE_RULES, _hold_lock, _spy, arm, by_hand,  # noqa: F401
+                            et, held_through, lines, placed, rig, run, send_times, touched, want_req, without_id)                 # (rig: Step 6's fixture)
 from test_trading import Resp
 
 CHASE_ENV = {**ENV, CHASE_FLAG: "1"}
@@ -35,7 +35,8 @@ def started_with(rig, env, playbook=PB_RAW):
     orders = lambda: list(rig.broker.orders.values())
     plan = X.AutoPlan(rig.desk, rig.trader, playbook, rig.tape, lambda rd, now: T.usable(rd, TAPE_RULES, now=now),
                       rig.view, orders, lambda: rig.knobs["fresh"], lambda: rig.knobs["cooldown"], env=dict(env),
-                      now=rig.clock.now, out_dir=rig.tmp / "auto")
+                      now=rig.clock.now, out_dir=rig.tmp / "auto",
+                      hold_later=lambda sec, why: rig.holds.append((rig.clock.now(), sec, why)))
     plan._mono = rig.clock.mono
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     rig.plan = plan
@@ -49,6 +50,11 @@ def crig(rig, monkeypatch):
     for k, v in CHASE_ENV.items():
         monkeypatch.setenv(k, v)
     return started_with(rig, CHASE_ENV)
+
+
+def chase_lines(rig, event):
+    """The chase's own send_start and send_answer lines: Step 6's lines with kind "chase"."""
+    return [x for x in lines(rig, event) if x.get("kind") == "chase"]
 
 
 def order_of(rig, sym):
@@ -136,7 +142,7 @@ def test_a_pick_already_past_its_trigger_is_chased_by_the_worker(crig):
     (d,) = lines(rig, "chase_decision")
     assert (d["ticker"], d["trigger"], d["cap"], d["limit"], d["stop"], d["last"], d["inside_cap"]) == \
         ("AAAA", "42.49", "0.06", "42.55", "41.92", "42.51", True)
-    assert [x["ticker"] for x in lines(rig, "chase_send_start")] == ["AAAA"]
+    assert [x["ticker"] for x in chase_lines(rig, "send_start")] == ["AAAA"]
     assert rig.plan.orders_day == 4
     run(rig, et(9, 31, 30))                                 # later readings send nothing new
     assert len(rig.broker.placed) == 4 and len(order_of(rig, "AAAA")) == 1
@@ -173,7 +179,7 @@ def test_timeline_of_one_chase_at_0_4_s_a_call(crig):
     run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
     got = [(s, round((t - et(9, 31)).total_seconds(), 2)) for s, t in rig.broker.at]
     assert got[0] == ("AAAA", 0.9)
-    (start,), (answer,) = lines(rig, "chase_send_start"), lines(rig, "chase_send_answer")
+    (start,), (answer,) = chase_lines(rig, "send_start"), chase_lines(rig, "send_answer")
     assert start["send_at"].startswith("2026-11-13T14:31:00.100") and start["t"] == "2026-11-13T14:31:00.100Z"
     assert answer["answer_at"].startswith("2026-11-13T14:31:00.900")
     (d,) = lines(rig, "chase_decision")
@@ -302,7 +308,7 @@ def test_a_lock_held_2_s_the_chase_waits_a_tick_and_goes_after_the_release(crig)
     assert 1 <= len(busy) <= 9 and set(busy) == {"AAAA"}
     assert rig.broker.placed == [] and rig.sent == [] and rig.desk.records() == {} and saves == []
     assert rig.desk._chase_tries == {} and rig.plan.orders_day == 0
-    assert lines(rig, "chase_send_start") == [] and lines(rig, "chase_decision") != []
+    assert chase_lines(rig, "send_start") == [] and lines(rig, "chase_decision") != []
     assert [(x["ticker"], x["what"]) for x in lines(rig, "busy")] == [("AAAA", "chase")]
     run(rig, et(9, 31, 5))
     assert placed(rig)[0] == "AAAA" and order_of(rig, "AAAA")[0]["orderType"] == "LIMIT"
@@ -322,7 +328,7 @@ def test_a_lock_held_2_s_and_the_price_back_inside_gives_the_break_entry_not_a_c
     _hold_lock(rig, rig.clock.t, 1.0)
     run(rig, et(9, 31, 5))
     (o,) = order_of(rig, "AAAA")
-    assert o["orderType"] == "STOP_LIMIT" and lines(rig, "chase_send_start") == []
+    assert o["orderType"] == "STOP_LIMIT" and chase_lines(rig, "send_start") == []
     assert [without_id(r) for r in rig.sent if r["symbol"] == "AAAA"] == [want_req("AAAA")]
 
 
@@ -430,7 +436,7 @@ def test_no_chase_after_a_click_cancel(crig):
     assert c["ok"] and rig.broker.cancelled == [oid]
     rig.tape.prices["AAAA"] = 42.51                         # past the trigger, inside the cap
     run(rig, et(9, 32, 0))
-    assert len(order_of(rig, "AAAA")) == 1 and not lines(rig, "chase_send_start")
+    assert len(order_of(rig, "AAAA")) == 1 and not chase_lines(rig, "send_start")
     rules = rig.plan.armed_rules
     o = rig.plan.order_for("AAAA", {"high": 42.48, "low": 41.92}, "long")
     r = rig.desk.chase_auto("AAAA", "LONG", o, quote_tries=rules.chase_quote_tries)
@@ -570,10 +576,13 @@ def test_after_a_flip_ashs_working_order_on_the_other_side_refuses_the_chase(fcr
     ids = short_trades_during_the_cancel(rig)
     run(rig, et(9, 31, 6))
     assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
-    assert not [r for r in rig.sent if r.get("entry") == "chase"] and not lines(rig, "chase_send_start")
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and not chase_lines(rig, "send_start")
     assert rig.plan.left["AAAA"] == ("chase not sent: You have a working long order on AAAA. The plan does not "
                                      f"take the other side of a name you trade. Nothing was sent; {LEFT_HANDED}")
     assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE and rig.desk._chase_tries == {}
+    (gone,) = [x for x in lines(rig, "leave") if x["ticker"] == "AAAA"]      # the code, not the words
+    assert (gone["why"], gone["side_rule"], gone["side"]) == (
+        f"chase not sent: the side rule said other_side; {LEFT_HANDED}", "other_side", "short")
 
 
 def test_after_a_flip_beside_ashs_own_short_order_the_short_chase_goes(fcrig):
@@ -605,11 +614,18 @@ def test_after_a_flip_ash_on_both_sides_the_chase_waits_and_goes_once_it_is_clea
     assert "AAAA" not in rig.plan.left and rig.desk._chase_tries == {}
     assert rig.desk.chase_waits()["AAAA"]["cancelled_order_id"] == ids["AAAA"]
     (w,) = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]          # said once, the chase named
-    assert w["what"] == "chase" and w["why"].startswith("You are on both sides of AAAA")
+    # The log keeps the side rule's code and the side, the page its words (Step 6 d77a859; review 4).
+    assert (w["what"], w["why"], w["side_rule"], w["side"]) == ("chase", "the side rule said not_clear",
+                                                                "not_clear", "short")
+    assert next(x["note"] for x in rig.plan.panel()["picks"] if x["ticker"] == "AAAA").startswith(
+        "You are on both sides of AAAA")
     rig.broker.orders[996]["status"] = "CANCELED"
     run(rig, et(9, 31, 9))
     assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]
     assert rig.desk.chase_waits() == {} and "AAAA" not in rig.plan.left
+    (over,) = [x for x in lines(rig, "wait_over") if x["ticker"] == "AAAA"]
+    assert (over["what"], over["why"], over["side_rule"], over["side"]) == ("chase", "the side rule said not_clear",
+                                                                            "not_clear", "short")
 
 
 def test_after_a_flip_ash_on_both_sides_until_the_watch_ends_sends_nothing_and_says_why(fcrig):
@@ -622,6 +638,35 @@ def test_after_a_flip_ash_on_both_sides_until_the_watch_ends_sends_nothing_and_s
     assert rig.plan.left["AAAA"] == ("chase not sent: You are on both sides of AAAA (shares or working orders), so "
                                      "the plan cannot tell which side you trade. Nothing was sent; " + LEFT_HANDED)
     assert rig.desk._chase_tries == {}
+    (gone,) = [x for x in lines(rig, "leave") if x["ticker"] == "AAAA"]      # the code, not the words
+    assert (gone["why"], gone["side_rule"], gone["side"]) == (
+        "chase not sent: the side rule said not_clear; " + LEFT_HANDED, "not_clear", "short")
+
+
+def test_after_a_flip_a_side_rule_that_cannot_be_read_waits_and_the_chase_goes_once_it_reads(fcrig, monkeypatch):
+    """When unsure, refuse (architect, 2026-11-13 23:30 UTC): the side rule raising at the chase's own
+    check (after Step 7's own check of the new side) is not clear: a wait through chase_wait and
+    offers, no Schwab call, no try, and the log keeps the code. Once it reads, a later reading chases."""
+    rig = fcrig
+    real = C.plan_entries.plan_side.manual_refusal
+
+    def boom(*a, **k):
+        raise RuntimeError("the side rule broke")
+    at_the_chase(rig, lambda: monkeypatch.setattr(C.plan_entries.plan_side, "manual_refusal", boom))
+    ids = short_trades_during_the_cancel(rig)
+    calls = len(rig.broker.calls)
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and ("quote", "AAAA") not in rig.broker.calls[calls:]
+    assert "AAAA" not in rig.plan.left and rig.desk._chase_tries == {}
+    assert rig.desk.chase_waits()["AAAA"]["cancelled_order_id"] == ids["AAAA"]
+    (w,) = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]
+    assert (w["what"], w["why"], w["side_rule"]) == ("chase", "the side rule said not_clear", "not_clear")
+    assert "the side rule broke" not in (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
+    monkeypatch.setattr(C.plan_entries.plan_side, "manual_refusal", real)
+    run(rig, et(9, 31, 9))
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]
+    assert rig.desk.chase_waits() == {} and "AAAA" not in rig.plan.left
 
 
 def test_a_rejected_entrys_chase_with_ash_on_the_other_side_leaves_the_pick(fcrig):
@@ -638,6 +683,44 @@ def test_a_rejected_entrys_chase_with_ash_on_the_other_side_leaves_the_pick(fcri
     assert rig.plan.left["AAAA"] == ("chase not sent: You have a working short order on AAAA. The plan does not "
                                      f"take the other side of a name you trade. Nothing was sent; {C.REJECTED_LEFT}")
     assert rig.plan.armed() and len(rejected_lines(rig, "AAAA")) == 1
+    (gone,) = [x for x in lines(rig, "leave") if x["ticker"] == "AAAA"]      # the code, not the words
+    assert (gone["why"], gone["side_rule"], gone["side"]) == (
+        f"chase not sent: the side rule said other_side; {C.REJECTED_LEFT}", "other_side", "long")
+
+
+def test_the_chase_never_puts_ashs_share_count_in_the_log(crig):
+    """Architect's review 4 of PR #25 (2026-11-13 22:20 UTC), as Step 6's d77a859: the side rule's
+    words can name the shares Ash holds by hand. The page keeps them; the chase's leave, wait and
+    wait_over lines keep only the rule's code and the side. AAAA (long chase) beside 50 short by hand:
+    the other side, left. BBBB (short chase) beside 250 long by hand and a short order by hand: not
+    clear, a wait; once the short order is gone, the 250 long is the other side, left."""
+    rig = crig
+    rig.knobs["positions"] = {"AAAA": -50.0, "BBBB": 250.0}
+    by_hand(rig, 7, "SELL_SHORT", "BBBB")
+    plans_own_entries_only(rig, {7})
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51                         # past the long trigger 42.49
+    rig.tape.prices["BBBB"] = 19.98                         # past the short trigger 19.99
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert touched(rig, "AAAA") == [] and touched(rig, "BBBB") == []
+    rig.broker.orders[7]["status"] = "CANCELED"
+    run(rig, et(9, 31, 6))
+    assert touched(rig, "AAAA") == [] and touched(rig, "BBBB") == []
+    text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
+    assert "by hand" not in text and "50 AAAA" not in text and "250 BBBB" not in text and "both sides" not in text
+    assert {x["ticker"]: (x["why"], x["side_rule"], x["side"]) for x in lines(rig, "leave")} == {
+        "AAAA": ("chase not sent: the side rule said other_side", "other_side", "long"),
+        "BBBB": ("chase not sent: the side rule said other_side", "other_side", "short")}
+    assert [(x["ticker"], x["what"], x["why"], x["side_rule"]) for x in lines(rig, "wait")] == [
+        ("BBBB", "chase", "the side rule said not_clear", "not_clear")]
+    # The wait ends when the pick acts (here: the plan leaves it), with the code as well.
+    assert [(x["ticker"], x["why"], x["side_rule"], x["side"]) for x in lines(rig, "wait_over")] == [
+        ("BBBB", "the side rule said not_clear", "not_clear", "short")]
+    # The page keeps the words.
+    assert rig.plan.left["AAAA"] == ("chase not sent: You are short 50 AAAA by hand. The plan does not take the "
+                                     "other side of a name you trade. Nothing was sent.")
+    assert rig.plan.left["BBBB"] == ("chase not sent: You are long 250 BBBB by hand. The plan does not take the "
+                                     "other side of a name you trade. Nothing was sent.")
 
 
 def test_after_a_flip_an_unusable_reading_gives_no_chase_and_says_nothing_rests(fcrig):
@@ -701,7 +784,7 @@ def test_no_balance_reaches_the_log_through_a_chase(fcrig, path):
         arm(rig)
         rig.tape.prices["AAAA"] = 42.51                     # past 42.49, inside the cap 42.55
         run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
-    assert {"chase_decision", "chase_send_start", "chase_send_answer"} <= {x["event"] for x in lines(rig)}
+    assert lines(rig, "chase_decision") and chase_lines(rig, "send_start") and chase_lines(rig, "send_answer")
     assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == \
         [CHASE_SHORT if path == "flip" else CHASE_AAAA]
     text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
@@ -740,7 +823,7 @@ def test_after_a_flip_a_stale_quote_waits_and_the_next_try_chases(fcrig, monkeyp
     assert "AAAA" not in rig.plan.left and rig.desk.chase_waits() == {}
     got = rig.desk.records()["AAAA"]
     assert (got["kind"], got["chases"], got["flips"]) == ("chase", 1, 1)
-    sends = [x for x in lines(rig, "chase_send_start") if x["ticker"] == "AAAA"]
+    sends = [x for x in chase_lines(rig, "send_start") if x["ticker"] == "AAAA"]
     assert len(sends) == 2                                              # the refused try, then the chase
     gap = (datetime.fromisoformat(sends[1]["send_at"]) - datetime.fromisoformat(sends[0]["send_at"])).total_seconds()
     assert gap >= ARMED_RETRY_S
@@ -829,7 +912,7 @@ def test_after_a_flip_an_old_order_list_until_the_watch_ends_sends_nothing_and_s
     run(rig, et(9, 35, 10))
     assert rig.broker.cancelled[0] == ids["AAAA"] and len(tries) > 10
     assert [x["why"] for x in lines(rig, "wait") if x["ticker"] == "AAAA"] == [plan_entries.ORDERS_OLD]
-    assert not [r for r in rig.sent if r.get("entry") == "chase"] and not lines(rig, "chase_send_start")
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and not chase_lines(rig, "send_start")
     assert ("quote", "AAAA") not in rig.broker.calls[calls:]
     left = rig.plan.left["AAAA"]
     assert left == f"chase not sent: {plan_entries.ORDERS_OLD.rstrip('.')}; {LEFT_HANDED}"
@@ -858,7 +941,7 @@ def test_after_a_flip_flat_alls_hold_leaves_the_pick_and_no_chase_goes(fcrig):
     run(rig, et(9, 31, 8))
     assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
     assert not [r for r in rig.sent if r.get("entry") == "chase"] and ("quote", "AAAA") not in rig.broker.calls[calls:]
-    assert not lines(rig, "chase_send_start")
+    assert not chase_lines(rig, "send_start")
     left = rig.plan.left["AAAA"]
     assert left == f"chase not sent: {plan_flat.HOLD.rstrip('.')}; {LEFT_HANDED}"
     assert {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}["AAAA"] == left
@@ -1013,6 +1096,73 @@ def test_with_the_chase_on_and_the_flip_off_a_rejected_through_entry_is_chased_o
 
 
 THROUGH = {"AAAA": 42.51, "BBBB": 19.98, "CCCC": 71.87, "DDDD": 9.98}     # each past its trigger, inside its cap
+
+
+# ---- the poller's hold (Step 6, 8f6b68c) ---------------------------------------------------------
+# One hold per arm, from 09:30:30 ET to 60 s after the plan's last send_start line, never past
+# 09:33:30 ET (reviews 6 and 7 of fork PR #27). The chase's send writes Step 6's send_start line with
+# kind "chase", like Step 7's flip, so it needs no hold of its own (architect, 2026-11-13 23:30 UTC).
+# The chases here come after Schwab rejects a resting entry as already through (N2), with the flip off.
+
+def chase_sends(rig):
+    return [datetime.fromisoformat(x["t"]) for x in chase_lines(rig, "send_start")]
+
+
+def rejected_through_at(rig, t, sym):
+    """Quiet until `t`; then Schwab shows `sym`'s entry REJECTED as already through and the tape is past
+    its trigger, inside its cap; 2 s on."""
+    run(rig, t)
+    reject(rig, rig.desk.records()[sym]["order_id"])
+    rig.tape.prices[sym] = THROUGH[sym]
+    run(rig, t + timedelta(seconds=2))
+
+
+def test_a_chases_send_inside_the_hold_moves_its_end_to_60_s_after_it(crig):
+    rig = crig
+    all_four_rest(rig)
+    last_entry = max(send_times(rig))
+    rejected_through_at(rig, et(9, 31, 40), "AAAA")
+    (chase_at,) = chase_sends(rig)
+    assert len(rig.broker.placed) == 5 and [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_AAAA]
+    assert last_entry + timedelta(seconds=30) < chase_at < last_entry + timedelta(seconds=60)
+    run(rig, et(9, 34, 0))
+    assert held_through(rig) == chase_at + timedelta(seconds=60)          # to the second
+    assert max(t for t, _, _ in rig.holds) < chase_at + timedelta(seconds=60)   # nothing renewed after it
+    assert len(lines(rig, "poll_hold")) == 1
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "60 s after the plan's last send"
+
+
+def test_chases_less_than_60_s_apart_never_keep_the_hold_past_0933_30(crig):
+    # Each chase would move the end 60 s on (09:32:50, 09:33:40); the hold's latest end is 09:33:30 ET
+    # (act_from + POLL_HOLD_LATEST_SECONDS).
+    rig = crig
+    all_four_rest(rig)
+    rejected_through_at(rig, et(9, 31, 50), "AAAA")
+    rejected_through_at(rig, et(9, 32, 40), "BBBB")
+    sends = chase_sends(rig)
+    assert len(sends) == 2 and et(9, 32, 40) <= sends[-1] < et(9, 32, 42)
+    assert [r["symbol"] for r in rig.sent if r.get("entry") == "chase"] == ["AAAA", "BBBB"]
+    run(rig, et(9, 34, 30))
+    assert held_through(rig) == et(9, 33, 30)
+    assert max(t for t, _, _ in rig.holds) < et(9, 33, 30)
+    (end,) = lines(rig, "poll_hold_end")
+    assert end["why"] == "the hold's latest end, 09:33:30 ET"
+    assert len(lines(rig, "poll_hold")) == 1
+
+
+def test_a_chase_after_the_hold_ended_calls_no_hold(crig):
+    rig = crig
+    all_four_rest(rig)
+    run(rig, et(9, 32, 30))
+    (end,) = lines(rig, "poll_hold_end")                     # 60 s after the last entry's send
+    assert end["why"] == "60 s after the plan's last send"
+    n = len(rig.holds)
+    rejected_through_at(rig, et(9, 33, 0), "AAAA")
+    assert len(chase_sends(rig)) == 1 and len(rig.broker.placed) == 5
+    run(rig, et(9, 34, 0))
+    assert len(rig.holds) == n                                # one hold per arm: the chase calls none
+    assert len(lines(rig, "poll_hold")) == 1 and len(lines(rig, "poll_hold_end")) == 1
 
 
 def test_with_the_chase_on_the_days_order_bound_holds(rig, monkeypatch):

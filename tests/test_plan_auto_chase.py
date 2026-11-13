@@ -298,8 +298,11 @@ def test_inside_the_cap_sends_one_limit_at_the_cap_with_its_stop(rig):
 def test_the_log_has_the_level_cap_last_trade_limit_and_times(rig):
     rig.host.handle("would_place", tape(42.51, age=0.3))
     events = [e for e, _, _ in rig.host.logs]
-    assert events == ["chase_decision", "chase_send_start", "chase_send_answer"]
+    # Step 6's send_start and send_answer lines with kind "chase" (the executor's poller hold reads
+    # the plan's last send from send_start; architect, 2026-11-13 23:30 UTC).
+    assert events == ["chase_decision", "send_start", "send_answer"]
     d, s, a = (f for _, _, f in rig.host.logs)
+    assert s["kind"] == a["kind"] == "chase"
     assert (d["trigger"], d["cap"], d["limit"], d["stop"], d["last"], d["inside_cap"]) == \
            ("42.49", "0.06", "42.55", "41.92", "42.51", True)
     assert d["last_age_s"] == 0.3 and d["pullback_wait_s"] == 120.0
@@ -559,6 +562,9 @@ def test_ash_on_the_other_side_of_the_name_leaves_the_pick_and_sends_nothing(rig
     nothing_used(rig)
     assert rig.host.left == {"AAAA": f"chase not sent: {text} The plan does not take the other side of a name "
                                      "you trade. Nothing was sent."}
+    # The log's fields: the side rule's code and side, never the words (Step 6 d77a859; review 4).
+    assert rig.host.left_logged == {"AAAA": {"why": "chase not sent: the side rule said other_side",
+                                             "side_rule": "other_side", "side": "long"}}
     assert rig.host.busies == [] and rig.host.disarms == []
 
 
@@ -573,9 +579,45 @@ def test_ash_on_both_sides_of_the_name_the_chase_waits_and_goes_once_it_is_clear
     assert rig.host.left == {} and rig.host.busies == [("AAAA", "chase")] * 3 and rig.host.ends == [False] * 3
     assert set(rig.host.waits) == {"You are on both sides of AAAA (shares or working orders), so the plan cannot "
                                    "tell which side you trade. Nothing was sent."}      # the executor says it once
+    assert rig.host.busy_logged == [{"why": "the side rule said not_clear", "side_rule": "not_clear",
+                                     "side": "long"}] * 3                                # what the log keeps
     rig.broker.orders[701]["status"] = "CANCELED"
     assert rig.host.handle("would_place", tape(42.51)) is True
     assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
+
+
+@pytest.mark.parametrize("part", ["manual_refusal", "plan_shares"])
+def test_a_side_rule_that_cannot_be_read_sends_nothing_and_waits(rig, monkeypatch, part):
+    """When unsure, refuse (brief 25; architect, 2026-11-13 23:30 UTC): the side rule raising is "not
+    clear" (_chase_beside). No Schwab call and no try; only this pick waits (the other picks go on);
+    the log keeps the code, the page the words. Once the rule reads again, the chase goes."""
+    real = getattr(plan_side, part)
+
+    def boom(*a, **k):
+        raise RuntimeError("the side rule broke")
+    monkeypatch.setattr(plan_side, part, boom)
+    for _ in range(2):
+        assert rig.host.handle("would_place", tape(42.51)) is False     # not an action: the others go on
+    nothing_used(rig)
+    assert rig.host.left == {} and rig.host.busies == [("AAAA", "chase")] * 2 and rig.host.ends == [False] * 2
+    assert set(rig.host.waits) == {"Could not read your AAAA position and orders (the side rule broke). "
+                                   "Nothing was sent."}
+    assert rig.host.busy_logged == [{"why": "the side rule said not_clear", "side_rule": "not_clear",
+                                     "side": "long"}] * 2
+    monkeypatch.setattr(plan_side, part, real)
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
+
+
+def test_unreadable_account_positions_the_chase_waits_like_old_ones(rig):
+    """The poller's positions raising read as old (PlanDesk._positions_read): every pick waits."""
+    def boom():
+        raise RuntimeError("no account")
+    rig.desk._positions_fn = boom
+    assert rig.host.handle("would_place", tape(42.51)) is True       # the step ends: a wait
+    nothing_used(rig)
+    assert rig.host.busies == [("AAAA", "chase")] and rig.host.waits == [plan_side.POSITIONS_OLD]
+    assert rig.host.ends == [True] and rig.host.left == {}
 
 
 def test_old_account_positions_the_chase_waits_like_an_old_order_list(rig):
@@ -584,6 +626,7 @@ def test_old_account_positions_the_chase_waits_like_an_old_order_list(rig):
     nothing_used(rig)
     assert rig.host.busies == [("AAAA", "chase")] and rig.host.waits == [plan_side.POSITIONS_OLD]
     assert rig.host.ends == [True] and rig.host.left == {}             # no pick goes on an old account read
+    assert rig.host.busy_logged == [None]                               # its words name no shares
     rig.pfresh[0] = True
     assert rig.host.handle("would_place", tape(42.51)) is True
     assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
