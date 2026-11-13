@@ -61,6 +61,11 @@ from zoneinfo import ZoneInfo
 
 log = logging.getLogger("companion.netlog")
 
+# The real clock and sleep, bound once: tests patch time.sleep and time.monotonic on the shared
+# time module, and the watcher thread must neither spin on a fake sleep nor feed it (PR #22 CI).
+_real_sleep = time.sleep
+_real_mono = time.monotonic
+
 DIR = Path(__file__).resolve().parent.parent / "data" / "netlog"
 APP = "edge-trader"                  # record format v1 (brief 08): every app names itself
 MAX_QUEUE = 20_000
@@ -187,9 +192,9 @@ def flush(timeout: float | None = None) -> bool:
     if timeout is None:
         _q.join()
         return True
-    end = time.monotonic() + timeout
-    while _q.unfinished_tasks and time.monotonic() < end:
-        time.sleep(0.01)
+    end = _real_mono() + timeout
+    while _q.unfinished_tasks and _real_mono() < end:
+        _real_sleep(0.01)
     return not _q.unfinished_tasks
 
 
@@ -217,7 +222,7 @@ def _utc_iso() -> str:
 
 def _mono() -> float:
     """The clock for every duration here (tests replace it)."""
-    return time.monotonic()
+    return _real_mono()
 
 
 def _put(rec: dict) -> None:
@@ -736,11 +741,11 @@ def _watch() -> None:
     """Every 100 ms: how late this thread wakes (lag), calls open too long, pauses over.
     Once a minute: the `lag` line."""
     samples: list[float] = []
-    minute, cpu0 = time.monotonic(), time.process_time()
+    minute, cpu0 = _real_mono(), time.process_time()
     while True:
-        t = time.monotonic()
-        time.sleep(0.1)
-        now = time.monotonic()
+        t = _real_mono()
+        _real_sleep(0.1)
+        now = _real_mono()
         samples.append(max(0.0, (now - t - 0.1) * 1000))
         try:
             _check(_mono())
@@ -765,9 +770,9 @@ async def watch_loop() -> None:
     """Event-loop lag for the minute's `lag` line: a task sleeping 100 ms measures how late it wakes."""
     global _loop_lag_max
     while True:
-        t = time.monotonic()
+        t = _real_mono()
         await asyncio.sleep(0.1)
-        late = round(max(0.0, (time.monotonic() - t - 0.1) * 1000), 1)
+        late = round(max(0.0, (_real_mono() - t - 0.1) * 1000), 1)
         if _loop_lag_max is None or late > _loop_lag_max:
             _loop_lag_max = late
 

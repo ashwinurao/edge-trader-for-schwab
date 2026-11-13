@@ -565,6 +565,18 @@ def test_the_sign_in_exchange_is_a_call_without_the_code(rec):
     assert "SECRETCODE123" not in rec.text()
 
 
+def test_the_watcher_never_uses_a_patched_time_sleep(monkeypatch):
+    """Tests patch time.sleep on the shared time module (test_trading.py). The watcher thread keeps
+    its own sleep: it must not spin on a fake one nor feed it (PR #22's first CI run)."""
+    import threading
+    import time as time_mod
+    netlog._ensure_watcher()
+    seen = []
+    monkeypatch.setattr(time_mod, "sleep", lambda s: seen.append(s))
+    threading.Event().wait(0.35)                   # real time passes; the watcher wakes 3 times
+    assert seen == []
+
+
 # ---- safety: no ids, the off switch, a broken record ---------------------------------------------
 
 def test_no_account_hash_or_order_id_is_ever_written(rig):
