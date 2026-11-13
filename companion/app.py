@@ -423,7 +423,7 @@ try:
     from .opening_plan import routes as _plan_routes
 except ImportError:
     _plan_routes = None
-FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO) if _plan_routes else []
+FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO, snapshot=poller.snapshot, private=PRIVATE) if _plan_routes else []
 FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
 # Place / Cancel / Flip on the plan rows (Step 4): only with EDGE_TRADER_PLAN_BUTTONS=1,
 # EDGE_TRADER_BREAK_ENTRY=1 and the plan on.
