@@ -85,7 +85,11 @@ name are refused). It needs no account and sends no telemetry.
   (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
   and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
   Each read carries `X-Edge-App: edge-trader` and the call's id in `X-Edge-Req`, so Edge Scanner's own
-  record can name it.
+  record can name it. With the armed plan on (`EDGE_TRADER_PLAN_AUTO=1`, below) it also reads Edge
+  Scanner's open tape (`GET /api/v2/ov-picks/open-tape`, `companion/opening_plan/tape.py`) on your LAN:
+  once when the Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
+  the end of the watch, at most every 0.25 s with a 0.5 s timeout. Edge Scanner answers from memory and
+  asks its data vendor for nothing more.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -370,6 +374,54 @@ If Edge Trader restarts while a click is running, the next start settles the row
 If `companion/opening_plan/playbook.json` cannot be read or has no `buttons.max_flips_per_row`, the
 buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
 
+**The armed plan (OV entries Step 6, off by default).** This is the one place Edge Trader sends and
+cancels orders without a click on each order (CONTRIBUTING rule 1, third exception). It needs
+`EDGE_TRADER_PLAN_AUTO=1` together with `EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1` and
+`EDGE_TRADER_PLAN_BUTTONS=1`. Without all four there is no thread, no route and no panel
+(`companion/plan_auto/`).
+
+The switch alone sends nothing. You arm it for the day with **Arm…** on the Opening plan page, from
+09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, 1 share each, the risk per pick and
+the calm flag, what the plan will and will not do, and its bounds. **Arm with these bounds** is refused,
+with every reason listed, when: it is not a market day or outside that window; ARM is off on the
+dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
+or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
+answer; the bounds or the playbook changed since the dialog showed them; or the plan was disarmed for
+the day.
+
+Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
+plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
+`Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
+attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
+again before each send. At the end of the fast watch (09:35 ET) it cancels each plan entry that has not
+filled, one attempt per order, waiting for Schwab to confirm, and then disarms. It never flips, chases,
+exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
+A filled entry is yours to manage, as with a click.
+
+It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
+today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
+**Disarm** click (one click, checked before every send and cancel); an unclear Schwab answer (that pick
+is left and the row follows its ticket, as after a click); a cancel Schwab does not confirm (the row
+turns red); a reached bound; ARM turned off on the dashboard; an old order list; or an unexpected error.
+A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
+pick and is never retried. After a disarm, entries already at Schwab stay: a red banner lists them,
+and each row's Cancel works. A restart never restores "armed".
+
+Its bounds are in `companion/opening_plan/playbook.json` under `armed`, each a start number Ash has not
+approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pick, 4 orders a day, and
+40 Schwab calls a minute by the plan. The calls bound counts and refuses sends only, each at its worst
+case of 5 calls (usually 4: the quote, the POST and two status reads; 5 when an earlier close on the
+name still has an open status), so at most 8 sends in any 60 s. A cancel is never refused by it: it can
+take up to 12 calls (`Trader.cancel_entry` reads, cancels and reads back up to ten times) and is tried
+once per order. Not measured live: the worst minute is 7 sends and 3 flip cancels, 71 calls, which with
+the poller's 32 to 50 a minute is 103 to 121 against Schwab's 120. That top needs every cancel to use
+all ten read-backs and every send to find an open close.
+
+Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
+time, the decision, the send's start and its answer with their times. It holds no account number, token
+or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
+`refusal` line, and the plan's Schwab calls their usual `call` lines.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -397,6 +449,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones at 09:35 ET. Off by default. |
 
 ## Good to know
 
