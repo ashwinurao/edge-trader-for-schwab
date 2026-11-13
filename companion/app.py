@@ -79,7 +79,7 @@ async def lifespan(_app: FastAPI):
     # The network record (netlog.py): its threads, a start note and the event-loop lag task.
     lag_task = netlog.start(f"Edge Trader {__version__} started{' in DEMO mode' if DEMO else ''}")
     poller.start()
-    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO)  # brief 09, off by default
+    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller))  # briefs 09 and 21, off by default
     if not DEMO:
         import threading
         from . import update_check

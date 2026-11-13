@@ -12,7 +12,7 @@ companion/break_entry.py). This thread measures all three and writes only netlog
 
 What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
 - One daemon thread "open-probe". Windows come from companion/open_probe.json (ET, weekdays),
-  default 09:28:00-09:40:00; EDGE_TRADER_OPEN_PROBE_WINDOWS overrides them and
+  default 09:26:30-09:40:00 (brief 21); EDGE_TRADER_OPEN_PROBE_WINDOWS overrides them and
   EDGE_TRADER_OPEN_PROBE_PREVIEWS the preview times, so a test run can be at another time.
 - One minute before a window it builds its own Schwab client that allows only `quotes` and
   `preview_order` (schwab.ReadOnlyClient raises PermissionError for every other method), with a
@@ -20,11 +20,21 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   6) plus SPY. The client is dropped when the window ends.
 - Every quote_every_s seconds: one quotes() call for all symbols, one `probe: "quote"` line per
   symbol with Schwab's own quote and trade times and their age when the answer was in hand.
-- At each preview time: one preview_order of a 1-share long Break order for the first pick (SPY
-  without picks), built by break_entry.build_request, break_entry.make_plan and
-  bracket.bracket_order (the ticket's own builder). One `probe: "preview"` line with the timing,
-  the status word and the texts of Schwab's lists. Nothing else from the answer is written: it
-  holds the account number.
+- At each preview time (brief 21): a LONG and a SHORT Break preview for ONE pick, the next in rank
+  order each time, so ranks 1 to 4 are covered both sides before the open and again after it (SPY
+  without picks). Each body is built at 1 share by break_entry.build_request, break_entry.make_plan
+  and bracket.bracket_order (the ticket's own builder; BREAK_MAX_SHARES stays 1), then a COPY gets
+  `preview_shares` (100) in every leg so Schwab's numbers are readable. At most
+  `max_previews_per_time` (2) per time and `max_previews_per_window` (24) per window.
+- One `probe: "preview"` line per preview: the timing, the status word, the texts of Schwab's
+  lists, the order's own numbers (side, order_type, qty, trigger, limit, stop, from the body the
+  probe built), `keys` (the dotted key names of Schwab's answer, never a value), the order value
+  and the projected commission and fees with the path each was read from, and the requirement
+  rates `bp_rate` / `af_rate`: (the account's value before - the projected value) / the order
+  value, with the two fields each came from. The "before" value is the poller's last balances
+  (at most 30 s old); a pairing whose rate is outside -5 to 5 is not written. NO balance, equity
+  or buying power in dollars is ever written, and nothing else from the answer: it holds the
+  account number.
 - No retries. Any 429, or the app's own 429 pause, stops the probe for the rest of the window.
 
 It never touches the trading client, Trader._send_lock, the poller's client or the store. It
@@ -32,6 +42,7 @@ does not import the order code. Every failure is contained here and said once in
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -70,6 +81,21 @@ TRIGGER_MIN = Decimal("0.05")
 TRIGGER_PCT = Decimal("0.002")
 STOP_PCT = Decimal("0.01")
 LISTS = ("rejects", "warns", "alerts", "accepts", "reviews")   # Schwab's preview lists
+SIDES = ("LONG", "SHORT")     # brief 21 item 5: both sides at every preview time
+# Brief 21 item 4: the "before" side of the requirement rate. Only these three balances are read,
+# never written. A projected value is paired with the balance of the same name first.
+BALANCE_FIELDS = ("buyingPower", "dayTradingBuyingPower", "availableFunds")
+BALANCES_MAX_AGE_S = 30       # brief 21: older balances give no rate
+RATE_LIMIT = 5                # a |rate| above this is not a requirement rate (see rate_fields)
+RATES = (  # (line prefix, projected key name in Schwab's answer, the balances to pair it with)
+    ("bp", "projectedBuyingPower", ("buyingPower", "dayTradingBuyingPower")),
+    ("af", "projectedAvailableFund", ("availableFunds",)),
+)
+KEYS_MAX, KEYS_DEPTH = 200, 6     # brief 21 item 2
+COSTS_MAX_PATHS, COSTS_MAX_VALUES = 20, 10
+# A leaf whose name holds one of these is account data: never a "cost" number.
+_ACCOUNT_WORDS = ("balance", "buyingpower", "fund", "equity", "cash", "account", "margin",
+                  "liquidation", "requirement")
 
 
 def enabled(env: Mapping[str, str] = os.environ) -> bool:
@@ -83,6 +109,10 @@ class Config:
     windows: tuple[tuple[dtime, dtime], ...]
     quote_every_s: float
     previews: tuple[dtime, ...]
+    # Brief 21, start numbers in open_probe.json, not approved by Ash.
+    preview_shares: int = 100
+    max_previews_per_time: int = 2
+    max_previews_per_window: int = 24
 
 
 def _hms(text) -> dtime:
@@ -121,7 +151,14 @@ def load_config(path: Path = CONFIG_FILE, env: Mapping[str, str] = os.environ) -
     every = float(raw.get("quote_every_s") or 5)
     if every < 1:
         raise ValueError("quote_every_s must be 1 or more")    # the Schwab app's budget is shared with OV
-    return Config(windows, every, previews)
+    shares = int(raw.get("preview_shares") or 100)
+    per_time = int(raw.get("max_previews_per_time") or 2)
+    per_window = int(raw.get("max_previews_per_window") or 24)
+    if not 1 <= shares <= 1000:
+        raise ValueError("preview_shares must be 1 to 1000")
+    if not (1 <= per_time <= 2 and 1 <= per_window <= 24):
+        raise ValueError("at most 2 previews per time and 24 per window (brief 21)")
+    return Config(windows, every, previews, shares, per_time, per_window)
 
 
 # ---- symbols ------------------------------------------------------------------
@@ -234,21 +271,216 @@ def preview_fields(body) -> dict:
     return out
 
 
-def preview_body(symbol: str, bid, ask) -> dict:
-    """The 1-share long Break order the probe previews, built by the ticket's own builders.
+def preview_body(symbol: str, bid, ask, side: str = "LONG") -> dict:
+    """The 1-share Break order the probe builds with the ticket's own builders (with_quantity makes
+    the preview copy).
 
-    trigger = ask + max(5 cents, 0.2% of the ask), rounded up to the tick; stop = trigger - 1% of
-    the ask, rounded down. Raises ValueError when make_plan refuses it."""
-    price = Decimal(str(ask))
+    Long: trigger = ask + max(5 cents, 0.2% of the ask), rounded up to the tick; stop = trigger -
+    1% of the ask, rounded down. Short (brief 21, the SELL_SHORT Break shape): trigger = bid -
+    max(5 cents, 0.2% of the bid), rounded down; stop = trigger + 1% of the bid, rounded up.
+    Raises ValueError when make_plan refuses it."""
+    if side not in SIDES:
+        raise ValueError("side must be LONG or SHORT")
+    long = side == "LONG"
+    price = Decimal(str(ask if long else bid))
     if not price.is_finite() or price <= 0:
-        raise ValueError("no ask")
-    trigger = _to_tick(price + max(TRIGGER_MIN, price * TRIGGER_PCT), ROUND_CEILING)
-    stop = _to_tick(trigger - price * STOP_PCT, ROUND_FLOOR)
-    req = build_request(symbol, "LONG", trigger, stop, 1)
-    plan = make_plan(req, {"bid": bid, "ask": float(price), "asset_type": "EQUITY"})
+        raise ValueError("no ask" if long else "no bid")
+    step = max(TRIGGER_MIN, price * TRIGGER_PCT)
+    if long:
+        trigger = _to_tick(price + step, ROUND_CEILING)
+        stop = _to_tick(trigger - price * STOP_PCT, ROUND_FLOOR)
+    else:
+        trigger = _to_tick(price - step, ROUND_FLOOR)
+        stop = _to_tick(trigger + price * STOP_PCT, ROUND_CEILING)
+    req = build_request(symbol, side, trigger, stop, 1)
+    q = {"bid": bid, "ask": float(price), "asset_type": "EQUITY"} if long else \
+        {"bid": float(price), "ask": ask, "asset_type": "EQUITY"}
+    plan = make_plan(req, q)
     if not plan.ok:
         raise ValueError("; ".join(plan.errors))
     return bracket_order(plan)
+
+
+def with_quantity(body: dict, qty: int) -> dict:
+    """A copy of a built body with `qty` in every leg of the parent and its children (brief 21
+    item 5). The built body is not touched, and BREAK_MAX_SHARES / make_plan keep refusing more
+    than 1 share: this copy only ever goes to preview_order."""
+    out = copy.deepcopy(body)
+
+    def walk(x) -> None:
+        if not isinstance(x, dict):
+            return
+        for leg in x.get("orderLegCollection") or []:
+            if isinstance(leg, dict) and "quantity" in leg:
+                leg["quantity"] = int(qty)
+        for child in x.get("childOrderStrategies") or []:
+            walk(child)
+
+    walk(out)
+    return out
+
+
+def _child_stop(x) -> Optional[str]:
+    for child in (x.get("childOrderStrategies") or []) if isinstance(x, dict) else []:
+        if isinstance(child, dict) and child.get("orderType") == "STOP":
+            return child.get("stopPrice")
+        found = _child_stop(child)
+        if found:
+            return found
+    return None
+
+
+def order_numbers(body: dict) -> dict:
+    """The previewed order's own numbers, read from the body the probe built (brief 21 item 1),
+    never from Schwab's answer."""
+    leg = (body.get("orderLegCollection") or [{}])[0]
+    instr = leg.get("instruction")
+    return {"side": "LONG" if instr == "BUY" else ("SHORT" if instr == "SELL_SHORT" else instr),
+            "order_type": body.get("orderType"), "qty": leg.get("quantity"),
+            "trigger": body.get("stopPrice"), "limit": body.get("price"), "stop": _child_stop(body)}
+
+
+# ---- what Schwab's preview answer holds: key names, order numbers, rates (brief 21) ----------
+
+_DIGITS = re.compile(r"\d+")
+_HEX24 = re.compile(r"[0-9A-Fa-f]{24,}")
+_B64_24 = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
+
+
+def _seg(key) -> str:
+    """One path segment: a key that looks like an account number or hash becomes {id} (all digits,
+    or 24+ hex or base64 characters; base64 only with a digit in it, so a long plain key name such
+    as projectedAvailableFundsTotal stays readable)."""
+    k = str(key)
+    if _DIGITS.fullmatch(k) or _HEX24.fullmatch(k) or (_B64_24.fullmatch(k) and any(c.isdigit() for c in k)):
+        return "{id}"
+    return k
+
+
+def _walk(body, on_key) -> None:
+    """Call on_key(path, raw_key, value) for every key, depth first, at most KEYS_DEPTH deep.
+    A list item adds "[]" to its parent's path and no depth."""
+    def walk(x, prefix: str, depth: int) -> None:
+        if depth >= KEYS_DEPTH:
+            return
+        if isinstance(x, dict):
+            for k, v in x.items():
+                p = f"{prefix}.{_seg(k)}" if prefix else _seg(k)
+                on_key(p, str(k), v)
+                walk(v, p, depth + 1)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, prefix + "[]", depth)
+    walk(body, "", 0)
+
+
+def key_paths(body) -> tuple[list[str], int]:
+    """(the sorted dotted key paths of an answer, at most KEYS_MAX; how many more there were).
+    Names only, never a value (brief 21 item 2)."""
+    seen: set[str] = set()
+    _walk(body, lambda p, k, v: seen.add(p))
+    out = sorted(seen)
+    return out[:KEYS_MAX], max(0, len(out) - KEYS_MAX)
+
+
+def _num(v) -> Optional[float]:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    return f if f == f and abs(f) != float("inf") else None
+
+
+def _is_cost(path: str, key: str) -> bool:
+    if any(w in key.lower() for w in _ACCOUNT_WORDS):
+        return False
+    for seg in path.lower().replace("[]", "").split("."):
+        if "commission" in seg or seg.startswith("fee") or seg.endswith("fee") or seg.endswith("fees"):
+            return True
+    return False
+
+
+def answer_numbers(body) -> dict:
+    """The numbers in a preview answer that are not account data, plus the projected values the
+    rates need (those stay in memory: the caller never writes them). Found by key name, wherever
+    they are, because the answer's shape is not confirmed (brief 21 "What is known")."""
+    found: list[tuple[str, str, float]] = []
+
+    def on_key(p: str, k: str, v) -> None:
+        n = _num(v)
+        if n is not None:
+            found.append((p, k, n))
+
+    _walk(body, on_key)
+    costs: dict[str, list[float]] = {}
+    for p, k, n in found:
+        if _is_cost(p, k) and (p in costs or len(costs) < COSTS_MAX_PATHS) and len(costs.get(p, [])) < COSTS_MAX_VALUES:
+            costs.setdefault(p, []).append(n)
+    projected = {short: [(p, n) for p, k, n in found if k.lower() == name.lower()] for short, name, _ in RATES}
+    values = [(p, n) for p, k, n in found if k.lower() == "ordervalue"]
+    # The order value beside the projected values (same parent) first, then the first non-zero one.
+    near = {p.rpartition(".")[0] for hits in projected.values() for p, _ in hits}
+    value = next((x for x in values if x[0].rpartition(".")[0] in near and x[1]), None) \
+        or next((x for x in values if x[1]), None)
+    return {"order_value": value, "costs": costs, "projected": projected}
+
+
+def rate_fields(nums: dict, balances: Optional[Mapping], age_s: Optional[float]) -> dict:
+    """The preview line's order value, costs and requirement rates (brief 21 items 3 and 4).
+
+    rate = (balance before - projected value) / order value, to 4 places, with [balance name,
+    projected path]. The balance named like the projected value is tried first, then the others
+    in RATES. A pairing whose |rate| is above RATE_LIMIT is not written: the two fields then
+    measure different things, and the number would carry the gap between two balances in
+    dollars. NEVER returns a balance or a projected value."""
+    value = nums.get("order_value")
+    out: dict = {"order_value": value[1] if value else None, "order_value_from": value[0] if value else None,
+                 "costs": nums.get("costs") or {},
+                 "balances_age_s": None if age_s is None else round(age_s, 1)}
+    for short, name, befores in RATES:
+        rate = frm = why = None
+        hits = (nums.get("projected") or {}).get(short) or []
+        if not value:
+            why = "no order value in the answer"
+        elif not hits:
+            why = f"no {name} in the answer"
+        elif balances is None:
+            why = "balances not known"
+        elif age_s is None:
+            why = "balances have no read time"
+        elif age_s > BALANCES_MAX_AGE_S:
+            why = f"balances are {age_s:.0f} s old (over {BALANCES_MAX_AGE_S} s)"
+        else:
+            have = [(b, _num(balances.get(b))) for b in befores]
+            have = [(b, n) for b, n in have if n is not None]
+            if not have:
+                why = f"no {' or '.join(befores)} in the balances"
+            else:
+                path, projected = hits[0]
+                for b, before in have:
+                    r = (before - projected) / value[1]
+                    if abs(r) <= RATE_LIMIT:
+                        rate, frm = round(r, 4), [b, path]
+                        break
+                else:
+                    why = f"outside -{RATE_LIMIT} to {RATE_LIMIT} against {' and '.join(b for b, _ in have)}"
+        out[f"{short}_rate"], out[f"{short}_rate_from"], out[f"{short}_rate_why"] = rate, frm, why
+    return out
+
+
+def poller_balances(poller) -> tuple[Optional[dict], Optional[datetime]]:
+    """(the three balances the rate needs from the poller's last account answer, when that answer
+    came). app.py passes this as the probe's balances getter. It reads two attributes; it calls
+    nothing and never raises."""
+    try:
+        acct = (getattr(poller, "account", None) or {}).get("securitiesAccount") or {}
+        cb = acct.get("currentBalances") or {}
+        ok_at = ((getattr(poller, "fresh", None) or {}).get("account") or {}).get("ok_at")
+        if not cb:
+            return None, None
+        at = datetime.fromisoformat(ok_at) if ok_at else None
+        return {k: cb.get(k) for k in BALANCE_FIELDS}, at
+    except Exception:
+        return None, None
 
 
 def error_class(e: BaseException) -> str:
@@ -305,9 +537,11 @@ class OpenProbe:
                  symbols: Callable[[], tuple[list[str], str]] = plan_symbols,
                  emit: Callable = netlog.emit,
                  wall: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 mono: Callable[[], float] = _time.monotonic) -> None:
+                 mono: Callable[[], float] = _time.monotonic,
+                 balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None)) -> None:
         self.cfg = cfg if cfg is not None else load_config()
         self._hash, self._paused, self._make_client = account_hash, paused, make_client
+        self._balances = balances
         self._symbols, self._emit, self._wall, self._mono = symbols, emit, wall, mono
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -323,8 +557,9 @@ class OpenProbe:
         self._next_quote = 0.0
         self._done: set[datetime] = set()
         self._last_quote: dict[str, tuple[float, dict]] = {}
+        self._turn = 0          # brief 21: the next pick in rank order at each preview time
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
-                       "previews_missed": 0, "cycle_errors": 0}
+                       "previews_missed": 0, "previews_capped": 0, "cycle_errors": 0}
 
     # thread plumbing
     def start(self) -> threading.Thread:
@@ -438,7 +673,9 @@ class OpenProbe:
         self._note("open probe: window start", window=self._win_text(), symbols=self.symbols,
                    picks_note=why or None, quote_every_s=self.cfg.quote_every_s,
                    previews=[f"{t:%H:%M:%S}" for t in self.cfg.previews],
-                   preview_symbol=(self.picks or ["SPY"])[0], timeout_s=TIMEOUT_S,
+                   preview_symbol=(self.picks or ["SPY"])[0], preview_sides=list(SIDES),
+                   preview_shares=self.cfg.preview_shares, max_previews_per_time=self.cfg.max_previews_per_time,
+                   max_previews_per_window=self.cfg.max_previews_per_window, timeout_s=TIMEOUT_S,
                    client=self.client is not None, halted=self.halted or None)
 
     def _close(self) -> None:
@@ -490,7 +727,10 @@ class OpenProbe:
                 self._last_quote[line["symbol"]] = (self._mono(), line)
 
     def _preview(self, t: datetime) -> None:
-        sym = (self.picks or ["SPY"])[0]
+        """One preview time: a long and a short preview of one pick, the next in rank order."""
+        picks = self.picks or ["SPY"]
+        sym = picks[self._turn % len(picks)]
+        self._turn += 1
         at = f"{t:%H:%M:%S}"
         hit = self._last_quote.get(sym)
         if hit is None or self._mono() - hit[0] > QUOTE_FRESH_S or not hit[1].get("ask") or not hit[1].get("bid"):
@@ -500,14 +740,38 @@ class OpenProbe:
         if not acct:
             self._line(probe="preview", symbol=sym, at=at, skipped="no_account")
             return
-        if self._pause_left() > 0:
-            self._halt("the app is in its 429 pause")
-            return
+        sent = 0
+        for side in SIDES:
+            if self.halted:
+                return
+            if sent >= self.cfg.max_previews_per_time or self.counts["previews"] >= self.cfg.max_previews_per_window:
+                self.counts["previews_capped"] += 1
+                self._line(probe="preview", symbol=sym, at=at, side=side, skipped="cap")
+                continue
+            if self._pause_left() > 0:
+                self._halt("the app is in its 429 pause")
+                return
+            if self._preview_one(sym, side, at, hit[1], acct):
+                sent += 1
+
+    def _read_balances(self) -> tuple[Optional[Mapping], Optional[float]]:
+        """(the poller's last balances, their age in seconds). Never raises."""
         try:
-            order = preview_body(sym, hit[1]["bid"], hit[1]["ask"])
-        except ValueError as e:     # e.g. a wide spread puts the 1% stop above the bid
-            self._line(probe="preview", symbol=sym, at=at, skipped="plan_refused", reason=str(e)[:200])
-            return
+            bal, at = self._balances()
+            if not bal:
+                return None, None
+            return bal, (None if at is None else (self._wall() - at).total_seconds())
+        except Exception:
+            return None, None
+
+    def _preview_one(self, sym: str, side: str, at: str, q: dict, acct: str) -> bool:
+        """One preview of one side. True when a preview_order call went out."""
+        try:
+            order = with_quantity(preview_body(sym, q["bid"], q["ask"], side), self.cfg.preview_shares)
+        except ValueError as e:     # e.g. a wide spread puts the 1% stop past the other side
+            self._line(probe="preview", symbol=sym, at=at, side=side, skipped="plan_refused", reason=str(e)[:200])
+            return False
+        numbers = order_numbers(order)
         self.counts["previews"] += 1
         t0 = self._mono()
         try:
@@ -515,8 +779,8 @@ class OpenProbe:
         except Exception as e:
             self.counts["preview_errors"] += 1
             self._line(probe="preview", symbol=sym, at=at, ok=False, error=error_class(e),
-                       total_ms=round((self._mono() - t0) * 1000, 1))
-            return
+                       total_ms=round((self._mono() - t0) * 1000, 1), **numbers)
+            return True
         total = round((self._mono() - t0) * 1000, 1)
         err = http_class(r.status_code)
         try:
@@ -532,20 +796,26 @@ class OpenProbe:
             except Exception:
                 raw = ""
             reason = error_texts(body, raw or "")
+        keys, more = key_paths(body)
+        bal, age = self._read_balances()
+        money = rate_fields(answer_numbers(body), bal, age)
         self._line(probe="preview", symbol=sym, at=at, wire_ms=_wire_ms(r), total_ms=total,
                    http=r.status_code, ok=err is None and not fields["rejects"], error=err,
-                   reasons=reason, retry_after=r.headers.get("Retry-After"), **fields)
+                   reasons=reason, retry_after=r.headers.get("Retry-After"), **numbers, **fields,
+                   keys=keys, keys_more=more, **money)
         if r.status_code == 429:
             self._halt("Schwab answered 429 to a preview")
+        return True
 
 
 def start(account_hash: Callable[[], Optional[str]], paused: Callable[[], float], demo: bool = False,
-          env: Mapping[str, str] = os.environ) -> Optional[OpenProbe]:
+          env: Mapping[str, str] = os.environ,
+          balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None)) -> Optional[OpenProbe]:
     """app.py's one start line. Off unless EDGE_TRADER_OPEN_PROBE=1, never in --demo. Never raises."""
     try:
         if demo or not enabled(env):
             return None
-        probe = OpenProbe(account_hash, paused)
+        probe = OpenProbe(account_hash, paused, balances=balances)
         probe.start()
         log.info("open probe on: windows %s ET", [f"{a:%H:%M:%S}-{b:%H:%M:%S}" for a, b in probe.cfg.windows])
         return probe
