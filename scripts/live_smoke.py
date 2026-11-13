@@ -920,7 +920,7 @@ def sc_restart_after(r: Run) -> None:
     t, oid = m["ticker"], m["order_id"]
     r.touched.add(t)
     st = r.state()
-    r.check("ARM is off after the restart", r.trading(st).get("armed") is False, trading=r.trading(st))
+    arm_off = r.check("ARM is off after the restart", r.trading(st).get("armed") is False, trading=r.trading(st))
     row, waited = r.row_resting(t, oid)
     r.check("the row still shows the same entry resting", bool(row), waited_s=round(waited, 1),
             row=r.row_brief(row) if row else r.row_brief(r.row_of(r.entries(), t) or {}))
@@ -928,7 +928,7 @@ def sc_restart_after(r: Run) -> None:
     if f is not None:
         r.note("FLAT_AFTER_RESTART", refusal=f.get("refusal"),
                items=[{k: it.get(k) for k in ("ticker", "action", "order_id")} for it in f.get("items") or []])
-    if row:
+    if row and arm_off:                          # only asked when ARM is off, so it can only be refused
         ans, _ = r.flip(t, ((row.get("send") or {}).get(OTHER[m["side"]].lower())), "flip with ARM off", count=False)
         r.check("Flip is refused with ARM off", ans.get("ok") is not True, got=r.pick(ans))
         if ans.get("ok") is True:
@@ -980,16 +980,72 @@ def sc_cleanup(r: Run) -> None:
            trading=r.trading(st))
 
 
-SCENARIOS = {"check": sc_check, "refusals": sc_refusals, "ticket_rest": sc_ticket_rest,
-             "ticket_fill": sc_ticket_fill, "plan_place_cancel": sc_plan_place_cancel, "plan_flip": sc_plan_flip,
-             "plan_flat": sc_plan_flat, "restart_before": sc_restart_before, "restart_after": sc_restart_after,
-             "cleanup": sc_cleanup}
+def sc_netlog(r: Run) -> None:
+    """Read only: the timing of every Schwab call and of our own order routes since Edge Trader
+    started (companion/netlog.py summary: counts, errors and milliseconds, no account numbers)."""
+    code, n, _ = r.api("GET", "/api/netlog/summary", timeout=20)
+    if code != 200 or not isinstance(n, dict):
+        raise Stop(f"/api/netlog/summary answered {code}")
+    r.note("NETLOG", on=n.get("on"), ts=n.get("ts"), pauses=n.get("pauses"), lag=n.get("lag"),
+           dropped=n.get("dropped"), queue=n.get("queue"), inflight=len(n.get("inflight") or []))
+    for vendor, eps in sorted((n.get("vendors") or {}).items()):
+        for name, e in sorted((eps or {}).items()):
+            r.note("VENDOR_CALLS", vendor=vendor, endpoint=name, since_start=e.get("since_0925_et"),
+                   last_5_min=e.get("last_5_min"), last_ok_age_s=e.get("last_ok_age_s"))
+    for name, e in sorted((n.get("routes") or {}).items()):
+        if name.startswith(("/api/ticket/", "/api/position/", "/api/opening-plan/")):
+            r.note("ROUTE", route=name, since_start=e.get("since_0925_et"), last_ok_age_s=e.get("last_ok_age_s"))
+
+
+def sc_ticket_fill_long(r: Run) -> None:
+    r.a.side = "LONG"
+    sc_ticket_fill(r)
+
+
+def sc_ticket_fill_short(r: Run) -> None:
+    r.a.side = "SHORT"
+    sc_ticket_fill(r)
+
+
+SCENARIOS = {"netlog": sc_netlog, "check": sc_check, "refusals": sc_refusals, "ticket_rest": sc_ticket_rest,
+             "ticket_fill": sc_ticket_fill, "ticket_fill_long": sc_ticket_fill_long,
+             "ticket_fill_short": sc_ticket_fill_short, "plan_place_cancel": sc_plan_place_cancel,
+             "plan_flip": sc_plan_flip, "plan_flat": sc_plan_flat, "restart_before": sc_restart_before,
+             "restart_after": sc_restart_after, "cleanup": sc_cleanup}
+
+
+def run_one(a, name: str) -> int:
+    """One scenario. 0 all checks passed, 1 a check failed, 2 stopped safely, 3 script error."""
+    a.scenario = name
+    side = a.side
+    r = Run(a)
+    r.note("START", base=r.base, symbol=r.sym, until_utc=a.until_utc, sends_so_far=r.mem.get("sends") or 0)
+    code = 0
+    try:
+        SCENARIOS[name](r)
+    except Stop as x:
+        r.safe_end(str(x))
+        code = 2
+    except Exception as x:                       # a bug in this script: end the same safe way
+        r.safe_end(f"script error: {type(x).__name__}: {x}"[:300])
+        code = 3
+    a.side = side
+    bad = [c["name"] for c in r.checks if not c["ok"]]
+    r.note("END", exit=code, checks=len(r.checks), failed=bad)
+    code = code if code else (1 if bad else 0)
+    word = {0: "all checks passed", 1: "FAILED CHECKS", 2: "STOPPED SAFELY", 3: "SCRIPT ERROR, STOPPED"}[code]
+    print(f"== {name}: {len(r.checks)} checks, {len(bad)} failed: {word} ==", flush=True)
+    for b in bad:
+        print(f"   failed: {b}", flush=True)
+    return code
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", required=True, help="Edge Trader's address, e.g. http://HOST:8770")
-    ap.add_argument("--scenario", required=True, choices=sorted(SCENARIOS))
+    ap.add_argument("--scenario", required=True,
+                    help="one scenario, or several with commas (run in order; a stop ends the list): "
+                         + ", ".join(sorted(SCENARIOS)))
     ap.add_argument("--symbol", default="SPY", help="the name the ticket scenarios use")
     ap.add_argument("--ticker", default="", help="plan scenarios: use this row")
     ap.add_argument("--side", default="", help="LONG or SHORT")
@@ -1004,20 +1060,21 @@ def main() -> int:
                     help="cleanup: close the test name's position when it is exactly the test's own 1 share")
     ap.add_argument("--out", default=".logs", help="folder for the record")
     a = ap.parse_args()
-    r = Run(a)
-    r.note("START", base=r.base, symbol=r.sym, until_utc=a.until_utc, sends_so_far=r.mem.get("sends") or 0)
-    code = 0
-    try:
-        SCENARIOS[a.scenario](r)
-    except Stop as x:
-        r.safe_end(str(x))
-        code = 2
-    except Exception as x:                       # a bug in this script: end the same safe way
-        r.safe_end(f"script error: {type(x).__name__}: {x}"[:300])
-        code = 3
-    bad = [c["name"] for c in r.checks if not c["ok"]]
-    r.note("END", exit=code, checks=len(r.checks), failed=bad)
-    return code if code else (1 if bad else 0)
+    names = [n.strip() for n in a.scenario.split(",") if n.strip()]
+    unknown = [n for n in names if n not in SCENARIOS]
+    if unknown or not names:
+        ap.error(f"unknown scenario: {', '.join(unknown) or '(none)'}")
+    worst = 0
+    for i, name in enumerate(names):
+        code = run_one(a, name)
+        worst = max(worst, code)
+        if code >= 2:
+            left = names[i + 1:]
+            if left:
+                print(f"== not run after the stop: {', '.join(left)} ==", flush=True)
+            break
+    print(f"== done: exit {worst} ==", flush=True)
+    return worst
 
 
 if __name__ == "__main__":
