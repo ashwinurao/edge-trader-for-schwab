@@ -94,5 +94,52 @@
       "value": 0.5,
       "note": "how often the live shadow reads Step 2's feed; the feed itself asks Edge Scanner at most every feed.picks_every_seconds"
     }
+  },
+  "armed": {
+    "_about": "Step 6, the armed send (companion/plan_auto, brief 16), only with EDGE_TRADER_PLAN_AUTO=1 and after Ash's Arm click. Every number is a start number from briefs 14 and 16 and the architect's ruling of 2026-11-13 15:47 UTC that Ash has not approved. The fast watch ends at automatic.watch_until_et.",
+    "arm_from_et": {
+      "value": "09:25:00",
+      "note": "start number, not approved by Ash; picks freeze at 09:25 ET"
+    },
+    "arm_until_et": {
+      "value": "09:30:45",
+      "note": "start number, not approved by Ash"
+    },
+    "act_from_et": {
+      "value": "09:31:00",
+      "note": "start number, not approved by Ash; the 09:30 bar ends then"
+    },
+    "orders_per_pick": {
+      "value": 1,
+      "note": "start number, not approved by Ash"
+    },
+    "orders_per_day": {
+      "value": 4,
+      "note": "start number, not approved by Ash"
+    },
+    "calls_per_minute": {
+      "value": 40,
+      "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC); with the poller's 32-50 a minute it stays under Schwab's 120"
+    },
+    "calls_per_send": {
+      "value": 4,
+      "note": "the code's worst case: the quote in break_entry.prepare, the POST, two status reads after a 201 (fork PR #15); tests/test_plan_auto.py pins it"
+    },
+    "calls_per_cancel": {
+      "value": 12,
+      "note": "the code's worst case: Trader.cancel_entry reads the order, cancels, and reads back up to ten times; never refused by the calls bound, logged with each cancel; tests/test_plan_auto.py pins it"
+    },
+    "every_seconds": {
+      "value": 0.25,
+      "note": "start number, not approved by Ash; how often the armed plan reads the open tape (brief 15 tape.every_seconds)"
+    },
+    "end_grace_seconds": {
+      "value": 20,
+      "note": "start number, not approved by Ash; the watch-end cancels run from watch_until_et until this much later, then the arm ends"
+    },
+    "clock_ahead_seconds": {
+      "value": 0.25,
+      "note": "start number, not approved by Ash; data stamped more than this after our clock makes the reading unusable (the clock looks behind)"
+    }
   }
 }
