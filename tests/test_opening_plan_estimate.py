@@ -1,0 +1,353 @@
+"""Estimated shares before the 09:30 minute, and the most that buying power allows (brief 22).
+Display only. Fake answers, fake clock, no network. Every balance here is made up (the demo's).
+
+Hand-worked, from brief 22: ATR 2.40, risk $100, last 42.10, day-trading buying power $209,360.72.
+- typical first minute 0.27 x 2.40 = 0.648 a share: 100 / 0.648 = 154.3 -> 154 shares;
+- wide 0.37 x 2.40 = 0.888: 100 / 0.888 = 112.6 -> 112; narrow 0.19 x 2.40 = 0.456: 100 / 0.456 = 219.3 -> 219;
+- calm day, 0.5 x $100 = $50: 50 / 0.648 = 77.2 -> 77; 50 / 0.888 = 56.3 -> 56; 50 / 0.456 = 109.6 -> 109;
+- buying power: 209,360.72 / 4 ranks = 52,340.18 a pick; 52,340.18 / 42.10 = 1,243.2 -> 1,243 shares.
+"""
+import dataclasses
+import json
+import logging
+import re
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from companion import netlog
+from companion.opening_plan import plan as P
+from companion.opening_plan import routes as R
+from companion.store import Store
+
+PB = P.load_playbook()
+ET = P.ET
+BAL = {"equity": 52340.18, "buyingPower": 104680.36, "dayTradingBuyingPower": 209360.72}
+
+
+def et(h, m, s=0):
+    return datetime(2026, 11, 13, h, m, s, tzinfo=ET).astimezone(timezone.utc)
+
+
+def acct(now, balances=BAL, private=False):
+    return {"balances": balances, "ok_at": now - timedelta(seconds=2), "private": private}
+
+
+def bp_ok(now=et(9, 10, 20)):
+    return P.buying_power(acct(now), now)
+
+
+def est(risk="100", calm=False, atr="2.40", price="42.10", bp=None, pb=PB):
+    d = lambda v: None if v is None else Decimal(v)
+    return P.estimate_row(d(risk), calm, d(atr), d(price), bp_ok() if bp is None else bp, pb)
+
+
+def clock(rv):
+    return {"spy_rv": None if rv is None else {"rv20": rv, "through": "2026-11-12", "calm": rv <= 10.5, "calm_max": 10.5}}
+
+
+def prow(rank, ticker, atr=2.4, last=42.1):
+    return {"rank": rank, "ticker": ticker, "top": rank <= 4, "metrics": [],
+            "levels": {"atr": atr, "pm_high": 42.82, "pm_low": 39.94, "last": last, "prior_close": 38.6}}
+
+
+def frow(rank, ticker, atr=2.4, last=42.1, fm=None, live=True):
+    row = {"rank": rank, "ticker": ticker, "top": True, "metrics": [],
+           "levels": {"atr": atr, "pm_high": 42.82, "pm_low": 39.94, "last": last}}
+    if live:
+        row["first_minute"] = fm
+    return row
+
+
+def es_answer(preview_rows=None, frozen_rows=None):
+    day = {"has_picks": bool(frozen_rows), "reason_code": "" if frozen_rows else "MISSING",
+           "reason": "" if frozen_rows else "No OV picks for 2026-11-13 yet.", "trading_date": "2026-11-13",
+           "frozen_at": "2026-11-13T14:25:00Z" if frozen_rows else None, "warmup_state": "READY",
+           "late": False, "shadow": False, "picks": frozen_rows or []}
+    preview = None if preview_rows is None else {
+        "has_preview": True, "trading_date": "2026-11-13", "as_of": "2026-11-13T14:10:00Z",
+        "previewed_at": "2026-11-13T14:10:04Z", "shadow": False, "picks": preview_rows}
+    return {"set_up": True, "reason_code": "", "reason": "", "day": day, "preview": preview}
+
+
+def view(answer, now, risk="100", rv=12.3, account="ok"):
+    account = acct(now) if account == "ok" else account
+    return P.build_view(answer, now - timedelta(seconds=0.5), "", clock(rv), now - timedelta(seconds=10), "",
+                        None if risk is None else Decimal(risk), now, PB, account=account)
+
+
+# ---- the playbook's numbers -----------------------------------------------------------------------
+
+def test_the_playbook_holds_ashs_pick_the_range_at_the_studys_numbers():
+    assert PB.estimate_show == "range"
+    assert (PB.estimate_first_minute_atr, PB.estimate_wide_atr, PB.estimate_narrow_atr) == (
+        Decimal("0.27"), Decimal("0.37"), Decimal("0.19"))
+    raw = json.loads(P.PLAYBOOK_FILE.read_text())["size"]["estimate"]
+    assert "pm_bar_break_trades.parquet" in raw["_about"] and "or1_risk_atr" in raw["_about"]
+    # Ash picked the card's first option, which names these numbers (review 1 of PR #31).
+    for k in ("show", "first_minute_atr", "wide_atr", "narrow_atr"):
+        note = raw[k]["note"]
+        assert note.startswith("Ash's pick, 2026-11-13 17:38:49 UTC"), k
+        assert '"Choose how the plan estimates shares before the first minute exists"' in note, k
+        assert '"Review OV picks desk architecture"' in note and '"About N, usually L to H"' in note, k
+        assert "0.27 x ATR" in note and "0.19 to 0.37 x ATR" in note, k
+
+
+@pytest.mark.parametrize("change, match", [
+    ({"show": {"value": "middle"}}, "show must be one of range, cautious, none"),
+    ({"wide_atr": {"value": 0.2}}, "narrow_atr < first_minute_atr < wide_atr"),
+    ({"narrow_atr": {"value": 0}}, "narrow_atr < first_minute_atr < wide_atr"),
+])
+def test_the_playbook_refuses_an_unknown_show_or_numbers_out_of_order(tmp_path, change, match):
+    raw = json.loads(P.PLAYBOOK_FILE.read_text())
+    raw["size"]["estimate"].update(change)
+    f = tmp_path / "pb.json"
+    f.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match=re.escape(match)):
+        P.load_playbook(f)
+
+
+# ---- the estimate, hand-worked --------------------------------------------------------------------
+
+def test_the_estimate_at_full_size_is_about_154_usually_112_to_219():
+    e = est()
+    assert e["kind"] == "estimate" and e["state"] == "FULL" and e["show"] == "range"
+    assert e["used"] == {"risk": 100.0, "about": 154, "fewer": 112, "more": 219, "headline": 154,
+                         "limited_by": "estimate", "capped": None}
+    assert e["full"] is None and e["half"] is None
+    assert e["bp_max"]["state"] == "OK" and e["bp_max"]["shares"] == 1243
+    assert e["text"] == "Estimate. $100.00 at risk."
+
+
+def test_the_estimate_on_a_calm_day_halves_the_risk_77_56_109():
+    e = est(calm=True)
+    assert e["state"] == "CALM" and e["used"]["risk"] == 50.0
+    assert (e["used"]["about"], e["used"]["fewer"], e["used"]["more"]) == (77, 56, 109)
+    assert e["text"] == "Estimate. Calm day: 0.5x $100.00 = $50.00 at risk."
+
+
+def test_calm_flag_not_known_shows_full_and_half_side_by_side():
+    e = est(calm=None)
+    assert e["state"] == "CALM_UNKNOWN" and e["used"] is None
+    assert (e["full"]["about"], e["full"]["fewer"], e["full"]["more"]) == (154, 112, 219)
+    assert (e["half"]["about"], e["half"]["fewer"], e["half"]["more"]) == (77, 56, 109)
+    assert e["text"] == "Calm flag not known: estimates at full $100.00 and 0.5x $50.00 side by side."
+
+
+def test_a_risk_above_what_buying_power_buys_is_limited_by_buying_power():
+    # $3,000 / 0.648 = 4,629.6 -> 4,629 shares ($194,880.90 at 42.10, inside the ticket's $250,000);
+    # buying power allows 1,243, so the headline is 1,243.
+    e = est(risk="3000")
+    assert e["used"]["about"] == 4629 and e["used"]["headline"] == 1243
+    assert e["used"]["limited_by"] == "buying_power"
+    # Equal is not limited: the estimate decides.
+    # 1,243 x 0.648 = 805.46; $805.50 / 0.648 = 1,243.05 -> 1,243 = the maximum.
+    e = est(risk="805.50")
+    assert e["used"]["about"] == 1243 and e["used"]["limited_by"] == "estimate"
+
+
+def test_cautious_shows_one_number_at_the_wide_minute_and_none_shows_no_estimate():
+    e = est(pb=dataclasses.replace(PB, estimate_show="cautious"))
+    assert e["show"] == "cautious" and e["used"]["about"] == 112 and e["used"]["headline"] == 112
+    assert e["used"]["fewer"] is None and e["used"]["more"] is None
+    e = est(pb=dataclasses.replace(PB, estimate_show="none"))
+    assert e["state"] == "OFF" and e["used"] is e["full"] is e["half"] is None
+    assert e["text"] == "No share estimate before the 09:30 minute (playbook size.estimate.show is none)."
+    assert e["bp_max"]["shares"] == 1243                 # the buying power maximum still shows
+
+
+def test_the_estimate_keeps_the_tickets_caps():
+    # ATR 0.10 at $10: 100,000 / 0.027 = 3.7 million shares, capped at the ticket's 10,000.
+    e = est(risk="100000", atr="0.10", price="10")
+    assert e["used"]["about"] == 10000 and e["used"]["capped"] == "capped at the 10,000 share limit"
+    # $5,000 at 42.10: 5,000 / 0.648 = 7,716, but $250,000 / 42.10 = 5,938.2 -> 5,938.
+    e = est(risk="5000")
+    assert e["used"]["about"] == 5938 and e["used"]["capped"] == "capped at the $250,000 notional limit"
+
+
+@pytest.mark.parametrize("risk, atr, price, text", [
+    (None, "2.40", "42.10", "No estimate: no risk per pick set."),
+    ("100", None, "42.10", "No estimate: no ATR from Edge Scanner."),
+    ("100", "0", "42.10", "No estimate: no ATR from Edge Scanner."),
+    ("100", "2.40", None, "No estimate: no last price from Edge Scanner."),
+    (None, None, None, "No estimate: no ATR from Edge Scanner and no last price from Edge Scanner and no risk per pick set."),
+])
+def test_a_missing_number_gives_no_estimate_and_says_which_never_zero(risk, atr, price, text):
+    e = est(risk=risk, atr=atr, price=price)
+    assert e["state"] == "MISSING" and e["text"] == text
+    assert e["used"] is None and e["full"] is None and e["half"] is None
+
+
+def test_no_risk_set_still_shows_what_buying_power_allows():
+    e = est(risk=None)
+    assert e["state"] == "MISSING" and e["bp_max"]["shares"] == 1243
+
+
+# ---- the buying power maximum ---------------------------------------------------------------------
+
+def test_the_buying_power_maximum_is_a_quarter_of_day_trading_buying_power_over_the_price():
+    mx = P.bp_max(bp_ok(), Decimal("42.10"), PB)
+    assert mx == {"state": "OK", "shares": 1243, "text": "Buying power allows 1,243 at full margin: a quarter "
+                                                         "of day-trading buying power at 42.10."}
+
+
+def test_the_buying_power_maximum_not_known_or_hidden_is_never_a_number():
+    now = et(9, 10, 20)
+    cases = [(P.buying_power(None, now), "NOT_KNOWN"),
+             (P.buying_power({**acct(now), "ok_at": now - timedelta(seconds=31)}, now), "NOT_KNOWN"),
+             (P.buying_power(acct(now, balances={**BAL, "dayTradingBuyingPower": None}), now), "NOT_KNOWN"),
+             (P.buying_power(acct(now, private=True), now), "HIDDEN"),
+             (None, "NOT_KNOWN")]
+    for bp, state in cases:
+        mx = P.bp_max(bp, Decimal("42.10"), PB)
+        assert mx["state"] == state and mx["shares"] is None, (bp, state)
+    assert P.bp_max(bp_ok(), None, PB)["text"] == "Buying power maximum not known: no price for this row."
+    assert P.bp_max(P.buying_power(acct(now, private=True), now), Decimal("42.10"), PB)["text"] == (
+        "Buying power maximum hidden: Edge Trader runs with --private.")
+    # Not known: the estimate stands alone, never limited by a guess.
+    e = est(risk="3000", bp=P.buying_power(None, now))
+    assert e["used"]["headline"] == 4629 and e["used"]["limited_by"] == "estimate"
+
+
+# ---- where it shows -------------------------------------------------------------------------------
+
+def test_every_preview_row_carries_an_estimate_and_the_header_says_what_it_assumes():
+    v = view(es_answer([prow(1, "AAAA"), prow(2, "BBBB", atr=None), prow(3, "CCCC", last=None)]), et(9, 10, 20))
+    assert v["state"] == P.PREVIEW and v["rows"] == []
+    a, b, c = v["preview"]["rows"]
+    assert (a["estimate"]["used"]["about"], a["estimate"]["used"]["headline"]) == (154, 154)
+    assert b["estimate"]["text"] == "No estimate: no ATR from Edge Scanner."
+    assert c["estimate"]["text"] == "No estimate: no last price from Edge Scanner."
+    assert c["estimate"]["bp_max"]["state"] == "NOT_KNOWN"
+    assert v["estimate"] == {
+        "show": "range", "first_minute_atr": 0.27, "wide_atr": 0.37, "narrow_atr": 0.19, "per_pick_of": 4,
+        "text": "Estimated shares before the 09:30 minute assume a typical first minute of 0.27 x ATR (OV's 2026 "
+                "top 4; usually 0.19 to 0.37 x ATR), Schwab's full margin for every name, and an equal quarter "
+                "of day-trading buying power per pick."}
+
+
+def test_frozen_rows_waiting_for_the_minute_carry_an_estimate_and_no_shares():
+    v = view(es_answer(frozen_rows=[frow(1, "AAAA"), frow(2, "BBBB")]), et(9, 26, 0), rv=9.8)
+    assert v["state"] == P.OK
+    for r in v["rows"]:
+        assert r["bar"]["state"] == P.WAITING and r["estimate"]["state"] == "CALM"
+        assert (r["estimate"]["used"]["about"], r["estimate"]["used"]["fewer"], r["estimate"]["used"]["more"]) == (77, 56, 109)
+        # Nothing a size reads: Step 9's size stage and the buttons read these, and they stay empty.
+        assert r["long"] is None and r["short"] is None and r["rps"] is None
+        assert r["shares"] == {"state": "NO_LEVELS", "used": None, "full": None, "half": None,
+                               "text": "No levels yet, so no shares."}
+
+
+def test_rows_without_first_minute_data_get_an_estimate_but_a_bad_bar_or_levels_do_not():
+    rows = [frow(1, "NODT", fm=None), frow(2, "NOLV", live=False),
+            frow(3, "BADB", fm={"open": 42, "high": 41, "low": 42, "close": 42}),
+            frow(4, "LEVL", fm={"open": 42.15, "high": 42.48, "low": 41.92, "close": 42.37})]
+    v = view(es_answer(frozen_rows=rows), et(9, 31, 10))
+    got = {r["ticker"]: (r["bar"]["state"], r["estimate"] and r["estimate"]["state"]) for r in v["rows"]}
+    assert got == {"NODT": (P.NO_DATA, "FULL"), "NOLV": (P.NO_LIVE, "FULL"), "BADB": (P.BAD, None),
+                   "LEVL": (P.FINAL, None)}
+
+
+def test_a_row_with_levels_keeps_its_shares_and_gets_a_note_above_the_buying_power_maximum():
+    # Bar 42.48 / 41.92: long 42.49 stop 41.92, short 41.91 stop 42.48, 0.57 a share.
+    # $1,000 / 0.57 = 1,754.4 -> 1,754 shares each side, as today.
+    # 52,340.18 / 42.49 = 1,231.8 -> 1,231 long; 52,340.18 / 41.91 = 1,248.9 -> 1,248 short.
+    fm = {"open": 42.15, "high": 42.48, "low": 41.92, "close": 42.37}
+    r = view(es_answer(frozen_rows=[frow(1, "AAAA", fm=fm)]), et(9, 31, 10), risk="1000")["rows"][0]
+    assert r["shares"]["used"] == {"long": 1754, "short": 1754} and r["long"]["shares"] == 1754
+    assert r["buying_power_note"] == {"long": 1231, "short": 1248,
+                                      "text": "Buying power allows at most 1,231 long and 1,248 short at full margin."}
+    assert r["estimate"] is None
+    # $100: 175 shares, under both: no note. Calm flag not known: the full size is checked.
+    r = view(es_answer(frozen_rows=[frow(1, "AAAA", fm=fm)]), et(9, 31, 10), risk="100")["rows"][0]
+    assert r["shares"]["used"] == {"long": 175, "short": 175} and r["buying_power_note"] is None
+    r = view(es_answer(frozen_rows=[frow(1, "AAAA", fm=fm)]), et(9, 31, 10), risk="1000", rv=None)["rows"][0]
+    assert r["shares"]["full"] == {"long": 1754, "short": 1754} and r["buying_power_note"]["long"] == 1231
+    # Buying power not known or hidden: no note, never a guess.
+    for account in (None, acct(et(9, 31, 10), private=True)):
+        r = view(es_answer(frozen_rows=[frow(1, "AAAA", fm=fm)]), et(9, 31, 10), risk="1000", account=account)["rows"][0]
+        assert r["buying_power_note"] is None and r["shares"]["used"] == {"long": 1754, "short": 1754}
+
+
+def test_the_readers_of_the_view_never_read_an_estimate():
+    """plan_entries (buttons and sends), the probe, the shadow and its engine read a row's long,
+    short and shares, never its estimate (brief 22 item 4)."""
+    root = Path(P.__file__).resolve().parent.parent
+    pat = re.compile(r"""\[\s*["']estimate["']\s*\]|get\(\s*["']estimate["']|buying_power_note""")
+    for f in ("plan_entries.py", "open_probe.py", "break_entry.py", "opening_plan/shadow.py",
+              "opening_plan/engine.py", "opening_plan/tape.py"):
+        assert not pat.search((root / f).read_text(encoding="utf-8")), f
+
+
+# ---- on screen only -------------------------------------------------------------------------------
+
+def _guard(request):
+    pass
+
+
+def test_no_balance_or_maximum_reaches_a_log_or_the_network_record(tmp_path, monkeypatch, caplog):
+    """The buying power numbers and every maximum are on the screen only (brief 21's rule, brief 22
+    item 5): serve the plan at 09:10, 09:26 and 09:31 with made-up balances through the network
+    record's middleware, catching every log line and every netlog line, and find none of them."""
+    lines = []
+    monkeypatch.setenv("EDGE_TRADER_NETLOG", "1")
+    monkeypatch.setattr(netlog, "emit", lambda kind, **f: lines.append({"kind": kind, **f}))
+    monkeypatch.setattr(netlog, "_to_rollup", lambda kind, f: lines.append({"kind": kind, **f}))
+    caplog.set_level(logging.DEBUG)
+    fm = {"open": 42.15, "high": 42.48, "low": 41.92, "close": 42.37}
+    answers = {et(9, 10, 20): es_answer([prow(1, "AAAA")]),
+               et(9, 26, 0): es_answer(frozen_rows=[frow(1, "AAAA")]),
+               et(9, 31, 10): es_answer(frozen_rows=[frow(1, "AAAA", fm=fm)])}
+    shown = []
+    for at, body in answers.items():
+        snap = {"balances": BAL, "freshness": {"account": {"ok_at": (at - timedelta(seconds=2)).isoformat()}}}
+        app = FastAPI()
+        store = Store(tmp_path / f"{at:%H%M}.db")
+        store.set_setting(R.RISK_KEY, "5000")
+        R.register(app, store, _guard, env={"EDGE_SCANNER_URL": "http://192.168.1.10:8772"}, now=lambda at=at: at,
+                   get=lambda url, timeout, body=body: body if url.endswith("/api/v2/ov-picks") else clock(12.3),
+                   snapshot=lambda snap=snap: snap)
+        app.add_middleware(netlog.RouteTimer)
+        shown.append(TestClient(app).get("/api/opening-plan").text)
+    # On screen: the balances, the maximum 1,243 at 42.10 and the note's 1,231 and 1,248 at the entries.
+    assert all("209360.72" in s for s in shown)
+    assert '"shares": 1243' in shown[0].replace('":', '": ') and '"shares": 1243' in shown[1].replace('":', '": ')
+    assert '"long": 1231' in shown[2].replace('":', '": ')
+    assert any(x["kind"] == "route" for x in lines)                  # the middleware did write its line
+    written = json.dumps(lines) + "\n".join(r.getMessage() for r in caplog.records)
+    for secret in ("209360", "209,360", "104680", "104,680", "52340", "52,340",
+                   "1243", "1,243", "1231", "1,231", "1248", "1,248"):
+        assert secret not in written, secret
+
+
+def test_the_page_marks_every_estimate_and_every_preview_row():
+    html = (Path(R.__file__).parent / "static" / "opening_plan.html").read_text(encoding="utf-8")
+    assert "Preview, not locked" in html and 'id="bp"' in html
+    assert "Est. shares" in html and 'class="tag est">estimate<' in html
+    assert "buying power allows" in html and "limited by buying power" in html
+
+
+def test_the_demo_shows_estimates_at_09_10_and_09_26_with_invented_buying_power(tmp_path):
+    from companion.opening_plan.demo_feed import DEMO_ET_ENV, DEMO_RV20_ENV, demo_rv20
+    calls = []
+    for start, rv, want_state in (("09:10:00", None, "CALM"), ("09:26:00", "12.3", "FULL")):
+        env = {DEMO_ET_ENV: start} if rv is None else {DEMO_ET_ENV: start, DEMO_RV20_ENV: rv}
+        app = FastAPI()
+        store = Store(tmp_path / f"demo{start[:2]}{start[3:5]}.db")
+        store.set_setting(R.RISK_KEY, "100")
+        R.register(app, store, _guard, demo=True, env=env, get=lambda u, t: calls.append(u))
+        v = TestClient(app).get("/api/opening-plan").json()
+        rows = v["preview"]["rows"] if start == "09:10:00" else v["rows"]
+        assert len(rows) == 4 and all(r["estimate"]["state"] == want_state for r in rows)
+        aaaa = next(r for r in rows if r["ticker"] == "AAAA")
+        # The demo's AAAA is the brief's example: ATR 2.40, last 42.10, invented DTBP 209,360.72.
+        used = aaaa["estimate"]["used"]
+        assert (used["about"], used["fewer"], used["more"]) == ((77, 56, 109) if want_state == "CALM" else (154, 112, 219))
+        assert aaaa["estimate"]["bp_max"]["shares"] == 1243
+    assert calls == []
+    assert (demo_rv20(None), demo_rv20("12.3"), demo_rv20("x"), demo_rv20("-1"), demo_rv20("nan")) == (9.8, 12.3, 9.8, 9.8, 9.8)
+

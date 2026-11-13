@@ -29,6 +29,15 @@ take a preview row for a pick. The frozen picks replace it, as before.
 
 view["buying_power"] shows Schwab's day-trading buying power, buying power and equity from the
 account read Edge Trader already makes, with the time read. On screen only.
+
+Before the 09:30 minute there is no range, so no exact share count (brief 22, Ash's ask of
+2026-11-13 17:18 UTC: "what would be the shares that would be purchased, including accounting
+for margin"). Preview rows, and frozen rows still waiting for the minute, carry an estimate in
+row["estimate"]: the risk used over a typical first minute (playbook size.estimate, from the 2026
+study), its usual range, and the most an equal share of day-trading buying power buys at the
+row's price. It is never a size: row["long"], row["short"] and row["shares"] stay empty until the
+minute gives levels, so no button, send, shadow or probe can read an estimate. A frozen row with
+levels keeps its shares; it only gets a note when they are above the buying power maximum.
 """
 from __future__ import annotations
 
@@ -74,6 +83,8 @@ PREVIEW_TEXT = "Preview, not locked. Picks freeze at 09:25 ET."
 PREVIEW_OLD_AFTER_S = 120   # Edge Scanner's card says the same after 2 minutes (dashboard view.ts PREVIEW_STALE_MS)
 PREVIEW_LEVELS = ("atr", "pm_high", "pm_low", "last")
 BALANCES_OLD_AFTER_S = 30   # the account is read every 5 s (poller.py INTERVALS); start number
+ESTIMATE_SHOWS = ("range", "cautious", "none")     # playbook size.estimate.show (brief 22, Ash's card)
+ESTIMATE_ROW_STATES = (WAITING, NO_DATA, NO_LIVE)  # frozen rows with no first minute yet get an estimate
 
 
 @dataclass(frozen=True)
@@ -97,6 +108,10 @@ class Playbook:
     timeout_seconds: float
     stale_after_seconds: float
     clock_old_after_seconds: float
+    estimate_show: str
+    estimate_first_minute_atr: Decimal
+    estimate_wide_atr: Decimal
+    estimate_narrow_atr: Decimal
 
 
 def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
@@ -104,6 +119,7 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     try:
         lst, lvl, ent, size, ext, feed = (raw[k] for k in ("list", "level", "entry", "size", "exit", "feed"))
+        est = size["estimate"]
         pb = Playbook(
             name=str(raw["name"]),
             rank_from=int(lst["rank_from"]), rank_to=int(lst["rank_to"]),
@@ -118,7 +134,11 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
             clock_every_seconds=float(feed["clock_every_seconds"]),
             timeout_seconds=float(feed["timeout_seconds"]),
             stale_after_seconds=float(feed["stale_after_seconds"]),
-            clock_old_after_seconds=float(feed["clock_old_after_seconds"]))
+            clock_old_after_seconds=float(feed["clock_old_after_seconds"]),
+            estimate_show=str(est["show"]["value"]),
+            estimate_first_minute_atr=Decimal(str(est["first_minute_atr"]["value"])),
+            estimate_wide_atr=Decimal(str(est["wide_atr"]["value"])),
+            estimate_narrow_atr=Decimal(str(est["narrow_atr"]["value"])))
     except (KeyError, TypeError, ValueError, InvalidOperation) as e:
         raise ValueError(f"playbook {path}: {type(e).__name__}: {e}") from e
     if lst.get("source") != "ov_picks":
@@ -137,6 +157,10 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
         raise ValueError("playbook: feed times must be above 0")
     if pb.timeout_seconds >= pb.picks_every_seconds:
         raise ValueError("playbook: the time limit must be shorter than the picks spacing")
+    if pb.estimate_show not in ESTIMATE_SHOWS:
+        raise ValueError(f"playbook: size.estimate.show must be one of {', '.join(ESTIMATE_SHOWS)}")
+    if not 0 < pb.estimate_narrow_atr < pb.estimate_first_minute_atr < pb.estimate_wide_atr:
+        raise ValueError("playbook: size.estimate needs 0 < narrow_atr < first_minute_atr < wide_atr")
     return pb
 
 
@@ -277,8 +301,9 @@ def _f(d: Optional[Decimal]) -> Optional[float]:
 
 
 def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[Decimal],
-              calm: Optional[bool], pb: Playbook) -> dict:
-    """One plan row from one row of Edge Scanner's ranked list."""
+              calm: Optional[bool], pb: Playbook, bp: Optional[Mapping] = None) -> dict:
+    """One plan row from one row of Edge Scanner's ranked list. `bp` is view["buying_power"], for
+    the estimate (brief 22) and the buying power note; None makes both "not known"."""
     levels = row.get("levels") if isinstance(row.get("levels"), Mapping) else {}
     atr = to_dec(levels.get("atr"))
     if atr is not None and atr <= 0:
@@ -288,7 +313,8 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                    "age_s": None, "unconfirmed": False, "text": ""},
            "long": None, "short": None, "rps": None, "nearer": None,
            "under_min_stop": None, "min_stop": None,
-           "shares": {"state": None, "used": None, "full": None, "half": None, "text": ""}}
+           "shares": {"state": None, "used": None, "full": None, "half": None, "text": ""},
+           "estimate": None, "buying_power_note": None}
     bar = out["bar"]
     start = datetime.combine(trading_date, pb.bar_start_et, tzinfo=ET)
     end = start + timedelta(minutes=pb.bar_minutes)
@@ -327,6 +353,9 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                 bar.update(state=FINAL, text=f"The {pb.bar_start_et:%H:%M} ET bar, final.")
     if bar["high"] is None:
         out["shares"].update(state="NO_LEVELS", text="No levels yet, so no shares.")
+        if bar["state"] in ESTIMATE_ROW_STATES:
+            # Brief 22: an estimate in its own key; the row's shares stay empty.
+            out["estimate"] = estimate_row(risk, calm, atr, to_dec(levels.get("last")), bp, pb)
         return out
 
     high, low = Decimal(str(bar["high"])), Decimal(str(bar["low"]))
@@ -353,6 +382,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                        "shown side by side.")
         for k in ("long", "short"):
             out[k]["capped"] = full[k]["capped"] or half[k]["capped"]
+        out["buying_power_note"] = buying_power_note(out, bp, pb)
         return out
     used = risk * pb.calm_multiplier if calm else risk
     got = {k: size(used, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
@@ -363,6 +393,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         else f"${used:,.2f} at risk."))
     if all(got[k]["shares"] == 0 for k in ("long", "short")):
         sh["text"] = f"${used:,.2f} is less than one share's risk (${lv['long']['rps']}): 0 shares."
+    out["buying_power_note"] = buying_power_note(out, bp, pb)
     return out
 
 
@@ -445,6 +476,135 @@ def buying_power(account: Optional[Mapping], now: datetime) -> dict:
     return out
 
 
+# ---------------------------------------------------------------- estimates before the minute (brief 22)
+
+_SHARE_WORDS = {1: "all", 2: "half", 3: "third", 4: "quarter"}
+
+
+def _share_word(n: int) -> str:
+    return _SHARE_WORDS.get(n, f"1/{n} share")
+
+
+def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook) -> dict:
+    """The most shares an equal share of day-trading buying power buys at `price`:
+    floor(day-trading buying power / the playbook's rank count / price). It assumes Schwab's full
+    margin for every name; each name's own rate is brief 23. Not known (never 0, never a guess)
+    when the buying power line is not OK or the row has no price; hidden with --private, because
+    the number gives the balance away. On screen only, like the balance it comes from."""
+    ranks = pb.rank_to - pb.rank_from + 1
+    out = {"state": "NOT_KNOWN", "shares": None, "text": ""}
+    state = bp.get("state") if isinstance(bp, Mapping) else None
+    if state == "HIDDEN":
+        out.update(state="HIDDEN", text="Buying power maximum hidden: Edge Trader runs with --private.")
+        return out
+    dtbp = to_dec(bp.get("day_trading")) if state == "OK" else None
+    if dtbp is None:
+        out["text"] = "Buying power maximum not known: day-trading buying power is not known."
+        return out
+    if price is None or price <= 0:
+        out["text"] = "Buying power maximum not known: no price for this row."
+        return out
+    n = int((max(dtbp, Decimal(0)) / ranks / price).to_integral_value(rounding=ROUND_FLOOR))
+    out.update(state="OK", shares=n, text=(f"Buying power allows {n:,} at full margin: a {_share_word(ranks)} "
+                                           f"of day-trading buying power at {price:,.2f}."))
+    return out
+
+
+def _estimate_at(risk: Decimal, atr: Decimal, price: Decimal, bp_shares: Optional[int], pb: Playbook) -> dict:
+    """One estimate at one risk: shares at the typical, wide and narrow first minute, each through
+    size() at the row's price so the ticket's caps hold, and the headline: the smaller of the
+    estimate and the buying power maximum, with which one decided."""
+    def at(mult: Decimal) -> dict:
+        return size(risk, atr * mult, price)
+    if pb.estimate_show == "cautious":
+        about, fewer, more = at(pb.estimate_wide_atr), None, None
+    else:
+        about, fewer, more = at(pb.estimate_first_minute_atr), at(pb.estimate_wide_atr), at(pb.estimate_narrow_atr)
+    n = about["shares"]
+    limited = bp_shares is not None and n is not None and bp_shares < n
+    return {"risk": _f(risk), "about": n, "fewer": fewer and fewer["shares"], "more": more and more["shares"],
+            "headline": bp_shares if limited else n, "limited_by": "buying_power" if limited else "estimate",
+            "capped": next((x["capped"] for x in (about, fewer, more) if x and x["capped"]), None)}
+
+
+def estimate_row(risk: Optional[Decimal], calm: Optional[bool], atr: Optional[Decimal],
+                 price: Optional[Decimal], bp: Optional[Mapping], pb: Playbook) -> dict:
+    """A row's estimated shares before the 09:30 minute (brief 22). Its own key, row["estimate"],
+    never a size: `kind` says "estimate" and nothing that sends reads it.
+
+    State FULL or CALM: `used` holds the estimate at the risk used (calm_multiplier of it on a calm
+    day). CALM_UNKNOWN: `full` and `half` side by side, as the rows do. MISSING: no ATR, no price or
+    no risk, said in `text`, never 0. OFF: size.estimate.show is "none". `bp_max` is bp_max()."""
+    mx = bp_max(bp, price, pb)
+    out = {"kind": "estimate", "show": pb.estimate_show, "state": None, "calm": calm,
+           "used": None, "full": None, "half": None, "bp_max": mx, "text": ""}
+    if pb.estimate_show == "none":
+        out.update(state="OFF", text="No share estimate before the 09:30 minute (playbook size.estimate.show is none).")
+        return out
+    missing = [w for w, v in (("no ATR from Edge Scanner", atr), ("no last price from Edge Scanner", price))
+               if v is None or v <= 0]
+    if risk is None:
+        missing.append("no risk per pick set")
+    if missing:
+        out.update(state="MISSING", text=f"No estimate: {' and '.join(missing)}.")
+        return out
+    if calm is None:
+        half = risk * pb.calm_multiplier
+        out.update(state="CALM_UNKNOWN", full=_estimate_at(risk, atr, price, mx["shares"], pb),
+                   half=_estimate_at(half, atr, price, mx["shares"], pb),
+                   text=f"Calm flag not known: estimates at full ${risk:,.2f} and {pb.calm_multiplier:g}x "
+                        f"${half:,.2f} side by side.")
+        return out
+    used = risk * pb.calm_multiplier if calm else risk
+    out.update(state="CALM" if calm else "FULL", used=_estimate_at(used, atr, price, mx["shares"], pb), text=(
+        f"Estimate. Calm day: {pb.calm_multiplier:g}x ${risk:,.2f} = ${used:,.2f} at risk." if calm
+        else f"Estimate. ${used:,.2f} at risk."))
+    return out
+
+
+def estimate_header(pb: Playbook) -> dict:
+    """What every estimate on the screen assumes, said once in the header."""
+    ranks = pb.rank_to - pb.rank_from + 1
+    bp = (f"Schwab's full margin for every name, and an equal {_share_word(ranks)} of day-trading buying "
+          "power per pick")
+    if pb.estimate_show == "none":
+        text = f"No share estimates before the 09:30 minute. The buying power maximum assumes {bp}."
+    elif pb.estimate_show == "cautious":
+        text = (f"Estimated shares before the 09:30 minute assume a wide first minute of "
+                f"{pb.estimate_wide_atr:g} x ATR (OV's 2026 top 4: three picks in four had a narrower one), {bp}.")
+    else:
+        text = (f"Estimated shares before the 09:30 minute assume a typical first minute of "
+                f"{pb.estimate_first_minute_atr:g} x ATR (OV's 2026 top 4; usually {pb.estimate_narrow_atr:g} to "
+                f"{pb.estimate_wide_atr:g} x ATR), {bp}.")
+    return {"show": pb.estimate_show, "first_minute_atr": _f(pb.estimate_first_minute_atr),
+            "wide_atr": _f(pb.estimate_wide_atr), "narrow_atr": _f(pb.estimate_narrow_atr),
+            "per_pick_of": ranks, "text": text}
+
+
+def buying_power_note(row: Mapping, bp: Optional[Mapping], pb: Playbook) -> Optional[dict]:
+    """A note on a row with levels whose shares are above the buying power maximum at that side's
+    entry, or None. Display only: the row's shares are NOT changed (capping real sizes is brief 23,
+    with Ash's own go). Calm flag not known: the full-size shares are checked."""
+    sh = row.get("shares") or {}
+    shown = sh.get("used") or sh.get("full")
+    if not isinstance(shown, Mapping):
+        return None
+    over = {}
+    for k in ("long", "short"):
+        side = row.get(k) or {}
+        mx = bp_max(bp, to_dec(side.get("entry")), pb)
+        if mx["state"] == "OK" and isinstance(shown.get(k), int) and shown[k] > mx["shares"]:
+            over[k] = mx["shares"]
+    if not over:
+        return None
+    if len(over) == 2 and over["long"] == over["short"]:
+        what = f"{over['long']:,}"
+    else:
+        what = " and ".join(f"{n:,} {k}" for k, n in over.items())
+    return {"long": over.get("long"), "short": over.get("short"),
+            "text": f"Buying power allows at most {what} at full margin."}
+
+
 def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_error: str,
                clock: Optional[Mapping], clock_ok_at: Optional[datetime], clock_error: str,
                risk: Optional[Decimal], now: datetime, pb: Playbook, account: Optional[Mapping] = None) -> dict:
@@ -470,6 +630,7 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         "risk": {"per_pick": _f(risk)},
         "calm": calm_reading(clock, clock_ok_at, clock_error, now, pb),
         "buying_power": buying_power(account, now),
+        "estimate": estimate_header(pb),
         "rows": [],
     }
     src = view["source"]
@@ -495,6 +656,9 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         if pv is not None:
             # Display only: the rows stay out of view["rows"] and the state is not OK (brief 21).
             view.update(state=PREVIEW, message=PREVIEW_TEXT, preview=pv)
+            for r in pv["rows"]:
+                r["estimate"] = estimate_row(risk, view["calm"]["calm"], to_dec(r["atr"]), to_dec(r["last"]),
+                                             view["buying_power"], pb)
             if not pv["rows"]:
                 view["notes"].append(f"No name ranked {pb.rank_from} to {pb.rank_to} in the preview as of "
                                      f"{pv['as_of_et'][:5]} ET.")
@@ -530,5 +694,6 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         return view
     if view["stale"]:
         view["state"] = STALE
-    view["rows"] = [build_row(r, trading_date, now, risk, view["calm"]["calm"], pb) for r in rows]
+    view["rows"] = [build_row(r, trading_date, now, risk, view["calm"]["calm"], pb, view["buying_power"])
+                    for r in rows]
     return view
