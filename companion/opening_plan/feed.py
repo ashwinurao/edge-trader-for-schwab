@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
+from .. import netlog
+
 log = logging.getLogger(__name__)
 
 ENV_VAR = "EDGE_SCANNER_URL"
@@ -52,15 +54,23 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # LAN o
 
 
 def http_get(url: str, timeout: float) -> Any:
-    """One GET, JSON back. Raises on a non-200 answer, a slow answer or an answer that is too big."""
-    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "edge-trader-opening-plan"})
-    with _OPENER.open(req, timeout=timeout) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"HTTP {resp.status}")
-        body = resp.read(MAX_BYTES + 1)
-    if len(body) > MAX_BYTES:
-        raise RuntimeError("answer too big")
-    return json.loads(body)
+    """One GET, JSON back. Raises on a non-200 answer, a slow answer or an answer that is too big.
+    Recorded in data/netlog/ as vendor edge_scanner (companion/netlog.py); X-Edge-App and X-Edge-Req
+    let Edge Scanner's own record name this call."""
+    with netlog.call("edge_scanner", netlog.endpoint_of(url), "plan_feed") as call:
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "edge-trader-opening-plan",
+                                                   **netlog.edge_headers(call)})
+        call.sending()
+        t0 = _time.monotonic()
+        with _OPENER.open(req, timeout=timeout) as resp:
+            netlog.answered("edge_scanner", "GET", url, resp.status, (_time.monotonic() - t0) * 1000, resp.headers)
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            body = resp.read(MAX_BYTES + 1)
+        call.returned()
+        if len(body) > MAX_BYTES:
+            raise RuntimeError("answer too big")
+        return json.loads(body)
 
 
 @dataclass

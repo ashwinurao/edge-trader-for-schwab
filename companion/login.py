@@ -16,7 +16,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-from . import schwab
+from . import netlog, schwab
 
 
 def main() -> None:
@@ -44,9 +44,13 @@ def main() -> None:
     print()
 
     import schwabdev
-    client = schwabdev.Client(app_key=key, app_secret=secret, callback_url=cb, tokens_db=str(schwab.TOKENS_DB))
-    if args.reauth:
-        client.tokens.update_tokens(force_refresh_token=True)
+    # Recorded in data/netlog/ (netlog.py): schwabdev's start exchanges or renews tokens when needed.
+    # Its time includes yours when it asks you to paste the address. Never the code or tokens.
+    with netlog.call("schwab_oauth", "token", "login_cli"):
+        client = schwabdev.Client(app_key=key, app_secret=secret, callback_url=cb, tokens_db=str(schwab.TOKENS_DB))
+        if args.reauth:
+            client.tokens.update_tokens(force_refresh_token=True)
+    netlog.attach(client._session)
 
     try:
         t = client.tokens
@@ -78,6 +82,7 @@ def main() -> None:
         ok = False
         print(f"  [FAIL] quotes: {exc}")
 
+    netlog.flush(2.0)        # the record's writer thread stops with this command
     print()
     if ok:
         print("  Ready. Start Edge Trader with launch.bat.")
