@@ -629,13 +629,32 @@ def test_not_on_an_old_price(r):
     assert r.host.said == [("flip_wait", "no flip: the price is 0.8 s old")]
 
 
-def test_not_on_an_old_order_list(r):
-    place_long(r)
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_an_old_order_list_before_the_cancel_waits_for_the_next_reading(r, kind):
+    # Architect's notes on the live test (2026-11-13 20:12 UTC, N1): an old list is a wait. Nothing
+    # is cancelled or written, no line per try (it can last 15 s), the order's one automatic cancel
+    # is not used up, and the panel says it once. On the next reading, with the list fresh, it goes once.
+    oid = place_long(r)
+    wrote = []
+    real_save = r.desk._save
+    r.desk._save = lambda recs: wrote.append(1) or real_save(recs)
     r.desk._orders_fresh_fn = lambda: False
-    assert run(r) is False
+    args = {} if kind == "would_flip" else {"last": 42.40, "high": 42.60}
+    if kind == "would_relevel":
+        new_bar(r)                                  # defined with the re-level tests below
+    what = "flip" if kind == "would_flip" else "re-level"
+    for _ in range(3):
+        assert run(r, kind, **args) is False
     nothing_at_schwab(r)
-    # A passing condition: nothing said, and the order's one automatic cancel is not used up.
-    assert r.host.said == [] and r.host.keys == set()
+    assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.gone == []
+    code = "flip" if kind == "would_flip" else "relevel"
+    assert r.host.said == [(f"{code}_orders_old",
+                            f"no {what} yet: Schwab's order list is old; the next reading decides again")] * 3
+    assert rec(r)["state"] == plan_entries.SENT and rec(r)["flips"] == 0 and rec(r).get("relevels", 0) == 0
+    r.desk._orders_fresh_fn = lambda: True
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 2 and len(r.sent) == 2
+    assert rec(r)["state"] == plan_entries.SENT and rec(r)["side"] == ("SHORT" if kind == "would_flip" else "LONG")
 
 
 def test_not_with_another_working_order_on_the_name(r):
@@ -1022,6 +1041,25 @@ def test_a_send_refused_by_traders_lock_after_the_look_waits_and_goes_once(r, mo
     assert r.host.left["orders_pick"] == left["orders_pick"] - 1
     assert len(r.broker.placed) == 2 and rec(r)["side"] == "SHORT" and rec(r)["state"] == plan_entries.SENT
     assert r.sent[-1] == r.sent[-2]                              # the same request, once at Schwab
+
+
+def test_after_the_cancel_a_schwab_quote_older_than_5_s_places_nothing_and_leaves_the_pick(r, monkeypatch):
+    # Architect's notes on the live test (2026-11-13 20:12 UTC, N4): Step 3's 5-second quote rule
+    # (break_entry.prepare) refuses the send after the confirmed cancel. Nothing rests, the row says
+    # Schwab's words, and the plan leaves the pick for the day. Pinned as it is, not a ruling.
+    place_long(r)
+    monkeypatch.setattr(r.trader, "quote", lambda sym, max_age=1.0: {
+        "bid": 42.09, "ask": 42.11, "realtime": True, "quote_time": _time.time() * 1000 - 5200,
+        "asset_type": "EQUITY"})
+    assert run(r) is True
+    assert len(r.broker.cancelled) == 1 and len(r.broker.placed) == 1
+    got = rec(r)
+    assert got["state"] == plan_entries.NONE
+    assert got["text"].startswith("Cancelled the long entry by the armed plan. The short was not placed: "
+                                  "Schwab's quote is 5.2 s old (a break entry needs one under 5 s).")
+    assert r.host.gone == ["cancelled by the armed plan; the short was not placed: " + got["text"].split(
+        "was not placed: ", 1)[1]]
+    assert [c for c in r.broker.calls if c[0] in ("spend", "refund")] == [("spend", 1, 4), ("refund", 1, 4)]
 
 
 # ---------------------------------------------------------------- Schwab says no
@@ -2072,6 +2110,105 @@ def test_the_second_look_that_runs_past_the_watch_end_stops_there(frig, monkeypa
     assert got["state"] == plan_entries.NONE and got["text"] == WATCH_ENDED and note(frig) == WATCH_ENDED
     said = [x for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == "flip_look_again"]
     assert len(said) == 1
+
+
+# ---------------------------------------------------------------- the live 1-share test (architect's notes, 20:12 UTC)
+
+def old_list_after_the_cancel(frig, monkeypatch, fresh_after=None):
+    """Schwab's order list goes old just as the flip's or re-level's cancel is confirmed (N1: the
+    poller holds itself to 70 calls a minute with the order calls counted in it, and live the list
+    was read every 12 to 19 s). Fresh again `fresh_after` seconds later on the fake clock, or never.
+    Returns (seconds, AAAA's row text) for each wait taken while it was old."""
+    real_cancel = frig.trader.cancel_entry
+    since = []
+
+    def cancel(oid):
+        got = real_cancel(oid)
+        frig.knobs["fresh"] = False
+        since.append(frig.clock.t)
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel)
+    waits = []
+
+    def sleep(s):
+        frig.clock.advance(s)
+        if since and not frig.knobs["fresh"]:
+            waits.append((s, frig.desk.records()["AAAA"]["text"]))
+            if fresh_after is not None and frig.clock.t >= since[0] + timedelta(seconds=fresh_after):
+                frig.knobs["fresh"] = True
+    monkeypatch.setattr(trading.time, "sleep", sleep)
+    return waits
+
+
+@pytest.mark.parametrize("ready, kind, side, text", [
+    (aaaa_past_its_flip_line, "flip", "short", "Flipped by the armed plan (1 of 3)."),
+    (relevel_ready, "relevel", "long", "Re-levelled by the armed plan: the range is now 42.60 / 41.92."),
+], ids=["flip", "relevel"])
+def test_an_order_list_old_after_the_cancel_waits_and_sends_once_when_fresh(frig, monkeypatch, ready, kind, side,
+                                                                             text):
+    # N1: after the confirmed cancel nothing rests, so the send waits a tick at a time for a fresh
+    # list (it never sends on an old one), says so once, and sends once when the list is fresh.
+    ids = ready(frig)
+    waits = old_list_after_the_cancel(frig, monkeypatch, fresh_after=1.0)
+    run_plan(frig, et(9, 31, 9))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5 and max(frig.working) == 1
+    assert frig.broker.placed[-1]["orderLegCollection"][0]["instruction"] == ("SELL_SHORT" if side == "short" else "BUY")
+    waiting = f"The armed plan cancelled the long entry. It places the {side} when Schwab's order list is fresh again."
+    assert waits == [(0.25, waiting)] * 4                   # 1.0 s at armed.every_seconds, one row line
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.SENT and got["text"] == text
+    said = [x["text"] for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == f"{kind}_orders_old"]
+    assert said == [f"cancelled the long entry; the {side} goes when Schwab's order list is fresh again"]
+    (line,) = [x for x in plan_lines(frig) if x["event"] == f"{kind}_auto"]
+    assert line["ok"] and {"orders_old_from", "orders_old_until"} <= set(line["times"])
+    assert frig.plan.arming.is_armed(frig.clock.now())
+
+
+@pytest.mark.parametrize("ready", [aaaa_past_its_flip_line, relevel_ready], ids=["flip", "relevel"])
+def test_an_order_list_old_until_the_watch_end_sends_nothing_and_the_row_says_why(frig, monkeypatch, ready):
+    ids = ready(frig)
+    waits = old_list_after_the_cancel(frig, monkeypatch)
+    run_plan(frig, et(9, 35, 0.1), start=et(9, 34, 58))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
+    assert len(waits) == 7                                   # 09:34:58.25 to 09:35:00, a tick apart
+    want = ("Cancelled the long entry by the armed plan; the fast watch ended while Schwab's order list was old, "
+            "so nothing rests.")
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and got["text"] == want
+    assert [x["why"] for x in plan_lines(frig, "leave") if x["ticker"] == "AAAA"] == [want]
+    (line,) = [x for x in plan_lines(frig) if x["event"].endswith("_auto") and x["ticker"] == "AAAA"
+               and x.get("stage") == "recheck"]
+    assert line["code"] == "orders_old" and line["cancelled_order_id"] == ids["AAAA"]
+
+
+# Schwab's words on 2026-11-13 (SPY short 18:49:43 UTC; CBRS long 19:39:08 UTC, 4.0 s after the 201).
+REJECTED_WHY = ("The stop price must be above the current ask for buy stop orders and below the bid for sell stop "
+                "orders.")
+
+
+@pytest.mark.parametrize("ready, text", [
+    (aaaa_past_its_flip_line, "Flipped by the armed plan (1 of 3)."),
+    (relevel_ready, "Re-levelled by the armed plan: the range is now 42.60 / 41.92."),
+], ids=["flip", "relevel"])
+def test_the_new_entry_schwab_rejects_after_its_201_is_not_sent_again(frig, ready, text):
+    # N2: Schwab answered 201 with an order id, then its order list showed REJECTED 4.0 s later. The
+    # engine reads the pick's entry as ended and marks the pick done: nothing is sent again for it,
+    # the plan stays armed, the other picks go on, and the row says Schwab's reason.
+    ids = ready(frig)
+    run_plan(frig, et(9, 31, 6))
+    assert len(frig.broker.placed) == 5
+    new_id = frig.desk.records()["AAAA"]["order_id"]
+    frig.clock.advance(4.0)
+    frig.broker.orders[new_id].update(status="REJECTED", statusDescription=REJECTED_WHY)
+    run_plan(frig, et(9, 34, 59))
+    assert len(frig.broker.placed) == 5 and frig.broker.cancelled == [ids["AAAA"]]
+    assert frig.plan.arming.is_armed(frig.clock.now())
+    e = row(frig)["entry"]
+    assert e["text"] == f"Ended REJECTED with nothing filled. Schwab: {REJECTED_WHY}" and e["auto_text"] == text
+    # The other picks go on: the watch end cancels their entries; AAAA's ended one is left alone.
+    run_plan(frig, et(9, 35, 10))
+    assert sorted(frig.broker.cancelled) == sorted(ids.values()) and new_id not in frig.broker.cancelled
+    assert len(frig.broker.placed) == 5
 
 
 def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):

@@ -961,7 +961,9 @@ class PlanDesk:
                   may_cancel: Callable[[int], bool] = lambda order_id: True,
                   log: Optional[Callable[..., None]] = None, times: Optional[dict] = None,
                   view: Optional[Mapping] = None,
-                  wait: Callable[[], str] = lambda: "another order action holds Trader's lock") -> dict:
+                  wait: Callable[..., str] = lambda reason="busy": (
+                      "another order action holds Trader's lock" if reason == "busy" else
+                      "Schwab's order list is old")) -> dict:
         """Flip's twin for the armed plan (Step 7, brief 17 item 2), and the re-level (item 4).
 
         kind "flip" cancels the row's resting entry and places the other side; "relevel" places
@@ -983,9 +985,17 @@ class PlanDesk:
         Trader's lock busy (another order action, architect's review 1 of Step 6, must 1): before the
         claim, the answer is `busy` with no record written and no line logged, and nothing reached
         Schwab. After the confirmed cancel, the row says the plan places the other side when the
-        action ends, and `wait()` runs once per tick while the lock stays busy: "" to look again, or
-        why to stop (the row then says the cancel went through and nothing rests). When the lock is
+        action ends, and `wait("busy")` runs once per tick while the lock stays busy: "" to look again,
+        or why to stop (the row then says the cancel went through and nothing rests). When the lock is
         free, recheck() and the checks run again before the send.
+
+        Schwab's order list old (ORDERS_OLD; architect's notes on the live test, 2026-11-13 20:12 UTC,
+        N1: the poller holds itself to 70 calls a minute with the order calls counted in it, so the
+        list can be 10 to 16 s late). Nothing is ever sent on an old list, and an old list is a wait,
+        never an end. Before the claim the answer is `again` with code "orders_old", no record
+        written and no line logged, and the next reading decides again. After the confirmed cancel
+        the flip waits as for the lock, `wait("orders_old")` once per tick, with one row line; when
+        the list is fresh, recheck() and the checks run again before the send.
 
         Flat all's hold (`held()`, Step 9): first of all, before the cancel, the answer is `held` with
         no record written and no line logged. After the confirmed cancel it is checked on each pass,
@@ -1053,8 +1063,15 @@ class PlanDesk:
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
             why = self._swap_refusal(ticker, side, kind, rec, entry, orders, blocked, fresh, limit)
+            if why == ORDERS_OLD:
+                # An old list is a wait (architect's notes on the live test, 2026-11-13 20:12 UTC, N1):
+                # nothing reached Schwab and nothing is written. No line per try either, since it can
+                # last 15 s while the poller waits under its 70 calls a minute; the lane says it once
+                # and the next reading decides again.
+                out.update(code="orders_old", error=why, again=True)
+                return out
             if why:
-                return done(error=why, again=(why == ORDERS_OLD or entry["state"] in BUSY))
+                return done(error=why, again=entry["state"] in BUSY)
             try:
                 shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
                 if shares < 1:
@@ -1112,31 +1129,37 @@ class PlanDesk:
         waiting = ""
         while True:
             held = self.held()
+            # What the send waits for, if anything: Trader's lock, then a fresh order list (N1).
+            pause = "" if held else "busy" if self.trader_busy() else "" if self._orders_fresh() else "orders_old"
             if held:
                 # Flat all started during the cancel: nothing new goes while it runs, and the batch
                 # disarms the plan first (Step 6's before_batch). Checked before the busy wait, since
                 # the batch's own cancels hold Trader's lock (architect, 17:42 UTC).
                 why, code = held, "held"
-            elif self.trader_busy():
-                if not waiting:
-                    stamp("busy_from")
-                    waiting = (f"The armed plan cancelled the {old.lower()} entry. It places the {side.lower()} "
-                               "when the order action in progress ends.")
+            elif pause:
+                if waiting != pause:
+                    waiting = pause
+                    stamp(f"{pause}_from")
+                    text = (f"The armed plan cancelled the {old.lower()} entry. It places the {side.lower()} "
+                            + ("when the order action in progress ends." if pause == "busy" else
+                               "when Schwab's order list is fresh again."))
                     with self._lock:
                         now_rec = self._load().get(ticker) or {}
                         if now_rec.get("origin") == "auto" and now_rec.get("state") == FLIPPING:
-                            self._put(ticker, text=waiting)
+                            self._put(ticker, text=text)
                 try:
-                    why = wait()
+                    why = wait(pause)
                 except Exception as e:                # a bug in the caller: stop waiting, place nothing
                     _log.exception("armed plan wait failed")
-                    why = f"the wait for the order action failed ({e})"
+                    why = (f"the wait for the order action failed ({e})" if pause == "busy" else
+                           f"the wait for a fresh order list failed ({e})")
                 if not why:
                     continue
-                code = "busy"
+                code = pause
             else:
                 if waiting:
-                    stamp("busy_until")
+                    stamp(f"{waiting}_until")
+                    waiting = ""
                 try:
                     why, code = recheck()
                 except Exception as e:                    # a bug in the caller: never place on it
@@ -1162,13 +1185,17 @@ class PlanDesk:
                     held = self.held()                    # a batch that started during the recheck
                     if held:
                         why, code = held, "held"
+                if not why and not fresh:
+                    # The list went old after the look at the top (N1): nothing is sent on it. Back to
+                    # the top, which waits for a fresh one a tick at a time (the lock is let go here).
+                    continue
                 if not why:
                     try:
                         blocked = self._blocked_names()
                     except Exception:
                         blocked = None                    # refuses: "not confirmed"
-                    why = ORDERS_OLD if not fresh else self._swap_send_refusal(ticker, oid, orders, blocked)
-                    code = "orders_old" if not fresh else ("refused" if why else "")
+                    why = self._swap_send_refusal(ticker, oid, orders, blocked)
+                    code = "refused" if why else ""
                 if not why:
                     red = self._row_disagrees(view, ticker, side, o)
                     if red:
@@ -1181,7 +1208,7 @@ class PlanDesk:
                     text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
                             f"Cancelled by the armed plan, nothing rests. {why}" if code == "held" else
                             f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
-                            if code in ("traded", "busy", "watch") else
+                            if code in ("traded", "busy", "watch", "orders_old") else
                             f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
                     self._put(ticker, state=NONE, order_id=None, text=text)
                     return done(stage="recheck", code=code, error=text)

@@ -40,6 +40,25 @@ flip waits for the lock a tick (armed.every_seconds) at a time, the row and the 
 and when the lock is free the recheck and the desk's checks run again before the send. It stops
 waiting when the plan is disarmed or the fast watch ends; nothing rests then.
 
+Schwab's order list old (architect's notes on the live test, 2026-11-13 20:12 UTC, N1): the
+poller holds itself to 70 calls a minute (poller.MAX_PER_MIN) and Trader's order calls count in the
+same window, so with the plan's calls the list was read only every 12 to 19 s live. Nothing is ever
+sent on an old list, and an old list is a wait, never an end. Before the cancel the step does
+nothing on that reading, says so once, and the next reading decides again (the entry stays). After
+the confirmed cancel the flip waits a tick at a time, as for Trader's lock, until the list is fresh
+(then everything is checked again before the send), the plan is disarmed or the fast watch ends.
+
+Schwab calls (fork PR #15's two status reads after a 201 included; the tape reads go to Edge Scanner,
+not Schwab): a flip or a re-level is one cancel and one send. The cancel is 3 calls usually (a read,
+the cancel, one read-back) and 12 at worst (ten read-backs, armed.calls_per_cancel); the send is 4
+usually and 5 at worst (armed.calls_per_send). So 7 usually and 17 at worst; a wait for the lock or
+for a fresh list costs none, and a send refused by Trader's lock costs none and goes once later.
+With four picks the bounds allow at most 8 sends (armed.orders_per_day_with_flips; and
+armed.calls_per_minute 40 at 5 a send) and one automatic cancel per order id, so at most 8 cancels:
+in one minute that is 56 calls usually and 136 at worst. The likely busy minute, four entries then
+four flips or re-levels, is 44 usually and 88 at worst. Brief 24 makes the poller read the order
+list first when the minute is tight (on main, not in this branch yet).
+
 Flat all (Step 9, companion/plan_flat.py): its click disarms the plan first (Step 6's before_batch),
 and while its batch runs PlanDesk.held() holds new entries. flip_auto checks the hold before the
 cancel (nothing sent, nothing written) and after it, before the busy wait and just before the send
@@ -379,20 +398,23 @@ def _swap(lane: Lane, kind: str) -> bool:
         spent["send"] = True
         return "", ""
 
-    told = {"busy": False}
+    told: dict[str, bool] = {}
 
-    def wait() -> str:
-        """After the confirmed cancel, Trader's lock is busy (a click's order action): one tick, then
-        the desk looks again. The pick's panel line says so once. Stops when the plan is disarmed or
-        the fast watch ends (no flip after it, Step 6's executor)."""
+    def wait(reason: str = "busy") -> str:
+        """After the confirmed cancel the send must wait: Trader's lock is busy (a click's order
+        action, "busy"), or Schwab's order list is old ("orders_old", N1). One tick, then the desk
+        looks again. The pick's panel line says so once for each reason. Stops when the plan is
+        disarmed or the fast watch ends (no flip after it, Step 6's executor)."""
+        ran = "another order action ran" if reason == "busy" else "Schwab's order list was old"
         if not lane.armed():
-            return "the plan was disarmed while another order action ran"
+            return f"the plan was disarmed while {ran}"
         if _watch_over(lane):
-            return "the fast watch ended while another order action ran"
-        if not told["busy"]:
-            told["busy"] = True
-            lane.say(f"{kind}_busy", f"cancelled the {old_side} entry; the {side} goes when the order action "
-                                     "in progress ends")
+            return f"the fast watch ended while {ran}"
+        if not told.get(reason):
+            told[reason] = True
+            lane.say(f"{kind}_{reason}", f"cancelled the {old_side} entry; the {side} goes when the order action "
+                                         "in progress ends" if reason == "busy" else
+                     f"cancelled the {old_side} entry; the {side} goes when Schwab's order list is fresh again")
         time.sleep(float(lane.armed_rules.every_seconds))
         return ""
 
@@ -410,6 +432,10 @@ def _swap(lane: Lane, kind: str) -> bool:
     if spent["send"] and (stage == "recheck" or r.get("not_sent")):
         lane.refund(orders=1, calls=calls)        # reserved, then refused before any request left
     if stage == "refused":
+        if r.get("code") == "orders_old":
+            # N1: nothing was cancelled and nothing written; the next reading decides again.
+            lane.say(f"{kind}_orders_old", f"no {what} yet: Schwab's order list is old; the next reading decides again")
+            return False
         if r.get("cancel_not_sent") and keys:
             lane.host.forget(keys[-1])            # Trader's lock was busy: nothing reached Schwab
         if r.get("busy"):
