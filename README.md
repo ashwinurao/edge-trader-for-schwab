@@ -111,12 +111,18 @@ name are refused). It needs no account and sends no telemetry.
   and fees with the path each was read from; and the requirement rates `bp_rate` and `af_rate` =
   (the account's buying power or available funds before, minus Schwab's projected value) / the order
   value, with the two fields each came from. The "before" value is the account read the app already makes
-  every 5 seconds; older than 30 seconds gives no rate and says why. **No balance, equity or buying power
-  in dollars is ever written**, and nothing else from the answer (it holds the account number). No retries:
+  every 5 seconds; older than 30 seconds gives no rate and says why. A pairing is taken only when its rate is
+  from -0.05 to 5 (an opening order never adds buying power); otherwise the next balance is tried, and when
+  none fits the line says "negative" or "above 5" for each, never the number. In every text it writes from
+  Schwab, a number after a `$` and any number of 4 or more digits becomes `{n}`, so a "not enough buying
+  power" text never carries a balance; "100%" or "12.5" stay. **No balance, equity or buying power in
+  dollars is ever written**, and nothing else from the answer (it holds the account number). No retries:
   any 429, or the app's own 429 pause, stops it for the rest of the window. About 182 Schwab requests per
   default window (162 quote calls and 20 previews in 13.5 minutes), on the same Schwab app limit as
-  everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner once, a minute before
-  each window (`companion/open_probe.py`).
+  everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
+  window (09:25:30 ET by default). When that gives no picks it reads again every 15 seconds (one request to
+  Edge Scanner on your LAN, never to Schwab) until the picks come or 09:29:00 ET, then starts the rotation at
+  rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`).
 
 ### API keys
 

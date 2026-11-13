@@ -86,7 +86,16 @@ SIDES = ("LONG", "SHORT")     # brief 21 item 5: both sides at every preview tim
 # never written. A projected value is paired with the balance of the same name first.
 BALANCE_FIELDS = ("buyingPower", "dayTradingBuyingPower", "availableFunds")
 BALANCES_MAX_AGE_S = 30       # brief 21: older balances give no rate
-RATE_LIMIT = 5                # a |rate| above this is not a requirement rate (see rate_fields)
+# A rate is taken only from RATE_MIN to RATE_LIMIT (review 1 of PR #29): an opening order never
+# adds buying power, so a clearly negative rate means the two fields do not belong together.
+# RATE_MIN allows for balances up to 30 s old. Start numbers, not approved by Ash.
+RATE_MIN = -0.05
+RATE_LIMIT = 5
+# Review 1 of PR #29 item 3: when the read before the window gives no picks (Edge Scanner may not
+# have frozen them by 09:25:30 ET), read again every PICKS_REREAD_S until PICKS_REREAD_UNTIL_ET.
+# One LAN GET to Edge Scanner each, never a Schwab call. Start numbers, not approved by Ash.
+PICKS_REREAD_S = 15
+PICKS_REREAD_UNTIL_ET = dtime(9, 29)
 RATES = (  # (line prefix, projected key name in Schwab's answer, the balances to pair it with)
     ("bp", "projectedBuyingPower", ("buyingPower", "dayTradingBuyingPower")),
     ("af", "projectedAvailableFund", ("availableFunds",)),
@@ -221,8 +230,19 @@ def quote_lines(body, symbols: list[str], recv_ms: float, wire_ms, total_ms) -> 
     return out
 
 
-_LONG_NUM = re.compile(r"\d{6,}")
 _LONG_ID = re.compile(r"[A-Za-z0-9]{20,}")
+# Review 1 of PR #29 item 2: Schwab's texts can carry a dollar balance ("$12,345.67 available").
+# A number after a $, and any number of 4 or more digits (through thousands commas and a decimal
+# point), becomes {n}. Short numbers such as "100%" or "12.5" stay readable. This also covers
+# brief 08's account and order numbers (6+ digits).
+_DOLLAR = re.compile(r"\$\s*[\d,]*\.?\d+")
+_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def mask(text: str) -> str:
+    t = _LONG_ID.sub("{id}", str(text))
+    t = _DOLLAR.sub("{n}", t)
+    return _NUMBER.sub(lambda m: "{n}" if sum(c.isdigit() for c in m.group()) >= 4 else m.group(), t)
 
 
 def _text(x) -> str:
@@ -233,7 +253,7 @@ def _text(x) -> str:
         rule = x.get("validationRuleName")
         msg = x.get("message") or x.get("activityMessage")
         x = f"{rule}: {msg}" if rule and msg else (msg or rule or "")
-    return _LONG_ID.sub("{id}", _LONG_NUM.sub("{n}", str(x)))[:200]
+    return mask(x)[:200]
 
 
 def error_texts(body, raw: str) -> list[str]:
@@ -429,9 +449,10 @@ def rate_fields(nums: dict, balances: Optional[Mapping], age_s: Optional[float])
 
     rate = (balance before - projected value) / order value, to 4 places, with [balance name,
     projected path]. The balance named like the projected value is tried first, then the others
-    in RATES. A pairing whose |rate| is above RATE_LIMIT is not written: the two fields then
-    measure different things, and the number would carry the gap between two balances in
-    dollars. NEVER returns a balance or a projected value."""
+    in RATES. A pairing is taken only when its rate is from RATE_MIN to RATE_LIMIT (review 1 of
+    PR #29): otherwise the two fields measure different things, and the number would carry the
+    gap between two balances in dollars, so the next balance is tried, and the why says only
+    "negative" or "above 5" for each. NEVER returns a balance or a projected value."""
     value = nums.get("order_value")
     out: dict = {"order_value": value[1] if value else None, "order_value_from": value[0] if value else None,
                  "costs": nums.get("costs") or {},
@@ -456,13 +477,16 @@ def rate_fields(nums: dict, balances: Optional[Mapping], age_s: Optional[float])
                 why = f"no {' or '.join(befores)} in the balances"
             else:
                 path, projected = hits[0]
+                misses = []
                 for b, before in have:
                     r = (before - projected) / value[1]
-                    if abs(r) <= RATE_LIMIT:
+                    if RATE_MIN <= r <= RATE_LIMIT:
                         rate, frm = round(r, 4), [b, path]
                         break
+                    # Say which way it missed, never the number (it would carry a balance gap).
+                    misses.append(f"{b} {'negative' if r < RATE_MIN else f'above {RATE_LIMIT}'}")
                 else:
-                    why = f"outside -{RATE_LIMIT} to {RATE_LIMIT} against {' and '.join(b for b, _ in have)}"
+                    why = f"no rate from {RATE_MIN} to {RATE_LIMIT}: {', '.join(misses)}"
         out[f"{short}_rate"], out[f"{short}_rate_from"], out[f"{short}_rate_why"] = rate, frm, why
     return out
 
@@ -558,8 +582,10 @@ class OpenProbe:
         self._done: set[datetime] = set()
         self._last_quote: dict[str, tuple[float, dict]] = {}
         self._turn = 0          # brief 21: the next pick in rank order at each preview time
+        self._reread_at: Optional[datetime] = None     # review 1 of PR #29: the next picks read
+        self._reads = 0
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
-                       "previews_missed": 0, "previews_capped": 0, "cycle_errors": 0}
+                       "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0}
 
     # thread plumbing
     def start(self) -> threading.Thread:
@@ -620,7 +646,9 @@ class OpenProbe:
         if win is None:
             return
         if self._win is None:
-            self._open(win)
+            self._open(win, now)
+        if self._reread_at is not None and now >= self._reread_at and not self.halted:
+            self._reread(now)
         if self.halted or self.client is None or now < win[0]:
             return
         if self._pause_left() > 0:
@@ -656,15 +684,28 @@ class OpenProbe:
         except Exception:
             return 0.0
 
-    def _open(self, win: tuple[datetime, datetime]) -> None:
+    def _read_picks(self) -> tuple[list[str], str]:
+        self._reads += 1
+        self.counts["picks_reads"] = self._reads
+        try:
+            picks, why = self._symbols()
+        except Exception as e:
+            picks, why = [], f"picks not read ({type(e).__name__})"
+        return [s for s in picks if s][:MAX_PICKS], why
+
+    def _set_symbols(self, picks: list[str]) -> None:
+        self.picks = picks
+        self.symbols = self.picks + ([] if "SPY" in self.picks else ["SPY"])
+
+    def _open(self, win: tuple[datetime, datetime], now: Optional[datetime] = None) -> None:
         self._reset()
         self._win = win
-        try:
-            self.picks, why = self._symbols()
-        except Exception as e:
-            self.picks, why = [], f"picks not read ({type(e).__name__})"
-        self.picks = [s for s in self.picks if s][:MAX_PICKS]
-        self.symbols = self.picks + ([] if "SPY" in self.picks else ["SPY"])
+        picks, why = self._read_picks()
+        self._set_symbols(picks)
+        if not picks:
+            until = datetime.combine(win[0].date(), PICKS_REREAD_UNTIL_ET, ET)
+            nxt = (now or self._wall()) + timedelta(seconds=PICKS_REREAD_S)
+            self._reread_at = nxt if nxt <= until else None
         try:
             self.client = self._make_client()
         except Exception as e:
@@ -673,10 +714,38 @@ class OpenProbe:
         self._note("open probe: window start", window=self._win_text(), symbols=self.symbols,
                    picks_note=why or None, quote_every_s=self.cfg.quote_every_s,
                    previews=[f"{t:%H:%M:%S}" for t in self.cfg.previews],
-                   preview_symbol=(self.picks or ["SPY"])[0], preview_sides=list(SIDES),
+                   preview_symbols=list(self.picks or ["SPY"]), preview_sides=list(SIDES),
                    preview_shares=self.cfg.preview_shares, max_previews_per_time=self.cfg.max_previews_per_time,
                    max_previews_per_window=self.cfg.max_previews_per_window, timeout_s=TIMEOUT_S,
+                   picks_reread=f"every {PICKS_REREAD_S} s until {PICKS_REREAD_UNTIL_ET:%H:%M:%S} ET" if self._reread_at else None,
                    client=self.client is not None, halted=self.halted or None)
+
+    def _reread(self, now: datetime) -> None:
+        """Read Edge Scanner's picks again (review 1 of PR #29). When they come: set the picks and
+        the quote symbols, start the rotation at rank 1, quote them now so the next preview has a
+        fresh price, and say so once. None by PICKS_REREAD_UNTIL_ET: SPY, and say so once."""
+        until = datetime.combine(self._win[0].date(), PICKS_REREAD_UNTIL_ET, ET)
+        picks, _why = self._read_picks()
+        if picks:
+            self._reread_at = None
+            self._set_symbols(picks)
+            self._turn = 0
+            self._note("open probe: picks came", at_et=f"{now.astimezone(ET):%H:%M:%S}", reads=self._reads,
+                       symbols=self.symbols, preview_symbols=list(self.picks))
+            if self.client is not None and not self.halted:
+                self._next_quote = self._mono() + self.cfg.quote_every_s
+                try:
+                    self._quotes()
+                except Exception as e:
+                    self._contain("quotes", e)
+            return
+        nxt = now + timedelta(seconds=PICKS_REREAD_S)
+        if nxt > until:
+            self._reread_at = None
+            self._note(f"open probe: no picks by {PICKS_REREAD_UNTIL_ET:%H:%M:%S} ET; previews SPY only",
+                       reads=self._reads)
+        else:
+            self._reread_at = nxt
 
     def _close(self) -> None:
         self._note("open probe: window stop", window=self._win_text(), halted=self.halted or None, **self.counts)
@@ -769,7 +838,7 @@ class OpenProbe:
         try:
             order = with_quantity(preview_body(sym, q["bid"], q["ask"], side), self.cfg.preview_shares)
         except ValueError as e:     # e.g. a wide spread puts the 1% stop past the other side
-            self._line(probe="preview", symbol=sym, at=at, side=side, skipped="plan_refused", reason=str(e)[:200])
+            self._line(probe="preview", symbol=sym, at=at, side=side, skipped="plan_refused", reason=_text(str(e)))
             return False
         numbers = order_numbers(order)
         self.counts["previews"] += 1

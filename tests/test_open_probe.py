@@ -186,7 +186,8 @@ def test_client_is_built_a_minute_early_once_and_dropped_after_the_window():
     assert probe.client is None and len(built) == 1
     start, stop = sink.notes()[0], sink.notes()[-1]
     assert start["text"] == "open probe: window start" and start["symbols"] == ["NVDA", "AMD", "SPY"]
-    assert start["quote_every_s"] == 5 and start["preview_symbol"] == "NVDA"
+    # Review 1 of PR #29 item 4 (was preview_symbol "NVDA"): the whole rotation order.
+    assert start["quote_every_s"] == 5 and start["preview_symbols"] == ["NVDA", "AMD"]
     # Brief 21 item 5: a long and a short preview at each of the 6 times (was 6 long previews).
     assert stop["text"] == "open probe: window stop" and stop["quote_calls"] == 144 and stop["previews"] == 12
 
@@ -698,13 +699,13 @@ class RichClient(FakeClient):
 
     RATES = {"BUY": (1.0, 0.25), "SELL_SHORT": (1.5, 0.375)}
 
-    def __init__(self, clock, before=BAL, bp_field="buyingPower", balance=True, **kw):
+    def __init__(self, clock, before=BAL, bp_field="buyingPower", balance=True, bid=99.98, ask=100.00, **kw):
         super().__init__(clock, **kw)
-        self.before, self.bp_field, self.balance = before, bp_field, balance
+        self.before, self.bp_field, self.balance, self.bid, self.ask = before, bp_field, balance, bid, ask
 
     def quotes(self, symbols):
         self.quote_calls.append((self.clock.wall(), list(symbols)))
-        return Answer(200, quote_body(self.clock, symbols, bid=99.98, ask=100.00))
+        return Answer(200, quote_body(self.clock, symbols, bid=self.bid, ask=self.ask))
 
     def preview_order(self, account, order):
         self.previews.append((self.clock.wall(), account, order))
@@ -851,15 +852,42 @@ def test_the_rate_pairs_with_the_balance_that_gives_a_requirement_rate():
     assert line["bp_rate"] == 1.0
     assert line["bp_rate_from"] == ["dayTradingBuyingPower", "orderStrategy.orderBalance.projectedBuyingPower"]
     assert "306172" not in json.dumps(line) and "296137" not in json.dumps(line)
-    # Neither balance gives a rate within -5 to 5: none is written, and why.
+    # Neither balance gives a rate from -0.05 to 5: none is written, and the why has no number
+    # but the two limits.
     odd = dict(BAL, buyingPower=999999.0, dayTradingBuyingPower=888888.0)
     clock = Clock(et(9, 29, 29))
     probe, sink = make_rich(clock, RichClient(clock, before=dict(BAL, buyingPower=10.0)), balances=odd)
     run(probe, clock, et(9, 29, 31))
     line = sink.probes("preview")[0]
     assert line["bp_rate"] is None and line["bp_rate_from"] is None
-    assert line["bp_rate_why"] == "outside -5 to 5 against buyingPower and dayTradingBuyingPower"
+    assert line["bp_rate_why"] == "no rate from -0.05 to 5: buyingPower above 5, dayTradingBuyingPower above 5"
+    assert not re.search(r"\d", re.sub(r"-0\.05|\b5\b", "", line["bp_rate_why"]))
     assert line["af_rate"] == 0.25
+    # Review 1 of PR #29 item 1, worked by hand: buyingPower 150,000, dayTradingBuyingPower 300,000,
+    # Schwab's projection follows the day-trading figure. Long at ask 600.00: trigger 601.20, stop
+    # 595.20, cap min(0.15 x 6.00, 0.15% of 601.20) = 0.90, limit 602.10; 100 shares = 60,210.00.
+    # Projection 300,000 - 60,210 = 239,790. Against buyingPower (150,000 - 239,790) / 60,210 =
+    # -1.4913: an opening order never adds buying power, so it is not taken; dayTradingBuyingPower
+    # gives 1.0.
+    big = {"buyingPower": 150000.0, "dayTradingBuyingPower": 300000.0, "availableFunds": 75000.0}
+    clock = Clock(et(9, 29, 29))
+    probe, sink = make_rich(clock, RichClient(clock, before=big, bp_field="dayTradingBuyingPower", bid=599.90,
+                                              ask=600.00), balances=big)
+    run(probe, clock, et(9, 29, 31))
+    line = sink.probes("preview")[0]
+    assert line["order_value"] == 60210.0 and line["limit"] == "602.10"
+    assert line["bp_rate"] == 1.0 and line["bp_rate_from"][0] == "dayTradingBuyingPower"
+    text = json.dumps(line)
+    for bad in ("-1.49", "150000", "300000", "239790", "75000"):
+        assert bad not in text, bad
+    # A projection above the balance before (a negative rate) is never taken, even a small one.
+    neg = {"buyingPower": 100000.0, "dayTradingBuyingPower": None, "availableFunds": 50000.0}
+    clock = Clock(et(9, 29, 29))
+    probe, sink = make_rich(clock, RichClient(clock, before=dict(BAL, buyingPower=100000.0 + 10035.0 * 2)),
+                            balances=neg)
+    run(probe, clock, et(9, 29, 31))
+    line = sink.probes("preview")[0]
+    assert line["bp_rate"] is None and line["bp_rate_why"] == "no rate from -0.05 to 5: buyingPower negative"
 
 
 def test_a_preview_time_rotates_through_the_picks_both_sides_at_the_shipped_times():
@@ -907,3 +935,110 @@ def test_poller_balances_reads_the_last_account_answer_and_its_time():
     assert at == datetime(2026, 11, 13, 14, 29, 55, tzinfo=timezone.utc)
     assert op.poller_balances(types.SimpleNamespace(account=None, fresh={})) == (None, None)
     assert op.poller_balances(object()) == (None, None)
+
+
+# ---- review 1 of PR #29: Schwab's texts never carry a dollar amount -----------------------------
+
+def test_dollar_amounts_and_long_numbers_in_schwabs_texts_are_masked():
+    t = "Insufficient buying power: $12,345.67 available, 9876.54 required, 100% requirement, 12.5 shares"
+    out = op._text(t)
+    assert out == "Insufficient buying power: {n} available, {n} required, 100% requirement, 12.5 shares"
+    for bad in ("12,345", "345.67", "9876"):
+        assert bad not in out
+    assert op._text("Short $5 under, $ 1,000 needed, -$250.10 short") == "Short {n} under, {n} needed, -{n} short"
+    assert op._text("Account 12345678 reviewed") == "Account {n} reviewed"
+    assert op._text({"validationRuleName": "BuyingPowerRule", "message": "Needs $1,234.00"}) == "BuyingPowerRule: Needs {n}"
+
+
+def test_a_preview_reject_and_a_refusal_never_write_the_dollar_amounts():
+    clock = Clock(et(9, 29, 29))
+
+    class Poor(FakeClient):
+        def preview_order(self, account, order):
+            self.previews.append((clock.wall(), account, order))
+            body = {"orderStrategy": {"status": "REJECTED"},
+                    "orderValidationResult": {"rejects": [{"validationRuleName": "BuyingPower",
+                                                           "message": "Insufficient buying power: $12,345.67 available, "
+                                                                      "9876.54 required, 100% requirement"}],
+                                              "warns": [{"activityMessage": "Hard to borrow: $43,210.00 held"}]}}
+            return Answer(201, body)
+    probe, sink, _ = make(clock, client=Poor(clock))
+    run(probe, clock, et(9, 29, 31))
+    line = sink.probes("preview")[0]
+    assert line["rejects"] == ["BuyingPower: Insufficient buying power: {n} available, {n} required, 100% requirement"]
+    assert line["warns"] == ["Hard to borrow: {n} held"]
+    body = {"message": "Not enough: $12,345.67", "errors": [{"detail": "Requires 9876.54"}]}
+    clock = Clock(et(9, 29, 29))
+    probe, sink, _ = make(clock, client=_refusing(clock, Answer(400, body)))
+    run(probe, clock, et(9, 29, 31))
+    assert sink.probes("preview")[0]["reasons"] == ["Not enough: {n}", "Requires {n}"]
+    text = json.dumps(sink.lines)
+    for bad in ("12,345", "345.67", "9876", "43,210"):
+        assert bad not in text
+
+
+# ---- review 1 of PR #29: the picks are read again until they come --------------------------------
+
+def _reading_picks(clock, ready_at=None, fail_first=0):
+    """A symbols reader on the fake clock: no picks before `ready_at`, the first reads may raise."""
+    reads = []
+
+    def symbols():
+        reads.append(clock.wall())
+        if len(reads) <= fail_first:
+            raise OSError("scanner down")
+        if ready_at is not None and clock.wall() >= ready_at:
+            return ["AAA", "BBB", "CCC", "DDD"], ""
+        return [], "NO_PICKS: No picks yet"
+    return symbols, reads
+
+
+def test_picks_that_come_at_the_third_read_are_used_from_the_next_preview_time():
+    cfg = op.load_config(env={})
+    clock = Clock(et(9, 25, 29))
+    symbols, reads = _reading_picks(clock, ready_at=et(9, 26))
+    client = RichClient(clock)
+    sink = Sink()
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=cfg, make_client=lambda: client, symbols=symbols,
+                         emit=sink, wall=clock.wall, mono=clock.mono, balances=lambda: (BAL, clock.wall()))
+    run(probe, clock, et(9, 29, 0), step=0.5)
+    assert reads == [et(9, 25, 30), et(9, 25, 45), et(9, 26)]
+    assert probe.symbols == ["AAA", "BBB", "CCC", "DDD", "SPY"]
+    got = [(p[0], p[2]["orderLegCollection"][0]["instrument"]["symbol"]) for p in client.previews]
+    assert got[0] == (et(9, 27), "AAA") and [s for _, s in got[::2]] == ["AAA", "BBB", "CCC", "DDD"]
+    came = [n for n in sink.notes() if n["text"].startswith("open probe: picks came")]
+    assert len(came) == 1 and came[0]["reads"] == 3 and came[0]["at_et"] == "09:26:00"
+    assert came[0]["symbols"] == ["AAA", "BBB", "CCC", "DDD", "SPY"]
+    assert all(c[1] == ["AAA", "BBB", "CCC", "DDD", "SPY"] for c in client.quote_calls if c[0] >= et(9, 26))
+
+
+def test_picks_that_never_come_give_spy_after_a_bounded_number_of_reads():
+    cfg = op.load_config(env={})
+    clock = Clock(et(9, 25, 29))
+    symbols, reads = _reading_picks(clock, fail_first=2)
+    client = RichClient(clock)
+    sink = Sink()
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=cfg, make_client=lambda: client, symbols=symbols,
+                         emit=sink, wall=clock.wall, mono=clock.mono)
+    run(probe, clock, et(9, 40, 1), step=0.5)
+    # 09:25:30, then every 15 s through 09:29:00: 15 reads; the two that raised were tried again.
+    assert reads == [et(9, 25, 30) + timedelta(seconds=15 * i) for i in range(15)]
+    assert probe.symbols == ["SPY"] and {p[2]["orderLegCollection"][0]["instrument"]["symbol"]
+                                         for p in client.previews} == {"SPY"}
+    gave_up = [n for n in sink.notes() if n["text"].startswith("open probe: no picks")]
+    assert len(gave_up) == 1 and gave_up[0]["reads"] == 15
+    assert gave_up[0]["text"] == "open probe: no picks by 09:29:00 ET; previews SPY only"
+    assert probe.counts["picks_reads"] == 15
+
+
+def test_picks_read_at_the_window_start_are_not_read_again():
+    clock = Clock(et(9, 25, 29))
+    reads = []
+
+    def symbols():
+        reads.append(clock.wall())
+        return ["AAA"], ""
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=op.load_config(env={}), make_client=lambda: RichClient(clock),
+                         symbols=symbols, emit=Sink(), wall=clock.wall, mono=clock.mono)
+    run(probe, clock, et(9, 40, 1))
+    assert reads == [et(9, 25, 30)]
