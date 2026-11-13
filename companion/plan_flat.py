@@ -551,6 +551,8 @@ def register(app, trader, poller, guard, desk: plan_entries.PlanDesk, demo: bool
         recs = desk._mem.get(desk._key()) or {}
         if "BBBB" in recs:
             # The demo's filled short has no live stop, so the cover watch has a red row to show.
+            # Demo data only: since PR #26 BBBB's bar reads "not confirmed", and live a row cannot have
+            # a filled flip on an unconfirmed bar (Place needs a final one). Architect's review 2, ok.
             recs["BBBB"]["text"] = ("Flip stopped: 1 shares filled before the cancel. NO LIVE STOP on those shares: "
                                     "fix it in thinkorswim now. Nothing new was placed.")
     else:

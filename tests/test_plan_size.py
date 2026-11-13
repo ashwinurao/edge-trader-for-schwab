@@ -32,11 +32,18 @@ def test_the_default_stage_is_one_share_and_the_allowed_set_is_pinned():
 
 
 def test_the_stage_note_points_at_the_readmes_list_before_any_stage_above_one_share():
-    # Architect's review 1 of Step 9 (2026-11-13): what must be true before the stage is raised.
+    # Architect's reviews 1 and 2 of Step 9 (2026-11-13): what must be true before the stage is raised.
     raw = json.loads(plan_size.PLAYBOOK_FILE.read_text(encoding="utf-8"))
     assert "Before any stage above 1 share" in raw["size"]["_stage_about"]
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     assert "**Before any stage above 1 share.**" in readme
+    section = readme.split("**Before any stage above 1 share.**", 1)[1].split("\n## ", 1)[0]
+    # Review 2: point 5, a stop under the research's minimum needs a rule Ash decides.
+    for point in ("1. Flat all handles", "2. Add stop covers", "3. Schwab's behavior",
+                  "4. The cover's grace", "5. A row whose stop is under the research's minimum"):
+        assert point in section
+    assert "min_stop_atr" in section and "Ash decides" in section
+    assert "min_stop_atr" in raw["size"]["_stage_about"]
 
 
 @pytest.mark.parametrize("stage,want,why", [

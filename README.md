@@ -380,7 +380,7 @@ buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
 
 Any other value turns the plan buttons off, like any bad playbook, and the log says why. A stage
 above 1 share also needs `EDGE_TRADER_PLAN_FLAT=1` (the cover watch below), or the buttons stay off,
-and the four points under "Before any stage above 1 share" below.
+and the points under "Before any stage above 1 share" below.
 The size is decided on the server only: the page sends the shares it showed, and a difference
 refuses. The ticket's own Break entry stays at `BREAK_MAX_SHARES` (1); only a plan entry may go above
 it, by its stage, which the server passes inside itself (`break_entry.plan_cap`), never from a
@@ -428,7 +428,7 @@ first partial fill. The cover watch is there for that case.
 
 **Before any stage above 1 share.** At 1 share an entry cannot fill in part, so the gaps below cannot
 happen. Above 1 share they can. Each must be closed before the PR that raises `size.stage` (architect's
-review 1 of Step 9, 2026-11-13):
+reviews 1 and 2 of Step 9, 2026-11-13):
 1. Flat all handles an entry that is partly filled and still working: cancel the rest, read it back,
    then close what filled. Today that row is refused.
 2. Add stop covers a partly covered position. Today that row is refused, because the dashboard's stop
@@ -437,6 +437,10 @@ review 1 of Step 9, 2026-11-13):
 3. Schwab's behavior for the attached stop on an entry's first partial fill is confirmed on a real
    order.
 4. The cover's grace runs on a server clock, or the page says it counts only while the page is open.
+5. A row whose stop is under the research's minimum (2% of ATR, `entry.min_stop_atr`) has a rule:
+   refuse the row, or size it from the minimum stop. Today the page only notes it. Ash decides, since
+   it is a sizing rule. For example, a one-cent 09:30 minute at the 10,000 share cap is 2,500 shares
+   at 25%, where ten cents of slippage is ten times the planned risk.
 
 ## Updating to a new release
 
