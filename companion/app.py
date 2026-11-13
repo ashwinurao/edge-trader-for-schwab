@@ -408,6 +408,9 @@ except ImportError:
     _plan_routes = None
 FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO) if _plan_routes else []
 FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
+# Place / Cancel / Flip on the plan rows (Step 4): only with EDGE_TRADER_BREAK_ENTRY=1 and the plan on.
+from . import plan_entries as _plan_entries
+_plan_entries.register(app, trader, poller, _guard, demo=DEMO)
 
 
 @app.post("/api/position/resolve_close")

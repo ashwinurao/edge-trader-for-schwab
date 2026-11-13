@@ -105,8 +105,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   $250,000 caps), and which side the minute's close is nearer. On a calm SPY day (RV20 at or below
   10.5) each row uses half the risk and says so; when the calm flag is not known it shows full and half
   size side by side. A stop under 2% of daily ATR is marked, not changed. Every number shows its age, and
-  an old or failed answer from Edge Scanner shows as old, never as current. The screen has no order
-  buttons: it places, changes and cancels nothing. Its list, times and numbers are in
+  an old or failed answer from Edge Scanner shows as old, never as current. Without
+  `EDGE_TRADER_BREAK_ENTRY=1` the screen has no order buttons: it places, changes and cancels nothing
+  (with it, see "Place, Cancel and Flip on the plan rows" below). Its list, times and numbers are in
   `companion/opening_plan/playbook.json`.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
@@ -227,6 +228,24 @@ refuses a request whose host is not in its `SCANNER_ALLOWED_HOSTS` (`scanner/loc
 Docker service name does not work. Unset (the default), there is no Opening plan button, no route and
 no request to Edge Scanner.
 
+**Place, Cancel and Flip on the plan rows (off by default).** With `EDGE_TRADER_BREAK_ENTRY=1` as well,
+each Opening plan row gets four buttons (`companion/plan_entries.py`). Each sends one request to
+Schwab when you click it; nothing is sent without a click.
+- **Place long break / Place short break** sends the break entry (a stop-limit entry with its stop
+  attached, `companion/break_entry.py`) for that pick: trigger one cent past the 09:30 ET minute, stop at
+  the other side, built from the server's own latest row, never from the page's prices. The page sends
+  what it showed; if the server's row differs, nothing is sent. Shares are capped at
+  `BREAK_MAX_SHARES` (1, the test stage); the row shows the plan size next to it.
+- **Cancel** cancels the row's resting, unfilled entry through the dashboard's own Cancel entry path.
+- **Flip** cancels the resting entry, waits until Schwab confirms it CANCELED with nothing filled, and
+  only then places the other side. If the cancel is not confirmed or anything filled, nothing new is
+  placed, the row turns red and says what to check, and the row sends nothing more that day. At most
+  `max_flips_per_row` flips per row a day (3, in `companion/opening_plan/playbook.json`).
+
+Place and Flip refuse, with the reason on the button, when entries are not armed, the market is closed,
+the 09:30 minute is not final, Edge Scanner's data is old, the calm flag is not known, an earlier order
+on the name is unclear, or the row already has an entry that is working, unclear or filled.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -248,6 +267,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `COMPANION_PORT` | The local port. Default `8770`. |
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
+| `EDGE_TRADER_BREAK_ENTRY` | `1` turns on the break entry and, with `EDGE_SCANNER_URL`, the Place / Cancel / Flip buttons on the Opening plan rows. Unset: off. |
 
 ## Good to know
 

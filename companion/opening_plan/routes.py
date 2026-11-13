@@ -1,8 +1,9 @@
 """Opening plan routes and page, registered by app.py only when EDGE_SCANNER_URL is set (or in demo).
 
 Unset EDGE_SCANNER_URL means the feature is off: no route, no menu entry, no request to Edge
-Scanner. Display only: no route here places, changes or cancels an order, and nothing here
-imports the order code (tests/test_opening_plan.py checks the imports).
+Scanner. No route here places, changes or cancels an order, and nothing here imports the order
+code (tests/test_opening_plan.py checks the imports). The row buttons of Step 4 live in
+companion/plan_entries.py, off unless EDGE_TRADER_BREAK_ENTRY=1; they read current_view().
 """
 from __future__ import annotations
 
@@ -68,9 +69,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     def opening_plan_page():
         return FileResponse(STATIC / "opening_plan.html", headers={"Cache-Control": "no-store"})
 
-    # A plain def: FastAPI runs it in a worker thread, so a slow Edge Scanner never blocks the server.
-    @app.get("/api/opening-plan")
-    def opening_plan_view():
+    def current_view() -> dict:
         at = now()
         if feed is None:
             view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb)
@@ -80,7 +79,17 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
             view = build_view(picks.body, picks.ok_at, picks.error, clock.body, clock.ok_at, clock.error,
                               stored_risk(store), at, pb)
         view["demo"] = demo and not url
-        return JSONResponse(view, headers={"Cache-Control": "no-store"})
+        return view
+
+    # A plain def: FastAPI runs it in a worker thread, so a slow Edge Scanner never blocks the server.
+    @app.get("/api/opening-plan")
+    def opening_plan_view():
+        return JSONResponse(current_view(), headers={"Cache-Control": "no-store"})
+
+    # The row buttons (companion/plan_entries.py, Step 4) read the same view the screen shows,
+    # so a click is checked against the server's own latest row, never the page's numbers.
+    app.state.opening_plan_view = current_view
+    app.state.opening_plan_now = now
 
     @app.post("/api/opening-plan/risk")
     async def opening_plan_risk(request: Request):
