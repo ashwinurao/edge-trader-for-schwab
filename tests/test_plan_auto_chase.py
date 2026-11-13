@@ -87,6 +87,8 @@ class Host:
         self.disarms, self.logs, self.said, self.left, self.reds, self.busies = [], [], [], {}, {}, []
         self.waits = []                     # the reason of each busy() (Step 6's Lane.busy(what, why))
         self.ends = []                      # each busy()'s end_step (Step 6 2ca2073)
+        self.busy_logged = []               # each busy()'s logged (Step 6 8f6b68c: the log's fields)
+        self.left_logged = {}               # each leave()'s logged, by ticker
         self.orders_pick, self.orders_day, self.calls = 1, 4, 40
         self.reads = []                     # queued answers for reread(); else the lane's own pick again
         self.seen = set()
@@ -128,8 +130,10 @@ class Host:
     def say(self, ticker, code, text):
         self.said.append((ticker, code, text))
 
-    def leave(self, ticker, reason):
+    def leave(self, ticker, reason, logged=None):
+        # logged: Step 6's keyword since 8f6b68c, the log's fields in place of the page's words.
         self.left[ticker] = reason
+        self.left_logged[ticker] = logged
 
     def red(self, ticker, reason):
         self.reds[ticker] = reason
@@ -148,10 +152,11 @@ class Host:
     def forget(self, key):
         self.seen.discard(key)
 
-    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY, end_step=True):
+    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY, end_step=True, logged=None):
         self.busies.append((ticker, what))
         self.waits.append(why)
         self.ends.append(end_step)          # False: only this pick waits (Step 6's brief 25 wait)
+        self.busy_logged.append(logged)     # since 8f6b68c, the log's fields in place of the page's words
 
     # ---- helpers for the tests: one decision, or one engine step --------------------------------
 

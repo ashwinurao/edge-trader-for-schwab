@@ -409,10 +409,10 @@ def test_click_flip_on_a_resting_chase_above_the_high_cancels_it_and_places_noth
     rig = crig
     chase_id = _resting_chase(rig)
     f = rig.desk.flip("AAAA", row(rig, "AAAA")["send"]["short"])
-    assert not f["ok"] and "stop 42.48 must be above the ask 42.61" in f["error"]
+    assert not f["ok"] and "The ask 42.61 is at or above this entry's stop 42.48." in f["error"]
     assert f["cancel"]["status"] == "CANCELED" and rig.broker.cancelled == [chase_id]
     e = row(rig, "AAAA")["entry"]
-    assert e["state"] == plan_entries.NONE and "Not sent: stop 42.48 must be above the ask 42.61" in e["text"]
+    assert e["state"] == plan_entries.NONE and "Not sent: The ask 42.61 is at or above this entry's stop 42.48." in e["text"]
     run(rig, et(9, 34, 0))
     assert len(order_of(rig, "AAAA")) == 1
 
