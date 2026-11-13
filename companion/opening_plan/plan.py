@@ -20,6 +20,15 @@ known, the row shows full and half size side by side and picks neither.
 
 "An incomplete view never looks complete" (CONTRIBUTING.md rule 3): every number carries its age,
 an old answer is marked old, and a missing number is missing, never zero.
+
+From 09:00 ET until the 09:25 freeze (brief 21, Ash's ask of 2026-11-13 15:17 UTC: "start
+populating from 9:00 ET just like the edge scanner does"), a day without frozen picks shows Edge
+Scanner's preview: state PREVIEW, never OK, and its rows in view["preview"]["rows"], never in
+view["rows"]. So no gate, button, shadow or probe that reads view["rows"] or tests for "OK" can
+take a preview row for a pick. The frozen picks replace it, as before.
+
+view["buying_power"] shows Schwab's day-trading buying power, buying power and equity from the
+account read Edge Trader already makes, with the time read. On screen only.
 """
 from __future__ import annotations
 
@@ -54,6 +63,17 @@ NO_ANSWER = "NO_ANSWER"
 NOT_SET_UP = "NOT_SET_UP"
 NO_PICKS = "NO_PICKS"
 NOT_TODAY = "NOT_TODAY"
+PREVIEW = "PREVIEW"      # brief 21: Edge Scanner's preview before the freeze, display only
+
+# Edge Scanner serves its preview from 09:00 ET (scanner/ov_picks_route.py PREVIEW_FROM) until the
+# 09:25 ET freeze (ov_picks/contract.py PREVIEW_BEFORE_ET). The plan checks both on its own clock
+# as well, so a preview never shows after the freeze.
+PREVIEW_FROM_ET = time(9, 0)
+FREEZE_ET = time(9, 25)
+PREVIEW_TEXT = "Preview, not locked. Picks freeze at 09:25 ET."
+PREVIEW_OLD_AFTER_S = 120   # Edge Scanner's card says the same after 2 minutes (dashboard view.ts PREVIEW_STALE_MS)
+PREVIEW_LEVELS = ("atr", "pm_high", "pm_low", "last")
+BALANCES_OLD_AFTER_S = 30   # the account is read every 5 s (poller.py INTERVALS); start number
 
 
 @dataclass(frozen=True)
@@ -358,13 +378,81 @@ def _et_text(text: Any) -> Optional[str]:
     return dt.astimezone(ET).strftime("%H:%M:%S") if dt.utcoffset() is not None else None
 
 
+def _instant(text: Any) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.utcoffset() is not None else None
+
+
+def preview_view(preview: Any, now: datetime, pb: Playbook) -> Optional[dict]:
+    """Edge Scanner's preview as the plan shows it, or None when it must not show: outside 09:00 to
+    09:25 ET by this clock, not readable, or not today's (its trading date or its as_of)."""
+    now_et = now.astimezone(ET)
+    if not isinstance(preview, Mapping) or not preview.get("has_preview"):
+        return None
+    if not PREVIEW_FROM_ET <= now_et.time() < FREEZE_ET:
+        return None
+    as_of = _instant(preview.get("as_of"))
+    if as_of is None or str(preview.get("trading_date")) != now_et.date().isoformat() \
+            or as_of.astimezone(ET).date() != now_et.date():
+        return None
+    prev_at = _instant(preview.get("previewed_at"))
+    rows = []
+    for r in preview.get("picks") or []:
+        if not isinstance(r, Mapping) or not isinstance(r.get("rank"), int) or isinstance(r.get("rank"), bool) \
+                or not pb.rank_from <= r["rank"] <= pb.rank_to:
+            continue
+        levels = r.get("levels") if isinstance(r.get("levels"), Mapping) else {}
+        row = {"rank": r["rank"], "ticker": r.get("ticker"), "top": bool(r.get("top"))}
+        row.update({k: _f(to_dec(levels.get(k))) for k in PREVIEW_LEVELS})
+        row.update(preview=True, text=PREVIEW_TEXT)
+        rows.append(row)
+    return {"trading_date": now_et.date().isoformat(), "as_of_et": as_of.astimezone(ET).strftime("%H:%M:%S"),
+            "previewed_at_et": prev_at.astimezone(ET).strftime("%H:%M:%S") if prev_at else None,
+            "as_of_age_s": round((now - as_of).total_seconds(), 1), "shadow": bool(preview.get("shadow")),
+            "text": PREVIEW_TEXT, "rows": sorted(rows, key=lambda x: x["rank"])}
+
+
+def buying_power(account: Optional[Mapping], now: datetime) -> dict:
+    """The header's buying power line from the poller's last account read: Schwab's own numbers,
+    or "not known" with why. Never a zero for a missing number (CONTRIBUTING.md rule 3).
+
+    `account` is {"balances": currentBalances as view.py keeps them, "ok_at": when that read
+    came, "private": Edge Trader runs with --private}."""
+    out = {"state": "NOT_KNOWN", "day_trading": None, "buying_power": None, "equity": None,
+           "read_at_et": None, "age_s": None, "text": ""}
+    if isinstance(account, Mapping) and account.get("private"):
+        out.update(state="HIDDEN", text="Buying power hidden: Edge Trader runs with --private.")
+        return out
+    bal = account.get("balances") if isinstance(account, Mapping) else None
+    ok_at = account.get("ok_at") if isinstance(account, Mapping) else None
+    if not isinstance(bal, Mapping) or not bal or not isinstance(ok_at, datetime):
+        out["text"] = "Buying power not known: Edge Trader has not read the account yet."
+        return out
+    age = (now - ok_at).total_seconds()
+    out.update(read_at_et=ok_at.astimezone(ET).strftime("%H:%M:%S"), age_s=round(age, 1))
+    if age > BALANCES_OLD_AFTER_S:
+        out["text"] = f"Buying power not known: Schwab's account was last read {int(age)} s ago."
+        return out
+    nums = {k: _f(to_dec(bal.get(f))) for k, f in (("day_trading", "dayTradingBuyingPower"),
+                                                    ("buying_power", "buyingPower"), ("equity", "equity"))}
+    if all(v is None for v in nums.values()):
+        out["text"] = "Buying power not known: Schwab's account answer has none of the three numbers."
+        return out
+    out.update(state="OK", **nums)
+    return out
+
+
 def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_error: str,
                clock: Optional[Mapping], clock_ok_at: Optional[datetime], clock_error: str,
-               risk: Optional[Decimal], now: datetime, pb: Playbook) -> dict:
+               risk: Optional[Decimal], now: datetime, pb: Playbook, account: Optional[Mapping] = None) -> dict:
     """The whole screen: header facts, the calm flag and one row per pick of the playbook.
 
     `picks` is Edge Scanner's last good answer from GET /api/v2/ov-picks (scanner/ov_picks_route.py),
     `picks_ok_at` when it came, `picks_error` the last failure ("" when the last ask worked).
+    `account` feeds the buying power line (buying_power()); None shows it as not known.
     """
     now_et = now.astimezone(ET)
     view = {
@@ -378,8 +466,10 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         "state": OK, "message": "", "notes": [], "stale": False,
         "source": {"ok_at_et": None, "age_s": None, "error": picks_error},
         "picks": None,
+        "preview": None,
         "risk": {"per_pick": _f(risk)},
         "calm": calm_reading(clock, clock_ok_at, clock_error, now, pb),
+        "buying_power": buying_power(account, now),
         "rows": [],
     }
     src = view["source"]
@@ -401,6 +491,16 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         return view
     day = picks.get("day") if isinstance(picks.get("day"), Mapping) else None
     if day is None or not day.get("has_picks"):
+        pv = preview_view(picks.get("preview"), now, pb)
+        if pv is not None:
+            # Display only: the rows stay out of view["rows"] and the state is not OK (brief 21).
+            view.update(state=PREVIEW, message=PREVIEW_TEXT, preview=pv)
+            if not pv["rows"]:
+                view["notes"].append(f"No name ranked {pb.rank_from} to {pb.rank_to} in the preview as of "
+                                     f"{pv['as_of_et'][:5]} ET.")
+            if pv["as_of_age_s"] > PREVIEW_OLD_AFTER_S:
+                view["notes"].append(f"No newer preview has come since {pv['as_of_et'][:5]} ET.")
+            return view
         why = (day or {}).get("reason") or "no picks for the day."
         view.update(state=NO_PICKS, message=f"No picks yet: {why} Picks freeze at 09:25 ET.")
         return view

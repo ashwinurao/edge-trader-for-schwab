@@ -71,6 +71,9 @@
   tr.red td { background: var(--red-bg); }
   .foot { padding: 0 16px 20px; color: var(--muted); font-size: 12px; line-height: 1.55; }
   .empty { padding: 26px 16px; color: var(--muted); }
+  .bp { font: 500 12.5px var(--sans); color: var(--muted); }
+  .bp b { font: 600 13px var(--mono); color: var(--text); }
+  table.preview td { background: repeating-linear-gradient(135deg, transparent 0 10px, rgba(214,165,43,.05) 10px 20px); }
 </style>
 </head>
 <body>
@@ -89,6 +92,7 @@
     <button class="btn" id="risk-save" type="button">Save</button><span class="msg" id="risk-msg"></span></div>
   <span class="pill" id="calm">calm flag</span>
   <span class="mut msg" id="calm-txt"></span>
+  <span class="bp" id="bp" title="Schwab's numbers from the account read Edge Trader already makes. On this screen only.">Buying power</span>
   <span class="sp"></span>
   <span class="mut msg" id="picks-txt"></span>
 </div>
@@ -231,6 +235,29 @@ function row(r) {
   </tr>${n}`;
 }
 
+// The buying power line (brief 21): Schwab's own numbers with the time read, or "not known".
+const usd = v => v == null ? "not known" : "$" + Number(v).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+function buyingPower(b) {
+  if (!b || b.state === "NOT_KNOWN") return `Buying power <b>not known</b>`;
+  if (b.state === "HIDDEN") return `Buying power <b>hidden</b>`;
+  return `Buying power · day trading <b>${usd(b.day_trading)}</b> · buying power <b>${usd(b.buying_power)}</b>
+    · equity <b>${usd(b.equity)}</b> · read ${esc(b.read_at_et)} ET, ${ago(b.age_s)}`;
+}
+
+// Edge Scanner's preview from 09:00 ET until the 09:25 freeze: names and pre-market levels only.
+// No 09:30 minute, no levels, no shares and no buttons: every row says it is not locked.
+function previewRow(r) {
+  return `<tr>
+    <td class="n">${esc(r.rank)}</td>
+    <td><span class="tk">${esc(r.ticker)}</span></td>
+    <td class="n">${px(r.atr)}</td>
+    <td class="n">${px(r.pm_high)}</td>
+    <td class="n">${px(r.pm_low)}</td>
+    <td class="n">${px(r.last)}</td>
+    <td><span class="tag sofar">Preview, not locked</span><span class="sub">Picks freeze at 09:25 ET.</span></td>
+  </tr>`;
+}
+
 function render(v, browserStale) {
   $("pb").textContent = `${v.playbook.name} · ranks ${v.playbook.ranks[0]}-${v.playbook.ranks[1]} · ${v.playbook.bar} · flat ${v.playbook.flat_et} ET`;
   $("demo").style.display = v.demo ? "" : "none";
@@ -256,17 +283,27 @@ function render(v, browserStale) {
   calm.title = c.text || "";
   if (!typing && document.activeElement !== $("risk"))
     $("risk").value = v.risk.per_pick == null ? "" : Number(v.risk.per_pick).toFixed(2);
-  const p = v.picks;
-  $("picks-txt").textContent = p ? `OV picks ${p.trading_date} · frozen ${p.frozen_at_et || "–"} ET${p.shadow ? " · shadow run" : ""}${p.late ? " · LATE" : ""}` : "";
+  const p = v.picks, pv = v.state === "PREVIEW" ? v.preview : null;
+  $("picks-txt").textContent = p ? `OV picks ${p.trading_date} · frozen ${p.frozen_at_et || "–"} ET${p.shadow ? " · shadow run" : ""}${p.late ? " · LATE" : ""}`
+    : pv ? `OV preview ${pv.trading_date} · as of ${pv.as_of_et.slice(0, 5)} ET · not locked` : "";
+  const bp = $("bp");
+  bp.innerHTML = buyingPower(v.buying_power);
+  bp.title = (v.buying_power && v.buying_power.text) || "Schwab's numbers from the account read Edge Trader already makes. On this screen only.";
   const banners = [];
   if (browserStale) banners.push(`<div class="banner bad">Edge Trader has not answered this page for ${Math.round((Date.now() - lastOk) / 1000)} s. Every number below is old.</div>`);
-  if (v.state !== "OK" && v.state !== "STALE" && v.message) banners.push(`<div class="banner ${v.state === "NO_ANSWER" || v.state === "NOT_SET_UP" ? "bad" : "info"}">${esc(v.message)}</div>`);
+  if (pv) banners.push(`<div class="banner warn"><b>${esc(v.message)}</b> OV's ranked list as of ${esc(pv.as_of_et.slice(0, 5))} ET from Edge Scanner. It changes each minute; the plan's levels, shares and buttons wait for the frozen picks and the 09:30 minute.</div>`);
+  else if (v.state !== "OK" && v.state !== "STALE" && v.message) banners.push(`<div class="banner ${v.state === "NO_ANSWER" || v.state === "NOT_SET_UP" ? "bad" : "info"}">${esc(v.message)}</div>`);
   for (const n of v.notes || []) banners.push(`<div class="banner ${n.startsWith("Old data") ? "bad" : "warn"}">${esc(n)}</div>`);
   if (c.calm == null && c.text && v.rows.length) banners.push(`<div class="banner warn">${esc(c.text)}</div>`);
   if (entries && entries.error) banners.push(`<div class="banner bad">${esc(entries.error)}</div>`);
   if (entries && entries.orders_old) banners.push(`<div class="banner bad">${esc(entries.orders_old)} Cancel still works.</div>`);
   $("banners").innerHTML = banners.join("");
-  if (!v.rows.length) { $("wrap").innerHTML = `<div class="empty">No plan rows.</div>`; }
+  if (pv) {
+    $("wrap").innerHTML = !pv.rows.length ? `<div class="empty">No preview rows.</div>`
+      : `<table class="preview${old ? " stale" : ""}"><thead><tr>
+      <th>#</th><th>Ticker</th><th>ATR</th><th>PM high</th><th>PM low</th><th>Last</th><th>Status</th>
+      </tr></thead><tbody>${pv.rows.map(previewRow).join("")}</tbody></table>`;
+  } else if (!v.rows.length) { $("wrap").innerHTML = `<div class="empty">No plan rows.</div>`; }
   else {
     $("wrap").innerHTML = `<table class="${old ? "stale" : ""}"><thead><tr>
       <th>#</th><th>Ticker</th><th>ATR</th><th>09:30 high</th><th>09:30 low</th><th>Data</th>

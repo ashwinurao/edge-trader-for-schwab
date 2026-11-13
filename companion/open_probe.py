@@ -722,8 +722,10 @@ class OpenProbe:
 
     def _reread(self, now: datetime) -> None:
         """Read Edge Scanner's picks again (review 1 of PR #29). When they come: set the picks and
-        the quote symbols, start the rotation at rank 1, quote them now so the next preview has a
-        fresh price, and say so once. None by PICKS_REREAD_UNTIL_ET: SPY, and say so once."""
+        the quote symbols, start the rotation at rank 1, and say so once. Inside the window, quote
+        them now so the next preview has a fresh price. Before the window start, wait: the regular
+        cycle quotes them at the start, because the window means the window (review 2 of PR #29).
+        None by PICKS_REREAD_UNTIL_ET: SPY, and say so once."""
         until = datetime.combine(self._win[0].date(), PICKS_REREAD_UNTIL_ET, ET)
         picks, _why = self._read_picks()
         if picks:
@@ -732,7 +734,7 @@ class OpenProbe:
             self._turn = 0
             self._note("open probe: picks came", at_et=f"{now.astimezone(ET):%H:%M:%S}", reads=self._reads,
                        symbols=self.symbols, preview_symbols=list(self.picks))
-            if self.client is not None and not self.halted:
+            if self.client is not None and not self.halted and now >= self._win[0]:
                 self._next_quote = self._mono() + self.cfg.quote_every_s
                 try:
                     self._quotes()
