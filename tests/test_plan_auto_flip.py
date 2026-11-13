@@ -1231,6 +1231,7 @@ from test_plan_auto import lines as plan_lines  # noqa: E402
 from test_plan_auto import placed as placed_names  # noqa: E402
 from test_plan_auto import rig  # noqa: E402,F401  (Step 6's rig fixture)
 from test_plan_auto import run as run_plan  # noqa: E402
+from test_plan_auto import _hold_lock, _spy  # noqa: E402
 
 from companion.opening_plan import tape as T  # noqa: E402
 from companion.plan_auto import executor as X  # noqa: E402
@@ -1423,6 +1424,81 @@ def test_executor_no_flip_after_a_click_cancel(frig):
     run_plan(frig, et(9, 31, 8))
     assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
     assert frig.plan.left["AAAA"] == plan_entries.CLICK_TAKES_ROW
+
+
+def aaaa_past_its_flip_line(r):
+    ids = all_four_rest(r)
+    r.tape.prices["AAAA"] = 42.14                     # past AAAA's flip line 42.144, untriggered
+    r.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    return ids
+
+
+def note(r, ticker="AAAA"):
+    return {p["ticker"]: p["note"] for p in r.plan.panel()["picks"]}[ticker]
+
+
+def test_executor_a_busy_lock_before_the_flips_cancel_waits_a_tick(frig):
+    # Architect's review 1 of Step 6 (must 1), for the flip: lock held 2 s, at most 9 tries, one log
+    # line, no record written while it is held, and the flip goes once the lock is free.
+    ids = aaaa_past_its_flip_line(frig)
+    tries = _spy(frig, "flip_auto")
+    saves, real_save = [], frig.desk._save
+
+    def save(recs):
+        if frig.trader._send_lock.locked():
+            saves.append(copy.deepcopy(recs))
+        return real_save(recs)
+    frig.desk._save = save
+    _hold_lock(frig, et(9, 31, 3), 2.0)
+    busy = [t for t, held in tries if held]
+    assert 1 <= len(busy) <= 9 and set(busy) == {"AAAA"}
+    assert saves == [] and frig.broker.cancelled == [] and len(frig.broker.placed) == 4
+    said = plan_lines(frig, "busy")
+    assert [(x["ticker"], x["what"]) for x in said] == [("AAAA", "cancel")]
+    assert note(frig) == plan_entries.TRADER_BUSY and plan_lines(frig, "flip_auto") == []
+    run_plan(frig, et(9, 31, 8))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5
+    assert frig.desk.records()["AAAA"]["side"] == "SHORT" and len(plan_lines(frig, "busy")) == 1
+    assert note(frig) != plan_entries.TRADER_BUSY
+
+
+def test_executor_a_busy_lock_after_the_flips_cancel_waits_then_places(frig, monkeypatch):
+    # The cancel is confirmed and a click takes the lock for 2 s: nothing rests, so the flip waits a
+    # tick (0.25 s) at a time, one row line and one panel line, then reads the tape again and sends.
+    ids = aaaa_past_its_flip_line(frig)
+    clicked, ticks, looks, rows = [], [], [], []
+    real_cancel = frig.trader.cancel_entry
+
+    def cancel_then_click(oid):
+        got = real_cancel(oid)
+        frig.trader._send_lock.acquire()
+        clicked.append(frig.clock.t)
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel_then_click)
+    real_busy = frig.desk.trader_busy
+    monkeypatch.setattr(frig.desk, "trader_busy", lambda: (looks.append(1) if clicked else None) or real_busy())
+
+    def sleep(s):
+        frig.clock.advance(s)
+        if clicked:
+            ticks.append(s)
+            rows.append(frig.desk.records()["AAAA"]["text"])
+            if frig.trader._send_lock.locked() and frig.clock.t >= clicked[0] + timedelta(seconds=2):
+                frig.trader._send_lock.release()
+    monkeypatch.setattr(trading.time, "sleep", sleep)
+    reads = frig.tape.reads
+    run_plan(frig, et(9, 31, 8))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5
+    assert ticks == [0.25] * 8 and len(looks) <= 9                       # held 2 s: at most 9 looks
+    assert set(rows) == {"The armed plan cancelled the long entry. It places the short when the order "
+                         "action in progress ends."}
+    notes = [x for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == "flip_busy"]
+    assert len(notes) == 1 and plan_lines(frig, "busy") == []
+    (line,) = plan_lines(frig, "flip_auto")
+    assert line["ok"] and {"busy_from", "busy_until"} <= set(line["times"])
+    assert frig.tape.reads > reads                                       # the send half read the tape again
+    got = frig.desk.records()["AAAA"]
+    assert got["side"] == "SHORT" and got["state"] == plan_entries.SENT and max(frig.working) == 1
 
 
 def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):
