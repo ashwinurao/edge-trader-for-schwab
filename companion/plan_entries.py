@@ -86,6 +86,11 @@ TRADER_BUSY = "Another submission is in progress"      # Trader.submit's own loc
 # and so does the chase's per-day counter (chases): a click never frees a row for another chase.
 AUTO_KEYS = ("kind", "sent", "sent_at", "wait_from", "wait_until", "range")
 CLICK_TAKES_ROW = "Yours since your click. The armed plan leaves this row for today."
+# Trader's one order lock is held by a click, a ticket send or Flat all: nothing reached Schwab.
+# The armed plan checks it before claiming a row (architect's review 1 of fork PR #27, 2026-11-13
+# 16:45 UTC), so a busy lock writes no record, and the plan tries again one tick later.
+TRADER_BUSY = "Another order action is running in Edge Trader (a click or Flat all). Nothing was sent; " \
+              "the armed plan tries again on its next reading."
 
 
 def enabled(env: Mapping[str, str] = os.environ) -> bool:
@@ -666,25 +671,34 @@ class PlanDesk:
                     f"{stop}, plan row trigger {n['trigger']} stop {n['stop']}. The armed plan sent nothing for it.")
         return ""
 
+    def trader_busy(self) -> bool:
+        """Trader's order lock is held right now (a click, a ticket send or Flat all). Only a hint:
+        Trader.submit and cancel_entry still refuse if it is taken after this check."""
+        lk = getattr(self.trader, "_send_lock", None)
+        try:
+            return bool(lk is not None and lk.locked())
+        except Exception:
+            return False
+
     def place_auto(self, ticker: str, side: str, o: Mapping, pick: Optional[Mapping] = None,
                    view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None) -> dict:
         """Place's twin for the armed plan: Step 3's break entry from the open tape's final range.
         `o` is engine.order_for of that range (trigger, stop, cap, shares); shares are capped by
-        BREAK_MAX_SHARES. Answers Trader.submit's dict, plus `not_sent` when no request left
-        (then `again` says whether the pick may try on a later reading: only Trader's own lock)."""
+        BREAK_MAX_SHARES. `view` is Step 2's view from the feed's last answer (the executor's);
+        this twin never asks Edge Scanner, and None or {} means no row check. Answers Trader.submit's
+        dict, plus `not_sent` when no request left (then `again` and `busy`: Trader's own lock was
+        busy, so the pick may try on a later reading)."""
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
         log = log or (lambda event, **kw: None)
         if self.demo:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
         if side not in OTHER:
             return self._refuse(ticker, "Pick long or short.", not_sent=True)
+        if self.trader_busy():
+            # Before the row is claimed: a busy lock writes and removes no SENDING record.
+            return self._refuse(ticker, TRADER_BUSY, not_sent=True, again=True, busy=True)
         orders = self._orders()
         fresh = self._orders_fresh()
-        if view is None:
-            try:
-                view = self._view()
-            except Exception:
-                view = None
         with self._lock:
             try:
                 recs = self._load()
@@ -734,17 +748,19 @@ class PlanDesk:
                 if again:
                     recs.pop(ticker, None)       # Trader's lock was busy (a click): the row is as before
                     self._save(recs)
-            return {**r, "not_sent": True, "again": again}
+            return {**r, "not_sent": True, "again": again, "busy": again}
         return r
 
     def cancel_auto(self, ticker: str, why: str = "", log: Optional[Callable[..., None]] = None) -> dict:
         """Cancel's twin for the armed plan: only the plan's own resting entry, through
         Trader.cancel_entry (which reads it back until Schwab says CANCELED with nothing filled).
-        `not_sent` when Trader's lock was busy (nothing reached Schwab)."""
+        `not_sent` when nothing reached Schwab, with `busy` when Trader's lock was the reason."""
         ticker = str(ticker or "").upper().strip()
         log = log or (lambda event, **kw: None)
         if self.demo:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
+        if self.trader_busy():
+            return self._refuse(ticker, TRADER_BUSY, not_sent=True, busy=True)
         with self._lock:
             try:
                 rec = self._load().get(ticker) or {}
@@ -760,7 +776,7 @@ class PlanDesk:
             r = {"ok": False, "error": f"Cancel failed: {e}"[:300]}
         log("cancel_answer", ok=bool(r.get("ok")), status=r.get("status"), order_id=oid)
         if not r.get("ok") and str(r.get("error") or "").startswith("Another order action is in progress"):
-            return {**r, "ticker": ticker, "not_sent": True}
+            return {**r, "ticker": ticker, "not_sent": True, "busy": True}
         if r.get("ok"):
             with self._lock:
                 self._put(ticker, state=NONE, order_id=None,
