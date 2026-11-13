@@ -630,6 +630,13 @@ them. On 2026-11-13, while order calls ran, the poller read the order list only 
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
+On a name you also trade by hand, the plan follows the side rule above (brief 25): it sends beside
+your shares and working orders on the same side. On the other side it sends nothing and leaves that
+pick to you for the day, with Place's words ("You are short 50 T by hand. The plan does not take the
+other side of a name you trade. Nothing was sent."). When your side is not clear (both sides, an
+order that is not a plain buy or sell, the plan unable to tell its shares from yours) that pick waits:
+it is looked at again on each reading until the watch ends, and the other picks go on. Schwab's
+positions old (no good account read for 15 seconds) is a wait for every pick, like an old order list.
 A **Flat all** click disarms the plan first, before Flat all builds its list ("the Flat all click").
 After it the plan sends and cancels nothing: Flat all's own list does the cancels. A send the plan had
 already started lands; its row says "A click on this row is still running" in that batch, and a second
@@ -663,12 +670,16 @@ before 09:35, then the four 09:35 cancels, each at its worst). The limit that bi
 but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
 Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
 wait. That is why the order list can go old while the plan works; brief 24 changes the poller.
+Since brief 26 (`companion/read_retry.py`) a quote or order read whose connection Schwab dropped before
+any answer is sent once more, so each such drop adds one call to a send or a cancel (on 2026-11-13,
+1 in 31 ticket quotes dropped). `calls_per_send` stays 5 and does not count them.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
 start and its answer with their times. A step that took over 100 ms before its action adds a
-`slow_step` line. A busy order lock adds one `busy` line per pick, an old order list one `wait` line,
-and the pick's action after either a `wait_over` line with how long it waited (`waited_s`). A skipped
+`slow_step` line. A busy order lock adds one `busy` line per pick; an old order list or account read,
+or a side that is not clear, one `wait` line; and the pick's action after either a `wait_over` line
+with how long it waited (`waited_s`). A skipped
 row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
 or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.

@@ -76,6 +76,8 @@ DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
 # Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
 # other working order on this name" from the poller's order list, so it never sends on an old one.
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
+# The armed send's two waits (_auto_refusal): no pick may go on this reading, or only this name waits.
+WAIT_ALL, WAIT_NAME = "all", "name"
 # The armed plan's cancel twin waits on an old list too (architect's live-test notes N1, 2026-11-13).
 ORDERS_OLD_AUTO_CANCEL = "Schwab's order list is old. The armed plan cancels nothing until it is fresh."
 ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
@@ -418,8 +420,8 @@ class PlanDesk:
 
     def _foreign(self, ticker: str, rec: Mapping, orders: list[dict]) -> Optional[dict]:
         """A working order on this name that this row did not send (the ticket, thinkorswim).
-        Not used by Place or Flip since brief 25 (the side rule, _beside); kept for Step 6's branch
-        (ET PR #27), whose armed send moves to plan_side.manual_refusal."""
+        Not used by Place, Flip or Step 6's armed send since brief 25 (the side rule: _beside and
+        _auto_refusal); kept for the branches of Steps 7 and 8 (ET PRs #28 and #25) until they move."""
         own = rec.get("order_id")
         for o in orders:
             if o.get("orderId") == own or o.get("status") not in LIVE:
@@ -712,33 +714,48 @@ class PlanDesk:
 
     # ---- the armed plan's twins (Step 6, brief 16 item 5) ------------------------------------
 
-    def _auto_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
-                      blocked: Optional[set], fresh: bool) -> str:
+    def _auto_refusal(self, ticker: str, side: str, rec: Mapping, entry: Mapping, orders: list[dict],
+                      blocked: Optional[set], fresh: bool) -> tuple[str, str]:
         """Place's row checks without Step 2's view: the tape's own tests (executor.py) replace
         "the row's first minute is final and fresh". The plan sends only on an empty row.
         A hold comes first (Flat all's batch, Step 9; a hold that cannot be read refuses): the
-        automatic twins do not go through _send_refusal (architect, 2026-11-13 16:25 UTC)."""
+        automatic twins do not go through _send_refusal (architect, 2026-11-13 16:25 UTC).
+        Returns (why, wait), ("", "") when the send may go. `wait` is "" for a refusal (the plan
+        leaves the pick for the day), WAIT_ALL when no pick may go on this reading (an old order
+        list or account read) and WAIT_NAME when only this name waits (its side is not clear)."""
         held = self.held()
         if held:
-            return held
+            return held, ""
         if rec.get("origin") == "click":
-            return CLICK_TAKES_ROW
+            return CLICK_TAKES_ROW, ""
         if rec:
-            return f"{ticker} already has an entry record today ({rec.get('state')})."
+            return f"{ticker} already has an entry record today ({rec.get('state')}).", ""
         if not self._armed():
-            return "ARM is off on the dashboard."
+            return "ARM is off on the dashboard.", ""
         if not self._market_open():
-            return "The market is closed."
+            return "The market is closed.", ""
         if not fresh:
-            return ORDERS_OLD
-        f = self._foreign(ticker, rec, orders)
-        if f is not None:
-            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+            return ORDERS_OLD, WAIT_ALL
         if blocked is None:
-            return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
+            return ("An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the "
+                    "dashboard."), ""
         if ticker in blocked:
-            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
-        return ""
+            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve.", ""
+        # Brief 25 rule B, in place of "one entry per name" (Ash, 2026-11-13 20:01:19 UTC, and his card
+        # pick "Plan trades beside you", 20:04:42 UTC; architect, 21:31 UTC): the plan's entry goes
+        # beside the user's own trades on the same side, never on the other side, and waits while the
+        # side is not clear. The row is empty here, so the plan holds no share of the name.
+        positions, pfresh = self._positions_read()
+        try:
+            ps = plan_side.plan_shares(rec, orders)
+            code, text = plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ps.ids, ps.held)
+        except Exception as e:                       # when unsure, send nothing
+            code, text = plan_side.NOT_CLEAR, f"Could not read your {ticker} position and orders ({e}). Nothing was sent."[:300]
+        if code == plan_side.OK:
+            return "", ""
+        if code == plan_side.OTHER_SIDE:
+            return text, ""
+        return text, WAIT_ALL if text in (plan_side.ORDERS_OLD, plan_side.POSITIONS_OLD) else WAIT_NAME
 
     def _row_disagrees(self, view: Optional[Mapping], ticker: str, side: str, o: Mapping) -> str:
         """Step 2's row, when its 09:30 bar is final: its trigger and stop within one cent of the
@@ -794,12 +811,13 @@ class PlanDesk:
                 return self._refuse(ticker, f"Not sent: {e}."[:300], not_sent=True)
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why = self._auto_refusal(ticker, rec, entry, orders, blocked, fresh)
+            why, wait = self._auto_refusal(ticker, side, rec, entry, orders, blocked, fresh)
             if why:
-                # An old order list is a wait, not a refusal for the day: `again` (not `busy`), so the
-                # pick tries on a later reading until the watch ends; nothing is ever sent on an old
-                # list (architect's live-test notes N1, 2026-11-13 20:12 UTC).
-                return self._refuse(ticker, why, not_sent=True, again=why == ORDERS_OLD)
+                # An old order list (or account read) is a wait, not a refusal for the day: `again`
+                # (not `busy`), so the pick tries on a later reading until the watch ends; nothing is
+                # ever sent on an old list (architect's live-test notes N1, 2026-11-13 20:12 UTC). A
+                # side that is not clear (brief 25) is a wait of this name only: `this_name`.
+                return self._refuse(ticker, why, not_sent=True, again=bool(wait), this_name=wait == WAIT_NAME)
             shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
             if shares < 1:
                 return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)

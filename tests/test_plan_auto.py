@@ -25,7 +25,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from companion import break_entry, netlog, plan_entries, plan_flat, plan_size, trading
+from companion import break_entry, netlog, plan_entries, plan_flat, plan_side, plan_size, trading
 from companion.opening_plan import engine
 from companion.opening_plan import plan as P
 from companion.opening_plan import tape as T
@@ -196,10 +196,12 @@ def rig(tmp_path, monkeypatch):
         return real_submit(req)
     monkeypatch.setattr(t, "submit", spy)
     view = View(clock)
-    knobs = {"fresh": True, "cooldown": 0.0}
+    # positions / pfresh: the poller's net shares per name and whether that read is fresh (brief 25).
+    knobs = {"fresh": True, "cooldown": 0.0, "positions": {}, "pfresh": True}
     orders = lambda: list(broker.orders.values())
     desk = plan_entries.PlanDesk(t, view, orders, plan_entries.max_flips(), now=clock.now,
-                                 orders_fresh=lambda: knobs["fresh"])
+                                 orders_fresh=lambda: knobs["fresh"], positions=lambda: knobs["positions"],
+                                 positions_fresh=lambda: knobs["pfresh"])
     plan = X.AutoPlan(desk, t, PB_RAW, tape, lambda r, now: T.usable(r, TAPE_RULES, now=now), view, orders,
                       lambda: knobs["fresh"], lambda: knobs["cooldown"], env=ENV, now=clock.now,
                       out_dir=tmp_path / "auto")
@@ -558,12 +560,129 @@ def test_must_not_send_on_a_blocked_name(rig):
     assert "not confirmed" in rig.plan.left["AAAA"]
 
 
-def test_must_not_send_when_another_order_works_on_the_name(rig):
+# ---------------------------------------------------------------- beside Ash's own trades (brief 25)
+
+OTHER_SIDE = "The plan does not take the other side of a name you trade. Nothing was sent."
+
+
+def by_hand(rig, oid, instruction, ticker, order_type="LIMIT", qty=100):
+    """An order Ash placed by hand on the same account (the ticket or thinkorswim)."""
+    rig.broker.orders[oid] = {"orderId": oid, "status": "WORKING", "filledQuantity": 0, "orderType": order_type,
+                              "orderStrategyType": "SINGLE", "quantity": qty,
+                              "orderLegCollection": [{"instruction": instruction, "quantity": qty,
+                                                      "instrument": {"symbol": ticker}}]}
+
+
+def touched(rig, sym):
+    """Every request about `sym` that reached the fake broker: its quote or an order for it."""
+    return [c for c in rig.broker.calls if c == ("quote", sym)] + [
+        o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == sym]
+
+
+def test_the_plan_sends_beside_ashs_own_trades_on_the_same_side(rig):
+    # Ash's card pick "Plan trades beside you" (2026-11-13 20:04:42 UTC): his shares and working orders
+    # on a pick's side do not stop it (this replaces "one entry per name"). AAAA and CCCC are long
+    # picks, BBBB and DDDD short.
+    rig.knobs["positions"] = {"AAAA": 100.0, "BBBB": -30.0}
+    by_hand(rig, 7, "SELL", "AAAA", order_type="STOP")          # his own stop on his long AAAA
+    by_hand(rig, 8, "BUY", "CCCC")
+    by_hand(rig, 9, "SELL_SHORT", "DDDD")
     arm(rig)
-    rig.broker.orders[7] = {"orderId": 7, "status": "WORKING", "filledQuantity": 0, "orderStrategyType": "SINGLE",
-                            "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "CCCC"}}]}
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
-    assert placed(rig) == ["DDDD", "AAAA", "BBBB"] and "One entry per name" in rig.plan.left["CCCC"]
+    assert placed(rig) == ["DDDD", "AAAA", "BBBB", "CCCC"]
+    assert [without_id(r) for r in rig.sent] == [want_req(s) for s in ("DDDD", "AAAA", "BBBB", "CCCC")]
+    assert lines(rig, "leave") == [] and lines(rig, "wait") == []
+    run(rig, et(9, 36, 0), start=et(9, 35, 0))
+    cancelled = set(rig.broker.cancelled)
+    assert len(cancelled) == 4 and not cancelled & {7, 8, 9}     # the 09:35 cancels are the plan's own
+    assert all(rig.broker.orders[i]["status"] == "WORKING" for i in (7, 8, 9))
+
+
+@pytest.mark.parametrize("setup,text", [
+    ("held_short", f"You are short 50 AAAA by hand. {OTHER_SIDE}"),
+    ("order_short", f"You have a working short order on AAAA. {OTHER_SIDE}"),
+    ("order_cover", f"You have a working short order on AAAA. {OTHER_SIDE}"),
+])
+def test_the_plan_leaves_a_pick_on_the_other_side_of_ashs_trades(rig, setup, text):
+    if setup == "held_short":
+        rig.knobs["positions"] = {"AAAA": -50.0}
+    else:
+        by_hand(rig, 7, "SELL_SHORT" if setup == "order_short" else "BUY_TO_COVER", "AAAA")
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC"] and touched(rig, "AAAA") == []
+    assert rig.plan.left["AAAA"] == f"not sent: {text}"
+    assert [x["why"] for x in lines(rig, "leave") if x["ticker"] == "AAAA"] == [f"not sent: {text}"]
+    p = rig.plan.panel()
+    assert p["used"]["orders_day"] == 3                         # nothing spent on AAAA
+    # Left for the day: once Ash is out of the name the plan still sends nothing for AAAA.
+    rig.knobs["positions"] = {}
+    rig.broker.orders.pop(7, None)
+    run(rig, et(9, 32, 0))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC"] and touched(rig, "AAAA") == []
+    assert len(lines(rig, "leave")) == 1
+
+
+@pytest.mark.parametrize("setup,text", [
+    ("both_sides", "You are on both sides of AAAA"),
+    ("shares_and_other_order", "You are on both sides of AAAA"),
+    ("odd_order", "One of your AAAA orders is not a plain buy or sell."),
+])
+def test_a_side_that_is_not_clear_waits_while_the_other_picks_go(rig, setup, text):
+    # Architect, 2026-11-13 21:31 UTC: not_clear is a wait, looked at again each tick until the watch
+    # ends. It is this name's own wait: the other picks go on the same reading.
+    if setup == "both_sides":
+        by_hand(rig, 7, "BUY", "AAAA")
+        by_hand(rig, 8, "SELL_SHORT", "AAAA")
+    elif setup == "shares_and_other_order":
+        rig.knobs["positions"] = {"AAAA": 100.0}
+        by_hand(rig, 8, "SELL_SHORT", "AAAA")
+    else:
+        by_hand(rig, 8, "EXCHANGE", "AAAA")
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC"] and touched(rig, "AAAA") == []
+    assert "AAAA" not in rig.plan.left
+    waits = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]
+    assert len(waits) == 1 and text in waits[0]["why"] and waits[0]["why"].endswith("Nothing was sent.")
+    assert waits[0]["what"] == "send"
+    p = rig.plan.panel()
+    assert p["used"]["orders_day"] == 3
+    assert text in next(x["note"] for x in p["picks"] if x["ticker"] == "AAAA")
+    # Clear again (his short order ends): AAAA goes once, on a new reading.
+    rig.broker.orders[8]["status"] = "CANCELED"
+    run(rig, et(9, 31, 5))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC", "AAAA"]
+    assert without_id(rig.sent[-1]) == want_req("AAAA")
+    (over,) = [x for x in lines(rig, "wait_over") if x["ticker"] == "AAAA"]
+    assert over["what"] == "send" and text in over["why"] and 2.5 <= over["waited_s"] <= 3.25
+
+
+def test_a_side_that_stays_unclear_until_the_watch_ends_sends_nothing_for_that_pick(rig):
+    by_hand(rig, 7, "BUY", "AAAA")
+    by_hand(rig, 8, "SELL_SHORT", "AAAA")
+    arm(rig)
+    run(rig, et(9, 36, 0), start=et(9, 31, 0.1))
+    assert "AAAA" not in placed(rig) and touched(rig, "AAAA") == []
+    assert len([x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]) == 1     # said once, not per tick
+    assert sorted(rig.broker.cancelled) == sorted(o["orderId"] for o in rig.broker.orders.values()
+                                                  if o["orderId"] not in (7, 8))
+    assert rig.broker.orders[7]["status"] == rig.broker.orders[8]["status"] == "WORKING"
+    assert not rig.plan.panel()["armed"]
+
+
+def test_an_old_account_read_is_a_wait_for_every_pick(rig):
+    # Schwab's positions old (Poller._fresh("account")): like an old order list, no pick goes on that
+    # reading; each goes once the read is fresh.
+    rig.knobs["pfresh"] = False
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert rig.broker.placed == [] and rig.broker.calls == []
+    assert [(x["ticker"], x["why"]) for x in lines(rig, "wait")] == [("DDDD", plan_side.POSITIONS_OLD)]
+    rig.knobs["pfresh"] = True
+    run(rig, et(9, 31, 5))
+    assert placed(rig) == ["DDDD", "AAAA", "BBBB", "CCCC"]
+    assert [x["ticker"] for x in lines(rig, "wait_over")] == ["DDDD"]
 
 
 @pytest.mark.parametrize("price", [42.49, 42.60])

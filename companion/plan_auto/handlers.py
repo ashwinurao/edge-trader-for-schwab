@@ -37,6 +37,9 @@ What a Lane gives a handler (names fixed with Step 7's thread, 2026-11-13):
   with `again` and no `busy`: an old list is a wait, architect's live-test notes N1, 2026-11-13).
   Not an action: return True after it; the executor ends the step, tries no other pick on that
   reading and waits one tick. Said once per pick while the same reason lasts.
+  busy(what, why, end_step=False): only this pick waits, and the handler returns False so the
+  other picks go on that reading. For a desk answer with `again` and `this_name`: the user's side
+  on this name is not clear (brief 25, companion/plan_side.py; architect, 2026-11-13 21:31 UTC).
 
 The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces brief 16's counts):
 - A send counts its worst case, armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC). The
@@ -136,7 +139,8 @@ class LaneHost(Protocol):
     def disarm(self, reason: str, for_day: bool = False) -> None: ...
     def once(self, key: str) -> bool: ...
     def forget(self, key: str) -> None: ...
-    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY) -> None: ...
+    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY,
+             end_step: bool = True) -> None: ...
 
 
 class Lane:
@@ -193,8 +197,8 @@ class Lane:
     def once(self, key: str) -> bool:
         return self.host.once(key)
 
-    def busy(self, what: str, why: str = plan_entries.TRADER_BUSY) -> None:
-        self.host.busy(self.ticker, what, why)
+    def busy(self, what: str, why: str = plan_entries.TRADER_BUSY, end_step: bool = True) -> None:
+        self.host.busy(self.ticker, what, why, end_step=end_step)
 
     def delegate(self, kind: str) -> Optional[bool]:
         h = self.host.registry.get(kind, self.host.env)
@@ -262,8 +266,14 @@ def on_place(lane: Lane) -> bool:
         lane.refund(orders=1, calls=calls)
         if r.get("busy"):
             lane.busy("send")                   # the step ends; the pick tries one tick later
+        elif r.get("again") and r.get("this_name"):
+            # Brief 25: the user's side on this name is not clear. Only this pick waits; the other
+            # picks go on this reading (architect, 2026-11-13 21:31 UTC).
+            lane.busy("send", str(r.get("error") or ""), end_step=False)
+            return False
         elif r.get("again"):
-            # An old order list (N1): the same wait, with the desk's reason on the pick's line.
+            # An old order list or account read (N1): the same wait, with the desk's reason on the
+            # pick's line.
             lane.busy("send", str(r.get("error") or ""))
         else:
             lane.leave(f"not sent: {r.get('error')}")

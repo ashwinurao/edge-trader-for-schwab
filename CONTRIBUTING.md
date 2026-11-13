@@ -24,12 +24,14 @@ These decide most review questions:
    click stops it, so does a Flat all click (before Flat all builds its list), and an unclear
    answer, a 429 or a reached bound disarms it. It arms only at the 1-share size stage. A Place, Flip or
    Cancel click on a row makes that row the user's for the day, and the plan never acts on it again
-   (`PlanDesk._put_click`). Ash's go for this exception is quoted in the
-   pull request that adds it. Any other change that would act without a click will not be merged. No order request (place, replace, cancel, preview) is ever
-   tried again. Only two reads of the order path are: the click's quote and a read of one order are
-   sent once more, at once, when Schwab drops the connection before any answer (reset, aborted,
-   refused), never after a timeout or an HTTP answer and never during a 429 pause
-   (`companion/read_retry.py`, brief 26, Ash's go 2026-11-13 20:01 UTC). The poller never tries again.
+   (`PlanDesk._put_click`). Like Place, it never takes the other side of a name the user trades by
+   hand (brief 25, `companion/plan_side.py`). Ash's go for this exception is quoted in the pull
+   request that adds it. Any other change that would act without a click will not be merged. No order
+   request (place, replace, cancel, preview) is ever tried again. Only two reads of the order path are:
+   the click's quote and a read of one order are sent once more, at once, when Schwab drops the
+   connection before any answer (reset, aborted, refused), never after a timeout or an HTTP answer and
+   never during a 429 pause (`companion/read_retry.py`, brief 26, Ash's go 2026-11-13 20:01 UTC). The
+   poller never tries again.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working

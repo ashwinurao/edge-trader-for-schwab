@@ -323,15 +323,18 @@ class AutoPlan:
         with self._lock:
             self.onces.discard(key)
 
-    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY) -> None:
+    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY, end_step: bool = True) -> None:
         """Nothing reached Schwab and the pick tries again on a later reading: Trader's order lock was
         busy (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC), or Schwab's order list was
         old (an old list is a wait: live-test notes N1, 2026-11-13 20:12 UTC). Not an action: the
-        step ends, no other pick tries on that reading and the worker waits one tick. Said once per
-        pick while the same reason lasts, not once per try: a "busy" line for the lock, "wait" else."""
+        step ends, no other pick tries on that reading and the worker waits one tick. With
+        `end_step` False only this pick waits and the other picks go on (brief 25: the user's side
+        on this name is not clear). Said once per pick while the same reason lasts, not once per
+        try: a "busy" line for the lock, "wait" else."""
         now = self._mono()
         with self._lock:
-            self._busy_step = True
+            if end_step:
+                self._busy_step = True
             prev = self.busy_picks.get(ticker)
             first = prev is None or prev[:2] != (what, why)
             # The wait counts from its first try, whatever the reason became (wait_over's waited_s).
@@ -696,6 +699,8 @@ class AutoPlan:
                     "Act on an old or late tape, an old order list (it waits until the list is fresh), an unclear "
                     "order, or after any disarm.",
                     "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",
+                    "Take the other side of a name you trade by hand (your shares or working orders): that pick is "
+                    "left to you. On your side it sends beside your trades; while your side is not clear it waits.",
                     f"Send more than {break_entry.BREAK_MAX_SHARES} share: the size stage is for your clicks only.",
                     "Act after a Flat all click: the click disarms it first, and Flat all does the cancels.",
                     "Survive a restart: arming is in memory only."]
