@@ -240,6 +240,7 @@ def test_a_larger_or_opposite_position_is_refused_for_that_row(fr, held, why):
 
 def test_a_partly_filled_entry_that_still_works_is_refused(fr):
     fr.desk.stage = plan_size.parse_stage(0.25)
+    fr.view.cap_fixed()             # brief 23: above 1 share the cap must be fixed; it never binds here
     a = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 43})["order_id"]
     fr.broker.fill_entry(a, n=10, done=False)
     it = by_ticker(fr.flat.items())["AAAA"]
@@ -717,6 +718,7 @@ def test_covered_again_resets_the_timer(fr):
 def test_add_stop_sends_exactly_a_stop_for_the_uncovered_shares(fr):
     # A 43-share entry at the 25% stage fills 10 and the rest is cancelled with its stop.
     fr.desk.stage = plan_size.parse_stage(0.25)
+    fr.view.cap_fixed()             # brief 23: above 1 share the cap must be fixed; it never binds here
     a = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 43})["order_id"]
     fr.broker.fill_entry(a, n=10, stop_live=False, done=True)
     assert fr.broker.orders[a]["status"] == "CANCELED"
@@ -761,6 +763,7 @@ def test_shares_bought_by_hand_beside_a_covered_plan_row_do_not_turn_it_red(fr):
     # Brief 25 rule E (changed expectation): until brief 25 the 3 shares bought elsewhere turned the
     # row red ("3 of 20 shares have no stop") with Add stop refused. They are the user's, not the plan's.
     fr.desk.stage = plan_size.parse_stage(0.10)
+    fr.view.cap_fixed()             # brief 23: above 1 share the cap must be fixed; it never binds here
     a = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 17})["order_id"]
     fr.broker.fill_entry(a, stop_live=True)                        # 17 held, stop for 17
     fr.broker.pos["AAAA"] = 20.0                                   # 3 more bought elsewhere: no stop

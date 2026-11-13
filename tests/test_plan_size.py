@@ -139,6 +139,8 @@ def test_a_stage_above_one_share_needs_the_cover_watch(rig, monkeypatch, caplog)
 
 def at_stage(rig, stage):
     rig.desk.stage = plan_size.parse_stage(stage)
+    # Brief 23: above 1 share a send needs the day's buying power cap fixed; here it never binds.
+    rig.view.cap_fixed()
 
 
 def test_the_default_stage_sends_one_share_and_the_row_says_so(rig):

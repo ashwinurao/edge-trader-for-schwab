@@ -99,6 +99,12 @@
   .tag.est { background: var(--blue-bg); color: var(--blue); margin-right: 4px; }
   td.est { min-width: 190px; }
   td.est b { font: 600 14px var(--mono); }
+  .in.pct { width: 56px; }
+  .cap { margin: 8px 16px 0; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--line-hi); font-size: 13px; }
+  .cap b { font: 600 13.5px var(--mono); }
+  .cap .two { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+  .cap .msg { margin-top: 4px; display: block; }
+  tr.notes.pv td { padding-top: 0; }
 </style>
 </head>
 <body>
@@ -115,6 +121,9 @@
   <div class="fld"><span class="mut">Risk per pick $</span>
     <input class="in" id="risk" inputmode="decimal" autocomplete="off" placeholder="not set">
     <button class="btn" id="risk-save" type="button">Save</button><span class="msg" id="risk-msg"></span></div>
+  <div class="fld" title="Brief 23: the share of each Schwab balance the plan may use; the rest stays for your own trades."><span class="mut">Plan may use</span>
+    <input class="in pct" id="share" inputmode="numeric" autocomplete="off" placeholder="50"><span class="mut">% of buying power</span>
+    <button class="btn" id="share-save" type="button">Save</button><span class="msg" id="share-msg"></span></div>
   <span class="pill" id="calm">calm flag</span>
   <span class="mut msg" id="calm-txt"></span>
   <span class="bp" id="bp" title="Schwab's numbers from the account read Edge Trader already makes. On this screen only.">Buying power</span>
@@ -122,6 +131,7 @@
   <span class="mut msg" id="picks-txt"></span>
   <span id="flat-slot"></span>
 </div>
+<div class="cap" id="cap" style="display:none"></div>
 <div id="banners"></div>
 <div class="dlg-bg" id="flat-dlg"><div class="dlg" role="dialog" aria-modal="true" aria-labelledby="flat-h">
   <h2 id="flat-h">Flat all: end the plan's trades</h2>
@@ -140,7 +150,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "
 const px = v => v == null ? "–" : Number(v).toFixed(2);
 const sh = v => v == null ? "–" : Number(v).toLocaleString("en-US");
 const ago = s => s == null ? "" : (s < 10 ? `${Number(s).toFixed(1)} s ago` : `${Math.round(s)} s ago`);
-let lastOk = 0, lastView = null, refresh = 2000, busy = false, typing = false;
+let lastOk = 0, lastView = null, refresh = 2000, busy = false, typing = false, typingShare = false;
 // Row buttons (companion/plan_entries.py): only when the server has them (EDGE_TRADER_PLAN_BUTTONS=1
 // and EDGE_TRADER_BREAK_ENTRY=1); a 404 means no buttons.
 let entries = null, entriesOff = false;
@@ -157,10 +167,12 @@ function shares(r) {
   const pair = p => p == null ? "–" : (p.long === p.short ? sh(p.long) : `L ${sh(p.long)} · S ${sh(p.short)}`);
   if (s.state === "SET_RISK") return `<span class="mut">set risk</span>`;
   if (s.state === "NO_LEVELS") return r.estimate ? estimateCell(r.estimate) : `<span class="mut">–</span>`;
+  // Brief 23: a size lowered to the most risk per pick that buying power allows says so.
+  const bpTag = s.by_buying_power ? `<span class="tag sofar">capped by buying power</span>` : "";
   if (s.state === "CALM_UNKNOWN")
-    return `full ${pair(s.full)}<span class="sub">half ${pair(s.half)} · calm not known</span>`;
+    return `full ${pair(s.full)}${bpTag}<span class="sub">half ${pair(s.half)} · calm not known</span>`;
   const tag = s.state === "CALM" ? `<span class="sub">half size: calm day</span>` : `<span class="sub">full size</span>`;
-  return `${pair(s.used)}${tag}`;
+  return `${pair(s.used)}${bpTag}${tag}`;
 }
 
 function side(r, k, cls) {
@@ -205,8 +217,8 @@ function notes(r) {
     esc(fr.result.replace("_", " "))} · ${esc(fr.text)}</div>`);
   if (b.state !== "FINAL" && b.state !== "SO_FAR" && b.text) out.push(`<div class="${b.state === "BAD" ? "badline" : "mutline"}">${esc(b.text)}</div>`);
   for (const k of ["long", "short"]) if (r[k] && r[k].capped) out.push(`<div class="badline">${k === "long" ? "Long" : "Short"} shares ${esc(r[k].capped)}.</div>`);
-  // Brief 22: display only; the row's shares are not changed.
-  if (r.buying_power_note) out.push(`<div class="warnline">${esc(r.buying_power_note.text)} The shares are not changed.</div>`);
+  // Brief 23: Schwab's margin rate for this name from today's previews, long and short apart when they differ.
+  out.push(...capLines(r));
   if (r.under_min_stop) {
     const pct = r.long && r.long.stop_atr_pct != null ? `${r.long.stop_atr_pct}% of ATR` : "under the minimum";
     out.push(`<div class="warnline">Stop is ${esc(pct)}, under the research's 2% minimum. The research would use stop
@@ -375,6 +387,29 @@ function row(r) {
   </tr>${n}`;
 }
 
+// Brief 23: the row's words on Schwab's margin for it; Schwab's own words are amber.
+function capLines(r) {
+  const t = (r.cap && r.cap.text) || [];
+  return t.map(x => `<div class="${x.startsWith("Schwab on the") ? "warnline" : "mutline"}">${esc(x)}</div>`);
+}
+
+// The buying power cap (brief 23): the two settings both ways round, then what X rests on.
+function capBox(v) {
+  const c = v.cap, box = $("cap");
+  if (!c) { box.style.display = "none"; return; }
+  box.style.display = "";
+  const state = c.state === "FIXED" ? `<span class="tag final">fixed ${esc(c.at_et)} ET</span>`
+    : c.state === "ESTIMATE" ? `<span class="tag est">estimate</span>` : `<span class="tag bad">not known</span>`;
+  const two = [c.share_text, c.needs_text].filter(Boolean).map(x => `<span>${esc(x).replace(/(\$[\d,.]+|\d+%)/g, "<b>$1</b>")}</span>`);
+  box.className = `cap${c.over ? " banner warn" : ""}`;
+  box.innerHTML = `<div class="two"><span class="mut">Buying power cap</span>${state}${two.join("")}</div>
+    ${c.risk_text ? `<span class="msg warnline">${esc(c.risk_text)}</span>` : ""}
+    <span class="msg mutline">${esc(c.text)}</span>
+    ${c.test_stage ? `<span class="msg mutline"><b>Test stage: each plan order is 1 share, whatever these two say.</b></span>` : ""}
+    ${(entries && entries.bp_uncovered) || c.uncovered_text ? `<span class="msg warnline">${esc((entries && entries.bp_uncovered) || c.uncovered_text)}</span>` : ""}`;
+  if (!typingShare && document.activeElement !== $("share")) $("share").value = c.share_pct;
+}
+
 // The buying power line (brief 21): Schwab's own numbers with the time read, or "not known".
 const usd = v => v == null ? "not known" : "$" + Number(v).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
 function buyingPower(b) {
@@ -385,24 +420,22 @@ function buyingPower(b) {
 }
 
 // Estimated shares before the 09:30 minute (brief 22): never a size and always marked "estimate".
-// The headline is the smaller of the estimate and what buying power allows, and says which decided.
+// Brief 23: the estimate is at most the risk per pick buying power allows, and says when it is capped.
 function estSet(x, label) {
   if (!x) return "–";
   const pre = label ? `<span class="mut">${label}</span> ` : "";
   const range = x.fewer != null && x.more != null ? `usually ${sh(x.fewer)} to ${sh(x.more)}` : "";
   const capped = x.capped ? esc(x.capped) : "";
   if (x.limited_by === "buying_power")
-    return `${pre}<b>${sh(x.headline)}</b> <span class="tag sofar">limited by buying power</span>
-      <span class="sub">${["estimate about " + sh(x.about), range, capped].filter(Boolean).join(" · ")}</span>`;
+    return `${pre}about <b>${sh(x.about)}</b> <span class="tag sofar">capped by buying power</span>
+      <span class="sub">${[range, capped].filter(Boolean).join(" · ")}</span>`;
   const sub = [range, capped].filter(Boolean).join(" · ");
   return `${pre}about <b>${sh(x.about)}</b>${sub ? `<span class="sub">${sub}</span>` : ""}`;
 }
 
 function estimateCell(e) {
   if (!e) return `<span class="mut">–</span>`;
-  const m = e.bp_max || {};
-  const bp = m.state === "OK" ? `buying power allows ${sh(m.shares)}` : m.state === "HIDDEN" ? "buying power hidden" : "buying power not known";
-  const bpLine = `<span class="sub" title="${esc(m.text)}">${bp}</span>`;
+  const bpLine = "";
   if (e.state === "OFF") return `<span class="mut">–</span>${bpLine}`;
   if (e.state === "MISSING") return `<span class="tag est">estimate</span><span class="mut">none</span><span class="sub">${esc(e.text)}</span>${bpLine}`;
   const body = e.state === "CALM_UNKNOWN"
@@ -414,7 +447,8 @@ function estimateCell(e) {
 // Edge Scanner's preview from 09:00 ET until the 09:25 freeze: names and pre-market levels only.
 // No 09:30 minute, no levels, no shares and no buttons: every row says it is not locked.
 function previewRow(r) {
-  return `<tr>
+  const lines = capLines(r);
+  return `<tr class="${lines.length ? "has-notes" : ""}">
     <td class="n">${esc(r.rank)}</td>
     <td><span class="tk">${esc(r.ticker)}</span></td>
     <td class="n">${px(r.atr)}</td>
@@ -423,7 +457,7 @@ function previewRow(r) {
     <td class="n">${px(r.last)}</td>
     <td class="n est">${estimateCell(r.estimate)}</td>
     <td><span class="tag sofar">Preview, not locked</span><span class="sub">Picks freeze at 09:25 ET.</span></td>
-  </tr>`;
+  </tr>${lines.length ? `<tr class="notes pv"><td></td><td colspan="7">${lines.join("")}</td></tr>` : ""}`;
 }
 
 function render(v, browserStale) {
@@ -454,6 +488,7 @@ function render(v, browserStale) {
   const p = v.picks, pv = v.state === "PREVIEW" ? v.preview : null;
   $("picks-txt").textContent = p ? `OV picks ${p.trading_date} · frozen ${p.frozen_at_et || "–"} ET${p.shadow ? " · shadow run" : ""}${p.late ? " · LATE" : ""}`
     : pv ? `OV preview ${pv.trading_date} · as of ${pv.as_of_et.slice(0, 5)} ET · not locked` : "";
+  capBox(v);
   const bp = $("bp");
   bp.innerHTML = buyingPower(v.buying_power);
   bp.title = (v.buying_power && v.buying_power.text) || "Schwab's numbers from the account read Edge Trader already makes. On this screen only.";
@@ -490,7 +525,8 @@ function render(v, browserStale) {
       </tr></thead><tbody>${v.rows.map(row).join("")}</tbody></table>`;
   }
   $("foot").innerHTML = `Rule (research, opening_drive/engine.py): enter ${px(v.playbook.offset)} past the 09:30 ET minute's high or low; the stop is the other side.
-    Shares = risk per pick ÷ risk per share, rounded down, inside the ticket's caps (10,000 shares, $250,000).
+    Shares = risk per pick ÷ risk per share, rounded down, inside the ticket's caps (10,000 shares, $250,000), with the risk at most
+    what your share of buying power allows at each name's margin rate from Schwab's previews (the Buying power cap line).
     Calm SPY day (RV20 ≤ ${v.playbook.calm_rv20_max}): ${v.playbook.calm_multiplier}× the risk. Nearer side: which break the minute's close sits closer to.
     ${entries ? `With the plan buttons on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
     the server's own row (never this page's prices). Flip cancels first and places the other side only after Schwab confirms the cancel with nothing
@@ -563,6 +599,26 @@ async function saveRisk() {
   }
 }
 $("risk-save").onclick = saveRisk;
+
+// Brief 23: "Plan may use N % of buying power", saved like the risk; a bad value is refused.
+async function saveShare() {
+  const msg = $("share-msg");
+  msg.textContent = "saving…"; msg.className = "msg mut";
+  try {
+    const r = await fetch("/api/opening-plan/share", {method: "POST", headers: {"Content-Type": "application/json", "X-Companion": "1"},
+                                                       body: JSON.stringify({share: $("share").value})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    msg.textContent = j.saved ? "saved" : `default ${j.share}%`; msg.className = "msg long";
+    typingShare = false;
+    tick();
+  } catch (e) {
+    msg.textContent = e.message; msg.className = "msg short";
+  }
+}
+$("share-save").onclick = saveShare;
+$("share").addEventListener("input", () => { typingShare = true; $("share-msg").textContent = "not saved"; $("share-msg").className = "msg mut"; });
+$("share").addEventListener("keydown", e => { if (e.key === "Enter") saveShare(); });
 $("risk").addEventListener("input", () => { typing = true; $("risk-msg").textContent = "not saved"; $("risk-msg").className = "msg mut"; });
 $("risk").addEventListener("keydown", e => { if (e.key === "Enter") saveRisk(); });
 tick();

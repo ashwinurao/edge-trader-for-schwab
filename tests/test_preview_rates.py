@@ -147,8 +147,8 @@ def test_the_plan_view_carries_todays_rates_and_the_app_hands_the_store_over(tmp
     s.add(line(sym="AAAA", af=0.30), et(9, 5, 30))
     now = et(9, 10, 20)
     app = FastAPI()
-    R.register(app, Store(tmp_path / "r.db"), lambda request: None, demo=True, env={}, now=lambda: now,
-               get=lambda u, t: None, rates=s)
+    R.register(app, Store(tmp_path / "r.db"), lambda request: None, env={"EDGE_SCANNER_URL": "http://192.168.1.10:8772"},
+               now=lambda: now, get=lambda u, t: {}, rates=s)
     v = TestClient(app).get("/api/opening-plan").json()
     assert v["preview_rates"]["AAAA"]["LONG"]["rates"]["af"] == {"rate": 0.3, "at_et": "09:05:30",
                                                                   "balance": "availableFunds"}

@@ -42,6 +42,17 @@
         "note": "Ash's pick, 2026-11-13 17:38:49 UTC, on the card \"Choose how the plan estimates shares before the first minute exists\" in the thread \"Review OV picks desk architecture\": \"About N, usually L to H\" (each row at a typical first minute of 0.27 x ATR with the usual range 0.19 to 0.37 x ATR, plus the most that buying power allows)",
         "why": "the study's lower quartile, 0.193: a narrower first minute, more shares"
       }
+    },
+    "buying_power": {
+      "_about": "Brief 23: the most risk per pick that buying power allows (companion/opening_plan/bp_cap.py). Each entry needs shares x the higher of its trigger and limit x that name's rate for that side from today's Schwab previews (companion/preview_rates.py). The plan may use Ash's share of each balance (his setting on the Opening plan page, a whole percent from 5 to 100; default_share_pct until he sets it); the rest stays for his own trades. X = balance x share / the sum over the picks of max(price x rate / risk per share) over long and short; the smallest X over available funds, buying power and day-trading buying power decides, and every pick is sized at min(risk used, X). The balances and sums are fixed for the day at the first view with a final 09:30 bar and balances at most 30 s old. Ash's asks: project chat 2026-11-13 15:17:44 and 15:18:31 UTC, thread \"Review OV picks desk architecture\" 22:05:32 UTC.",
+      "default_share_pct": {
+        "value": 50,
+        "note": "start number, Ash's to approve: the share of each balance the plan may use until Ash saves his own on the page"
+      },
+      "default_rate": {
+        "value": 1.0,
+        "note": "start number, Ash's to approve: a name or side without a preview today counts without margin (available funds rate 1.0); buying power and day-trading buying power use this times that pair's median ratio to available funds over today's previews"
+      }
     }
   },
   "exit": {

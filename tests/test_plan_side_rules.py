@@ -388,6 +388,7 @@ def test_the_plans_stop_gone_and_shares_held_is_refused(fr):
 def test_fewer_shares_than_the_plan_filled_while_its_stop_works_is_refused(fr):
     from companion import plan_size
     fr.desk.stage = plan_size.parse_stage(0.25)
+    fr.view.cap_fixed()             # brief 23: above 1 share the cap must be fixed; it never binds here
     a = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 43})["order_id"]
     fr.broker.fill_entry(a, n=10, stop_live=True)
     fr.broker.pos["AAAA"] = 4.0                                       # 6 sold by hand

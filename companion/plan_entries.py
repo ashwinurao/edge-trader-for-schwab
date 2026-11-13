@@ -45,6 +45,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import break_entry, plan_side, plan_size, trading
+from .opening_plan import bp_cap
 from .orders import LIVE
 from .pnl import ET
 
@@ -68,6 +69,8 @@ DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
 # Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
 # other working order on this name" from the poller's order list, so it never sends on an old one.
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
+# Brief 23: above the 1-share stage a send needs the day's buying power cap (opening_plan/bp_cap.py).
+BP_NOT_KNOWN = "Buying power is not known yet: nothing above 1 share is sent."
 ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
                      "Use the dashboard or thinkorswim.")
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
@@ -251,14 +254,24 @@ class PlanDesk:
     def _sized(self, row: Mapping, side: str) -> tuple[Optional[dict], str]:
         """What a send for this row and side would be: trigger, stop, the plan's shares and the
         shares sent (the size stage's result, companion/plan_size.py; 1 share at the default
-        stage), and the stage in words. (None, "") when the row has no numbers."""
+        stage), and the stage in words. (None, "") when the row has no numbers.
+
+        Brief 23: the row's buying power cap (row["cap"], companion/opening_plan/bp_cap.py) goes
+        through plan_size.shares(caps=) as the server's own guard. Above 1 share a send needs it
+        fixed for the day; until then (None, why) refuses it. At 1 share a send goes as before."""
         s = row.get(side.lower())
         if not isinstance(s, Mapping):
             return None, ""
         trig, stop, shares = _dec(s.get("entry")), _dec(s.get("stop")), s.get("shares")
         if trig is None or stop is None or not isinstance(shares, int) or isinstance(shares, bool) or shares < 0:
             return None, ""
-        n, why = plan_size.shares(shares, self.stage, price=trig)
+        cap = row.get("cap") if isinstance(row.get("cap"), Mapping) else {}
+        fixed = cap.get("state") == "FIXED"
+        if self.stage != plan_size.ONE_SHARE and not fixed:
+            return None, BP_NOT_KNOWN
+        most = cap.get(side.lower()) if fixed else None
+        caps = [("buying power", most)] if isinstance(most, int) and not isinstance(most, bool) else []
+        n, why = plan_size.shares(shares, self.stage, caps=caps, price=trig)
         return ({"trigger": str(trig.quantize(Decimal("0.01"))), "stop": str(stop.quantize(Decimal("0.01"))),
                  "plan_shares": shares, "shares": n}, why)
 
@@ -296,7 +309,7 @@ class PlanDesk:
             return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
         n = self._numbers(row, side)
         if n is None:
-            return (row.get("shares") or {}).get("text") or "The row has no shares for that side."
+            return self._sized(row, side)[1] or (row.get("shares") or {}).get("text") or "The row has no shares for that side."
         if n["shares"] < 1:
             return f"0 shares for the {side.lower()} side at this risk."
         return ""
@@ -459,7 +472,7 @@ class PlanDesk:
         out = {"enabled": True, "demo": self.demo, "armed": self._armed(), "market_open": self._market_open(),
                "break_max_shares": break_entry.BREAK_MAX_SHARES, "max_flips": self.flips, "rows": [],
                "size_stage": plan_size.label(self.stage),
-               "error": "", "orders_old": "" if fresh else ORDERS_OLD}
+               "error": "", "orders_old": "" if fresh else ORDERS_OLD, "bp_uncovered": ""}
         try:
             with self._lock:
                 recs = self._load()
@@ -482,6 +495,9 @@ class PlanDesk:
                  "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh),
                  "manual": self._manual_line(ticker, rec, orders)}
             out["rows"].append(r)
+        # Brief 23 item 5, display only: fresh balances against what the rows not sent yet need.
+        unsent = {r["ticker"] for r in out["rows"] if r["entry"]["state"] == NONE}
+        out["bp_uncovered"] = bp_cap.uncovered(view.get("cap") or {}, view.get("rows") or [], unsent)
         return out
 
     # ---- clicks -----------------------------------------------------------------------------
@@ -511,8 +527,10 @@ class PlanDesk:
         self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
                   text=f"Sending the {side.lower()} break entry." if not flip_from else
                   f"Cancelled the {flip_from.lower()} entry; sending the {side.lower()} break entry.")
+        # Brief 23: a plan size capped by buying power gives the balance away, so it is not logged.
+        capped = bool((row.get("shares") or {}).get("by_buying_power"))
         log.warning("OPENING PLAN %s %s break: trigger %s stop %s, %s sh (plan %s)", side, ticker,
-                    n["trigger"], n["stop"], n["shares"], n["plan_shares"])
+                    n["trigger"], n["stop"], n["shares"], "capped by buying power" if capped else n["plan_shares"])
         return req, None
 
     def _send(self, ticker: str, side: str, req: dict) -> dict:
