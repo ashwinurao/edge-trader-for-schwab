@@ -52,6 +52,9 @@
   .seg button.on { background: var(--raise-hi); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.5); }
   .seg button.on.long { background: var(--green); color: #06150f; } .seg button.on.short { background: var(--red); color: #fff; }
   .seg button:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  /* Break entry (Step 3): six entry buttons share the row; the sizing and stop-type rows do not apply. */
+  #t-entryfld.six { grid-column: 1 / -1; }
+  body.brk #t-stoptypefld, body.brk #t-sizefld, body.brk #t-riskfld, body.brk #t-qtyfld, body.brk #t-trailbox { display: none !important; }
   .in { height: 32px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--line-hi); background: #0a0d12;
     color: var(--text); font: 14px var(--mono); width: 96px; }
   .in:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(76,141,255,.2); }
@@ -371,14 +374,18 @@
       </div>
       <div class="row2">
         <div class="fld"><span class="lbl" id="t-stoplbl">Stop price</span><input class="in" id="t-stop" inputmode="decimal" autocomplete="off" placeholder="$$$"></div>
-        <div class="fld"><span class="lbl">Entry price</span><div class="seg full" id="t-entry">
-          <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button><button type="button" data-v="limit" title="Your own limit price">Lmt</button></div></div>
+        <div class="fld" id="t-entryfld"><span class="lbl">Entry price</span><div class="seg full" id="t-entry">
+          <button type="button" data-v="mid" class="on">Mid</button><button type="button" data-v="market">Mkt</button><button type="button" data-v="ask">Ask</button><button type="button" data-v="bid">Bid</button><button type="button" data-v="limit" title="Your own limit price">Lmt</button><button type="button" data-v="break" id="t-brkbtn" style="display:none" title="Stop-limit entry at a break level, its stop attached (1 share)">Break</button></div></div>
+      </div>
+      <div class="row2" id="t-brkfld" style="display:none">
+        <div class="fld"><span class="lbl">Break level (entry stop)</span><input class="in" id="t-trig" inputmode="decimal" autocomplete="off" placeholder="level"></div>
+        <div class="fld"><span class="lbl">Cap (limit past the level)</span><input class="in" id="t-cap" inputmode="decimal" autocomplete="off" placeholder="auto: 0.15R"></div>
       </div>
       <div class="fld" id="t-lmtfld" style="display:none"><span class="lbl">Limit price (entry)</span><input class="in" id="t-lmt" inputmode="decimal" autocomplete="off" placeholder="limit price"></div>
-      <div class="fld"><span class="lbl">Stop type</span><div class="seg full" id="t-stoptype">
+      <div class="fld" id="t-stoptypefld"><span class="lbl">Stop type</span><div class="seg full" id="t-stoptype">
         <button type="button" data-v="fixed" class="on">Fixed</button><button type="button" data-v="autobe">Auto B/E 1R</button><button type="button" data-v="trail">Trail</button><button type="button" data-v="none" title="Only when sizing by quantity">None</button></div></div>
       <div class="chips" id="t-trailbox" style="display:none"><span class="chips" id="t-trailunit"></span><input class="in" id="t-trailval" inputmode="decimal" value="1"><span class="chips" id="t-trailbasis"></span></div>
-      <div class="fld"><span class="lbl">Size by</span><div class="seg full" id="t-size"><button type="button" data-v="risk" class="on">Risk $</button><button type="button" data-v="qty">Quantity</button></div></div>
+      <div class="fld" id="t-sizefld"><span class="lbl">Size by</span><div class="seg full" id="t-size"><button type="button" data-v="risk" class="on">Risk $</button><button type="button" data-v="qty">Quantity</button></div></div>
       <div class="fld" id="t-qtyfld" style="display:none"><span class="lbl" id="t-qtylbl">Shares</span><input class="in" id="t-qty" inputmode="numeric" autocomplete="off" placeholder="how many"></div>
       <div class="fld" id="t-riskfld"><span class="lbl" style="display:flex;align-items:center;gap:6px">Risk $
         <button type="button" class="gear" id="t-risk-gear" title="Change the risk buttons">⚙</button></span>
@@ -1285,7 +1292,10 @@ function onGrid(price, ticks, up) {      // up: round toward a buy's fill; down 
   return v.toFixed(ticks && ticks !== "EQUITY" ? 2 : v < 1 ? 4 : 2);
 }
 const optTicks = o => !o ? "OPT_NICKEL" : /^(SPY|QQQ|IWM)\s/.test(o.symbol || "") ? "OPT_PENNY_ALL" : o.penny ? "OPT_PENNY" : "OPT_NICKEL";
-const ENTRY_TXT = {mid: "limit at mid", bid: "limit at bid", ask: "limit at ask", market: "market", limit: "limit"};
+const ENTRY_TXT = {mid: "limit at mid", bid: "limit at bid", ask: "limit at ask", market: "market", limit: "limit",
+                   break: "stop-limit, limit"};
+// Break entry (break_entry.py, Step 3): on only when the server says so; 1 share, a fixed stop.
+const BRK = {on: false, max: 1};
 // Every POST gives up after 25 s, so a button never hangs on "Working..." if the server is gone.
 const post = (url, body, ms = 25000) => {
   const ctl = new AbortController();
@@ -1302,23 +1312,28 @@ const priceBox = id => $(id).value.trim() || null;   // blank = use R; anything 
 function ticketReq() {
   const two = T.targets === 2;
   const noTgt = T.targets === 0;
+  const brk = T.entry === "break";
   return {symbol: isOpt() ? (T.opt ? T.opt.symbol : "") : $("t-sym").value.trim().toUpperCase(), side: T.side,
-          stop: T.stopType === "none" ? "" : $("t-stop").value.trim(),
+          stop: T.stopType === "none" && !brk ? "" : $("t-stop").value.trim(),
           risk: T.sizeMode === "risk" ? riskValue() : 0, r: noTgt ? 0 : T.r, entry: T.entry, target_price: noTgt ? null : priceBox("t-tp"),
           split: two ? T.split : 0, t1_r: two ? T.t1r : 0, t1_price: two ? priceBox("t-t1p") : null,
-          stop_type: T.stopType, trail_unit: T.trailUnit, trail_value: parseFloat($("t-trailval").value) || 0,
-          trail_basis: T.trailBasis, size_mode: T.sizeMode, qty: T.sizeMode === "qty" ? ($("t-qty").value.trim() || null) : null,
-          targets: T.targets, limit_price: T.entry === "limit" ? ($("t-lmt").value.trim() || null) : null};
+          stop_type: brk ? "fixed" : T.stopType, trail_unit: T.trailUnit, trail_value: parseFloat($("t-trailval").value) || 0,
+          trail_basis: T.trailBasis, size_mode: brk ? "qty" : T.sizeMode,
+          qty: brk ? BRK.max : T.sizeMode === "qty" ? ($("t-qty").value.trim() || null) : null,
+          targets: T.targets, limit_price: T.entry === "limit" ? ($("t-lmt").value.trim() || null) : null,
+          trigger: brk ? ($("t-trig").value.trim() || null) : null, cap: brk ? ($("t-cap").value.trim() || null) : null};
 }
 function ticketReady() {
   const q = ticketReq();
   if (!q.symbol || (q.entry === "limit" && !q.limit_price)) return false;
+  if (q.entry === "break") return !!(q.trigger && q.stop);
   if (q.size_mode === "risk") return q.stop && q.risk > 0;
   const stopOk = q.stop || q.stop_type === "none" || (q.stop_type === "trail" && q.trail_unit !== "R");
   return parseInt(q.qty) > 0 && stopOk;
 }
 const keyOf = q => [q.symbol, q.side, q.stop, q.risk, q.r, q.entry, q.target_price, q.split, q.t1_r, q.t1_price,
-                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis, q.size_mode, q.qty, q.targets, q.limit_price].join("|");
+                    q.stop_type, q.trail_unit, q.trail_value, q.trail_basis, q.size_mode, q.qty, q.targets, q.limit_price,
+                    q.trigger, q.cap].join("|");
 let lookupSeq = 0, lookupTimer = null, LAST_Q = null;
 function showName(q) {
   const el = $("t-name");
@@ -1566,6 +1581,7 @@ function renderTicket() {
     const tR = (v, r) => r != null ? `${r.toFixed(2)}R` : "";
     const exitTxt = o ? (p.side === "LONG" ? "SELL_TO_CLOSE" : "BUY_TO_CLOSE") : "";
     calc.innerHTML = `
+      ${p.entry === "break" ? `<div class="pr"><span class="mut">Break level (triggers the entry) · cap ${Math.abs(p.limit - p.trigger).toFixed(2)} · test stage: ${BRK.max} share</span><span class="num">${esc(p.trigger)}</span></div>` : ""}
       <div class="pr"><span class="mut">${verb} ${qty(p.qty)} ${esc(name)}, ${ENTRY_TXT[p.entry] || "limit"}</span><span class="num">${p.market ? "~" : ""}${esc(p.limit)}</span></div>
       ${!p.has_stop ? `<div class="pr"><span class="mut">No stop: add one later in Manage</span><span class="num neg">none</span></div>`
       : p.trail ? `<div class="pr"><span class="mut">Stop: trailing ${p.trail.link === "PERCENT" ? p.trail.offset + "%" : "$" + p.trail.offset.toFixed(2)} from ${p.trail.basis.toLowerCase()} · ${qty(p.qty)}</span><span class="num neg">starts ${esc(p.trail_start)}</span></div>`
@@ -1605,6 +1621,7 @@ function renderTicket() {
     `Cancel entry · ${o.instruction.replaceAll("_", " ").toLowerCase()} ${qty(o.qty)} ${o.display || o.symbol} @ ${px(o.price)}`,
     "entry", {order: o.order_id}, "", false, "danger")).join("");
   $("t-hint").textContent = !T.armed ? "Entries are disarmed: click Entries disarmed to arm until the close."
+    : T.entry === "break" ? `Break: one Schwab order, a stop-limit at the level with its stop attached, ${BRK.max} share (test stage). It rests until price reaches the level and may not fill. Cancel entry shows here while it waits.`
     : T.entry === "limit" ? (p && p.ok && (p.side === "LONG" ? +p.limit >= p.ask : +p.limit <= p.bid) ? ""
         : "Your limit rests until the price reaches it, and may not fill. Cancel entry shows here while it waits.")
     : T.entry === "mid" || (T.entry === "bid" && T.side === "LONG") || (T.entry === "ask" && T.side === "SHORT")
@@ -1625,6 +1642,7 @@ async function submitTicket() {
                 r: p.r_multiple, entry: p.entry, target_price: req.target_price, t1_price: req.t1_price,
                 size_mode: p.size_mode, qty: p.size_mode === "qty" ? p.qty : null, targets: req.targets,
                 limit_price: p.entry === "limit" ? p.limit : null,
+                trigger: p.entry === "break" ? p.trigger : null, limit: p.entry === "break" ? p.limit : null,
                 confirm_no_stop: !p.has_stop,
                 expected_limit: p.limit, expected_qty: p.qty, expected_target: p.has_target ? p.target : null,
                 split: p.split, t1_r: p.t1_r, expected_qty1: p.qty1 || 0, expected_target1: p.target1,
@@ -1703,6 +1721,8 @@ $("t-entry").addEventListener("click", e => {
   [...$("t-entry").children].forEach(x => x.classList.toggle("on", x === b));
   const lmt = T.entry === "limit";
   $("t-lmtfld").style.display = lmt ? "" : "none";
+  $("t-brkfld").style.display = T.entry === "break" ? "" : "none";
+  document.body.classList.toggle("brk", T.entry === "break");
   if (lmt && !$("t-lmt").value.trim()) {
     // Start from the mid of what the ticket last saw; you then type your own price.
     // On the contract's own price grid (a plain cent mid is off the nickel grid), rounded toward a fill.
@@ -1797,6 +1817,12 @@ $("t-brackets").addEventListener("click", async e => {
 renderTargets();
 renderStopType();
 
+function showBreak(b) {
+  BRK.on = !!(b && b.on); BRK.max = (b && b.max_shares) || 1;
+  $("t-brkbtn").style.display = BRK.on ? "" : "none";
+  $("t-entryfld").classList.toggle("six", BRK.on);
+  if (!BRK.on && T.entry === "break") $("t-entry").querySelector('[data-v="mid"]').click();
+}
 // Optional features the server names (not part of every build) bring their own page script.
 const FEATURES_LOADED = new Set();
 function loadFeatures(st) {
@@ -1825,6 +1851,7 @@ async function tick() {
     updateHealth();          // health first, so the render below draws buttons with the right state
     render(lastState);
     loadFeatures(lastState);
+    showBreak(lastState.break_entry);
     try { announceTrades(lastState); } catch (e) { console.error("trade voice", e); }
   } catch (e) { /* updateHealth turns the page red */ }
   TICKING = false;

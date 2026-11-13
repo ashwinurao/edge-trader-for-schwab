@@ -73,6 +73,12 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
   (it checks every 3 seconds and only while the app is running; it never loosens a stop). One click
   sends one Schwab bracket. Entries must be armed each session.
+- **Break entry (test stage, off by default):** with `EDGE_TRADER_BREAK_ENTRY=1` the ticket gets a
+  Break button: a stop-limit entry at a break level with its stop attached, so entry and stop rest at
+  Schwab as one order. You type the level, the stop and optionally a cap (how far past the level the
+  limit sits; blank = 0.15 x risk per share, at least 2 cents, at most 0.15% of the price). One share
+  only for now (`BREAK_MAX_SHARES` in `companion/break_entry.py`). The click is refused when the price
+  is already through the level or Schwab's quote is not real-time or is over 5 seconds old.
 - **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
   shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
   confirmation on every click) and either way you can send **no target**. The order then carries only
@@ -248,6 +254,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `SCHWAB_ENV_FILE` | Read the keys from another app's `.env`, to share one Schwab sign-in between apps. |
 | `COMPANION_PORT` | The local port. Default `8770`. |
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
+| `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 

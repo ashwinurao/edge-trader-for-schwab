@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from . import schwab
+from . import break_entry, schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -455,6 +455,7 @@ class Trader:
                "name": ref.get("description"), "exchange": ref.get("exchangeName"),
                "asset_type": asset, "underlying": underlying, "multiplier": ref.get("multiplier"),
                "is_penny": penny if isinstance(penny, bool) else None, "realtime": entry.get("realtime"),
+               "quote_time": q.get("quoteTime"),      # epoch ms; the break entry refuses an old quote
                "deliverables": ref.get("deliverables"), "put_call": put_call(sym) if asset == "OPTION" else None,
                "expiration": (f"{ref['expirationYear']:04d}-{ref['expirationMonth']:02d}-{ref['expirationDay']:02d}"
                               if all(isinstance(ref.get(k), int) for k in ("expirationYear", "expirationMonth",
@@ -481,6 +482,8 @@ class Trader:
     def make_plan(self, req: dict, fresh: bool = False, q: dict | None = None, limit_override=None) -> Plan:
         """Asset, multiplier and price grid always come from Schwab's quote, never from the page."""
         q = q or self.quote(req["symbol"], max_age=0 if fresh else 1.0)
+        if req.get("entry") == "break":
+            return break_entry.make_plan(req, q)
         asset = "OPTION" if q.get("asset_type") == "OPTION" else "EQUITY"
         mult = q.get("multiplier") or (100 if asset == "OPTION" else 1)
         odd = _odd_deliverable(q, req["symbol"]) if asset == "OPTION" else None
@@ -654,6 +657,9 @@ class Trader:
             return False
 
     def _submit_locked(self, req: dict, ticket_id: str, state: dict) -> dict:
+        if req.get("entry") == "break":     # Step 3: its own checks (break_entry.py), same send
+            p, order = break_entry.prepare(self, req)
+            return self._place(p, order, ticket_id, state) if p else order
         try:
             exp_limit = Decimal(str(req.get("expected_limit") or 0))
             exp_target = Decimal(str(req.get("expected_target") or 0))
@@ -757,6 +763,11 @@ class Trader:
                         f"Schwab's preview did not confirm the trailing stop ({why})")
                 return {"ok": False, "error": head.rstrip(".") + ". Nothing was sent: use a fixed stop or Auto B/E.",
                         "plan": now.as_dict()}
+        return self._place(p, order, ticket_id, state)
+
+    def _place(self, p: Plan, order: dict, ticket_id: str, state: dict) -> dict:
+        """Record the intent, send it once and report what Schwab said. Never retried."""
+        f = p.f
         intent = {"ticket_id": ticket_id, "symbol": p.symbol, "side": p.side, "qty": p.qty,
                   "limit": f(p.limit), "stop": f(p.stop) if p.stop else "", "target": f(p.target) if p.has_target else "",
                   "risk": float(p.planned_risk), "request": order}
@@ -2468,7 +2479,11 @@ class Trader:
         if o.get("orderStrategyType") not in ("TRIGGER", "SINGLE") or len(legs) != 1:
             return None
         entry = (legs[0].get("instruction"), (legs[0].get("instrument") or {}).get("symbol"),
-                 num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")))
+                 num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")),
+                 # A break entry's level (Step 3), so an unknown break matches only an order at its
+                 # own level. Only a STOP_LIMIT parent has one: any other entry stays None even if
+                 # Schwab echoes a stopPrice on it, so older tickets keep matching as before.
+                 num(o.get("stopPrice")) if o.get("orderType") == "STOP_LIMIT" else None)
         if o.get("orderStrategyType") == "SINGLE":
             # An entry sent without stop or target: only an opening order can be a ticket's entry.
             return ((entry, ()) if not o.get("childOrderStrategies") and entry[0] in OPENING_INSTRUCTIONS | {"BUY"}
