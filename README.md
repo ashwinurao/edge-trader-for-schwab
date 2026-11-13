@@ -669,6 +669,16 @@ stays" (or "re-level is not on") and the entry stays.
   watch. The other way round: while the plan's own cancel and send run (about 2.25 s at 0.4 s a Schwab
   call, up to about 7.3 s when Schwab never shows CANCELED), a click on the ticket or a plan row answers
   "Another submission is in progress." or "Another order action is in progress." and sends nothing.
+- **Flat all** (Step 9, `EDGE_TRADER_PLAN_FLAT=1`). Its click disarms the plan first, and while its
+  batch runs it holds new entries. A flip looks at the hold before its cancel: held, it sends and
+  writes nothing. After the cancel it looks again on each pass, before any wait for the order lock,
+  and once more just before the send: held, nothing is placed, the plan leaves the pick and the row
+  says "Cancelled by the armed plan, nothing rests. Flat all is running: no new entries until it
+  ends. Nothing was sent." A Flat all click while the flip's cancel holds the order lock refuses the
+  flipping row ("A click on this row is still running. Look again in a moment.") and every row whose
+  cancel meets the lock ("Another order action is in progress."); the flip places nothing after its
+  cancel, and a second Flat all click cancels the rest. The new entry is 1 share whatever
+  `size.stage` says (the Arm click refuses any other stage).
 - When the cancel is not confirmed, or Schwab answers 429, nothing new is placed, the row turns red and
   the plan disarms (for the day on a 429). A fill during the cancel turns the row red, and the plan
   leaves that pick. When the plan was disarmed between the cancel and the place, or the other side's

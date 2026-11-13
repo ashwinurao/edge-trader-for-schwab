@@ -40,6 +40,11 @@ flip waits for the lock a tick (armed.every_seconds) at a time, the row and the 
 and when the lock is free the recheck and the desk's checks run again before the send. It stops
 waiting when the plan is disarmed or the fast watch ends; nothing rests then.
 
+Flat all (Step 9, companion/plan_flat.py): its click disarms the plan first (Step 6's before_batch),
+and while its batch runs PlanDesk.held() holds new entries. flip_auto checks the hold before the
+cancel (nothing sent, nothing written) and after it, before the busy wait and just before the send
+(nothing placed; the pick is left). The new entry is 1 share, as place_auto's (architect, 17:42 UTC).
+
 The fast watch's end (architect's review 1 of Step 7, 2026-11-13 17:14 UTC, must 2): the executor
 filters decisions at the start of a step only, and the plan stays armed for
 armed.end_grace_seconds after the watch end so the 09:35 cancels can run. So each look after the

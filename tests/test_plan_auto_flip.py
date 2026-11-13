@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from companion import break_entry, plan_entries, trading
+from companion import break_entry, plan_entries, plan_flat, trading
 from companion.opening_plan import engine
 from companion.plan_auto import AUTO_FLAG, FLIP_FLAG, SCANNER_URL, flip, handlers
 from companion.store import Store
@@ -454,6 +454,93 @@ def test_the_flip_answer_names_the_cancelled_order_only_once_the_cancel_is_confi
     held[0] = False
     got = r.desk.flip_auto("AAAA", "SHORT", o, limit=3, recheck=traded)
     assert got["stage"] == "recheck" and got["code"] == "traded" and got["cancelled_order_id"] == oid
+
+
+# ---------------------------------------------------------------- Flat all's hold (Step 9)
+# Architect, 2026-11-13 17:42 UTC, after Step 9 (#24) merged: flip_auto checks desk.held() first,
+# before the cancel, and again before the send half. Cancel is never held (it only removes risk), but
+# a flip's cancel needs a new entry after it, so the flip does not start.
+
+HELD_ROW = "Cancelled by the armed plan, nothing rests. " + plan_flat.HOLD
+
+
+def test_a_hold_before_the_flip_sends_nothing_and_writes_nothing(r):
+    place_long(r)
+    before = copy.deepcopy(rec(r))
+    r.desk.add_hold(lambda: plan_flat.HOLD)
+    assert run(r) is False                        # nothing done: the next decision may go on
+    nothing_at_schwab(r)
+    assert rec(r) == before and r.host.keys == set()
+    assert [f for e, t, f in r.host.logs if e == "flip_auto"] == []
+    assert r.host.said[-1] == ("flip_refused", plan_flat.HOLD) and r.host.gone == []
+
+
+def hold_from(r, monkeypatch, when):
+    """Flat all's hold turns on after the flip's confirmed cancel ("cancel"), or while the recheck
+    reads the tape ("recheck"). Returns the hold's on/off list."""
+    on = []
+    r.desk.add_hold(lambda: plan_flat.HOLD if on else "")
+    if when == "cancel":
+        real_cancel = r.trader.cancel_entry
+
+        def cancel(oid):
+            got = real_cancel(oid)
+            on.append(True)
+            return got
+        monkeypatch.setattr(r.trader, "cancel_entry", cancel)
+    else:
+        real_reread = r.host.reread
+        reads = []
+
+        def reread(t):
+            reads.append(1)
+            if len(reads) == 2:                   # the recheck's look after the cancel
+                on.append(True)
+            return real_reread(t)
+        r.host.reread = reread
+    return on
+
+
+@pytest.mark.parametrize("when", ["cancel", "recheck"])
+def test_a_hold_during_the_send_half_places_nothing(r, monkeypatch, when):
+    oid = place_long(r)
+    hold_from(r, monkeypatch, when)
+    busy = []
+    monkeypatch.setattr(r.desk, "trader_busy", lambda: busy.append(1) or False)
+    assert run(r) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 1
+    got = rec(r)
+    assert got["state"] == plan_entries.NONE and got["order_id"] is None and got["text"] == HELD_ROW
+    assert r.host.gone == [HELD_ROW]
+    # Nothing reserved stays reserved; the hold is seen before any wait for Trader's lock.
+    assert r.host.left == {"orders_pick": 5, "orders_day": 20, "calls_minute": 40}
+    assert len(busy) == (1 if when == "cancel" else 2)
+    line = flip_log(r)
+    assert line["stage"] == "recheck" and line["code"] == "held" and line["cancelled_order_id"] == oid
+
+
+def test_a_hold_with_traders_lock_busy_after_the_cancel_does_not_wait(r, monkeypatch):
+    # The batch's own cancels hold Trader's lock: the hold comes first, so the flip never waits.
+    oid = place_long(r)
+    hold_from(r, monkeypatch, "cancel")
+    looks = []
+    # Busy for the first two looks after the cancel (bounded, so a flip that waited would place).
+    monkeypatch.setattr(r.desk, "trader_busy",
+                        lambda: bool(r.broker.cancelled) and (looks.append(1) or len(looks) <= 2))
+    assert run(r) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 1 and rec(r)["text"] == HELD_ROW
+    assert "flip_busy" not in [c for c, _ in r.host.said]
+
+
+def test_the_new_entry_stays_at_one_share_whatever_the_size_stage(r):
+    # Architect, 17:42 UTC: flip_auto stays at 1 share (break_entry.BREAK_MAX_SHARES) like place_auto;
+    # Step 6's Arm refuses any stage but 1 share, so this is the second line, not the first.
+    from companion import plan_size
+    oid = place_long(r)
+    r.desk.stage = plan_size.parse_stage(1.0)
+    assert run(r) is True and r.broker.cancelled == [oid]
+    leg = r.broker.placed[-1]["orderLegCollection"][0]
+    assert (leg["instruction"], leg["quantity"]) == ("SELL_SHORT", break_entry.BREAK_MAX_SHARES) == ("SELL_SHORT", 1)
 
 
 # ---------------------------------------------------------------- must NOT flip
@@ -1745,13 +1832,21 @@ def test_executor_hands_the_chase_a_lane_read_after_the_flips_cancel(frig, monke
 
 def test_no_balance_reaches_the_log_through_a_flip_a_relevel_and_a_hand_over(frig, monkeypatch):
     """Step 6's rule since main 9f15270 (#30): Step 2's view carries buying power in dollars, and no
-    line the armed plan logs holds one of those numbers. The flip, the re-level and the chase's lane
-    get the view in memory only."""
+    line the armed plan logs holds one of those numbers, also with the rows' buying_power_note and
+    estimate (PR #31). The flip, the re-level and the chase's lane get the view in memory only."""
     def with_balances():
         v = frig.view()
         v["buying_power"] = P.buying_power({"balances": BAL, "ok_at": frig.clock.now()}, frig.clock.now())
+        # PR #31 adds both to each row; made up here from the balances, since they give them away
+        # (architect, 2026-11-13 17:42 UTC).
+        v["rows"] = [{**row, "buying_power_note": f"Uses part of your ${BAL['buyingPower']:,.2f} buying power "
+                                                  f"(equity ${BAL['equity']:,.2f}).",
+                      "estimate": {"buying_power": BAL["buyingPower"], "equity": BAL["equity"],
+                                   "day_trading_buying_power": BAL["dayTradingBuyingPower"]}}
+                     for row in v.get("rows") or []]
         return v
     frig.plan._view = frig.plan._row_view = with_balances
+    assert with_balances()["rows"][0]["estimate"]["equity"] == 81234.57    # the rows do carry them
     handed = []
     use_chase(frig.plan.registry, lambda ln: handed.append(ln.view) or False)
     ids = aaaa_past_its_flip_line(frig)
@@ -1777,6 +1872,123 @@ def test_no_balance_reaches_the_log_through_a_flip_a_relevel_and_a_hand_over(fri
     for n in BAL.values():
         for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
             assert form not in text
+
+
+def flat_all(frig):
+    """Step 9's Flat all on the rig's desk, broker and clock, with the armed plan registered as app.py
+    does it (Step 6's executor.register wires Flat all's before_batch to the plan's Disarm), with this
+    step's switch on. As tests/test_plan_auto.py's with_flat; the rows only rest, so no positions.
+    Call it before arming: it replaces the rig's plan."""
+    from fastapi import FastAPI
+    orders = lambda: list(frig.broker.orders.values())          # noqa: E731
+    flat = plan_flat.PlanFlat(frig.trader, frig.desk, orders, lambda: {}, lambda: set(), lambda: (True, True),
+                              lambda: [], dt_time(10, 0), 3.0)
+    app = FastAPI()
+    app.state.opening_plan_desk, app.state.opening_plan_view = frig.desk, frig.view
+    app.state.opening_plan_view_cached = frig.view
+    app.state.opening_plan_now = frig.clock.now
+    app.state.opening_plan_flat = flat
+    knobs = frig.knobs
+
+    class Poller:
+        _merged_orders = staticmethod(orders)
+        cooldown_left = staticmethod(lambda: knobs["cooldown"])
+
+        def _fresh(self, name):
+            return knobs["fresh"]
+    plan = X.register(app, frig.trader, Poller(), lambda r: None, env=FLIP_ON, tape=frig.tape,
+                      usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=frig.tmp / "auto",
+                      start=False)
+    assert plan is not None and plan.registry.get(flip.FLIP, plan.env) is not None
+    plan._mono = frig.clock.mono
+    frig.plan = plan
+    frig.broker.locks = [plan._lock, frig.desk._lock, plan.arming._lock]
+    return flat
+
+
+def test_flat_all_clicked_while_the_flips_cancel_holds_traders_lock(frig, monkeypatch):
+    # Architect, 2026-11-13 17:42 UTC (item 5 of "What Ash decides"): the click disarms the plan
+    # first, the batch refuses the flipping row and every row whose cancel meets Trader's lock, the
+    # flip places nothing after its cancel, and a second click does the rest.
+    flat = flat_all(frig)
+    ids = aaaa_past_its_flip_line(frig)
+    first, real_cancel = [], frig.broker.cancel_order
+
+    def cancel_order(h, oid):
+        if oid == ids["AAAA"] and not first:
+            assert frig.trader._send_lock.locked()          # inside the flip's Trader.cancel_entry
+            first.append(flat.run(flat.items()))
+        return real_cancel(h, oid)
+    monkeypatch.setattr(frig.broker, "cancel_order", cancel_order)
+    run_plan(frig, et(9, 31, 8))
+    (batch,) = first
+    rows = {x["ticker"]: x for x in batch["batch"]["rows"]}
+    assert not batch["ok"] and rows["AAAA"]["result"] == plan_flat.REFUSED
+    assert rows["AAAA"]["text"] == "A click on this row is still running. Look again in a moment."
+    for t in ("BBBB", "CCCC", "DDDD"):
+        assert rows[t]["result"] == plan_flat.REFUSED and rows[t]["text"].startswith("Another order action is in progress")
+    assert not frig.plan.armed() and [x["why"] for x in plan_lines(frig, "disarm")] == [X.FLAT_ALL_CLICK]
+    # The flip's cancel went through and nothing new was placed.
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and got["order_id"] is None
+    assert got["text"].startswith("Cancelled by the armed plan, nothing rests")
+    # The second click cancels the three entries the first one could not reach.
+    second = flat.run(flat.items())
+    rows = {x["ticker"]: x for x in second["batch"]["rows"]}
+    assert second["ok"] and rows["AAAA"]["result"] == plan_flat.NOTHING
+    assert {t: rows[t]["result"] for t in ("BBBB", "CCCC", "DDDD")} == dict.fromkeys(("BBBB", "CCCC", "DDDD"),
+                                                                                     plan_flat.DONE)
+    assert sorted(frig.broker.cancelled) == sorted(ids.values()) and len(frig.broker.placed) == 4
+
+
+def test_flat_all_whose_disarm_fails_still_stops_the_flip_by_its_hold(frig, monkeypatch):
+    # The batch logs a failed before_batch and goes on (plan_flat.py), so the plan stays armed: the
+    # hold alone keeps the flip from placing while the batch runs (architect, 17:42 UTC, item 2).
+    import threading
+    flat = flat_all(frig)
+    ids = aaaa_past_its_flip_line(frig)
+    started, looked, out = threading.Event(), threading.Event(), []
+
+    def broken(reason, for_day=False):
+        started.set()                                       # the batch runs: the hold is on
+        raise RuntimeError("the Disarm could not be reached")
+    monkeypatch.setattr(frig.plan, "disarm", broken)       # what Step 6's before_batch calls first
+    real_refusal = flat._refusal
+
+    def refusal():
+        looked.wait(5)                                      # the batch stays on until the flip has looked
+        return real_refusal()
+    flat._refusal = refusal
+    real_held = frig.desk.held
+
+    def held():
+        why = real_held()
+        if why:
+            looked.set()
+        return why
+    monkeypatch.setattr(frig.desk, "held", held)
+    batch, real_cancel = [], frig.broker.cancel_order
+
+    def cancel_order(h, oid):
+        if oid == ids["AAAA"] and not batch:
+            expected = flat.items()                         # the page's list: AAAA's click still runs
+            batch.append(threading.Thread(target=lambda: out.append(flat.run(expected))))
+            batch[0].start()
+            assert started.wait(5)
+        return real_cancel(h, oid)
+    monkeypatch.setattr(frig.broker, "cancel_order", cancel_order)
+    run_plan(frig, et(9, 31, 8))
+    batch[0].join(5)
+    assert looked.is_set() and frig.plan.armed()
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and got["text"] == HELD_ROW and note(frig) == HELD_ROW
+    # The page's list showed AAAA's flip running; the batch saw it ended, so it sent nothing.
+    (first,) = out
+    assert not first["ok"] and first["error"].startswith("The list changed since the page showed it")
+    second = flat.run(flat.items())
+    assert second["ok"] and sorted(frig.broker.cancelled) == sorted(ids.values())
 
 
 # ---------------------------------------------------------------- the fast watch ends during the cancel
