@@ -80,6 +80,16 @@ def test_an_old_price_gives_its_age_and_no_verdict():
     assert plan_price.line("LONG", LV_L, ST_L, q("42.50", "42.52", age=15.0), NOW)["state"] == "THROUGH"
 
 
+def test_a_very_old_price_is_no_price():
+    # Architect's review 1: the tape's last answer stays in memory after 09:36 ET. Above 120 s
+    # (plan_price.GONE_AFTER_S, a start number) the row says "No recent price", not its age.
+    assert plan_price.GONE_AFTER_S == 120.0
+    lo = plan_price.line("LONG", LV_L, ST_L, q("42.50", "42.52", age=119.0), NOW)
+    assert (lo["state"], lo["text"]) == ("OLD", "Price is 119 s old: no check before the click.")
+    lo = plan_price.line("LONG", LV_L, ST_L, q("42.50", "42.52", age=121.0), NOW)
+    assert (lo["state"], lo["text"]) == ("NONE", "No recent price: no check before the click.")
+
+
 def test_no_price_says_so():
     lo, sh = both(None)
     assert lo["state"] == sh["state"] == "NONE"
@@ -143,6 +153,7 @@ def test_a_source_that_fails_is_no_price():
 
 def test_tape_peek_never_asks_edge_scanner():
     asks = []
+    clock = [1000.0]
 
     def get(url, timeout):
         asks.append(url)
@@ -152,19 +163,27 @@ def test_tape_peek_never_asks_edge_scanner():
     base = "http://192.0.2.10:8772"
     assert tape_mod.peek(base) is None                 # no tape made for it: none, and none is made
     assert base not in tape_mod._shared
-    tape = tape_mod.EsTape(base, rules, get=get)
+    tape = tape_mod.EsTape(base, rules, get=get, clock=lambda: clock[0])
     assert tape.last() is None                         # no answer yet: none, and no ask
     assert asks == []
     tape.read()
     assert len(asks) == 1
+    # Past the tape's own pace a read() would ask again (review 1: so a last() or peek() that
+    # asked would fail here, not hide inside the pace).
+    clock[0] += 10 * rules.every_seconds
     for _ in range(3):
         assert tape.last() is not None
     assert len(asks) == 1                              # last() only reads memory
     tape_mod._shared[base] = tape
     try:
-        assert tape_mod.peek(base) is not None and len(asks) == 1
+        for _ in range(3):
+            clock[0] += 10 * rules.every_seconds
+            assert tape_mod.peek(base) is not None
+        assert len(asks) == 1                          # peek() only reads memory too
     finally:
         del tape_mod._shared[base]
+    tape.read()                                        # the check itself: a real read past the pace asks
+    assert len(asks) == 2
 
 
 # ---------------------------------------------------------------- on the plan rows

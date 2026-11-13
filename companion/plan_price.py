@@ -8,7 +8,9 @@ the click, and no row said so before it. This file says it before the click, dis
 - nothing when the price is inside the band (between the side's stop and its level);
 - "Price is 42 s old: no check before the click." when the newest price is older than
   OLD_AFTER_S, with no verdict;
-- "No recent price: no check before the click." when nothing holds a price for the name.
+- "No recent price: no check before the click." when nothing holds a price for the name, or the
+  newest one is older than GONE_AFTER_S (the tape's last answer stays in memory after 09:36 ET, so
+  without this a row would say "Price is 5040 s old" all day; architect's review 1, 2026-11-13).
 
 The verdict is the click's own rule (companion/break_entry.py make_plan): a long is through when
 the ask is at or above its level and refused when the bid is at or below its stop; a short is
@@ -21,7 +23,7 @@ click can differ, and the page says so.
 Where the price comes from: only what Edge Trader already holds in memory. No Schwab call and no
 Edge Scanner call is added (brief 29: the 70 calls a minute in companion/poller.py are spoken for).
 The newest of these by its own quote time wins:
-- the poller's batched Schwab quotes (Poller.quotes, every 3 s), which cover only names with an
+- the poller's batched Schwab quotes (Poller.quotes, every 3 s, or 6 s while a ticket has focus or after a click), which cover only names with an
   open position or a working order (Poller._quote_symbols);
 - the last Schwab quote of a ticket or a click on the name (Trader._quote_cache: the ticket asks
   every 5 s while it has focus; a Place click reads one);
@@ -39,6 +41,9 @@ from .bracket import fmt
 
 # Start number (brief 29), not approved by Ash: a price older than this gives no verdict.
 OLD_AFTER_S = 15.0
+# Start number (architect's review 1 of brief 29), not approved by Ash: a price older than this is
+# no price at all ("No recent price"), not "Price is N s old".
+GONE_AFTER_S = 120.0
 
 THROUGH = "THROUGH"      # the click would say "already through the break level"
 STOP = "STOP"            # the click would say the bid or ask is past this side's stop
@@ -47,7 +52,7 @@ OLD = "OLD"              # newest price older than OLD_AFTER_S: no verdict
 NONE = "NONE"            # no price held for the name
 NO_LEVELS = "NO_LEVELS"  # the side has no level or stop (callers do not ask for one)
 
-SRC_POLLER = "Schwab quote (positions and orders, every 3 s)"
+SRC_POLLER = "Schwab quote (positions and orders)"
 SRC_CLICK = "Schwab quote (last ticket or click)"
 SRC_TAPE = "open tape (Alpaca through Edge Scanner)"
 
@@ -142,7 +147,7 @@ def _age_text(age: float) -> str:
 
 
 def line(side: str, level: Any, stop: Any, q: Optional[Mapping], now: datetime,
-         old_after: float = OLD_AFTER_S) -> dict:
+         old_after: float = OLD_AFTER_S, gone_after: float = GONE_AFTER_S) -> dict:
     """The line for one row side: {state, text, bid, ask, age_s, source}. Display only.
 
     `side` is LONG or SHORT, `level` the side's break level (the trigger), `stop` its stop, `q` the
@@ -155,6 +160,8 @@ def line(side: str, level: Any, stop: Any, q: Optional[Mapping], now: datetime,
     age = max((now - q["at"]).total_seconds(), 0.0)
     b, a = q["bid"], q["ask"]
     out.update(bid=float(b), ask=float(a), age_s=round(age, 1), source=q["source"])
+    if age > gone_after:
+        return out                                  # NONE: "No recent price"
     if age > old_after:
         out.update(state=OLD, text=f"Price is {_age_text(age)} old: no check before the click.")
         return out
