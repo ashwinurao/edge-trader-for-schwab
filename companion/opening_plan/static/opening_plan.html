@@ -125,8 +125,9 @@
 <div id="banners"></div>
 <div class="dlg-bg" id="flat-dlg"><div class="dlg" role="dialog" aria-modal="true" aria-labelledby="flat-h">
   <h2 id="flat-h">Flat all: end the plan's trades</h2>
-  <div class="mut msg">Cancels first, then closes, one row at a time in rank order, each through the dashboard's own Cancel entry and
-    Close paths. Nothing is retried. The server builds this list again and sends nothing if it differs.</div>
+  <div class="mut msg">Cancels first, then closes, one row at a time in rank order: an unfilled entry through the dashboard's own Cancel
+    entry path, the plan's shares by one replace of the plan's own stop, which leaves your own shares and orders alone. Nothing is
+    retried. The server builds this list again and sends nothing if it differs.</div>
   <div id="flat-list"></div>
   <div class="row-btns"><button class="btn" type="button" id="flat-back">Back</button>
     <button class="btn go" type="button" id="flat-go">Confirm Flat all</button></div>

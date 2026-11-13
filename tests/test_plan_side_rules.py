@@ -306,6 +306,55 @@ def test_no_shares_held_and_the_plans_stop_works_cancels_that_stop(fr):
     assert {x["ticker"]: x for x in r["batch"]["rows"]}["AAAA"]["result"] == "done"
 
 
+def test_the_stop_cancel_reads_schwabs_position_first_and_refuses_on_any_share(fr, monkeypatch):
+    # Architect's review 1 of PR #35, must 1: the poller's positions said none, but Schwab's own read
+    # under Trader's lock shows 1 share (a fill the poller has not seen yet): no cancel, row refused.
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    fr.broker.pos["AAAA"] = 0.0
+    items = fr.flat.items()
+    assert {x["ticker"]: x for x in items}["AAAA"]["action"] == "cancel_stop"
+    monkeypatch.setattr(fr.flat, "_positions", lambda: {"AAAA": 0.0})   # the poller's older read
+    fr.broker.pos["AAAA"] = 1.0                                          # Schwab, read now
+    fr.broker.calls.clear()
+    r = fr.flat.run(expected(items))
+    res = {x["ticker"]: x for x in r["batch"]["rows"]}["AAAA"]
+    assert res["result"] == "refused"
+    assert res["text"] == "Schwab's position now shows 1 AAAA. The plan's stop stays. Nothing was sent."
+    assert mutating(fr) == [] and stop_of(fr, a)["status"] == "WORKING"
+
+
+def test_the_stop_cancel_sends_nothing_when_schwabs_position_read_fails(fr, monkeypatch):
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    fr.broker.pos["AAAA"] = 0.0
+    items = fr.flat.items()
+    monkeypatch.setattr(fr.flat, "_positions", lambda: {"AAAA": 0.0})
+
+    def boom(h, fields=None):
+        raise TimeoutError("no answer")
+    monkeypatch.setattr(fr.broker, "account_details", boom)
+    fr.broker.calls.clear()
+    r = fr.flat.run(expected(items))
+    res = {x["ticker"]: x for x in r["batch"]["rows"]}["AAAA"]
+    assert res["result"] == "refused" and res["text"].startswith("Schwab's position could not be read")
+    assert mutating(fr) == [] and stop_of(fr, a)["status"] == "WORKING"
+
+
+def test_a_plan_stop_for_more_shares_than_the_entry_filled_is_refused(fr):
+    # Architect's review 1 of PR #35, must 2: the stop must be for exactly the filled quantity.
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    stop_of(fr, a)["quantity"] = 2
+    fr.broker.pos["AAAA"] = 101.0
+    ps = plan_side.plan_shares(fr.desk._load()["AAAA"], list(fr.broker.orders.values()))
+    assert ps.state == plan_side.UNCLEAR and "for 2.0 shares, not the 1 its entry filled" in ps.text
+    it = {x["ticker"]: x for x in fr.flat.items()}["AAAA"]
+    assert it["action"] == "refuse" and "not the 1 its entry filled" in it["text"]
+    stop_of(fr, a)["quantity"] = 1                                    # the case where it must not fire
+    assert {x["ticker"]: x for x in fr.flat.items()}["AAAA"]["action"] == "close_plan"
+
+
 @pytest.mark.parametrize("after,ok", [(9.9, False), (10.0, True)])
 def test_the_stop_is_cancelled_only_on_an_account_read_after_the_fill_and_margin(fr, after, ok):
     # Architect's ruling: the order list can show FILLED while the last positions read is from

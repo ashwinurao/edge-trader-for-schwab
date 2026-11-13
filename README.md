@@ -506,8 +506,8 @@ by the clock: every order is your click.
   from the poller); any difference refuses the whole batch and sends nothing: "The list changed since
   the page showed it. Nothing was sent. Look again."
 - Then it works one row at a time in rank order: all cancels first, then the closes, through the
-  dashboard's own Cancel entry and Close paths, each under their own one-at-a-time lock, never
-  retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
+  dashboard's own Cancel entry path and the plan's own close of its shares (below), each under
+  Trader's one-at-a-time lock, never retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
   thinkorswim). A refused or unclear row does not stop the others. A 429 from Schwab, or the app's
   429 pause, stops the batch: the rows not reached say "Not sent: Schwab is throttling". The last
   batch of the day stays on the screen, with one line per row.

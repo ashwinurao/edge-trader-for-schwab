@@ -16,8 +16,9 @@ Flat all (Part A): one button ends the morning's plan trades.
   market, nothing, or refused (with why). Confirm sends that list back as `expected`.
 - The server builds the list again from its own state: the rows' records (PlanDesk), Schwab's
   orders and positions from the poller. Any difference refuses the whole batch.
-- Then one row at a time in rank order: all cancels first, then the closes, through the existing
-  paths (PlanDesk.cancel -> Trader.cancel_entry, Trader.close_position), each under Trader's own
+- Then one row at a time in rank order: all cancels first, then the closes, through the paths
+  (PlanDesk.cancel -> Trader.cancel_entry; plan_close.close_plan_shares and cancel_plan_stop since
+  brief 25, which replace Trader.close_position for a plan row), each under Trader's own
   one-at-a-time lock, never retried. Each row ends done, refused (with the reason) or unclear (red:
   check thinkorswim). A refused or unclear row does not stop the others. A 429 stops the batch.
 - It closes only the plan's own shares (brief 25, companion/plan_side.py and plan_close.py): with the
@@ -105,7 +106,8 @@ CLOSE_REFUSED = ("Regular hours only", "Another order action is in progress", "T
                  "A previous ", "Cannot close", "Schwab refused the close", "Schwab throttled the close",
                  "Schwab's position now shows")
 STOP_CANCEL_REFUSED = ("Regular hours only", "Another order action is in progress", "That contract is a leg",
-                       "A previous ", "Schwab refused the cancel", "Schwab throttled the cancel")
+                       "A previous ", "Schwab refused the cancel", "Schwab throttled the cancel",
+                       "Schwab's position now shows", "Schwab's position could not be read")
 LOST = ("The plan's stop is not working any more, so the plan cannot tell its share from yours. Close it on "
         "the dashboard or in thinkorswim.")
 

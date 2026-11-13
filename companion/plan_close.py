@@ -14,12 +14,14 @@ cancel the user's orders. These two actions touch only the plan's own stop:
   exactly the plan's shares).
 - cancel_plan_stop: cancels the plan's stop when the account holds none of the name, and reads it
   back until Schwab says CANCELED, as Trader.cancel_entry does. If it filled meanwhile, it says so.
+  It is the one action here that removes a stop, so it reads Schwab's position again under Trader's
+  lock first and sends nothing unless that read shows none (architect's review 1 of PR #35).
 
 Both run inside Trader, never around it (architect, 2026-11-13 20:30 UTC): Trader's one-at-a-time
 lock (_send_lock), its client (_ensure), its block on a name with an unclear close (_blocked), its
 request log (_logged) and its action log. An unclear answer is logged as a "close" with status
 UNKNOWN, so the name stays blocked for closes, stops and targets until Resolve, as an unclear close
-is today. tests/test_plan_close.py fails if Trader loses any private name used here.
+is today. tests/test_plan_side_rules.py fails if Trader loses any private name used here.
 """
 from __future__ import annotations
 
@@ -169,6 +171,16 @@ def _cancel(trader, symbol: str, stop_id: int) -> dict:
     blocked = trader._blocked(symbol, client)
     if blocked:
         return blocked
+    # The poller's positions said none; Schwab's own answer, read now, must say so too before the
+    # plan's stop goes (architect's review 1 of PR #35). A read that fails sends nothing.
+    try:
+        pos, _ = trader._position(client, symbol)
+    except Exception as e:
+        return {"ok": False, "symbol": symbol,
+                "error": f"Schwab's position could not be read ({e}). The plan's stop stays. Nothing was sent."[:300]}
+    if abs(pos) > 1e-9:
+        return {"ok": False, "symbol": symbol,
+                "error": f"Schwab's position now shows {pos:g} {symbol}. The plan's stop stays. Nothing was sent."}
     trader.store.log_action("close", symbol, stop_id, "SENDING", f"cancel the plan's stop {stop_id} (no shares held)")
     log.warning("PLAN STOP CANCEL %s %s (the account holds none)", symbol, stop_id)
     try:
