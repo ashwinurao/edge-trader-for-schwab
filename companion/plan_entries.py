@@ -62,6 +62,9 @@ RED = "RED"              # a flip stopped: nothing more from this row today
 BUSY = (SENDING, FLIPPING)
 
 DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
+# Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
+# other working order on this name" from the poller's order list, so it never sends on an old one.
+ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
 
 
@@ -103,8 +106,11 @@ class PlanDesk:
     def __init__(self, trader, view: Callable[[], dict], orders: Callable[[], list[dict]],
                  flips: int, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  armed: Optional[Callable[[], bool]] = None,
-                 market_open: Optional[Callable[[], bool]] = None, demo: bool = False) -> None:
+                 market_open: Optional[Callable[[], bool]] = None, demo: bool = False,
+                 orders_fresh: Optional[Callable[[], bool]] = None) -> None:
+        """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today"))."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
+        self._orders_fresh_fn = orders_fresh or (lambda: True)
         self._armed = armed or (lambda: bool(trader.armed))
         self._market_open = market_open or (lambda: trading.market_open())
         self.demo = demo
@@ -152,7 +158,11 @@ class PlanDesk:
                 continue
             t = self.trader.store.get_ticket(rec["ticket_id"])
             status = (t or {}).get("status")
-            if status == "ACCEPTED" and t.get("order_id"):
+            if t is None:
+                # Trader.submit writes the intent BEFORE sending (trading.py, _place): no ticket
+                # means no request ever left (a restart or an error before that point).
+                rec.update(state=NONE, order_id=None, text="Nothing was sent: Edge Trader has no record of it.")
+            elif status == "ACCEPTED" and t.get("order_id"):
                 rec.update(state=SENT, order_id=t["order_id"], text="Schwab's order list matched it.")
             elif status in ("RESOLVED_MANUALLY", "REJECTED", "RATE_LIMITED"):
                 rec.update(state=NONE, order_id=None, text=f"Last entry {status.replace('_', ' ').lower()}.")
@@ -161,6 +171,32 @@ class PlanDesk:
             changed = True
         if changed:
             self._save(recs)
+
+    def recover(self) -> None:
+        """At startup: a click that was running when Edge Trader stopped never finished (architect's
+        review of PR #19). A SENDING row becomes UNKNOWN, so it follows its ticket (_settle); a
+        FLIPPING row becomes RED: its cancel may or may not have reached Schwab, and the other side
+        was not sent (the row turns SENDING before that)."""
+        with self._lock:
+            recs = self._load()
+            changed = False
+            for ticker, rec in recs.items():
+                if rec.get("state") == SENDING:
+                    rec.update(state=UNKNOWN, text="Edge Trader restarted while this entry was being sent. "
+                                                   "Check thinkorswim, then press Resolve.")
+                elif rec.get("state") == FLIPPING:
+                    rec.update(state=RED, text=f"Edge Trader restarted during a flip, before the other side was "
+                                               f"sent. The {str(rec.get('side') or '').lower()} entry may or may "
+                                               f"not be cancelled. Check the {ticker} order in thinkorswim.",
+                               red_why=f"{ticker}: Edge Trader restarted during a flip. Use the ticket or "
+                                       "thinkorswim for it today.")
+                else:
+                    continue
+                changed = True
+                log.error("opening plan: %s was %s at startup; now %s", ticker,
+                          "SENDING" if rec["state"] == UNKNOWN else "FLIPPING", rec["state"])
+            if changed:
+                self._save(recs)
 
     def _blocked_names(self) -> Optional[set]:
         """Names an unclear order blocks; None means every name is blocked (no per-name list)."""
@@ -221,6 +257,12 @@ class PlanDesk:
             return f"0 shares for the {side.lower()} side at this risk."
         return ""
 
+    def _orders_fresh(self) -> bool:
+        try:
+            return bool(self._orders_fresh_fn())
+        except Exception:
+            return False                      # can't tell: old
+
     def _order(self, rec: Mapping, orders: list[dict]) -> Optional[dict]:
         oid = rec.get("order_id")
         return next((o for o in orders if oid is not None and o.get("orderId") == oid), None)
@@ -265,14 +307,16 @@ class PlanDesk:
                 return o
         return None
 
-    def _place_refusal(self, view, ticker, side, rec, entry, orders, blocked) -> str:
+    def _place_refusal(self, view, ticker, side, rec, entry, orders, blocked, fresh: bool = True) -> str:
         state = entry["state"]
         if state in BUSY:
             return f"{ticker}: the last click is still running."
         if state == RED:
-            return f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
+            return rec.get("red_why") or f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
         if state == UNKNOWN:
             return f"{ticker}: the last entry's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        if not fresh:
+            return ORDERS_OLD
         if state == SENT and not entry["done"]:
             return f"{ticker} already has an entry today."
         f = self._foreign(ticker, rec, orders)
@@ -280,11 +324,13 @@ class PlanDesk:
             return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
         return self._send_refusal(view, ticker, side, blocked)
 
-    def _flip_refusal(self, view, ticker, rec, entry, orders, blocked) -> str:
+    def _flip_refusal(self, view, ticker, rec, entry, orders, blocked, fresh: bool = True) -> str:
         if entry["state"] in BUSY:
             return f"{ticker}: the last click is still running."
         if entry["state"] == RED:
-            return f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
+            return rec.get("red_why") or f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
+        if not fresh:
+            return ORDERS_OLD
         if entry["state"] != SENT or not entry["resting"]:
             return f"{ticker} has no resting, unfilled entry to flip."
         used = int(rec.get("flips") or 0)
@@ -298,9 +344,10 @@ class PlanDesk:
         """Every row's entry and which buttons work now, each refusal in words."""
         view = self._view()
         orders = self._orders()
+        fresh = self._orders_fresh()
         out = {"enabled": True, "demo": self.demo, "armed": self._armed(), "market_open": self._market_open(),
                "break_max_shares": break_entry.BREAK_MAX_SHARES, "max_flips": self.flips, "rows": [],
-               "error": ""}
+               "error": "", "orders_old": "" if fresh else ORDERS_OLD}
         try:
             with self._lock:
                 recs = self._load()
@@ -315,12 +362,12 @@ class PlanDesk:
             entry = self._entry_state(rec, orders)
             r = {"ticker": ticker, "entry": entry, "flips": int(rec.get("flips") or 0),
                  "send": {k.lower(): self._numbers(row, k) for k in ("LONG", "SHORT")},
-                 "place": {k.lower(): self._place_refusal(view, ticker, k, rec, entry, orders, blocked)
+                 "place": {k.lower(): self._place_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
                            for k in ("LONG", "SHORT")},
                  "cancel": "" if entry["state"] == SENT and entry["order_id"] and not entry["done"]
                            and not (entry["filled"] or 0) > 0 else "Nothing to cancel.",
                  "flip_to": OTHER[entry["side"]].lower() if entry["side"] in OTHER else None,
-                 "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked)}
+                 "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh)}
             out["rows"].append(r)
         return out
 
@@ -384,6 +431,7 @@ class PlanDesk:
             return self._refuse(ticker, "Pick long or short.")
         view = self._view()                 # may ask Edge Scanner (feed spacing); no lock held
         orders = self._orders()
+        fresh = self._orders_fresh()
         with self._lock:
             try:
                 recs = self._load()
@@ -393,7 +441,7 @@ class PlanDesk:
                 return self._refuse(ticker, f"Not sent: {e}."[:300])
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why = self._place_refusal(view, ticker, side, rec, entry, orders, blocked)
+            why = self._place_refusal(view, ticker, side, rec, entry, orders, blocked, fresh)
             if why:
                 return self._refuse(ticker, why)
             req, why = self._claim_send(view, ticker, side, expected)
@@ -425,7 +473,13 @@ class PlanDesk:
             r = {"ok": False, "error": f"Cancel failed: {e}"[:300]}
         if r.get("ok"):
             with self._lock:
-                self._put(ticker, state=NONE, order_id=None, text="Cancelled, nothing filled.")
+                if rec.get("state") == RED:
+                    # A row that stopped after a flip stays stopped for the day (README), even once
+                    # its entry is cancelled: only the user's ticket or thinkorswim acts on it.
+                    self._put(ticker, state=RED, order_id=None,
+                              text="Cancelled, nothing filled. The row stays stopped for today after the flip.")
+                else:
+                    self._put(ticker, state=NONE, order_id=None, text="Cancelled, nothing filled.")
         return {**r, "ticker": ticker}
 
     def flip(self, ticker: str, expected: Any) -> dict:
@@ -436,6 +490,7 @@ class PlanDesk:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.")
         view = self._view()
         orders = self._orders()
+        fresh = self._orders_fresh()
         with self._lock:
             try:
                 recs = self._load()
@@ -445,7 +500,7 @@ class PlanDesk:
                 return self._refuse(ticker, f"Not flipped: {e}."[:300])
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why = self._flip_refusal(view, ticker, rec, entry, orders, blocked)
+            why = self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh)
             if why:
                 return self._refuse(ticker, why)
             old = rec["side"]
@@ -472,18 +527,24 @@ class PlanDesk:
                     return self._refuse(ticker, f"Not flipped: {err} The {old.lower()} entry still rests.")
                 text = (f"Flip stopped: {err.rstrip('.')}. Nothing new was placed. Check the {ticker} "
                         "order and position in thinkorswim.")
-                self._put(ticker, state=RED, text=text)
+                self._put(ticker, state=RED, text=text, red_why=None)
             return self._refuse(ticker, text, red=True, cancel=c)
         # Confirmed: Schwab says CANCELED with nothing filled (Trader.cancel_entry). Check again
         # before the new side: the click's rules hold at the moment of the send, not of the click.
         view = self._view()
         orders = self._orders()
+        fresh = self._orders_fresh()
         with self._lock:
             try:
                 blocked = self._blocked_names()
             except Exception:
                 blocked = None                       # refuses: "not confirmed"
-            why = self._send_refusal(view, ticker, new, blocked)
+            # The same list checks as Place (architect's review of PR #19): a fresh order list, and
+            # no other working order on the name (the cancelled entry is not working any more).
+            f = self._foreign(ticker, {"order_id": oid}, orders) if fresh else None
+            why = (ORDERS_OLD if not fresh else
+                   f"a working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+                   if f is not None else self._send_refusal(view, ticker, new, blocked))
             if why:
                 self._put(ticker, state=NONE, order_id=None,
                           text=f"Cancelled the {old.lower()} entry. Did not place the {new.lower()}: {why}")
@@ -506,14 +567,26 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
     if view is None or not enabled(env):
         return False
     now = now or getattr(app.state, "opening_plan_now", None) or (lambda: datetime.now(timezone.utc))
+    try:
+        flips = max_flips()
+    except Exception as e:
+        # A bad playbook never stops Edge Trader: no buttons, and the log says why.
+        log.error("opening plan buttons are off: %s", e)
+        return False
     if demo:
         # Invented entries so the screen shows each state; every click is still refused.
         recs, orders = demo_entries()
-        desk = PlanDesk(trader, view, lambda: orders, max_flips(), now=now,
+        desk = PlanDesk(trader, view, lambda: orders, flips, now=now,
                         armed=lambda: True, market_open=lambda: True, demo=True)
         desk._mem = {desk._key(): recs}
     else:
-        desk = PlanDesk(trader, view, poller._merged_orders, max_flips(), now=now)
+        desk = PlanDesk(trader, view, poller._merged_orders, flips, now=now,
+                        orders_fresh=lambda: poller._fresh("orders_today"))
+        try:
+            desk.recover()
+        except Exception as e:
+            # Records that don't read: every click refuses until they do (_load raises).
+            log.error("opening plan: could not check the entry records at startup: %s", e)
 
     async def body(request: Request) -> dict:
         guard(request)

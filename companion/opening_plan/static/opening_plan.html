@@ -260,6 +260,7 @@ function render(v, browserStale) {
   for (const n of v.notes || []) banners.push(`<div class="banner ${n.startsWith("Old data") ? "bad" : "warn"}">${esc(n)}</div>`);
   if (c.calm == null && c.text && v.rows.length) banners.push(`<div class="banner warn">${esc(c.text)}</div>`);
   if (entries && entries.error) banners.push(`<div class="banner bad">${esc(entries.error)}</div>`);
+  if (entries && entries.orders_old) banners.push(`<div class="banner bad">${esc(entries.orders_old)} Cancel still works.</div>`);
   $("banners").innerHTML = banners.join("");
   if (!v.rows.length) { $("wrap").innerHTML = `<div class="empty">No plan rows.</div>`; }
   else {

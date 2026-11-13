@@ -104,6 +104,9 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(trading.time, "sleep", lambda s: None)
     t = Trader(Store(tmp_path / "t.db"))
     t._client, t._hash = PlanBroker(), "H" * 64
+    # The status reads right after a send (fork PR #15) run on their own thread and client; they
+    # are tested in tests/test_trading.py. Here they would make a real client and race the broker's call log.
+    t._spawn = lambda fn: None
     monkeypatch.setattr(t, "quote", lambda sym, max_age=1.0: {
         "bid": 42.30, "ask": 42.32, "realtime": True, "quote_time": _time.time() * 1000, "asset_type": "EQUITY"})
     t.arm(True)
@@ -412,7 +415,7 @@ def test_flip_when_arming_lapses_after_the_cancel_places_nothing(rig, monkeypatc
 BOTH = {break_entry.FLAG: "1", plan_entries.BUTTONS_FLAG: "1"}
 
 
-def make_app(rig, env, demo=False):
+def make_app(rig, env, demo=False, fresh=True):
     app = FastAPI()
     app.state.opening_plan_view = rig.view
     app.state.opening_plan_now = lambda: NOW
@@ -420,6 +423,10 @@ def make_app(rig, env, demo=False):
     class Poller:
         def _merged_orders(self):
             return list(rig.broker.orders.values())
+
+        def _fresh(self, name):
+            assert name == "orders_today"
+            return fresh
     added = plan_entries.register(app, rig.trader, Poller(), lambda request: None, demo=demo, env=env)
     return app, added
 
@@ -485,3 +492,124 @@ def test_records_are_per_day(rig):
     rig.desk.place("AAAA", "LONG", LONG)
     rig.desk._now = lambda: NOW + timedelta(days=1)
     assert row(rig)["entry"]["state"] == plan_entries.NONE
+
+
+# ---------------------------------------------------------------- architect's review of PR #19
+
+def test_an_old_order_list_refuses_place_and_flip_but_not_cancel(rig):
+    rig.desk._orders_fresh_fn = lambda: False
+    r = rig.desk.place("AAAA", "LONG", LONG)
+    assert not r["ok"] and r["error"] == plan_entries.ORDERS_OLD and rig.sent == [] and rig.broker.placed == []
+    st = rig.desk.state()
+    assert st["orders_old"] == plan_entries.ORDERS_OLD
+    assert row(rig)["place"] == {"long": plan_entries.ORDERS_OLD, "short": plan_entries.ORDERS_OLD}
+    rig.desk._orders_fresh_fn = lambda: True
+    assert rig.desk.state()["orders_old"] == ""
+    assert rig.desk.place("AAAA", "LONG", LONG)["ok"]
+    rig.desk._orders_fresh_fn = lambda: False
+    r = rig.desk.flip("AAAA", SHORT)
+    assert not r["ok"] and r["error"] == plan_entries.ORDERS_OLD and rig.broker.cancelled == []
+    assert row(rig)["flip"] == plan_entries.ORDERS_OLD
+    assert rig.desk.cancel("AAAA")["ok"] and len(rig.broker.cancelled) == 1
+
+
+def test_a_freshness_check_that_fails_counts_as_old(rig):
+    def broken():
+        raise RuntimeError("no poller")
+    rig.desk._orders_fresh_fn = broken
+    assert rig.desk.place("AAAA", "LONG", LONG)["error"] == plan_entries.ORDERS_OLD
+
+
+def test_register_reads_the_pollers_orders_today_freshness(rig):
+    app, added = make_app(rig, env=BOTH, fresh=False)
+    st = TestClient(app).get("/api/opening-plan/entries").json()
+    assert added and st["orders_old"] == plan_entries.ORDERS_OLD
+    r = TestClient(app).post("/api/opening-plan/place", json={"ticker": "AAAA", "side": "LONG", "expected": LONG}).json()
+    assert not r["ok"] and r["error"] == plan_entries.ORDERS_OLD and rig.broker.placed == []
+
+
+def test_restart_while_sending_turns_the_row_unknown_and_it_follows_the_ticket(rig):
+    rig.trader.store.insert_ticket({"ticket_id": "half-sent-1", "symbol": "AAAA", "side": "LONG", "qty": 1,
+                                    "limit": "42.55", "stop": "41.92", "target": "", "risk": 0, "request": {}})
+    rig.desk._put("AAAA", state=plan_entries.SENDING, side="LONG", ticket_id="half-sent-1", order_id=None)
+    make_app(rig, env=BOTH)                    # a restart: register() runs again on the same database
+    e = row(rig)["entry"]
+    assert e["state"] == plan_entries.UNKNOWN and "restarted while this entry was being sent" in e["text"]
+    r = rig.desk.place("AAAA", "LONG", LONG)
+    assert not r["ok"] and "not confirmed" in r["error"] and rig.broker.placed == []
+    rig.trader.resolve("half-sent-1")           # the user checked thinkorswim
+    assert row(rig)["entry"]["state"] == plan_entries.NONE
+
+
+def test_restart_before_the_ticket_was_written_frees_the_row(rig):
+    # No ticket row: Trader.submit writes the intent before it sends, so nothing left Edge Trader.
+    rig.desk._put("AAAA", state=plan_entries.SENDING, side="LONG", ticket_id="never-written", order_id=None)
+    make_app(rig, env=BOTH)
+    e = row(rig)["entry"]
+    assert e["state"] == plan_entries.NONE and "Nothing was sent" in e["text"]
+
+
+def test_restart_during_a_flip_turns_the_row_red(rig):
+    rig.desk.place("AAAA", "LONG", LONG)
+    oid = row(rig)["entry"]["order_id"]
+    rig.desk._put("AAAA", state=plan_entries.FLIPPING, flips=1)
+    make_app(rig, env=BOTH)
+    r = row(rig)
+    assert r["entry"]["red"] and "restarted during a flip" in r["entry"]["text"]
+    assert "restarted during a flip" in r["place"]["long"] and "restarted during a flip" in r["flip"]
+    assert not rig.desk.flip("AAAA", SHORT)["ok"] and rig.broker.cancelled == []
+    # Cancel still works, and the row stays stopped for the day.
+    assert rig.desk.cancel("AAAA")["ok"] and rig.broker.cancelled == [oid]
+    r = row(rig)
+    assert r["entry"]["red"] and "stays stopped" in r["entry"]["text"]
+    assert not rig.desk.place("AAAA", "SHORT", SHORT)["ok"] and len(rig.broker.placed) == 1
+
+
+def test_a_running_click_is_not_touched_by_settle(rig):
+    # Only startup (recover) turns SENDING into UNKNOWN; a click in flight keeps its claim.
+    rig.desk._put("AAAA", state=plan_entries.SENDING, side="LONG", ticket_id="in-flight", order_id=None)
+    assert row(rig)["entry"]["state"] == plan_entries.SENDING
+
+
+def test_a_bad_playbook_adds_no_routes_and_never_stops_the_app(rig, monkeypatch, caplog):
+    def bad(path=plan_entries.PLAYBOOK_FILE):
+        raise ValueError("playbook: buttons.max_flips_per_row: KeyError")
+    monkeypatch.setattr(plan_entries, "max_flips", bad)
+    app, added = make_app(rig, env=BOTH)
+    assert not added and TestClient(app).get("/api/opening-plan/entries").status_code == 404
+    assert "opening plan buttons are off" in caplog.text
+
+
+def test_a_playbook_without_the_buttons_section_is_refused(tmp_path):
+    f = tmp_path / "playbook.json"
+    f.write_text('{"name": "x"}')
+    with pytest.raises(ValueError):
+        plan_entries.max_flips(f)
+
+
+def test_flip_does_not_place_when_another_order_appears_on_the_name(rig, monkeypatch):
+    rig.desk.place("AAAA", "LONG", LONG)
+    real = rig.trader.cancel_entry
+
+    def cancel_then_other_order(oid):
+        out = real(oid)
+        rig.broker.orders[4242] = {"orderId": 4242, "status": "WORKING", "filledQuantity": 0,
+                                   "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "AAAA"}}]}
+        return out
+    monkeypatch.setattr(rig.trader, "cancel_entry", cancel_then_other_order)
+    r = rig.desk.flip("AAAA", SHORT)
+    assert not r["ok"] and "order 4242" in r["error"] and len(rig.broker.placed) == 1
+    assert row(rig)["entry"]["state"] == plan_entries.NONE
+
+
+def test_flip_does_not_place_when_the_order_list_goes_old_after_the_cancel(rig, monkeypatch):
+    rig.desk.place("AAAA", "LONG", LONG)
+    real = rig.trader.cancel_entry
+
+    def cancel_then_old(oid):
+        out = real(oid)
+        rig.desk._orders_fresh_fn = lambda: False
+        return out
+    monkeypatch.setattr(rig.trader, "cancel_entry", cancel_then_old)
+    r = rig.desk.flip("AAAA", SHORT)
+    assert not r["ok"] and plan_entries.ORDERS_OLD in r["error"] and len(rig.broker.placed) == 1
