@@ -7,6 +7,7 @@ default stage. Each test places the entries it needs through PlanDesk.place, the
 broker (fills, positions) to the state it tests.
 """
 import copy
+import json
 import threading
 import time as _time
 from datetime import datetime, time, timedelta, timezone
@@ -525,6 +526,24 @@ def test_before_batch_is_a_constructor_argument_too(fr):
                            before_batch=lambda: called.append(1))
     f.run([])
     assert called == [1]
+
+
+def test_a_preview_view_with_buying_power_is_never_read_or_written(fr, caplog):
+    # Brief 21 (main 9f15270, PR #30): from 09:00 to 09:25 ET the view is PREVIEW, with no rows and
+    # view["buying_power"] in dollars. Flat all then lists only its own records, and no balance
+    # reaches its list, its batch, its saved record or the log.
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    fr.desk._view = lambda: {"state": "PREVIEW", "rows": [], "message": "Preview, not locked.",
+                             "buying_power": {"state": "OK", "day_trading": 987654.32,
+                                              "buying_power": 876543.21, "equity": 765432.10}}
+    st = fr.flat.state()
+    assert [(i["ticker"], i["action"], i["rank"]) for i in st["items"]] == [("AAAA", "close", None)]
+    r = fr.flat.run(expected(st["items"]))
+    assert r["ok"] and fr.broker.pos["AAAA"] == 0
+    seen = json.dumps(st) + json.dumps(r) + json.dumps(fr.flat.last()) + caplog.text
+    for amount in ("987654", "876543", "765432"):
+        assert amount not in seen
 
 
 def test_an_etf_position_closes_like_shares(fr):
