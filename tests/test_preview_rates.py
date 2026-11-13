@@ -157,3 +157,22 @@ def test_the_plan_view_carries_todays_rates_and_the_app_hands_the_store_over(tmp
     src = (Path(R.__file__).parent.parent / "app.py").read_text(encoding="utf-8")
     assert "rates=PREVIEW_RATES)" in next(x for x in src.splitlines() if "_plan_routes.register(" in x)
     assert "rates=PREVIEW_RATES.add" in next(x for x in src.splitlines() if "open_probe.start(" in x)
+
+
+def test_a_bp_rate_measured_against_the_day_trading_balance_never_counts_for_bp():
+    s = PreviewRates()
+    s.add(line(af=0.30, bp=1.20), et(9, 5, 30))
+    odd = line(at="09:06:00", af=0.30, bp=2.00)
+    odd["bp_rate_from"] = ["dayTradingBuyingPower", "orderStrategy.orderBalance.projectedBuyingPower"]
+    s.add(odd, et(9, 6))
+    assert s.best("NVDA", "LONG", "bp", DAY) == {"rate": 1.20, "at_et": "09:05:30", "balance": "buyingPower"}
+
+
+def test_ratios_are_the_median_of_each_pair_over_af_on_counted_previews():
+    s = PreviewRates()
+    assert s.ratios(et(9, 0)) == {"af": None, "bp": None, "dt": None}
+    s.add(line(sym="AAA", af=0.25, bp=1.00, dt=1.00), et(9, 5, 30))          # 4, 4
+    s.add(line(sym="BBB", af=0.30, bp=1.20, dt=0.90), et(9, 6))              # 4, 3
+    s.add(line(sym="CCC", af=0.40, bp=1.60, dt=None), et(9, 6, 30))          # 4, -
+    s.add(line(sym="DDD", af=1.50, bp=9.00, dt=9.00), et(9, 7))              # bent: not counted
+    assert s.ratios(et(9, 10)) == {"af": 1.0, "bp": 4.0, "dt": 3.5}

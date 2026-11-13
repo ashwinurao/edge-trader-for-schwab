@@ -11,8 +11,9 @@ fields: (the account's balance before - Schwab's projected value) / the order's 
 preview it hands its line here (`PreviewRates.add`), and app.py hands this store to the plan.
 
 Pairs (open_probe.RATES): `af` availableFunds against projectedAvailableFund, `bp` buyingPower
-(or dayTradingBuyingPower) against projectedBuyingPower, `dt` dayTradingBuyingPower against
-projectedIntradayBuyingPower. Each kept rate says which balance it was measured against.
+against projectedBuyingPower, `dt` dayTradingBuyingPower against projectedIntradayBuyingPower
+(BALANCE). The probe may measure `bp` against dayTradingBuyingPower when buyingPower gives no
+requirement rate; such a rate belongs to another balance, so it never counts for `bp`.
 
 Which rate counts (brief 23 item 4), per symbol, side and pair: the HIGHEST rate seen today whose
 `af` rate on the same preview is from AF_MIN to AF_MAX. Why: the balance before comes from the
@@ -42,6 +43,8 @@ from .open_probe import mask
 
 ET = ZoneInfo("America/New_York")
 PAIRS = ("af", "bp", "dt")              # open_probe.RATES line prefixes
+# The balance each pair's rate is for: the plan sizes each balance with its own pair (brief 23).
+BALANCE = {"af": "availableFunds", "bp": "buyingPower", "dt": "dayTradingBuyingPower"}
 SIDES = ("LONG", "SHORT")
 # Brief 23 item 4: an `af` rate from 0.24 to 1.10 is believable. 2026-11-13's previews read 0.25 to
 # 0.40 (Schwab asks 25 to 40 percent of a name's value); 1.10 leaves room for a name without margin.
@@ -121,13 +124,22 @@ class PreviewRates:
                 return []
             return list(self._seen.get((str(symbol).upper(), side), []))
 
+    @staticmethod
+    def _counted(r: dict, pair: str) -> Optional[float]:
+        """The pair's rate of one preview when it counts: Schwab answered it without a reject,
+        its `af` rate is believable and the rate was measured against the pair's own balance."""
+        rate = r["rates"].get(pair)
+        if not r["ok"] or rate is None or not plausible(r["rates"].get("af")):
+            return None
+        return rate if r["balance"].get(pair) == BALANCE[pair] else None
+
     def best(self, symbol: str, side: str, pair: str, day: date) -> Optional[dict]:
         """The rate that counts for one symbol, side and pair today (brief 23 item 4), as
         {"rate", "at_et", "balance"}, or None when no preview of today gives one."""
         best = None
         for r in self._records(symbol, side, day):
-            rate = r["rates"].get(pair)
-            if not r["ok"] or rate is None or not plausible(r["rates"].get("af")):
+            rate = self._counted(r, pair)
+            if rate is None:
                 continue
             if best is None or rate > best["rate"]:
                 best = {"rate": rate, "at_et": r["at_et"], "balance": r["balance"].get(pair)}
@@ -146,6 +158,21 @@ class PreviewRates:
         return {"previews": len(recs), "dropped": dropped,
                 "rates": {p: self.best(symbol, side, p, day) for p in PAIRS},
                 "last": {k: last[k] for k in ("at_et", "http", "ok", "status", *TEXT_LISTS)}}
+
+    def ratios(self, when: datetime) -> dict:
+        """{pair: the median of (that pair's rate / the af rate) over today's counted previews, or
+        None}. The plan's default rate for a name without a preview of a pair (brief 23 PR B):
+        2026-11-13's previews had bp = 4 x af on every line."""
+        day = _et_day(when)
+        with self._lock:
+            recs = [r for rs in self._seen.values() for r in rs] if self._day == day else []
+        out = {}
+        for p in PAIRS:
+            got = sorted(self._counted(r, p) / r["rates"]["af"] for r in recs
+                         if self._counted(r, p) is not None and self._counted(r, "af"))
+            n = len(got)
+            out[p] = None if not n else round(got[n // 2] if n % 2 else (got[n // 2 - 1] + got[n // 2]) / 2, 4)
+        return out
 
     def today(self, when: datetime) -> dict:
         """{symbol: {"LONG": side(), "SHORT": side()}} for the ET day of `when`. No dollars."""
