@@ -437,7 +437,7 @@ sends one request to Schwab when you click it; nothing is sent without a click.
 - **Cancel** cancels the row's resting, unfilled entry through the dashboard's own Cancel entry path.
 - **Flip** cancels the resting entry, waits until Schwab confirms it CANCELED with nothing filled, and
   only then places the other side. Just before that send it checks again that Schwab's order list is
-  fresh and shows no other working order on the name. If the cancel is not confirmed or anything
+  fresh and that you are not on the other side of the name (below). If the cancel is not confirmed or anything
   filled, nothing new is placed, the row turns red and says what to check, and the row sends nothing
   more that day. At most `max_flips_per_row` flips per row a day (3, in
   `companion/opening_plan/playbook.json`).
@@ -449,6 +449,28 @@ on the name is unclear, or the row already has an entry that is working, unclear
 They also refuse when Schwab's order list is old, meaning the last read failed or is older than three
 polling intervals: "Schwab's order list is old. Nothing is sent until it is fresh." A banner says so.
 Cancel still works on a sent entry.
+
+**The plan trades beside your own trades on the same name** (brief 25, `companion/plan_side.py`;
+Ash's card pick "Plan trades beside you", project thread "Review OV picks desk architecture",
+2026-11-13 20:04:42 UTC). You may trade a plan name by hand on the same account, on the ticket or in
+thinkorswim. Schwab nets each name, so your shares and the plan's are one position; the plan's own
+stop (the stop attached to its entry) is what tells its shares from yours.
+- **Same side, or not in the name:** Place and Flip go. Your own working orders and shares on the same
+  side no longer refuse ("One entry per name" until brief 25). Buy and sell orders count as the long
+  side, sell-short and buy-to-cover orders as the short side.
+- **Other side:** Place and Flip refuse before anything is sent, Flip before its cancel: "You are short
+  50 T by hand. The plan does not take the other side of a name you trade. Nothing was sent." (or "You
+  have a working short order on T.").
+- **Not clear:** your orders or shares on both sides, an order that is not a plain buy or sell, the plan
+  no longer able to tell its shares from yours, or Schwab's positions or order list old: refused.
+- The row says when you are in the name: "You also hold 100 T by hand", "You are also short 50 T by
+  hand" or "You also have a working order on T".
+- The row's own rules stay: one plan entry per row a day, the flip limit, ARM, the quote checks.
+
+The plan's shares are its entry's filled quantity for as long as its own stop works: the stop attached
+to the entry, followed through a replacement (an edit in thinkorswim), or a stop Add stop created for
+the row. When that stop filled, the plan's shares are gone. When it is gone without a fill, the plan can
+no longer tell its shares from yours and says so.
 
 A red row keeps Place and Flip off for the day. When Schwab's order list shows the row's entry, a line
 under the red text gives its status (for example "Resting at Schwab (WORKING), nothing filled."). Cancel works on it only while the order list is fresh and shows
@@ -489,15 +511,32 @@ by the clock: every order is your click.
   from the poller); any difference refuses the whole batch and sends nothing: "The list changed since
   the page showed it. Nothing was sent. Look again."
 - Then it works one row at a time in rank order: all cancels first, then the closes, through the
-  dashboard's own Cancel entry and Close paths, each under their own one-at-a-time lock, never
-  retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
+  dashboard's own Cancel entry path and the plan's own close of its shares (below), each under
+  Trader's one-at-a-time lock, never retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
   thinkorswim). A refused or unclear row does not stop the others. A 429 from Schwab, or the app's
   429 pause, stops the batch: the rows not reached say "Not sent: Schwab is throttling". The last
   batch of the day stays on the screen, with one line per row.
-- It closes only what the plan's own entries opened: the row's entry filled today, the account is on
-  the same side and holds no more shares of that name than the entry filled. A larger or opposite
-  position is refused for that row ("Close it on the dashboard"). So is an entry that is partly filled
-  and still working.
+- It closes only the plan's own shares (brief 25, `companion/plan_close.py`), whatever you hold beside
+  them. For a row whose entry filled today:
+  - the plan's stop works and the account holds the plan's shares or more on that side: one PUT
+    replaces the plan's stop with a market order for the plan's quantity, the same one-PUT shape as the
+    dashboard's Close. Nothing else on the name is cancelled or changed, and nothing is cleaned up
+    after it: "Close the plan's 1 share at the market. Your other 100 stay." Unlike the dashboard's
+    Close, a plan close no longer cancels other working orders on the name, so your own orders survive;
+  - the plan's stop filled: nothing ("the plan's stop sold its 1 share");
+  - the account holds none and the plan's stop still works: cancel that stop, read back until Schwab
+    says CANCELED. Only on a positions read taken at least `flat.positions_after_fill_seconds` (10 s, a
+    start number Ash has not approved) after the entry's fill, because the order list and the positions
+    are read at different moments; otherwise "The plan's entry filled N s ago and the account read is
+    older. Open Flat all again in a few seconds.";
+  - the plan's stop is gone without a fill and shares are held: refused, "The plan's stop is not
+    working any more, so the plan cannot tell its share from yours. Close it on the dashboard or in
+    thinkorswim.";
+  - fewer shares than the plan filled while its stop works, the other side, or anything not clear:
+    refused for that row. So is an entry that is partly filled and still working.
+  A row with no plan entry says "No plan entry today" and, when shares are held, that they are not
+  from the plan. An unclear answer to the PUT or to the stop's cancel turns the row red and blocks the
+  name until you press Resolve, as an unclear close does.
 - It refuses when the market is closed, Schwab's order list or positions are old, Schwab is
   throttling, or a batch is already running. A name blocked by an unclear order is refused for that
   row only.
@@ -510,13 +549,15 @@ by the clock: every order is your click.
   new order rests. A batch first calls the hook Step 6 wires to its Disarm.
 - From 2 minutes before the playbook's flat time (`exit.flat_et`, 10:00 ET) the button turns red and
   says the flat time.
-- **Cover watch:** for each plan row that holds shares, the dashboard's own stop protection of the
-  row's ticket (PROTECTED, PARTIAL, NO_STOP). Shares without a working stop for longer than
+- **Cover watch:** for each plan row that holds shares, the plan's own shares against the plan's own
+  stop (brief 25): your shares beside them never turn a plan row red, and Add stop never sends a stop
+  for them (it refuses when you hold more than the plan's shares). Shares without a working stop for longer than
   `cover.grace_seconds` (3 s, a start number Ash has not approved) turn the row red: "N of M shares
   have no stop", with one **Add stop** button. The click sends a stop for those shares at the row's
   stop price (the stop its entry was sent with) through the dashboard's own Set stop path, with that
   path's refusals; it needs entries armed. That path creates a stop only when the position has none,
-  so a row whose position is partly covered stays red and says to set the rest in thinkorswim.
+  so a row whose position is partly covered stays red and says to set the rest in thinkorswim. The stop
+  Add stop creates becomes the row's own plan stop.
   Nothing is added automatically. The grace counts only while the Opening plan page is open: the
   server measures it when the page asks (every 2 s), so with the page closed no row turns red.
 
