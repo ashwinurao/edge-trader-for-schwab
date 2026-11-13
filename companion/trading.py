@@ -6,8 +6,9 @@ Safety that is engineering, not coaching:
   once, when the mark touches +1R (auto_breakeven, called by the poller).
 - Separate Schwab client that can only preview and place; it cannot cancel or replace.
 - Intent is written to SQLite BEFORE sending; a ticket id can be sent once (double clicks).
-- One submission at a time. A timeout or 5xx is UNKNOWN, never retried: new submissions wait
-  until the poller finds the order or the user marks it resolved after checking thinkorswim.
+- One submission at a time. A timeout or 5xx is UNKNOWN, never retried: new submissions on the
+  same name (the stock, or an option's underlying) wait until the poller finds the order or the
+  user marks it resolved after checking thinkorswim. Other names are not blocked.
 - Fresh quote at click time. Within LOCK_R of the risk per share (at least LOCK_MIN_TICKS), the
   click sends exactly what the ticket showed (shares, limit, stop, targets); if price moved further
   against the entry, or the stop is now at or through the bid / ask, nothing is sent and the
@@ -205,6 +206,20 @@ def _units(asset: str | None) -> tuple[str, str]:
 def _occ_root(symbol: str) -> str:
     """The root of an OCC option symbol ("SPY   261120C00600000" -> "SPY")."""
     return symbol[:6].strip() if len(symbol) > 15 else symbol
+
+
+def _name(symbol: str) -> str:
+    """The underlying a ticket trades: the stock itself, or an option's root, with index roots
+    SPXW / SPXP read as SPX and an adjusted root (AAPL1) as its underlying. An unclear ticket blocks
+    new tickets on the same name (CONTRIBUTING rule 4; Ash's go 2026-11-13, OV entries Step 0): the
+    wider of the two choices, so an unclear option also blocks its stock and every other contract on it."""
+    s = (symbol or "").upper().strip().lstrip("$")
+    if len(s) <= 15:
+        return s
+    root = _occ_root(s).rstrip("0123456789") or _occ_root(s)
+    if len(root) > 1 and root[:-1] in INDEX_ROOTS and root[-1] in "WP":
+        root = root[:-1]
+    return root
 
 
 def _odd_deliverable(q: dict, symbol: str = "") -> str | None:
@@ -542,7 +557,9 @@ class Trader:
             return {"ok": False, "error": "Trading is not armed. Use the ARM switch on the ticket."}
         if not market_open():
             return {"ok": False, "error": "Regular hours only (9:30 to 16:00 ET)."}
-        pending = self.store.open_tickets()
+        # Only an unclear ticket on the same name blocks (CONTRIBUTING rule 4); the page lists all.
+        name = _name(str(req.get("symbol") or ""))
+        pending = [t for t in self.store.open_tickets() if _name(t["symbol"]) == name]
         if pending:
             t = pending[0]
             return {"ok": False, "error": f"Previous order ({t['symbol']} {t['qty']}) is not confirmed "
@@ -2581,5 +2598,9 @@ class Trader:
         return {sym: {**c[0], "alts": c[1:]} for sym, c in cands.items()}
 
     def status(self) -> dict:
-        return {"armed": self.armed, "market_open": market_open(),
-                "blocked": bool(self.store.open_tickets()), "risk_choices": RISK_CHOICES}
+        """blocked: any ticket's outcome is unclear. blocked_names: the names those tickets block, with
+        SPX's option roots (SPXW, SPXP) spelled out so the page can match an option by its OCC root."""
+        names = {_name(t["symbol"]) for t in self.store.open_tickets()}
+        names |= {n + x for n in names & INDEX_ROOTS for x in "WP"}
+        return {"armed": self.armed, "market_open": market_open(), "blocked": bool(names),
+                "blocked_names": sorted(names), "risk_choices": RISK_CHOICES}

@@ -97,8 +97,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
 - **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
-  further orders for that symbol until Schwab confirms it or you press Resolve; the app never opens
-  Schwab's streamer, so it never disconnects another app that uses it.
+  further orders for that symbol (an option counts as its underlying, so it also blocks the stock and
+  its other contracts) until Schwab confirms it or you press Resolve; other symbols can still be
+  traded; the app never opens Schwab's streamer, so it never disconnects another app that uses it.
 
 ## Screenshots
 
