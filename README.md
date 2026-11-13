@@ -131,8 +131,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   $250,000 caps), and which side the minute's close is nearer. On a calm SPY day (RV20 at or below
   10.5) each row uses half the risk and says so; when the calm flag is not known it shows full and half
   size side by side. A stop under 2% of daily ATR is marked, not changed. Every number shows its age, and
-  an old or failed answer from Edge Scanner shows as old, never as current. The screen has no order
-  buttons: it places, changes and cancels nothing. Its list, times and numbers are in
+  an old or failed answer from Edge Scanner shows as old, never as current. Without
+  `EDGE_TRADER_PLAN_BUTTONS=1` and `EDGE_TRADER_BREAK_ENTRY=1` the screen has no order buttons: it places, changes and cancels nothing
+  (with it, see "Place, Cancel and Flip on the plan rows" below). Its list, times and numbers are in
   `companion/opening_plan/playbook.json`.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
@@ -304,6 +305,46 @@ would flip it to the short side. In the same file, the next line after it says `
 ("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
 `would_fill` at 50.04, a trade inside 50.01 to 50.08.
 
+**Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
+and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
+(`companion/plan_entries.py`). Without both, there are no buttons and no button routes. Each button
+sends one request to Schwab when you click it; nothing is sent without a click.
+- **Place long break / Place short break** sends the break entry (a stop-limit entry with its stop
+  attached, `companion/break_entry.py`) for that pick: trigger one cent past the 09:30 ET minute, stop at
+  the other side, built from the server's own latest row, never from the page's prices. The page sends
+  what it showed; if the server's row differs, nothing is sent. Shares are capped at
+  `BREAK_MAX_SHARES` (1, the test stage); the row shows the plan size next to it.
+- **Cancel** cancels the row's resting, unfilled entry through the dashboard's own Cancel entry path.
+- **Flip** cancels the resting entry, waits until Schwab confirms it CANCELED with nothing filled, and
+  only then places the other side. Just before that send it checks again that Schwab's order list is
+  fresh and shows no other working order on the name. If the cancel is not confirmed or anything
+  filled, nothing new is placed, the row turns red and says what to check, and the row sends nothing
+  more that day. At most `max_flips_per_row` flips per row a day (3, in
+  `companion/opening_plan/playbook.json`).
+
+Place and Flip refuse, with the reason on the button, when entries are not armed, the market is closed,
+the 09:30 minute is not final, Edge Scanner's data is old, the calm flag is not known, an earlier order
+on the name is unclear, or the row already has an entry that is working, unclear or filled.
+
+They also refuse when Schwab's order list is old, meaning the last read failed or is older than three
+polling intervals: "Schwab's order list is old. Nothing is sent until it is fresh." A banner says so.
+Cancel still works on a sent entry.
+
+A red row keeps Place and Flip off for the day. When Schwab's order list shows the row's entry, a line
+under the red text gives its status (for example "Resting at Schwab (WORKING), nothing filled."). Cancel works on it only while the order list is fresh and shows
+the entry resting with nothing filled. Any fill, an order the list does not show, or an old list keeps
+Cancel off. After a cancel the row stays red.
+
+If Edge Trader restarts while a click is running, the next start settles the row:
+- **Sending:** the row shows the entry as not confirmed: "Edge Trader restarted while this entry was
+  being sent. Check thinkorswim, then press Resolve." It then follows its ticket, like any unclear
+  order. If no ticket was written, nothing left Edge Trader and the row is free again.
+- **Flipping:** the row turns red ("Edge Trader restarted during a flip"), because the cancel may or
+  may not have reached Schwab. Use Cancel on the row, the ticket or thinkorswim for that name today.
+
+If `companion/opening_plan/playbook.json` cannot be read or has no `buttons.max_flips_per_row`, the
+buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -330,6 +371,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_NETLOG` | `0` turns off the timing record of Schwab's answers in `data/netlog/`. On by default. |
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
+| `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
 
 ## Good to know
 

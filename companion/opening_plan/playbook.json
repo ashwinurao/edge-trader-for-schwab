@@ -23,6 +23,10 @@
   "exit": {
     "flat_et": "10:00"
   },
+  "buttons": {
+    "_about": "Step 4 row buttons (companion/plan_entries.py), only with EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1. Start value from the fast-open design (max 3 flips), not yet approved by Ash.",
+    "max_flips_per_row": 3
+  },
   "feed": {
     "picks_path": "/api/v2/ov-picks",
     "clock_path": "/api/v2/clock",

@@ -62,6 +62,13 @@
   td.data { min-width: 150px; white-space: nowrap; }
   .tag { white-space: nowrap; }
   table.stale td { opacity: .45; background: repeating-linear-gradient(135deg, transparent 0 8px, rgba(229,83,75,.06) 8px 16px); }
+  .ob { height: 26px; padding: 0 9px; margin: 0 4px 4px 0; border-radius: 6px; border: 1px solid var(--line-hi);
+        background: var(--panel); color: var(--text); font: 600 12px var(--sans); cursor: pointer; white-space: nowrap; }
+  .ob.long { border-color: rgba(63,182,139,.6); color: var(--green); }
+  .ob.short { border-color: rgba(229,83,75,.6); color: var(--red); }
+  .ob:disabled { opacity: .35; cursor: not-allowed; }
+  td.orders { min-width: 220px; }
+  tr.red td { background: var(--red-bg); }
   .foot { padding: 0 16px 20px; color: var(--muted); font-size: 12px; line-height: 1.55; }
   .empty { padding: 26px 16px; color: var(--muted); }
 </style>
@@ -70,7 +77,7 @@
 <header>
   <h1>Opening plan</h1>
   <span class="mut" id="pb"></span>
-  <span class="pill info" title="This screen shows numbers only. It has no order buttons and sends nothing to Schwab.">Display only · no orders</span>
+  <span class="pill info" id="mode" title="This screen shows numbers only. It has no order buttons and sends nothing to Schwab.">Display only · no orders</span>
   <span class="pill warn" id="demo" style="display:none">DEMO · invented picks</span>
   <span class="sp"></span>
   <span class="pill" id="src">connecting</span>
@@ -95,6 +102,10 @@ const px = v => v == null ? "–" : Number(v).toFixed(2);
 const sh = v => v == null ? "–" : Number(v).toLocaleString("en-US");
 const ago = s => s == null ? "" : (s < 10 ? `${Number(s).toFixed(1)} s ago` : `${Math.round(s)} s ago`);
 let lastOk = 0, lastView = null, refresh = 2000, busy = false, typing = false;
+// Row buttons (companion/plan_entries.py): only when the server has them (EDGE_TRADER_PLAN_BUTTONS=1
+// and EDGE_TRADER_BREAK_ENTRY=1); a 404 means no buttons.
+let entries = null, entriesOff = false;
+const clicking = {}, said = {};
 const STALE_MS = 6000;   // the page's own check: no answer from Edge Trader for 6 s marks the view old
 
 function shares(r) {
@@ -127,6 +138,16 @@ function dataCell(b) {
 // keep their columns.
 function notes(r) {
   const b = r.bar || {}, out = [];
+  const e = entryOf(r.ticker);
+  if (e) {
+    const st = e.entry, m = said[r.ticker];
+    if (m) out.push(`<div class="${m.ok ? "mutline" : "badline"}">${esc(m.text)}</div>`);
+    if (st.text && !(m && m.text === st.text)) out.push(`<div class="${st.red ? "badline" : "mutline"}">${esc(st.text)}</div>`);
+    else if (!st.text && e.place.long && e.place.long === e.place.short && e.place.long !== b.text && !m)
+      out.push(`<div class="mutline">Place: ${esc(e.place.long)}</div>`);
+    // A red row's entry may still rest at Schwab: its status goes under the red text.
+    if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);
+  }
   if (b.state !== "FINAL" && b.state !== "SO_FAR" && b.text) out.push(`<div class="${b.state === "BAD" ? "badline" : "mutline"}">${esc(b.text)}</div>`);
   for (const k of ["long", "short"]) if (r[k] && r[k].capped) out.push(`<div class="badline">${k === "long" ? "Long" : "Short"} shares ${esc(r[k].capped)}.</div>`);
   if (r.under_min_stop) {
@@ -136,8 +157,54 @@ function notes(r) {
   } else if (r.under_min_stop === null && r.long) {
     out.push(`<div class="warnline">No ATR from Edge Scanner: the 2% minimum stop can't be checked.</div>`);
   }
-  return out.length ? `<tr class="notes"><td></td><td colspan="10">${out.join("")}</td></tr>` : "";
+  const red = e && e.entry.red ? " red" : "";
+  return out.length ? `<tr class="notes${red}"><td></td><td colspan="${entries ? 11 : 10}">${out.join("")}</td></tr>` : "";
 }
+
+function entryOf(ticker) {
+  return entries && entries.rows ? entries.rows.find(x => x.ticker === ticker) : null;
+}
+
+function ordersCell(r) {
+  const e = entryOf(r.ticker);
+  if (!e) return `<td class="orders mut">–</td>`;
+  const off = (why) => (why || clicking[r.ticker] || Date.now() - lastOk > STALE_MS) ? "disabled" : "";
+  const tip = (why) => esc(why || "");
+  const b = (cls, act, side, label, why) =>
+    `<button class="ob ${cls}" data-act="${act}" data-t="${esc(r.ticker)}" data-side="${side}" ${off(why)} title="${tip(why)}">${label}</button>`;
+  const fl = e.flip_to || "";
+  return `<td class="orders">${b("long", "place", "long", "Place long break", e.place.long)}${b("short", "place", "short", "Place short break", e.place.short)}<br>
+    ${b("", "cancel", "", "Cancel", e.cancel)}${b(fl, "flip", fl, fl ? `Flip to ${fl}` : "Flip", e.flip)}
+    <span class="sub">${e.flips}/${entries.max_flips} flips · ${entries.break_max_shares} share, test stage${
+      e.send && e.send.long ? `; plan size ${sh(e.send.long.plan_shares)}` : ""}</span></td>`;
+}
+
+async function act(btn) {
+  const t = btn.dataset.t, a = btn.dataset.act, side = btn.dataset.side, e = entryOf(t);
+  if (!e || clicking[t]) return;
+  const num = side && e.send && e.send[side];
+  const body = {ticker: t};
+  if (a === "place") body.side = side;
+  if (a === "place" || a === "flip") {
+    if (!num) return;
+    body.expected = {trigger: num.trigger, stop: num.stop, shares: num.shares};   // what this page showed
+  }
+  clicking[t] = true; said[t] = {ok: true, text: `${a === "place" ? `Placing the ${side} break` : a === "flip" ? `Flipping to ${side}` : "Cancelling"}…`};
+  if (lastView) render(lastView, false);
+  try {
+    const r = await fetch(`/api/opening-plan/${a}`, {method: "POST", headers: {"Content-Type": "application/json", "X-Companion": "1"},
+                                                     body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    said[t] = {ok: !!j.ok, text: j.ok ? (a === "cancel" ? "Cancelled, nothing filled." : `Sent: order ${j.order_id ?? "?"} (${j.status}).`) : (j.error || "Refused.")};
+  } catch (err) {
+    said[t] = {ok: false, text: `No answer from Edge Trader (${err.message}). Check the Pending orders on the dashboard before clicking again.`};
+  } finally {
+    clicking[t] = false;
+    tick();
+  }
+}
+document.addEventListener("click", ev => { const btn = ev.target.closest("button.ob"); if (btn && !btn.disabled) act(btn); });
 
 function row(r) {
   const b = r.bar || {};
@@ -145,7 +212,8 @@ function row(r) {
   const near = r.nearer === "long" ? `<span class="long">long (high)</span>` : r.nearer === "short"
     ? `<span class="short">short (low)</span>` : r.nearer === "even" ? "even" : "–";
   const n = notes(r);
-  return `<tr class="${n ? "has-notes" : ""}">
+  const e = entryOf(r.ticker);
+  return `<tr class="${n ? "has-notes" : ""}${e && e.entry.red ? " red" : ""}">
     <td class="n">${esc(r.rank)}</td>
     <td><span class="tk">${esc(r.ticker)}</span></td>
     <td class="n">${px(r.atr)}</td>
@@ -157,12 +225,19 @@ function row(r) {
     <td class="n">${px(r.rps)}</td>
     <td class="n">${shares(r)}</td>
     <td>${near}${b.state === "SO_FAR" ? `<span class="sub">from the close so far</span>` : ""}</td>
+    ${entries ? ordersCell(r) : ""}
   </tr>${n}`;
 }
 
 function render(v, browserStale) {
   $("pb").textContent = `${v.playbook.name} · ranks ${v.playbook.ranks[0]}-${v.playbook.ranks[1]} · ${v.playbook.bar} · flat ${v.playbook.flat_et} ET`;
   $("demo").style.display = v.demo ? "" : "none";
+  const mode = $("mode");
+  if (entries) {
+    mode.className = "pill warn";
+    mode.textContent = `Plan buttons ON · ${entries.break_max_shares} share test stage${entries.armed ? "" : " · ARM is off"}`;
+    mode.title = "Each button sends one order to Schwab when you click it (EDGE_TRADER_PLAN_BUTTONS=1). Nothing is sent without a click.";
+  }
   $("clock").textContent = `${v.now_et} ET`;
   const old = v.stale || browserStale;
   const src = $("src");
@@ -186,18 +261,24 @@ function render(v, browserStale) {
   if (v.state !== "OK" && v.state !== "STALE" && v.message) banners.push(`<div class="banner ${v.state === "NO_ANSWER" || v.state === "NOT_SET_UP" ? "bad" : "info"}">${esc(v.message)}</div>`);
   for (const n of v.notes || []) banners.push(`<div class="banner ${n.startsWith("Old data") ? "bad" : "warn"}">${esc(n)}</div>`);
   if (c.calm == null && c.text && v.rows.length) banners.push(`<div class="banner warn">${esc(c.text)}</div>`);
+  if (entries && entries.error) banners.push(`<div class="banner bad">${esc(entries.error)}</div>`);
+  if (entries && entries.orders_old) banners.push(`<div class="banner bad">${esc(entries.orders_old)} Cancel still works.</div>`);
   $("banners").innerHTML = banners.join("");
   if (!v.rows.length) { $("wrap").innerHTML = `<div class="empty">No plan rows.</div>`; }
   else {
     $("wrap").innerHTML = `<table class="${old ? "stale" : ""}"><thead><tr>
       <th>#</th><th>Ticker</th><th>ATR</th><th>09:30 high</th><th>09:30 low</th><th>Data</th>
       <th>Long: buy stop → stop</th><th>Short: sell stop → stop</th><th>Risk / share</th><th>Shares</th><th>Nearer side</th>
+      ${entries ? "<th>Orders</th>" : ""}
       </tr></thead><tbody>${v.rows.map(row).join("")}</tbody></table>`;
   }
   $("foot").innerHTML = `Rule (research, opening_drive/engine.py): enter ${px(v.playbook.offset)} past the 09:30 ET minute's high or low; the stop is the other side.
     Shares = risk per pick ÷ risk per share, rounded down, inside the ticket's caps (10,000 shares, $250,000).
     Calm SPY day (RV20 ≤ ${v.playbook.calm_rv20_max}): ${v.playbook.calm_multiplier}× the risk. Nearer side: which break the minute's close sits closer to.
-    This screen places, changes and cancels nothing.`;
+    ${entries ? `With the plan buttons on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
+    the server's own row (never this page's prices). Flip cancels first and places the other side only after Schwab confirms the cancel with nothing
+    filled; otherwise the row turns red and nothing more is sent from it today. At most ${entries.max_flips} flips per row a day.`
+    : "This screen places, changes and cancels nothing."}`;
 }
 
 async function tick() {
@@ -210,6 +291,7 @@ async function tick() {
     clearTimeout(t);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     lastView = await r.json();
+    await readEntries();
     lastOk = Date.now();
     refresh = Math.max(1000, (lastView.playbook.refresh_seconds || 2) * 1000);
     render(lastView, false);
@@ -218,6 +300,17 @@ async function tick() {
     else $("banners").innerHTML = `<div class="banner bad">Edge Trader is not answering (${esc(e.message)}). No data.</div>`;
   } finally {
     busy = false;
+  }
+}
+
+async function readEntries() {
+  if (entriesOff) return;
+  try {
+    const r = await fetch("/api/opening-plan/entries", {cache: "no-store"});
+    if (r.status === 404) { entriesOff = true; entries = null; return; }   // break entries are off
+    entries = r.ok ? await r.json() : null;
+  } catch (e) {
+    entries = null;      // no answer: no buttons, rather than buttons on old state
   }
 }
 
