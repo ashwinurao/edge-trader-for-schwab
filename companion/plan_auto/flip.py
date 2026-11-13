@@ -34,8 +34,9 @@ and orders per day is armed.orders_per_day_with_flips (armed_with_flips, brief 1
 
 Trader's lock busy (another order action, a click or a Flat all; architect's review 1 of Step 6,
 2026-11-13 16:45 UTC, must 1). Before the cancel: nothing reached Schwab, so the step ends with
-lane.busy("cancel"), no other pick tries on that reading, the worker waits a tick and the next
-reading decides again; no record is written. After the confirmed cancel: nothing rests, so the
+lane.busy(kind) ("flip" or "relevel", so the log's wait lines tell it from a 09:35 cancel's), no
+other pick tries on that reading, the worker waits a tick and the next reading decides again; no
+record is written. After the confirmed cancel: nothing rests, so the
 flip waits for the lock a tick (armed.every_seconds) at a time, the row and the panel say so once,
 and when the lock is free the recheck and the desk's checks run again before the send. It stops
 waiting when the plan is disarmed or the fast watch ends; nothing rests then.
@@ -44,7 +45,8 @@ Schwab's order list old (architect's notes on the live test, 2026-11-13 20:12 UT
 poller holds itself to 70 calls a minute (poller.MAX_PER_MIN) and Trader's order calls count in the
 same window, so with the plan's calls the list was read only every 12 to 19 s live. Nothing is ever
 sent on an old list, and an old list is a wait, never an end. Before the cancel it is Step 6's
-wait (lane.busy with the desk's reason): the step ends, the entry stays and the next reading decides
+wait (lane.busy with the desk's reason, named "flip" or "relevel"): the step ends, the entry stays
+and the next reading decides
 again. After the confirmed cancel the flip waits a tick at a time, as for Trader's lock, until the
 list is fresh (then everything is checked again before the send), the plan is disarmed or the fast
 watch ends.
@@ -53,7 +55,9 @@ Schwab calls (fork PR #15's two status reads after a 201 included; the tape read
 not Schwab): a flip or a re-level is one cancel and one send. The cancel is 3 calls usually (a read,
 the cancel, one read-back) and 12 at worst (ten read-backs, armed.calls_per_cancel); the send is 4
 usually and 5 at worst (armed.calls_per_send). So 7 usually and 17 at worst; a wait for the lock or
-for a fresh list costs none, and a send refused by Trader's lock costs none and goes once later.
+for a fresh list costs none, and a send refused by Trader's lock costs none and goes once later. A
+send refused for a Schwab quote older than 5 s made the quote call, but the calls bound gives all
+of its reservation back (at most once a pick a day; architect's review 3, N4).
 With four picks the bounds allow at most 8 sends (armed.orders_per_day_with_flips; and
 armed.calls_per_minute 40 at 5 a send) and one automatic cancel per order id, so at most 8 cancels:
 in one minute that is 56 calls usually and 136 at worst. The likely busy minute, four entries then
@@ -431,19 +435,24 @@ def _swap(lane: Lane, kind: str) -> bool:
                              "decision": _iso(decided)}, view=getattr(lane, "view", None), wait=wait)
     stage = r.get("stage")
     if spent["send"] and (stage == "recheck" or r.get("not_sent")):
-        lane.refund(orders=1, calls=calls)        # reserved, then refused before any request left
+        # Reserved, then refused before any order request left. All of armed.calls_per_send goes back,
+        # also when Trader refused after Schwab's quote (a quote older than 5 s): that one quote call
+        # was made and is not counted, at most once a pick a day (architect's review 3, N4).
+        lane.refund(orders=1, calls=calls)
     if stage == "refused":
         if r.get("code") == "orders_old":
             # An old list is a wait (N1), as Step 6's on_place and on_cancel: nothing was cancelled or
             # written, the step ends, and the next reading decides again; the pick's line gives the reason.
-            lane.busy("cancel", str(r.get("error") or ""))
+            lane.busy(kind, str(r.get("error") or ""))
             return True
         if r.get("cancel_not_sent") and keys:
             lane.host.forget(keys[-1])            # Trader's lock was busy: nothing reached Schwab
         if r.get("busy"):
             # Nothing reached Schwab: the step ends, no other pick tries on this reading, and the
-            # worker waits a tick (architect's review 1 of Step 6, must 1; Step 6's lane.busy).
-            lane.busy("cancel")
+            # worker waits a tick (architect's review 1 of Step 6, must 1; Step 6's lane.busy). Named
+            # for the flip or re-level, not "cancel", so the log tells it from a 09:35 cancel's wait
+            # (architect's review 3 of Step 7, 2026-11-13 20:34 UTC, ask 1).
+            lane.busy(kind)
             return True
         if not r.get("again"):
             lane.say(f"{kind}_refused", str(r.get("error") or "refused"))

@@ -684,8 +684,12 @@ stays" (or "re-level is not on") and the entry stays.
   read-back; 12 at worst) and one send (4 usually: the quote, the order, two status reads; 5 at worst),
   so 7 usually and 17 at worst. Waiting costs no call. With four picks the bounds allow at most 8 sends
   and 8 cancels a day: if all fell in one minute, 56 calls usually and 136 at worst. Four entries then four
-  flips or re-levels in one minute are 44 usually and 88 at worst. Edge Trader as a whole keeps to 70
-  calls a minute (`companion/poller.py` `MAX_PER_MIN`), so the poller's own reads wait.
+  flips or re-levels in one minute are 44 usually and 88 at worst. A send that Schwab's 5-second quote
+  rule refuses made one call (the quote), but the plan's calls bound gives all of its reservation back.
+  The poller holds its own reads to 70 a minute (`companion/poller.py` `MAX_PER_MIN`) and counts the
+  order calls in that minute, but order calls never wait: only the poller's reads do. So Edge Trader
+  can pass 70 (the live test of 2026-11-13 counted 76 and 78 in a minute), and the 136 worst case
+  would pass Schwab's 120 a minute; a 429 disarms the plan for the day.
 - **Another order action running** (a click, a ticket send, Flat all) holds the dashboard's one order
   lock. Before the cancel the flip tries nothing: no record, one `busy` line, and the next reading
   decides again. After the confirmed cancel nothing rests, so the flip waits for the lock a tick at a

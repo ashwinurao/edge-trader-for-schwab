@@ -648,7 +648,7 @@ def test_an_old_order_list_before_the_cancel_waits_for_the_next_reading(r, kind)
         assert run(r, kind, **args) is True         # not an action: the step ends, a tick later again
     nothing_at_schwab(r)
     assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.gone == []
-    assert r.host.busied == ["cancel"] * 3 and r.host.busy_why == [plan_entries.ORDERS_OLD] * 3
+    assert r.host.busied == [kind[len("would_"):]] * 3 and r.host.busy_why == [plan_entries.ORDERS_OLD] * 3
     assert r.host.said == []
     assert rec(r)["state"] == plan_entries.SENT and rec(r)["flips"] == 0 and rec(r).get("relevels", 0) == 0
     r.desk._orders_fresh_fn = lambda: True
@@ -808,7 +808,7 @@ def test_a_busy_order_line_before_the_cancel_writes_nothing_and_waits_a_tick(r, 
         assert run(r) is True
     finally:
         r.trader._send_lock.release()
-    assert r.host.busied == ["cancel"] and wrote == [] and r.host.logs == []
+    assert r.host.busied == ["flip"] and wrote == [] and r.host.logs == []
     got = rec(r)
     assert got["state"] == plan_entries.SENT and got["flips"] == 0 and r.host.keys == set()
     nothing_at_schwab(r)
@@ -826,7 +826,7 @@ def test_a_busy_order_line_met_at_the_cancel_itself_is_busy_too(r, monkeypatch):
         assert run(r) is True
     finally:
         r.trader._send_lock.release()
-    assert r.host.busied == ["cancel"] and r.host.logs == [] and r.host.keys == set()
+    assert r.host.busied == ["flip"] and r.host.logs == [] and r.host.keys == set()
     got = rec(r)
     assert got["state"] == plan_entries.SENT and got["flips"] == 0 and r.broker.cancelled == []
 
@@ -1785,7 +1785,7 @@ def test_executor_a_busy_lock_before_the_flips_cancel_waits_a_tick(frig):
     assert 1 <= len(busy) <= 9 and set(busy) == {"AAAA"}
     assert saves == [] and frig.broker.cancelled == [] and len(frig.broker.placed) == 4
     said = plan_lines(frig, "busy")
-    assert [(x["ticker"], x["what"]) for x in said] == [("AAAA", "cancel")]
+    assert [(x["ticker"], x["what"]) for x in said] == [("AAAA", "flip")]
     assert note(frig) == plan_entries.TRADER_BUSY and plan_lines(frig, "flip_auto") == []
     run_plan(frig, et(9, 31, 8))
     assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5
@@ -2151,7 +2151,8 @@ def test_an_order_list_old_at_one_reading_and_fresh_at_the_next_sends_once(frig,
     assert frig.broker.cancelled == [] and len(frig.broker.placed) == 4
     assert frig.plan.arming.is_armed(frig.clock.now())
     waits = [x for x in plan_lines(frig, "wait") if x["ticker"] == "AAAA"]
-    assert [(x["what"], x["why"]) for x in waits] == [("cancel", plan_entries.ORDERS_OLD)]
+    kind = "flip" if side == "short" else "relevel"
+    assert [(x["what"], x["why"]) for x in waits] == [(kind, plan_entries.ORDERS_OLD)]
     assert note(frig) == plan_entries.ORDERS_OLD
     frig.knobs["fresh"] = True
     run_plan(frig, et(9, 31, 9))
