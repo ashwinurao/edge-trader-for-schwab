@@ -89,11 +89,11 @@ name are refused). It needs no account and sends no telemetry.
   0.25 seconds with a 0.5 second time limit, from 09:29 to 09:36 ET only; Edge Scanner answers from
   memory and asks Alpaca for nothing more).
   Each read carries `X-Edge-App: edge-trader` and the call's id in `X-Edge-Req`, so Edge Scanner's own
-  record can name it. With the armed plan on (`EDGE_TRADER_PLAN_AUTO=1`, below) it also reads Edge
-  Scanner's open tape (`GET /api/v2/ov-picks/open-tape`, `companion/opening_plan/tape.py`) on your LAN:
-  once when the Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
-  the end of the watch, at most every 0.25 s with a 0.5 s timeout. Edge Scanner answers from memory and
-  asks its data vendor for nothing more.
+  record can name it. The armed plan (`EDGE_TRADER_PLAN_AUTO=1`, below) reads the same open tape through
+  the same reader, so with the shadow log on as well it is still at most one read every 0.25 seconds:
+  once when its Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
+  the end of the watch (about 09:35:20 ET). Before each send it also checks the pick's row against the
+  OV picks read above (at most every 2 seconds), even with the screen closed.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -427,6 +427,8 @@ attached. It sends one order at a time, the pick nearest its trigger first (in R
 again before each send. At the end of the fast watch (09:35 ET) it cancels each plan entry that has not
 filled, one attempt per order, waiting for Schwab to confirm, and then disarms. It never flips, chases,
 exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
+When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
+stop, that row turns red and nothing is sent for it.
 A filled entry is yours to manage, as with a click.
 
 It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
