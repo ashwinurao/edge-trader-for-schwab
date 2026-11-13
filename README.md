@@ -249,6 +249,42 @@ Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in E
 
     python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
 
+`--risk` is the risk per pick in dollars before the calm half. `--calm` is `yes` when SPY RV20 was at
+or below 10.5 that day (Edge Scanner's top-bar badge is red), `no` above it, or `unknown`, which
+places nothing. Without `--out` the lines go to the screen. A count by kind goes to the error stream,
+e.g. `would_place 4`.
+
+**Reading the replay output.** Each line is one decision about one pick, in time order:
+
+| Field | Meaning |
+| --- | --- |
+| `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
+| `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_cancel` or `no_action`. |
+| `symbol`, `why` | The pick, and the reason in words. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
+| `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
+| `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
+| `fill` | On `would_fill`: the trade price seen inside the order's band. |
+| `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
+| `range` | The first minute's high and low, whether it was final, and what made it final (`trade at or after 09:31` or `09:30 bar`). |
+
+A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
+with no `would_place` line never got an order, and its last `no_action` says why.
+
+A worked example (made-up ticker and prices, from the test file in `tests/test_opening_plan_shadow.py`):
+
+    {"t": "2026-11-13T14:31:00.200000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 49.8 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 49.8, "price_age_s": 0.1, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "trade at or after 09:31"}}
+
+At 09:31:00.2 ET the first trade stamped 09:31 had arrived, so the first minute (high 50.00, low
+49.00) was final. The last trade, 49.80, was 0.1 s old: fresh enough to act on. It was 0.20 from the
+high and 0.80 from the low, so the plan goes long. The trigger is one cent above the high (50.01) and
+the stop is the low (49.00), so the risk per share is 1.01. The cap is 0.15 x 1.01 = 0.15, but at most
+0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is 50.08. $101 at risk on a day that is not
+calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40 before a fill (60% of the way to the low)
+would flip it to the short side. In the same file, the next line after it says `stale_price`
+("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
+`would_fill` at 50.04, a trade inside 50.01 to 50.08.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
