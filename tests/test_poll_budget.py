@@ -475,3 +475,18 @@ def test_the_skip_line_names_the_poll_and_the_reason(monkeypatch):
     assert lines and lines[0][0] == "skip"
     assert lines[0][1]["endpoint"] == "quotes" and lines[0][1]["reason"] == "after_burst"
     assert lines[0][1]["purpose"] == "poller"
+
+
+def test_an_error_in_the_budget_lets_the_poll_go(traffic, monkeypatch):
+    """Review 1 of PR #33: an error while asking the budget means the poll goes as before brief 24
+    (it may wait in the limiter), never the loop's 5 s error wait."""
+    def boom(*a, **k):
+        raise RuntimeError("deque mutated during iteration")
+    monkeypatch.setattr(poll_budget, "give_way", boom)
+    monkeypatch.setattr(poll_budget, "goes_first", boom)
+    p = traffic.p
+    assert p._give_way("quotes") is False
+    assert p._goes_first("quotes") is True
+    run(traffic, 30)
+    assert 5 not in p._stop.waits
+    assert max(gaps(traffic, "quotes", 0.0, traffic.clock.mono)) <= INTERVALS["quotes"] + 0.5
