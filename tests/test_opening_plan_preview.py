@@ -149,10 +149,16 @@ def test_an_old_answer_marks_the_preview_old_and_an_old_preview_says_so():
 
 # ---- nothing treats a preview row as a pick ------------------------------------------------------
 
-def test_the_probe_reads_no_symbol_from_a_preview():
+def test_the_probe_previews_the_preview_picks_but_the_plan_rows_stay_empty():
+    # Brief 23 PR A item 2 changed this expectation (brief 21 had the probe read no symbol from a
+    # preview, so it previewed SPY only before the freeze): the probe now previews the preview's
+    # top rows, so each name's margin rate is known before 09:25. Only the probe reads them:
+    # view["rows"] stays empty and the state stays PREVIEW, so no button or send can take them.
     syms, why = op.plan_symbols(env={"EDGE_SCANNER_URL": "http://192.168.1.10:8772"},
                                 get=lambda url, timeout: es_answer(ROWS), now=lambda: et(9, 10, 20))
-    assert syms == [] and why.startswith("PREVIEW")                     # so the probe previews SPY only
+    assert syms == ["AAAA", "BBBB", "CCCC", "DDDD"] and why == ""        # ranks 1 to 4 (playbook)
+    v = view(es_answer(ROWS))
+    assert v["state"] == P.PREVIEW and v["rows"] == []
 
 
 def test_the_shadow_takes_no_pick_from_a_preview():

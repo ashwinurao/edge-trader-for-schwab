@@ -12,12 +12,14 @@ companion/break_entry.py). This thread measures all three and writes only netlog
 
 What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
 - One daemon thread "open-probe". Windows come from companion/open_probe.json (ET, weekdays),
-  default 09:26:30-09:40:00 (brief 21); EDGE_TRADER_OPEN_PROBE_WINDOWS overrides them and
+  default 09:05:00-09:07:30 and 09:15:00-09:17:30 before the 09:25 freeze (brief 23, on the preview
+  picks) and 09:26:30-09:40:00 (brief 21); EDGE_TRADER_OPEN_PROBE_WINDOWS overrides them and
   EDGE_TRADER_OPEN_PROBE_PREVIEWS the preview times, so a test run can be at another time.
 - One minute before a window it builds its own Schwab client that allows only `quotes` and
   `preview_order` (schwab.ReadOnlyClient raises PermissionError for every other method), with a
   3 s time limit, and reads the day's Opening plan symbols once (ranks as the plan rows, at most
-  6) plus SPY. The client is dropped when the window ends.
+  6; before the 09:25 freeze the plan's preview rows) plus SPY. The client is dropped when the
+  window ends.
 - Every quote_every_s seconds: one quotes() call for all symbols, one `probe: "quote"` line per
   symbol with Schwab's own quote and trade times and their age when the answer was in hand.
 - At each preview time (brief 21): a LONG and a SHORT Break preview for ONE pick, the next in rank
@@ -30,12 +32,15 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   lists, the order's own numbers (side, order_type, qty, trigger, limit, stop, from the body the
   probe built), `keys` (the dotted key names of Schwab's answer, never a value), the order value
   and the projected commission and fees with the path each was read from, and the requirement
-  rates `bp_rate` / `af_rate`: (the account's value before - the projected value) / the order
-  value, with the two fields each came from. The "before" value is the poller's last balances
+  rates `bp_rate` / `af_rate` / `dt_rate`: (the account's value before - the projected value) /
+  the order value, with the two fields each came from (`dt`: dayTradingBuyingPower against
+  projectedIntradayBuyingPower, brief 23). The "before" value is the poller's last balances
   (at most 30 s old); a pairing whose rate is outside -5 to 5 is not written. NO balance, equity
   or buying power in dollars is ever written, and nothing else from the answer: it holds the
   account number.
 - No retries. Any 429, or the app's own 429 pause, stops the probe for the rest of the window.
+- Brief 23: each preview line also goes to the plan's rate store (companion/preview_rates.py,
+  in memory, rates and Schwab's texts only), so the Opening plan can size by each name's rate.
 
 It never touches the trading client, Trader._send_lock, the poller's client or the store. It
 does not import the order code. Every failure is contained here and said once in a note.
@@ -99,6 +104,9 @@ PICKS_REREAD_UNTIL_ET = dtime(9, 29)
 RATES = (  # (line prefix, projected key name in Schwab's answer, the balances to pair it with)
     ("bp", "projectedBuyingPower", ("buyingPower", "dayTradingBuyingPower")),
     ("af", "projectedAvailableFund", ("availableFunds",)),
+    # Brief 23 PR A item 1: Schwab's answer also has projectedIntradayBuyingPower; paired with the
+    # day-trading figure so the plan can size against each balance with its own rate.
+    ("dt", "projectedIntradayBuyingPower", ("dayTradingBuyingPower",)),
 )
 KEYS_MAX, KEYS_DEPTH = 200, 6     # brief 21 item 2
 COSTS_MAX_PATHS, COSTS_MAX_VALUES = 20, 10
@@ -183,14 +191,20 @@ def plan_symbols(env: Mapping[str, str] = os.environ, get=None,
     if not url:
         return [], "EDGE_SCANNER_URL is not set"
     from .opening_plan.feed import Feed, http_get
-    from .opening_plan.plan import build_view, load_playbook
+    from .opening_plan.plan import PREVIEW, build_view, load_playbook
     pb = load_playbook()
     at = (now or (lambda: datetime.now(timezone.utc)))()
     feed = Feed(url, pb, get=get or http_get, wall=lambda: at)
     got = feed.picks.read()
     view = build_view(got.body, got.ok_at, got.error, None, None, "", None, at, pb)
+    rows = view.get("rows") or []
+    if view.get("state") == PREVIEW:
+        # Brief 23 PR A item 2: from 09:00 to the 09:25 freeze the plan shows Edge Scanner's
+        # preview in view["preview"]["rows"], never in view["rows"] (so no button takes it for a
+        # pick). The probe previews those names, so their rates are known before the freeze.
+        rows = (view.get("preview") or {}).get("rows") or []
     out: list[str] = []
-    for row in sorted(view.get("rows") or [], key=lambda r: r.get("rank") or 0):
+    for row in sorted(rows, key=lambda r: r.get("rank") or 0):
         sym = str(row.get("ticker") or "").upper().strip()
         if sym and sym not in out:
             out.append(sym)
@@ -562,10 +576,12 @@ class OpenProbe:
                  emit: Callable = netlog.emit,
                  wall: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  mono: Callable[[], float] = _time.monotonic,
-                 balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None)) -> None:
+                 balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
+                 rates: Optional[Callable[[Mapping, datetime], object]] = None) -> None:
         self.cfg = cfg if cfg is not None else load_config()
         self._hash, self._paused, self._make_client = account_hash, paused, make_client
         self._balances = balances
+        self._rates = rates     # brief 23 PR A: preview_rates.PreviewRates.add, the plan's store
         self._symbols, self._emit, self._wall, self._mono = symbols, emit, wall, mono
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -825,6 +841,16 @@ class OpenProbe:
             if self._preview_one(sym, side, at, hit[1], acct):
                 sent += 1
 
+    def _keep(self, line: dict) -> None:
+        """Hand the preview line to the plan's rate store (brief 23 PR A item 3). The line holds
+        rates, never a dollar balance. Never raises."""
+        if self._rates is None:
+            return
+        try:
+            self._rates(line, self._wall())
+        except Exception as e:
+            self._contain("rates", e)
+
     def _read_balances(self) -> tuple[Optional[Mapping], Optional[float]]:
         """(the poller's last balances, their age in seconds). Never raises."""
         try:
@@ -870,10 +896,12 @@ class OpenProbe:
         keys, more = key_paths(body)
         bal, age = self._read_balances()
         money = rate_fields(answer_numbers(body), bal, age)
-        self._line(probe="preview", symbol=sym, at=at, wire_ms=_wire_ms(r), total_ms=total,
-                   http=r.status_code, ok=err is None and not fields["rejects"], error=err,
-                   reasons=reason, retry_after=r.headers.get("Retry-After"), **numbers, **fields,
-                   keys=keys, keys_more=more, **money)
+        line = dict(probe="preview", symbol=sym, at=at, wire_ms=_wire_ms(r), total_ms=total,
+                    http=r.status_code, ok=err is None and not fields["rejects"], error=err,
+                    reasons=reason, retry_after=r.headers.get("Retry-After"), **numbers, **fields,
+                    keys=keys, keys_more=more, **money)
+        self._line(**line)
+        self._keep(line)
         if r.status_code == 429:
             self._halt("Schwab answered 429 to a preview")
         return True
@@ -881,12 +909,13 @@ class OpenProbe:
 
 def start(account_hash: Callable[[], Optional[str]], paused: Callable[[], float], demo: bool = False,
           env: Mapping[str, str] = os.environ,
-          balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None)) -> Optional[OpenProbe]:
+          balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
+          rates: Optional[Callable[[Mapping, datetime], object]] = None) -> Optional[OpenProbe]:
     """app.py's one start line. Off unless EDGE_TRADER_OPEN_PROBE=1, never in --demo. Never raises."""
     try:
         if demo or not enabled(env):
             return None
-        probe = OpenProbe(account_hash, paused, balances=balances)
+        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates)
         probe.start()
         log.info("open probe on: windows %s ET", [f"{a:%H:%M:%S}-{b:%H:%M:%S}" for a, b in probe.cfg.windows])
         return probe
