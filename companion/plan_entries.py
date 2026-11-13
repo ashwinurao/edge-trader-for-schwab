@@ -38,7 +38,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -47,7 +47,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, trading
+from . import break_entry, chase_entry, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -74,6 +74,14 @@ ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
 ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
                      "Use the dashboard or thinkorswim.")
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
+# The armed plan's chase (Step 8, brief 18): one per row per day.
+CHASES_PER_ROW = 1
+# A chase refused at the send after Schwab's quote was read, for a passing reason (an old quote, the
+# price back inside the level), may try again on a later reading, at most this many times a row a
+# day: a quote that keeps disagreeing with the tape costs at most this many Schwab quote calls.
+# Start number, not approved by Ash (Step 8).
+CHASE_QUOTE_TRIES = 3
+TRADER_BUSY = "Another submission is in progress"      # Trader.submit's own lock: nothing was sent
 
 
 def enabled(env: Mapping[str, str] = os.environ) -> bool:
@@ -124,6 +132,7 @@ class PlanDesk:
         self.demo = demo
         self._lock = threading.Lock()
         self._mem: Optional[dict] = {} if demo else None   # demo: records in memory, never the db
+        self._chase_tries: dict[str, int] = {}          # Step 8: refused chase tries a row a day, in memory
 
     # ---- records (one JSON per ET day in the settings table) --------------------------------
 
@@ -400,6 +409,7 @@ class PlanDesk:
             ticker = str(row.get("ticker") or "").upper()
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
+            entry["auto_text"] = self._chase_text(rec, entry)          # Step 8, brief 18 item 6
             r = {"ticker": ticker, "entry": entry, "flips": int(rec.get("flips") or 0),
                  "send": {k.lower(): self._numbers(row, k) for k in ("LONG", "SHORT")},
                  "place": {k.lower(): self._place_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
@@ -806,6 +816,151 @@ class PlanDesk:
             self._settle(recs)
             return json.loads(json.dumps(recs))
 
+    # ---- the armed plan's capped chase (Step 8, brief 18; companion/plan_auto/chase.py) --------
+
+    def _chase_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
+                       blocked: Optional[set], fresh: bool) -> str:
+        """Why the plan can't chase this row now, or "" when it can. Like _auto_refusal, except that
+        a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once."""
+        if rec and rec.get("origin") != "auto":
+            return f"{ticker}: a click used this row today. The armed plan leaves it."
+        state = entry["state"]
+        if state in BUSY:
+            return f"{ticker}: an action on this row is still running."
+        if state == RED:
+            return rec.get("red_why") or f"{ticker} is stopped for today."
+        if state == UNKNOWN:
+            return f"{ticker}: the last entry's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        if state == SENT and not entry["done"]:
+            return f"{ticker} already has an entry today (resting or filled)."
+        if int(rec.get("chases") or 0) >= CHASES_PER_ROW:
+            return f"{ticker} was already chased today (one chase per pick per day)."
+        if self._chase_tries.get(self._key() + ticker, 0) >= CHASE_QUOTE_TRIES:
+            return (f"{ticker}: the chase was refused at the send {CHASE_QUOTE_TRIES} times today "
+                    "(CHASE_QUOTE_TRIES in companion/plan_entries.py). The armed plan leaves it.")
+        if not self._armed():
+            return "ARM is off on the dashboard."
+        if not self._market_open():
+            return "The market is closed."
+        if not fresh:
+            return ORDERS_OLD
+        f = self._foreign(ticker, rec, orders)
+        if f is not None:
+            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+        if blocked is None:
+            return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
+        if ticker in blocked:
+            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        return ""
+
+    def chase_auto(self, ticker: str, side: str, o: Mapping, pick: Optional[Mapping] = None,
+                   view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None,
+                   wait_s: Optional[float] = None) -> dict:
+        """place_auto's twin for the chase: chase_entry's LIMIT at the cap with its stop attached.
+
+        `o` is engine.order_for of the tape's final range (trigger, limit, stop, cap, shares); shares
+        are capped by BREAK_MAX_SHARES. The record keeps origin "auto", kind "chase", the range,
+        sent_at, wait_from (the send: the engine's pullback wait counts from it, engine._follow),
+        wait_until (wait_from + wait_s, shown on the row), the chases used and `sent`.
+
+        Answers Trader.submit's dict, plus `not_sent` when no request left. Then `again` says the
+        reason passes (Trader's lock, an old quote, the price back inside the level, an old order
+        list): the row is put back exactly as it was and the pick may try on a later reading, at most
+        CHASE_QUOTE_TRIES times after a quote. Otherwise the row keeps "Not sent" and the plan leaves
+        it. `quoted` says Schwab's quote was read (one call)."""
+        ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
+        log = log or (lambda event, **kw: None)
+        if self.demo:
+            return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
+        if side not in OTHER:
+            return self._refuse(ticker, "Pick long or short.", not_sent=True)
+        orders = self._orders()
+        fresh = self._orders_fresh()
+        if view is None:
+            try:
+                view = self._view()
+            except Exception:
+                view = None
+        with self._lock:
+            try:
+                recs = self._load()
+                self._settle(recs)
+                blocked = self._blocked_names()
+            except Exception as e:
+                return self._refuse(ticker, f"Not sent: {e}."[:300], not_sent=True)
+            prior = json.loads(json.dumps(recs[ticker])) if ticker in recs else None
+            rec = recs.get(ticker) or {}
+            entry = self._entry_state(rec, orders)
+            why = self._chase_refusal(ticker, rec, entry, orders, blocked, fresh)
+            if why:
+                return self._refuse(ticker, why, not_sent=True, again=why == ORDERS_OLD)
+            shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
+            if shares < 1:
+                return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
+            red = self._row_disagrees(view, ticker, side, o)
+            if red:
+                self._put(ticker, state=RED, side=side, origin="auto", kind="chase", order_id=None,
+                          text=red, red_why=f"{ticker}: the tape and the plan row disagree. Use the ticket or "
+                                            "thinkorswim for it today.")
+                return self._refuse(ticker, red, not_sent=True, red=True)
+            try:
+                req = chase_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, o["cap"])
+            except ValueError as e:
+                return self._refuse(ticker, f"Could not build the chase: {e}", not_sent=True)
+            now = self._now()
+            sent_at = now.isoformat(timespec="milliseconds")
+            wait_until = (now + timedelta(seconds=float(wait_s))).isoformat(timespec="milliseconds") if wait_s else None
+            rng = {"high": None if pick is None else str(pick.get("high")),
+                   "low": None if pick is None else str(pick.get("low"))}
+            self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
+                      kind="chase", range=rng, sent_at=sent_at, wait_from=sent_at, wait_until=wait_until,
+                      chases=int(rec.get("chases") or 0) + 1, flips=int(rec.get("flips") or 0),
+                      sent={"ticket_id": req["ticket_id"], "trigger": req["trigger"], "limit": req["limit"],
+                            "stop": req["stop"], "shares": shares, "cap": req["cap"]},
+                      text=f"Sending the {side.lower()} chase: limit {req['limit']}, cap {req['cap']} (armed plan).")
+        log("chase_send_start", side=side.lower(), trigger=req["trigger"], cap=req["cap"], limit=req["limit"],
+            stop=req["stop"], shares=shares, plan_shares=int(o["shares"]), ticket_id=req["ticket_id"],
+            send_at=sent_at)
+        logging.getLogger("companion.plan_auto").warning(
+            "ARMED PLAN %s %s chase: trigger %s cap %s limit %s stop %s, %s sh", side, ticker, req["trigger"],
+            req["cap"], req["limit"], req["stop"], shares)
+        r = self._send(ticker, side, req)
+        log("chase_send_answer", ok=bool(r.get("ok")), status=r.get("status"), order_id=r.get("order_id"),
+            ticket_id=req["ticket_id"], error=str(r.get("error") or "")[:300] or None,
+            answer_at=self._now().isoformat(timespec="milliseconds"))
+        if self.trader.store.get_ticket(req["ticket_id"]) is None:
+            # Trader.submit refused before recording the intent: no request left (CONTRIBUTING rule 4).
+            again = bool(r.get("again")) or str(r.get("error") or "").startswith(TRADER_BUSY)
+            if again:
+                with self._lock:
+                    recs = self._load()
+                    if prior is None:
+                        recs.pop(ticker, None)
+                    else:
+                        recs[ticker] = prior
+                    self._save(recs)
+                    if r.get("quoted"):
+                        k = self._key() + ticker
+                        self._chase_tries[k] = self._chase_tries.get(k, 0) + 1
+            return {**r, "not_sent": True, "again": again, "quoted": bool(r.get("quoted"))}
+        return r
+
+    @staticmethod
+    def _chase_text(rec: Mapping, entry: Mapping) -> str:
+        """The row's line for a chase of the armed plan (brief 18 item 6), "" for anything else."""
+        if rec.get("kind") != "chase" or not rec.get("order_id"):
+            return ""
+        sent = rec.get("sent") or {}
+        text = f"Chased by the armed plan: limit {sent.get('limit')}, cap {sent.get('cap')}."
+        until = rec.get("wait_until")
+        if entry.get("resting") and until:
+            try:
+                at = datetime.fromisoformat(str(until)).astimezone(ET)
+                text += f" It waits for a pullback until {at:%H:%M:%S} ET, then the plan cancels it."
+            except ValueError:
+                pass
+        return text
+
 
 def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
              now: Optional[Callable[[], datetime]] = None) -> bool:
@@ -825,7 +980,7 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         return False
     if demo:
         # Invented entries so the screen shows each state; every click is still refused.
-        recs, orders = demo_entries()
+        recs, orders = demo_entries(env)
         desk = PlanDesk(trader, view, lambda: orders, flips, now=now,
                         armed=lambda: True, market_open=lambda: True, demo=True)
         desk._mem = {desk._key(): recs}
@@ -872,9 +1027,11 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
     return True
 
 
-def demo_entries() -> tuple[dict, list[dict]]:
+def demo_entries(env: Mapping[str, str] = os.environ) -> tuple[dict, list[dict]]:
     """`--demo` only: AAAA has a resting long entry (Cancel and Flip work), BBBB's flip stopped on a
-    fill (red). Order ids and fills are invented; nothing reaches Schwab."""
+    fill (red). Order ids and fills are invented; nothing reaches Schwab. With
+    EDGE_TRADER_PLAN_AUTO_CHASE=1 too, AAAA's entry is the armed plan's chase resting past its cap
+    (Step 8), so the screen shows the chase line."""
     recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0},
             "BBBB": {"state": RED, "side": "SHORT", "ticket_id": "demo-bbbb", "order_id": 9002, "flips": 1,
                      "text": "Flip stopped: 1 shares filled before the cancel. Its stop is live. Nothing new "
@@ -883,4 +1040,10 @@ def demo_entries() -> tuple[dict, list[dict]]:
                "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "AAAA"}}]},
               {"orderId": 9002, "status": "FILLED", "filledQuantity": 1, "orderStrategyType": "TRIGGER",
                "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "BBBB"}}]}]
+    if env.get(chase_entry.FLAG) == "1":
+        # AAAA's demo numbers (companion/opening_plan/demo_feed.py): level 42.49, stop 41.92, cap 0.06.
+        until = datetime.now(ET).replace(hour=9, minute=33, second=5, microsecond=0)   # demo 09:31:05 + 120 s
+        recs["AAAA"].update(origin="auto", kind="chase", chases=1, wait_until=until.isoformat(),
+                            sent={"ticket_id": "demo-aaaa", "trigger": "42.49", "limit": "42.55", "stop": "41.92",
+                                  "shares": 1, "cap": "0.06"})
     return recs, orders

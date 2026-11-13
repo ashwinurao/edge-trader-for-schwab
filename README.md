@@ -330,6 +330,35 @@ would flip it to the short side. In the same file, the next line after it says `
 ("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
 `would_fill` at 50.04, a trade inside 50.01 to 50.08.
 
+**Capped chase by the armed plan (Step 8, off by default; not merged until Ash's go).** With
+`EDGE_TRADER_PLAN_AUTO_CHASE=1` on top of the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`,
+`EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1`, `EDGE_TRADER_PLAN_BUTTONS=1`) and only after Ash's Arm
+click, a pick that has already traded at or past its level when the plan would place gets a chase
+instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_entry.py`):
+- The order is the ticket's own limit entry with its stop attached, not a new order shape: BUY (SELL
+  SHORT) LIMIT at the level plus (minus) the cap, the stop at the other side of the 09:30 range,
+  1 share (`BREAK_MAX_SHARES`). The cap is 0.15 x the risk per share, at least 2 cents, at most
+  0.15% of the price, rounded down to the cent (`companion/opening_plan/playbook.json` "automatic";
+  `companion/chase_entry.py` refuses any cap above that rule). A fill at the cap loses at most 1.15 R.
+- Inside the cap it should fill at once. Past the cap it rests at the cap; the plan cancels it
+  `pullback_wait_seconds` (120) after the send if it has not filled, and waits for Schwab's confirmed
+  cancel. The limit never moves. The end of the fast watch (09:35 ET) cancels it like any plan entry.
+- One chase per pick a day. A chased entry is never flipped and never chased again. After a flip,
+  the other side may be chased once when its level has already traded.
+- Just before the send the plan reads the tape again: the reading must be usable, still at or past
+  the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
+  entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
+  level and not through the stop. A quote that is old or back inside the level lets the plan try
+  again on a later reading, at most `CHASE_QUOTE_TRIES` (3) times a row a day.
+- Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
+  a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name
+  blocked until you press Resolve.
+- The row says "Chased by the armed plan: limit X, cap Y." and, while it rests, until when it waits.
+  The plan's log (`data/opening_plan/auto/`) has the level, the cap, the last trade and its age, the
+  limit sent and the times (reading, decision, send, answer).
+- Not confirmed at Schwab: how a marketable limit entry with an attached stop behaves in the first
+  seconds after 09:31 (the first 1-share live morning answers it).
+
 **Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
 and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
 (`companion/plan_entries.py`). Without both, there are no buttons and no button routes. Each button
@@ -397,6 +426,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO_CHASE` | `1`, together with `EDGE_TRADER_PLAN_AUTO=1` and the switches it needs, lets the armed plan chase a pick that already traded through its level: one limit entry at the capped price with its stop, once per pick a day. Off by default. |
 
 ## Good to know
 

@@ -18,6 +18,10 @@ These decide most review questions:
    allowed in this fork by Ash on 2026-11-09, fork PR #12): when the app-watched stop fires, the app
    sends that spread's close once, only while it runs, never retried. Any other change that would act
    without a click will not be merged.
+   The armed Opening plan (OV entries Steps 6 to 8, `companion/plan_auto/`) would be a third
+   exception, armed by Ash's click each morning; its capped chase (Step 8,
+   `EDGE_TRADER_PLAN_AUTO_CHASE`) sends one limit entry at the capped price with its stop, once per
+   pick a day. None of it merges without Ash's own go for that exception.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working

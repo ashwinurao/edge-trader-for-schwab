@@ -16,7 +16,8 @@ at least CAP_MIN, at most CAP_MAX_PCT of the trigger (the floor wins when they c
 to the cent. These are break_entry.py's numbers, which equal the playbook's "automatic" start
 numbers (tests/test_chase_entry.py checks they match). Ash has not approved them (brief 14).
 
-Off unless EDGE_TRADER_PLAN_AUTO_CHASE=1 and EDGE_TRADER_PLAN_AUTO=1. Shares only, at most
+Off unless EDGE_TRADER_PLAN_AUTO_CHASE=1 with every switch before it (EDGE_TRADER_PLAN_AUTO=1,
+EDGE_SCANNER_URL, EDGE_TRADER_BREAK_ENTRY=1, EDGE_TRADER_PLAN_BUTTONS=1). Shares only, at most
 break_entry.BREAK_MAX_SHARES. Ash's go for building it: "Build 6,7,8,9 in parallel branches right
 now, build, test and then wait to merge those branches" (project thread "Review OV picks desk
 architecture", 2026-11-13 15:21:55 UTC). Sending without a click is a new exception to CONTRIBUTING
@@ -35,14 +36,16 @@ from typing import Mapping
 
 from . import break_entry
 from .bracket import Plan, _price, _to_tick, bracket_order, fmt, plan, tick
+from .plan_auto import AUTO_FLAG, CHASE_FLAG, switch_on
 
-FLAG = "EDGE_TRADER_PLAN_AUTO_CHASE"
-AUTO_FLAG = "EDGE_TRADER_PLAN_AUTO"          # Step 6's switch: the chase needs it (brief 14 rule 1)
+FLAG = CHASE_FLAG
 MAX_QUOTE_AGE_MS = break_entry.MAX_QUOTE_AGE_MS   # R-03: under 5 s, as the break entry
+BACK_INSIDE = "Price is back"                # the refusal when Schwab's quote is back inside the level
 
 
 def enabled(env: Mapping[str, str] = os.environ) -> bool:
-    return env.get(FLAG) == "1" and env.get(AUTO_FLAG) == "1"
+    """This switch with every switch before it (companion/plan_auto/__init__.py, brief 14 rule 1)."""
+    return switch_on(CHASE_FLAG, env)
 
 
 def max_cap(trigger, stop) -> Decimal:
@@ -162,10 +165,10 @@ def make_plan(req: dict, q: dict) -> Plan:
     # A chase is only for a price at or past the level. Back inside it, a limit at the cap would buy
     # (sell short) at once BEFORE the break: that is the break entry's job (brief 05), not this one.
     if long and ask < trig:
-        return _bad(sym, req, f"Price is back under the level: ask {fmt(ask)} is below {fmt(trig)}. "
+        return _bad(sym, req, f"{BACK_INSIDE} under the level: ask {fmt(ask)} is below {fmt(trig)}. "
                               "The chase is only for a price at or past the level")
     if not long and bid > trig:
-        return _bad(sym, req, f"Price is back over the level: bid {fmt(bid)} is above {fmt(trig)}. "
+        return _bad(sym, req, f"{BACK_INSIDE} over the level: bid {fmt(bid)} is above {fmt(trig)}. "
                               "The chase is only for a price at or past the level")
     # The rest is the limit bracket's own sizing and checks (stop below the bid, at least
     # MIN_STOP_TICKS from the limit, the share and notional caps), entered at the limit.
@@ -192,26 +195,33 @@ def prepare(trader, req: dict, now_ms: float | None = None) -> tuple[Plan | None
         return None, {"ok": False, "error": msg, **extra}
 
     if not enabled():
-        return no(f"Chase entries are off. They need {FLAG}=1 and {AUTO_FLAG}=1 in .env. Nothing was sent.")
+        return no(f"Chase entries are off. They need {FLAG}=1 and {AUTO_FLAG}=1 with the switches before it "
+                  "(companion/plan_auto/__init__.py). Nothing was sent.")
     got = _check_request(req)
     if isinstance(got, str):
         return no(got.rstrip(".") + ". Nothing was sent.")
+    # From here on one Schwab call (the quote) was made: every refusal says so ("quoted"), and
+    # "again" marks a passing reason, so the armed plan may try the pick on a later reading
+    # (companion/plan_auto/chase.py counts those tries).
     q = trader.quote(req["symbol"], max_age=0)
     if q.get("realtime") is not True:
-        return no("Schwab's quote is not real-time, so the chase cannot be checked. Nothing was sent.")
+        return no("Schwab's quote is not real-time, so the chase cannot be checked. Nothing was sent.",
+                  quoted=True, again=True)
     qt = q.get("quote_time")
     now_ms = time.time() * 1000 if now_ms is None else now_ms
     if not isinstance(qt, (int, float)) or isinstance(qt, bool) or now_ms - qt > MAX_QUOTE_AGE_MS:
         age = f"{(now_ms - qt) / 1000:.1f} s old" if isinstance(qt, (int, float)) and not isinstance(qt, bool) \
             else "without a time"
         return no(f"Schwab's quote is {age} (a chase needs one under {MAX_QUOTE_AGE_MS / 1000:g} s). "
-                  "Nothing was sent.")
+                  "Nothing was sent.", quoted=True, again=True)
     p = make_plan(req, q)
     if not p.ok:
-        return no("; ".join(p.errors).rstrip(".") + ". Nothing was sent.", plan=p.as_dict())
+        back = any(e.startswith(BACK_INSIDE) for e in p.errors)
+        return no("; ".join(p.errors).rstrip(".") + ". Nothing was sent.", plan=p.as_dict(), quoted=True,
+                  again=back)
     if p.has_target:                          # never: target=False above; a guard, not a path
-        return no("A chase entry takes no target. Nothing was sent.")
+        return no("A chase entry takes no target. Nothing was sent.", quoted=True, again=False)
     blocked = trader._blocked(p.symbol, trader._ensure()) or trader._spread_gate([p.symbol])
     if blocked:
-        return no(blocked["error"])
+        return no(blocked["error"], quoted=True, again=False)
     return p, bracket_order(p)

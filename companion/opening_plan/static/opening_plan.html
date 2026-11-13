@@ -147,6 +147,8 @@ function notes(r) {
       out.push(`<div class="mutline">Place: ${esc(e.place.long)}</div>`);
     // A red row's entry may still rest at Schwab: its status goes under the red text.
     if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);
+    // The armed plan's chase (Step 8): its limit, cap and, while it rests, until when it waits.
+    if (st.auto_text) out.push(`<div class="mutline">${esc(st.auto_text)}</div>`);
   }
   if (b.state !== "FINAL" && b.state !== "SO_FAR" && b.text) out.push(`<div class="${b.state === "BAD" ? "badline" : "mutline"}">${esc(b.text)}</div>`);
   for (const k of ["long", "short"]) if (r[k] && r[k].capped) out.push(`<div class="badline">${k === "long" ? "Long" : "Short"} shares ${esc(r[k].capped)}.</div>`);

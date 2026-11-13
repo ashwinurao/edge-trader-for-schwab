@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional, Protocol
 
-from . import switch_on
+from . import CHASE_FLAG, switch_on
 
 Handler = Callable[["Lane"], bool]
 
@@ -266,7 +266,9 @@ def on_cancel(lane: Lane) -> bool:
 
 def default_registry() -> Registry:
     """Step 6's handlers. Steps 7 and 8 add theirs here, each behind its own switch."""
+    from .chase import on_chase               # Step 8 (brief 18); imported here: chase.py imports this file
     reg = Registry()
     reg.register("would_place", on_place)
     reg.register("would_cancel", on_cancel)
+    reg.register(PAST_TRIGGER, on_chase, switch=CHASE_FLAG)
     return reg

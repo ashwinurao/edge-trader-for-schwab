@@ -21,6 +21,9 @@ from companion.trading import Trader
 NOW_MS = 1_763_044_260_000.0           # a fixed clock; quote times are set relative to it
 INSTR = {"symbol": "ABCD", "assetType": "EQUITY"}
 PLAYBOOK = Path(__file__).resolve().parents[1] / "companion" / "opening_plan" / "playbook.json"
+# The chase's switch and every switch before it (companion/plan_auto/__init__.py, brief 14 rule 1).
+SWITCHES = {"EDGE_SCANNER_URL": "http://scanner.test:8772", "EDGE_TRADER_BREAK_ENTRY": "1",
+            "EDGE_TRADER_PLAN_BUTTONS": "1", "EDGE_TRADER_PLAN_AUTO": "1", "EDGE_TRADER_PLAN_AUTO_CHASE": "1"}
 
 
 class Resp:
@@ -50,8 +53,8 @@ def _q(bid, ask, age_ms=500.0, realtime=True, **kw):
 
 @pytest.fixture
 def trader(tmp_path, monkeypatch):
-    monkeypatch.setenv("EDGE_TRADER_PLAN_AUTO", "1")
-    monkeypatch.setenv("EDGE_TRADER_PLAN_AUTO_CHASE", "1")
+    for k, v in SWITCHES.items():
+        monkeypatch.setenv(k, v)
     monkeypatch.setattr(chase_entry.time, "time", lambda: NOW_MS / 1000)
     t = Trader(Store(tmp_path / "t.db"))
     t._client, t._hash = FakeClient(), "H" * 64
@@ -226,15 +229,9 @@ def _refused(trader, r, text):
     assert trader.store.open_tickets() == []
 
 
-@pytest.mark.parametrize("unset", ["EDGE_TRADER_PLAN_AUTO_CHASE", "EDGE_TRADER_PLAN_AUTO"])
-def test_switch_off_refuses_the_entry_type(trader, monkeypatch, unset):
+@pytest.mark.parametrize("unset", sorted(SWITCHES))
+def test_any_switch_off_refuses_the_entry_type(trader, monkeypatch, unset):
     monkeypatch.delenv(unset)
-    _refused(trader, trader.submit(long_req()), "Chase entries are off")
-
-
-def test_the_break_switch_alone_does_not_allow_a_chase(trader, monkeypatch):
-    monkeypatch.delenv("EDGE_TRADER_PLAN_AUTO_CHASE")
-    monkeypatch.setenv("EDGE_TRADER_BREAK_ENTRY", "1")
     _refused(trader, trader.submit(long_req()), "Chase entries are off")
 
 
