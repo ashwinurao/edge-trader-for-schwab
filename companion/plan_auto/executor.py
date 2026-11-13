@@ -1,8 +1,9 @@
 """The armed plan's worker (brief 16 item 2): one daemon thread, asleep unless armed and in the window.
 
 Each step, from armed.act_from_et (09:31:00 ET) while armed:
-1. Whole-plan checks: the dashboard's ARM, Schwab's 429 pause, Schwab's order list fresh. Any one
-   failing disarms (a 429 for the day).
+1. Whole-plan checks: the dashboard's ARM and Schwab's 429 pause. Either one disarms (a 429 for
+   the day). An old order list does not disarm: it is a wait (architect's live-test notes N1,
+   2026-11-13): the desk's twins refuse with `again` and the pick tries on a later reading.
 2. Take Step 2's view from the feed's last answer (never asking Edge Scanner: the page and the
    shadow fetch it) for the row check; when it is missing or older than feed.stale_after_seconds
    the row check is skipped and the log says so once. Then read the open tape (brief 15,
@@ -14,11 +15,14 @@ Each step, from armed.act_from_et (09:31:00 ET) while armed:
    pick's real entry (PlanDesk.auto_entry: the row record joined with Schwab's order list).
 4. engine.decide, then give the decisions to their handlers (handlers.py) nearest to the trigger
    first, in R. One order action per reading: after a send or a cancel the next step takes a new
-   reading and decides again, so a later pick never goes out on an earlier pick's reading. A busy
-   Trader lock (a click, a ticket send or Flat all) is not an action: the step ends, no other pick
-   tries on that reading, and the next step comes one tick later.
+   reading and decides again, so a later pick never goes out on an earlier pick's reading. A wait
+   (Trader's lock busy: a click, a ticket send or Flat all; or Schwab's order list old) is not an
+   action: the step ends, no other pick tries on that reading, and the next step comes one tick
+   later. When a pick that waited acts, one `wait_over` line says how long it waited.
 5. At the watch end the engine says would_cancel for each unfilled plan entry; once none is left
-   the plan disarms ("the fast watch ended").
+   the plan disarms ("the fast watch ended"). The arm ends at the latest end_grace_seconds later;
+   if the cancels were still waiting on an old order list, the disarm says how many entries were
+   not cancelled for that reason (review 4 of fork PR #27).
 
 The worker never holds a lock of its own across a call to Schwab or Edge Scanner, contains every
 exception (an unexpected one disarms for the day and shows why) and never blocks the ticket, the
@@ -167,7 +171,7 @@ class AutoPlan:
         self.sends: deque = deque()             # (monotonic seconds, calls) of the plan's sends
         self.onces: set = set()
         self.last_reading: dict = {}
-        self.busy_picks: dict[str, tuple] = {}  # ticker -> (what, why) while it waits (Trader's lock, an old list)
+        self.busy_picks: dict[str, tuple] = {}  # ticker -> (what, why, since mono) while it waits (Trader's lock, an old list)
         self._busy_step = False
         self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
         self.row_check_why = ""                 # the same in words, for the panel
@@ -325,16 +329,21 @@ class AutoPlan:
         old (an old list is a wait: live-test notes N1, 2026-11-13 20:12 UTC). Not an action: the
         step ends, no other pick tries on that reading and the worker waits one tick. Said once per
         pick while the same reason lasts, not once per try: a "busy" line for the lock, "wait" else."""
+        now = self._mono()
         with self._lock:
             self._busy_step = True
-            first = self.busy_picks.get(ticker) != (what, why)
-            self.busy_picks[ticker] = (what, why)
+            prev = self.busy_picks.get(ticker)
+            first = prev is None or prev[:2] != (what, why)
+            # The wait counts from its first try, whatever the reason became (wait_over's waited_s).
+            self.busy_picks[ticker] = (what, why, now if prev is None else prev[2])
             if first:
                 self.notes.setdefault(ticker, {})["note"] = why
         if first:
             self.log("busy" if why == plan_entries.TRADER_BUSY else "wait", ticker, what=what, why=why)
 
     def _busy_over(self, ticker: str) -> None:
+        """A pick that waited acted: one wait_over line with how long it waited (review 4 of fork PR
+        #27: the first armed morning shows how long the order list was old)."""
         with self._lock:
             got = self.busy_picks.pop(ticker, None)
             if got is None:
@@ -342,6 +351,28 @@ class AutoPlan:
             n = self.notes.setdefault(ticker, {})
             if n.get("note") == got[1]:
                 n["note"] = ""
+        self.log("wait_over", ticker, what=got[0], why=got[1], waited_s=round(self._mono() - got[2], 2))
+
+    def _resting(self) -> list[str]:
+        """The plan's own entries still working at Schwab, by the poller's order list."""
+        recs, orders = self.desk.records(), self._orders()
+        return [t for t, rec in recs.items()
+                if rec.get("origin") == "auto" and self.desk.auto_entry(t, recs, orders).get("state") == "working"]
+
+    def _arm_end_reason(self) -> str:
+        """Why the arm ended. When the cancels were still waiting on an old order list, how many
+        entries that left resting (review 4 of fork PR #27, 2026-11-13 20:23 UTC)."""
+        why = "the end of the fast watch passed"
+        with self._lock:
+            waited = any(w[:2] == ("cancel", plan_entries.ORDERS_OLD_AUTO_CANCEL) for w in self.busy_picks.values())
+        if not waited:
+            return why
+        try:
+            n = len(self._resting())
+        except Exception:
+            return f"{why}; entries were not cancelled because Schwab's order list was old"
+        return (f"{why}; {n} entr{'y was' if n == 1 else 'ies were'} not cancelled because Schwab's order "
+                "list was old")
 
     # ---- one step -----------------------------------------------------------------------------
 
@@ -502,7 +533,7 @@ class AutoPlan:
         snap = self.arming.snapshot()
         if not self.arming.is_armed(now):
             if snap["armed_at"] is not None:
-                self.disarm("the end of the fast watch passed")
+                self.disarm(self._arm_end_reason())
             return False
         why, for_day = self._plan_problem()
         if why:
@@ -692,10 +723,7 @@ class AutoPlan:
             row_check_why = self.row_check_why if self.row_check else ""
         resting = []
         try:
-            recs, orders = self.desk.records(), self._orders()
-            for t, rec in recs.items():
-                if rec.get("origin") == "auto" and self.desk.auto_entry(t, recs, orders).get("state") == "working":
-                    resting.append(t)
+            resting = self._resting()
         except Exception:
             pass
         out = {"enabled": True, "demo": self.demo, "playbook": self.playbook_name, "armed": armed,

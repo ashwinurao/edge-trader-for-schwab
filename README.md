@@ -577,8 +577,10 @@ An old order list is a wait in the same way: one failed read of Schwab's order l
 for 15 seconds (3 times the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in
 `companion/poller.py`). The plan sends and cancels nothing on it, the pick's line says "Schwab's order
 list is old. Nothing is sent until it is fresh." (or "…cancels nothing…" for a cancel), and it tries
-again on each reading until the list is fresh or the watch ends. On 2026-11-13, while order calls ran,
-the poller read the order list only every 12 to 19 seconds.
+again on each reading until the list is fresh or the watch ends. If the 09:35 cancels are still
+waiting when the arm ends (45 seconds after 09:35), the plan disarms with "the end of the fast watch
+passed; N entries were not cancelled because Schwab's order list was old", and the red banner lists
+them. On 2026-11-13, while order calls ran, the poller read the order list only every 12 to 19 seconds.
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
@@ -619,8 +621,9 @@ wait. That is why the order list can go old while the plan works; brief 24 chang
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
 start and its answer with their times. A step that took over 100 ms before its action adds a
-`slow_step` line. A busy order lock adds one `busy` line per pick, and a skipped row check one
-`row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
+`slow_step` line. A busy order lock adds one `busy` line per pick, an old order list one `wait` line,
+and the pick's action after either a `wait_over` line with how long it waited (`waited_s`). A skipped
+row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
 or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
 

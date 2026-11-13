@@ -490,6 +490,9 @@ def test_an_old_order_list_is_a_wait_and_the_pick_goes_once_it_is_fresh(rig):
     run(rig, et(9, 31, 3))
     assert placed(rig) == NEAREST_FIRST                     # each exactly once
     assert [(x["ticker"], x["what"], x["why"]) for x in lines(rig, "wait")] == [("DDDD", "send", plan_entries.ORDERS_OLD)]
+    # Review 4 of PR #27: one wait_over line when the pick that waited acts, with how long it waited.
+    assert [(x["ticker"], x["what"], x["why"], x["waited_s"]) for x in lines(rig, "wait_over")] == [
+        ("DDDD", "send", plan_entries.ORDERS_OLD, 0.25)]
     p = rig.plan.panel()
     assert {x["ticker"]: x["note"] for x in p["picks"]}["DDDD"] == "" and all(x["left"] == "" for x in p["picks"])
 
@@ -524,6 +527,26 @@ def test_an_old_order_list_at_the_watch_end_holds_the_cancels_until_it_is_fresh(
     run(rig, et(9, 35, 15))
     assert sorted(rig.broker.cancelled) == sorted(ids.values())
     assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "AAAA", "BBBB", "CCCC"]
+    over = lines(rig, "wait_over")                          # about the 2 s the list was old, on 0.25 s ticks
+    assert [(x["ticker"], x["what"]) for x in over] == [("DDDD", "cancel")] and 2.0 <= over[0]["waited_s"] <= 2.25
+    assert "order list was old" not in rig.plan.panel()["disarmed"]["why"]
+
+
+def test_an_old_order_list_past_the_arm_end_cancels_nothing_and_says_how_many_rest(rig):
+    """Review 4 of PR #27 (architect, 2026-11-13 20:23 UTC): the unhappy end of the cancel wait. Four
+    entries rest and the list is old from 09:35:00 past the arm's end (09:35 + end_grace_seconds 45).
+    No cancel goes, the plan disarms at 09:35:45 and says how many entries the old list left resting,
+    and the red banner names all four."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.knobs["fresh"] = False
+    run(rig, et(9, 36, 0), start=et(9, 35, 0))
+    assert rig.broker.cancelled == [] and lines(rig, "cancel_start") == [] and lines(rig, "wait_over") == []
+    p = rig.plan.panel()
+    want = ("the end of the fast watch passed; 4 entries were not cancelled because Schwab's order list was old")
+    assert not p["armed"] and p["disarmed"] == {"at_et": "09:35:45", "why": want}
+    assert [x["why"] for x in lines(rig, "disarm")] == [want]
+    assert sorted(p["resting"]) == sorted(PICKS) and all(t in p["resting_text"] for t in PICKS)
 
 
 def test_must_not_send_on_a_blocked_name(rig):
