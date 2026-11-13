@@ -225,6 +225,26 @@ def test_minute_so_far_is_marked_with_its_age():
     assert r["long"]["entry"] == 71.85 and r["short"]["entry"] == 71.19
 
 
+def test_the_snapshots_0930_bar_says_not_confirmed_and_stays_so_far():
+    # Edge Scanner PR #45 (2026-11-13): just after 09:31 it sends the 09:30 bar from Alpaca's
+    # snapshot with first_minute_as_of "09:31:00", the bar's end, until its bar request confirms it.
+    r = view([pick(3, "CCCC", 71.84, 71.20, 71.31, atr=3.1, as_of="09:31:00")], risk=250,
+             now=et(9, 31, 1))["rows"][0]
+    assert r["bar"]["state"] == P.SO_FAR            # not FINAL, so the order buttons still wait
+    assert r["bar"]["as_of_et"] == "09:31:00" and r["bar"]["age_s"] == 1.0
+    assert r["bar"]["text"] == ("The 09:30 ET bar from Edge Scanner's snapshot, not confirmed yet. "
+                                "Edge Scanner's bar request confirms it within seconds.")
+    assert r["long"]["entry"] == 71.85 and r["short"]["entry"] == 71.19
+
+
+def test_a_trades_time_keeps_the_so_far_text():
+    for as_of in ("09:30:47", "09:30:59"):
+        r = view([pick(3, "CCCC", 71.84, 71.20, 71.31, atr=3.1, as_of=as_of)], risk=250,
+                 now=et(9, 31, 1))["rows"][0]
+        assert r["bar"]["state"] == P.SO_FAR
+        assert r["bar"]["text"] == f"So far, to {as_of} ET. The bar replaces it just after 09:31 ET."
+
+
 def test_before_the_open_rows_wait():
     r = view([pick(1, "AAAA")], risk=250, now=et(9, 29, 50))["rows"][0]
     assert r["bar"]["state"] == P.WAITING and r["long"] is None and r["shares"]["state"] == "NO_LEVELS"
