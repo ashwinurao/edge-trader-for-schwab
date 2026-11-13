@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 log = logging.getLogger("companion.netlog")
 
 DIR = Path(__file__).resolve().parent.parent / "data" / "netlog"
+APP = "edge-trader"                  # record format v1 (brief 08): every app names itself
 MAX_QUEUE = 20_000
 
 _q: queue.Queue = queue.Queue(maxsize=MAX_QUEUE)
@@ -105,17 +106,39 @@ def _run() -> None:
                 _q.task_done()
 
 
+def _ensure_writer() -> None:
+    """Start the writer thread once (and again if it ever died)."""
+    global _writer
+    with _start_lock:
+        if _writer is None or not _writer.is_alive():
+            _writer = threading.Thread(target=_run, name="netlog-writer", daemon=True)
+            _writer.start()
+
+
+def emit(kind: str, **fields) -> None:
+    """Queue one line of any kind (record format v1, brief 08). Never raises."""
+    global dropped
+    try:
+        if not enabled():
+            return
+        _ensure_writer()
+        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), "kind": kind,
+               "app": APP, **fields}
+        try:
+            _q.put_nowait(rec)
+        except queue.Full:
+            dropped += 1
+    except Exception:
+        pass
+
+
 def attach(session) -> bool:
     """Record every answer this requests session gets. True when attached."""
-    global _writer
     try:
         if not enabled():
             return False
         hooks = session.hooks.setdefault("response", [])
-        with _start_lock:
-            if _writer is None or not _writer.is_alive():
-                _writer = threading.Thread(target=_run, name="netlog-writer", daemon=True)
-                _writer.start()
+        _ensure_writer()
         if _on_response not in hooks:
             hooks.append(_on_response)
         return True
