@@ -61,6 +61,21 @@ name are refused). It needs no account and sends no telemetry.
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
   (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
   and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
+- **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
+  around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
+  Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
+  weekdays, from `companion/open_probe.json` (default 09:28:00 to 09:40:00). Every 5 seconds it asks one
+  quote for the day's Opening plan symbols (ranks 1 to 4, at most 6) plus SPY, and at 09:29:30, 09:30:02,
+  09:30:30, 09:31:02, 09:32:00 and 09:35:00 it previews a long Break order for the first pick (SPY when there
+  is none): trigger = ask + the larger of 5 cents and 0.2%, stop = trigger - 1% of the price. It writes
+  `kind: "probe"` lines to `data/netlog/`: Schwab's quote and trade times and their age when the answer
+  arrived, bid, ask, last, the wire time, and for a preview only the status word, the texts of Schwab's
+  rejects, warns, alerts, accepts and reviews (rule name and message), and on a refused preview the texts
+  of its message and errors (never the rest of the answer, which holds the account number). No retries:
+  any 429, or the app's own 429 pause, stops it for the rest of the window. About 150
+  Schwab requests per default window (144 quote calls and 6 previews in 12 minutes), on the same Schwab app
+  limit as everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner once, a minute
+  before each window (`companion/open_probe.py`).
 
 ### API keys
 
@@ -313,6 +328,8 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 | `EDGE_TRADER_NETLOG` | `0` turns off the timing record of Schwab's answers in `data/netlog/`. On by default. |
+| `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
+| `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 
 ## Good to know
 
