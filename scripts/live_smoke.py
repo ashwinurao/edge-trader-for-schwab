@@ -410,23 +410,30 @@ class Run:
                     out.append(info)
                     continue
                 info["quote"] = q
-                for side in ("LONG", "SHORT"):
-                    s = (r.get("send") or {}).get(side.lower())
-                    if not isinstance(s, dict) or s.get("shares") != 1:
-                        info["sides"][side] = {"ok": False, "why": "no 1-share numbers"}
-                        continue
-                    trig, stp = float(s["trigger"]), float(s["stop"])
-                    if side == "LONG":
-                        through, dist = q["ask"] >= trig, (trig - q["ask"]) / q["ask"] * 100
-                        stop_ok = stp < q["bid"]
-                    else:
-                        through, dist = q["bid"] <= trig, (q["bid"] - trig) / q["bid"] * 100
-                        stop_ok = stp > q["ask"]
-                    why = ("the price is through the level" if through else
-                           "" if stop_ok else "the price is beyond the stop")
-                    info["sides"][side] = {"ok": not why, "why": why, "distance_pct": round(dist, 3),
-                                           "expected": {"trigger": s["trigger"], "stop": s["stop"], "shares": 1}}
+                info["sides"] = self.sides_now(r, q)
             out.append(info)
+        return out
+
+    @staticmethod
+    def sides_now(r: dict, q: dict) -> dict:
+        """Per side of a plan row: would Edge Trader take it at this quote, and how far is its level."""
+        out = {}
+        for side in ("LONG", "SHORT"):
+            s = (r.get("send") or {}).get(side.lower())
+            if not isinstance(s, dict) or s.get("shares") != 1:
+                out[side] = {"ok": False, "why": "no 1-share numbers"}
+                continue
+            trig, stp = float(s["trigger"]), float(s["stop"])
+            if side == "LONG":
+                through, dist = q["ask"] >= trig, (trig - q["ask"]) / q["ask"] * 100
+                stop_ok = stp < q["bid"]
+            else:
+                through, dist = q["bid"] <= trig, (q["bid"] - trig) / q["bid"] * 100
+                stop_ok = stp > q["ask"]
+            why = ("the price is through the level" if through else
+                   "" if stop_ok else "the price is beyond the stop")
+            out[side] = {"ok": not why, "why": why, "distance_pct": round(dist, 3),
+                         "expected": {"trigger": s["trigger"], "stop": s["stop"], "shares": 1}}
         return out
 
     def choose(self, rows: list[dict], need_both: bool = False, exclude=(), nearest: bool = False):
@@ -1163,6 +1170,200 @@ def sc_plan_flat(r: Run) -> None:
     r.arm(False)
 
 
+def sc_pick_ticket(r: Run) -> None:
+    """At the current price, on one of today's plan picks, with the ticket's Break entry (the plan
+    row's own levels are not used, so no waiting for the price to reach one). Part A: a ticket entry
+    rests far from the price: the plan row must refuse an entry on that name and Flat all must
+    leave it alone. Part B: a ticket entry fills 1 share a few cents from the price: Flat all must
+    say the share is not from the plan and not touch it; what the row offers is recorded; Close."""
+    e = r.entries()
+    if e is None:
+        raise Stop("the plan buttons are off (no /api/opening-plan/entries)")
+    if r.flat() is None:
+        raise Stop("Flat all is off (no /api/opening-plan/flat)")
+    side = (r.a.side or "LONG").upper()
+    sign = 1 if side == "LONG" else -1
+    st = r.state()
+    cands = []
+    for row in e.get("rows") or []:
+        t = row.get("ticker")
+        if r.a.ticker and t != r.a.ticker.upper():
+            continue
+        why = ("row state " + str((row.get("entry") or {}).get("state"))
+               if (row.get("entry") or {}).get("state") != "NONE" else
+               "held or has a working order" if r.holds(t, st) or r.orders(t, st) else "")
+        if not why:
+            try:
+                q = r.quote(t)
+                cands.append(((q["ask"] - q["bid"]) / q["bid"] * 100, t, q))
+                continue
+            except Stop as x:
+                why = str(x)
+        r.note("PICK_SKIPPED", ticker=t, why=why)
+    if not cands:
+        r.check("a plan pick is free for the test (not held, no order, nothing on its row)", False)
+        return
+    cands.sort(key=lambda c: c[0])                # the tightest spread: the cheapest 1-share round trip
+    spread, t, q = cands[0]
+    r.note("PICK_CHOSEN", ticker=t, side=side, quote=q, spread_pct=round(spread, 3),
+           others=[{"ticker": c[1], "spread_pct": round(c[0], 3)} for c in cands[1:]])
+    r.arm(True)
+
+    def flat_mine():
+        f = r.flat() or {}
+        items = [{k: it.get(k) for k in ("ticker", "rank", "action", "order_id", "shares", "side")}
+                 for it in f.get("items") or []]
+        mine = [{k: it.get(k) for k in ("ticker", "action", "order_id", "shares", "side", "text")}
+                for it in f.get("items") or [] if it.get("ticker") == t]
+        return f, items, mine
+
+    def place_words(row):
+        return {k: str(((row or {}).get("place") or {}).get(k) or "") for k in ("long", "short")}
+
+    # ---- Part A: a ticket entry rests on the pick ------------------------------------------------
+    trig, stop = far(q, side)
+    ans, _ = r.submit(r.break_req(t, side, trig, stop), f"{t} {side} rest")
+    r.must(f"{t}: Schwab accepted the ticket's break entry", ans.get("ok") is True and bool(ans.get("order_id")),
+           got=r.pick(ans))
+    oid = ans["order_id"]
+    rows, waited = r.wait(lambda: [o for o in r.orders(t) if oid in (o["order_id"], o["group_id"])], 20, 1.0)
+    r.must(f"{t}: the entry shows in Schwab's order list", bool(rows), waited_s=round(waited, 1), orders=rows)
+
+    def row_blocked():
+        row = r.row_of(r.entries(), t)
+        return row if row and all("already at Schwab" in w for w in place_words(row).values()) else None
+    row, waited = r.wait(row_blocked, 15, 1.0)
+    cur = row or r.row_of(r.entries(), t) or {}
+    r.check(f"{t}: the plan row's Place buttons are off while a ticket entry works on the name", bool(row),
+            waited_s=round(waited, 1), row=r.row_brief(cur))
+    sides = r.sides_now(cur, r.quote(t))
+    s2 = next((s for s in ("LONG", "SHORT") if sides[s].get("ok")), side)
+    n = (cur.get("send") or {}).get(s2.lower())
+    exp = None if not isinstance(n, dict) else {k: n.get(k) for k in ("trigger", "stop", "shares")}
+    ans2, _ = r.place(t, s2, exp, "plan Place while a ticket entry works on the name")
+    refused(r, f"{t}: plan Place is refused while a ticket entry works on the name", ans2, "already at Schwab")
+    f, items, mine = flat_mine()
+    r.check(f"{t}: Flat all's list does nothing with the ticket's resting entry",
+            len(mine) == 1 and mine[0]["action"] == "nothing" and mine[0]["order_id"] != oid, mine=mine)
+    c, csecs = r.cancel_ticket(oid, f"{t} cancel the resting ticket entry")
+    r.must(f"{t}: cancel confirmed with nothing filled", c.get("ok") is True and c.get("status") == "CANCELED",
+           got=r.pick(c), secs=round(csecs, 3))
+    gone, waited = r.wait(lambda: not r.orders(t), 20, 1.0)
+    r.must(f"{t}: nothing works on the name after the cancel", bool(gone), waited_s=round(waited, 1))
+
+    def row_free():
+        row = r.row_of(r.entries(), t)
+        return row if row and not any("already at Schwab" in w for w in place_words(row).values()) else None
+    row, waited = r.wait(row_free, 30, 1.0)
+    r.check(f"{t}: the row's Place buttons come back after the cancel", bool(row), waited_s=round(waited, 1),
+            row=r.row_brief(row or r.row_of(r.entries(), t) or {}))
+    r.check(f"{t}: no share was bought or sold so far", r.shares(t) == 0)
+
+    # ---- Part B: a ticket entry fills 1 share on the pick ------------------------------------------
+    near = Decimal(str(r.a.near))
+
+    def filled():
+        s = r.state()
+        k = r.shares(t, s)
+        if k * sign >= 1:
+            return {"shares": k, "orders": r.orders(t, s)}
+        b = entry_ended(r, t, oid, s)
+        return {"ended": b} if b else None
+    got, req = None, None
+    for attempt in (1, 2, 3, 4):
+        q = r.quote(t)
+        r.note("QUOTE", **q)
+        trig = d2(q["ask"]) + near if side == "LONG" else d2(q["bid"]) - near
+        # The stop: --stop-away, or 0.6% of the price when that is more (a pick moves more than SPY).
+        away = max(Decimal(str(r.a.stop_away)), (trig * Decimal("0.006")).quantize(CENT))
+        req = r.break_req(t, side, trig, trig - away * sign)
+        ans, _ = r.submit(req, f"{t} {side} fill, try {attempt}")
+        err = str(ans.get("error") or "")
+        if ans.get("ok") is not True:
+            if attempt < 4 and ("already through" in err or any(x in err for x in TRANSIENT)):
+                r.note("REFUSED_AT_THE_CLICK", attempt=attempt, error=ans.get("error"))
+                time.sleep(2)
+                continue
+            r.must(f"{t}: Schwab accepted the break entry", False, got=r.pick(ans))
+        oid = ans["order_id"]
+        t_sent = time.monotonic()
+        got, waited = r.wait(filled, r.a.fill_wait, 1.0)
+        if not got:
+            r.note("NO_FILL", attempt=attempt, waited_s=round(waited, 1), orders=r.orders(t), quote=r.quote(t))
+            c, _ = r.cancel_ticket(oid, f"{t} no fill: cancel")
+            if c.get("ok") is True:
+                gone, _ = r.wait(lambda: not r.orders(t), 20, 1.0)
+                r.must(f"{t}: nothing works on the name after the cancel", bool(gone))
+                continue
+            r.note("CANCEL_REFUSED", answer=r.pick(c))
+            got, waited = r.wait(filled, 20, 1.0)
+            if not got:
+                raise Stop("the cancel was refused and no share shows: unclear")
+        if got.get("ended"):                      # Schwab rejected it after accepting it (found 18:49 UTC)
+            b = got["ended"]
+            r.open.pop(oid, None)
+            r.note("ENDED_AFTER_ACCEPTED", attempt=attempt, ended=b.get("entry_status") or b.get("status"),
+                   reason=b.get("entry_reason") or b.get("detail"), seen_after_s=round(waited, 1), quote=r.quote(t))
+            got = None
+            time.sleep(2)
+            continue
+        break
+    if not got:
+        r.check(f"{t}: a ticket entry filled within 4 tries", False)
+        r.arm(False)
+        return
+    r.note("FILLED", seen_after_s=round(time.monotonic() - t_sent, 1), shares=got["shares"], orders=got["orders"])
+    r.check(f"{t}: exactly 1 share filled", abs(got["shares"]) == 1, shares=got["shares"])
+    pr, pwait = wait_protected(r, t, oid)
+    if pr and pr.get("gone"):
+        r.note("POSITION_GONE_BEFORE_CLOSE", brackets=pr["brackets"], orders=r.orders(t, live_only=False))
+        r.check(f"{t}: the share was closed before the test's Close (its stop filled?)", True)
+        r.arm(False)
+        return
+    r.check(f"{t}: the attached stop works for the filled share", bool(pr), waited_s=round(pwait, 1),
+            seen=pr or {"orders": r.orders(t), "brackets": r.brackets(t)})
+    f, items, mine = flat_mine()
+    r.note("FLAT_LIST", refusal=f.get("refusal"), items=items, mine=mine, cover=(f.get("cover") or {}).get(t))
+    r.check(f"{t}: Flat all's list says the held share is not from the plan and does nothing with it",
+            len(mine) == 1 and mine[0]["action"] == "nothing" and "not from the plan" in str(mine[0].get("text")),
+            mine=mine)
+    if any(it["action"] in ("cancel", "close") for it in items):
+        r.note("FLAT_ALL_NOT_SENT", why="the list holds an action; the test sends only a list with nothing to do")
+    else:
+        expected = [{k: it[k] for k in ("ticker", "action", "order_id", "shares")} for it in items]
+        ans, secs = r.flat_all(expected, "a list with nothing to do")
+        r.check("Flat all with nothing to do answers ok",
+                ans.get("ok") is True or any(it["action"] == "refuse" for it in items),
+                secs=round(secs, 3), got=r.pick(ans))
+        time.sleep(3)
+        s = r.state()
+        stops = [o for o in r.orders(t, s) if o["role"] == "STOP" and o["status"] == "WORKING"]
+        r.check(f"{t}: the share and its stop are untouched after Flat all", r.shares(t, s) * sign == 1 and bool(stops),
+                shares=r.shares(t, s), stops=stops)
+    row = r.row_of(r.entries(), t) or {}
+    r.note("ROW_WHILE_HELD", row=r.row_brief(row), sides=r.sides_now(row, r.quote(t)))
+    # Not clicked: an accepted click would put a second order on a name that holds a share.
+    r.check(f"{t}: the plan row offers no new entry while the account holds the name",
+            all(place_words(row).values()), place=place_words(row))
+    k = r.shares(t)
+    if abs(k) != 1 or k * sign < 0:
+        raise Stop(f"{t}: the account shows {k:g} shares, not the test's 1: no Close by the test")
+    c, csecs = r.close(t, f"{t} close")
+    r.must(f"{t}: Close accepted", c.get("ok") is True, got=r.pick(c), secs=round(csecs, 3))
+
+    def flat_now():
+        s = r.state()
+        return r.shares(t, s) == 0 and not r.orders(t, s)
+    done, waited = r.wait(flat_now, 40, 1.0)
+    s = r.state()
+    r.check(f"{t}: flat and nothing working on the name after Close", bool(done), waited_s=round(waited, 1),
+            shares=r.shares(t, s), orders=r.orders(t, s))
+    f, items, mine = flat_mine()
+    r.note("AFTER_CLOSE", row=r.row_brief(r.row_of(r.entries(), t) or {}), mine=mine,
+           brackets=[b for b in r.brackets(t, s) if b.get("order_id") == oid])
+    r.arm(False)
+
+
 def sc_restart_before(r: Run) -> None:
     """Leave one entry resting, for a restart of Edge Trader. Run restart_after next. A plan row's
     entry when a row can be used, else a ticket Break entry on the test name far from the price."""
@@ -1253,14 +1454,19 @@ def sc_cleanup(r: Run) -> None:
     r.touched |= set(names)
     e = r.entries()
     st = r.state()
-    ticket_ids = {o["order_id"] for o in mine if o.get("kind") == "ticket"}
+    own_ids = {o["order_id"] for o in mine}
     for t in names:
         row = r.row_of(e, t) if e else None
         en = (row or {}).get("entry") or {}
+        by_row = None
         if en.get("state") in ("SENT", "RED") and en.get("resting"):
             r.plan_cancel(t, "cleanup")
+            by_row = en.get("order_id")
+        # Any other entry of this test still working (a ticket's, or a plan entry the row no longer
+        # points at): cancelled by its own id. A cancel only removes risk.
         for o in r.orders(t, st):
-            if o["role"] == "ENTRY" and o["order_id"] in ticket_ids and not (o.get("filled") or 0):
+            if (o["role"] == "ENTRY" and o["order_id"] in own_ids and o["order_id"] != by_row
+                    and not (o.get("filled") or 0)):
                 r.cancel_ticket(o["order_id"], "cleanup")
     for t in names:
         n, hit = r.own_fill(t, st)
@@ -1325,7 +1531,7 @@ SCENARIOS = {"netlog": sc_netlog, "own": sc_own, "check": sc_check, "refusals": 
              "ticket_fill": sc_ticket_fill, "ticket_fill_long": sc_ticket_fill_long,
              "ticket_fill_short": sc_ticket_fill_short, "plan_place_cancel": sc_plan_place_cancel,
              "plan_flip": sc_plan_flip, "plan_flat": sc_plan_flat, "plan_fill_flat": sc_plan_fill_flat,
-             "restart_before": sc_restart_before,
+             "pick_ticket": sc_pick_ticket, "restart_before": sc_restart_before,
              "restart_after": sc_restart_after, "cleanup": sc_cleanup}
 
 
