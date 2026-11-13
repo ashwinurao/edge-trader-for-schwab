@@ -198,6 +198,13 @@ def test_refused_while_the_first_minute_is_only_so_far(rig):
     assert "not final" in refuse(rig, "CCCC", "LONG", {"trigger": "71.85", "stop": "71.20", "shares": 1})
 
 
+def test_refused_while_the_first_minute_is_the_snapshots_unconfirmed_bar(rig):
+    # Edge Scanner PR #45: the snapshot's 09:30 bar comes with first_minute_as_of "09:31:00"
+    # until the bar request confirms it. The row stays SO_FAR, so nothing is sent on it.
+    rig.view.rows = [pick(1, "AAAA", 42.48, 41.92, 42.37, as_of="09:31:00")]
+    assert "not final" in refuse(rig)
+
+
 def test_refused_on_old_data(rig):
     rig.view.picks_age = PB.stale_after_seconds + 1
     assert "Old data" in refuse(rig)

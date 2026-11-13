@@ -149,6 +149,8 @@ function side(r, k, cls) {
 function dataCell(b) {
   const st = b.state;
   if (st === "FINAL") return `<span class="tag final">final bar</span>`;
+  // Edge Scanner's early 09:30 bar from Alpaca's snapshot (its PR #45): whole, not confirmed yet.
+  if (st === "SO_FAR" && b.unconfirmed) return `<span class="tag sofar">not confirmed</span><span class="sub">09:30 bar from the snapshot · ${ago(b.age_s)}</span>`;
   if (st === "SO_FAR") return `<span class="tag sofar">so far</span><span class="sub">to ${esc(b.as_of_et)} ET · ${ago(b.age_s)}</span>`;
   if (st === "WAITING") return `<span class="tag none">waiting</span>`;
   if (st === "BAD") return `<span class="tag bad">bad data</span>`;
@@ -232,7 +234,7 @@ document.addEventListener("click", ev => { const btn = ev.target.closest("button
 
 function row(r) {
   const b = r.bar || {};
-  const so = b.state === "SO_FAR" ? `<span class="sub">so far</span>` : "";
+  const so = b.state === "SO_FAR" ? `<span class="sub">${b.unconfirmed ? "not confirmed" : "so far"}</span>` : "";
   const near = r.nearer === "long" ? `<span class="long">long (high)</span>` : r.nearer === "short"
     ? `<span class="short">short (low)</span>` : r.nearer === "even" ? "even" : "–";
   const n = notes(r);
@@ -248,7 +250,7 @@ function row(r) {
     ${side(r, "short", "short")}
     <td class="n">${px(r.rps)}</td>
     <td class="n">${shares(r)}</td>
-    <td>${near}${b.state === "SO_FAR" ? `<span class="sub">from the close so far</span>` : ""}</td>
+    <td>${near}${b.state === "SO_FAR" ? `<span class="sub">${b.unconfirmed ? "from the unconfirmed close" : "from the close so far"}</span>` : ""}</td>
     ${entries ? ordersCell(r) : ""}
   </tr>${n}`;
 }
