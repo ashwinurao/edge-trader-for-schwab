@@ -5,6 +5,10 @@ Scanner. No route here places, changes or cancels an order, and nothing here imp
 code (tests/test_opening_plan.py checks the imports). The row buttons of Step 4 live in
 companion/plan_entries.py, off unless EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1;
 they read current_view().
+
+The header's buying power line (brief 21) reads the poller's last account answer through the
+`snapshot` getter app.py passes in (the same state /api/state serves): no new call, and hidden
+with --private as the dashboard hides the account value.
 """
 from __future__ import annotations
 
@@ -36,11 +40,30 @@ def stored_risk(store) -> Optional[Decimal]:
         return None
 
 
+def account_reading(snapshot: Optional[Callable[[], Mapping]], private: bool) -> Optional[dict]:
+    """{balances, ok_at, private} from the poller's state (view.py "balances", the poller's
+    freshness of "account"), or None when there is nothing to read. Never raises."""
+    if private:
+        return {"balances": None, "ok_at": None, "private": True}
+    if snapshot is None:
+        return None
+    try:
+        snap = snapshot() or {}
+        ok_at = (((snap.get("freshness") or {}).get("account") or {}).get("ok_at"))
+        at = datetime.fromisoformat(str(ok_at).replace("Z", "+00:00")) if ok_at else None
+        return {"balances": snap.get("balances"), "ok_at": at if at and at.utcoffset() is not None else None,
+                "private": False}
+    except Exception:
+        return None
+
+
 def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
-             now: Optional[Callable[[], datetime]] = None, get: Get = http_get) -> list[str]:
+             now: Optional[Callable[[], datetime]] = None, get: Get = http_get,
+             snapshot: Optional[Callable[[], Mapping]] = None, private: bool = False) -> list[str]:
     """Add the Opening plan's page and endpoints; returns the page scripts the dashboard should load.
 
-    `now` returns an aware time (tests pass a fake); `get` makes the GET (tests pass a fake).
+    `now` returns an aware time (tests pass a fake); `get` makes the GET (tests pass a fake);
+    `snapshot` returns the poller's state for the buying power line; `private` hides that line.
     """
     url = (env.get(ENV_VAR) or "").strip()
     if not url and not demo:
@@ -48,8 +71,8 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     pb = load_playbook()
     bad_url = ""
     if demo:
-        from .demo_feed import DemoFeed, demo_clock
-        now = now or demo_clock()
+        from .demo_feed import DEMO_ET_ENV, DemoFeed, demo_account, demo_clock
+        now = now or demo_clock(env.get(DEMO_ET_ENV) or None)
     now = now or (lambda: datetime.now(timezone.utc))
     feed = None
     if url:
@@ -80,13 +103,15 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
         """Step 2's view. ask=False builds it from the feed's last answers and never asks Edge
         Scanner (the armed plan's row check: architect's review 1 of fork PR #27, 2026-11-13)."""
         at = now()
+        # The demo shows invented balances (demo_feed.demo_account); never the account's own.
+        account = demo_account(at) if demo and not url else account_reading(snapshot, private)
         if feed is None:
-            view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb)
+            view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb, account=account)
             view.update(state=NOT_SET_UP, message=f"The Opening plan is off: {bad_url}")
         else:
             picks, clock = feed.read() if ask else feed.peek()
             view = build_view(picks.body, picks.ok_at, picks.error, clock.body, clock.ok_at, clock.error,
-                              stored_risk(store), at, pb)
+                              stored_risk(store), at, pb, account=account)
         view["demo"] = demo and not url
         return view
 

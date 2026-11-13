@@ -1042,3 +1042,45 @@ def test_picks_read_at_the_window_start_are_not_read_again():
                          symbols=symbols, emit=Sink(), wall=clock.wall, mono=clock.mono)
     run(probe, clock, et(9, 40, 1))
     assert reads == [et(9, 25, 30)]
+
+
+# ---- review 2 of PR #29: the window means the window ----------------------------------------------
+
+def test_picks_that_come_before_the_window_start_are_first_quoted_at_the_start():
+    clock = Clock(et(9, 25, 29))
+    symbols, _reads = _reading_picks(clock, ready_at=et(9, 26))
+    client = RichClient(clock)
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=op.load_config(env={}), make_client=lambda: client,
+                         symbols=symbols, emit=Sink(), wall=clock.wall, mono=clock.mono)
+    run(probe, clock, et(9, 26, 40), step=0.5)
+    assert probe.symbols == ["AAA", "BBB", "CCC", "DDD", "SPY"]
+    assert all(c[0] >= et(9, 26, 30) for c in client.quote_calls)     # nothing at 09:26:00
+    assert client.quote_calls[0] == (et(9, 26, 30), ["AAA", "BBB", "CCC", "DDD", "SPY"])
+
+
+def test_picks_that_come_inside_the_window_are_quoted_at_once():
+    import dataclasses
+    cfg = dataclasses.replace(op.load_config(env={}), quote_every_s=60)
+    clock = Clock(et(9, 25, 29))
+    symbols, _reads = _reading_picks(clock, ready_at=et(9, 26, 40))
+    client = RichClient(clock)
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=cfg, make_client=lambda: client,
+                         symbols=symbols, emit=Sink(), wall=clock.wall, mono=clock.mono)
+    run(probe, clock, et(9, 26, 50), step=0.5)
+    assert client.quote_calls == [(et(9, 26, 30), ["SPY"]),
+                                  (et(9, 26, 45), ["AAA", "BBB", "CCC", "DDD", "SPY"])]
+
+
+def test_picks_that_come_inside_the_window_are_not_quoted_in_the_429_pause():
+    import dataclasses
+    cfg = dataclasses.replace(op.load_config(env={}), quote_every_s=60)
+    clock = Clock(et(9, 25, 29))
+    symbols, _reads = _reading_picks(clock, ready_at=et(9, 26, 40))
+    client = RichClient(clock)
+    sink = Sink()
+    probe = op.OpenProbe(lambda: HASH, lambda: 20.0 if clock.wall() >= et(9, 26, 45) else 0.0, cfg=cfg,
+                         make_client=lambda: client, symbols=symbols, emit=sink, wall=clock.wall, mono=clock.mono)
+    # The pause starts in the step where the picks come: the quote at once still meets the pause check.
+    run(probe, clock, et(9, 40, 1), step=0.5)
+    assert client.quote_calls == [(et(9, 26, 30), ["SPY"])] and client.previews == []
+    assert sink.notes()[-1]["halted"] == "the app is in its 429 pause"
