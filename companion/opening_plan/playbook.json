@@ -36,6 +36,30 @@
     "stale_after_seconds": 6,
     "clock_old_after_seconds": 300
   },
+  "tape": {
+    "_about": "Brief 15: Edge Scanner's open tape (scanner/open_tape.py), read by companion/opening_plan/tape.py for the shadow and the armed plan. One LAN GET to Edge Scanner, inside Step 2's approved link; Edge Scanner answers from memory and asks Alpaca for nothing more. On 2026-11-13 the recorder read a snapshot every 0.50 s (840 in 7 minutes, request p50 48 ms, p95 143 ms, max 488 ms), the snapshot's minute bar became the 09:30 bar at 09:31:00.08-0.65 ET, and SPY's newest trade was 60-150 ms old at arrival (busy names), COIN and CRWD 0.4-1 s (p95 4.5 s).",
+    "path": "/api/v2/ov-picks/open-tape",
+    "every_seconds": {
+      "value": 0.25,
+      "note": "start number, not approved by Ash",
+      "why": "half the recorder's 0.5 s poll (2026-11-13: 2.00 snapshots a second), so a new snapshot is seen within about 0.25 s"
+    },
+    "timeout_seconds": {
+      "value": 0.5,
+      "note": "start number, not approved by Ash",
+      "why": "a memory read on the LAN; a late answer is a problem, never waited for"
+    },
+    "stale_seconds": {
+      "value": 1.0,
+      "note": "start number, not approved by Ash",
+      "why": "Edge Scanner's newest snapshot to now: 0.5 s poll + 0.25 s read + the request (2026-11-13 p95 143 ms, 220 ms in 09:30:00-30)"
+    },
+    "feed_late_seconds": {
+      "value": 1.5,
+      "note": "start number, not approved by Ash",
+      "why": "SPY's newest trade or quote to the answer in hand; 2026-11-13 SPY trades were 60-150 ms old at arrival plus up to about 0.75 s of polling"
+    }
+  },
   "automatic": {
     "_about": "Step 5, shadow: what the automatic OR1 plan WOULD do (companion/opening_plan/engine.py). Nothing here sends, changes or cancels an order. Every number is a start number from the design (project memory ov-fast-open-design and ov-entries-failure-rules, 2026-11-13) that Ash has not approved; the tick study and shadow mornings are meant to set them.",
     "range_final_wait_seconds": {
