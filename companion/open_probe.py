@@ -200,7 +200,8 @@ def _text(x) -> str:
 
 
 def error_texts(body, raw: str) -> list[str]:
-    """Schwab's reason for a preview answer that is not 200/201, at most 5 texts, each through
+    """Schwab's reason for a preview answer that is not 200/201 (the preview line's `reasons`;
+    not brief 08's `error_text`, which is one string on `call` lines), at most 5 texts, each through
     _text: the body's "message" and each item of "errors" (a string, or a dict's detail, title or
     message). A body that is not JSON gives the first 200 characters of the raw text."""
     out: list[str] = []
@@ -533,7 +534,7 @@ class OpenProbe:
             reason = error_texts(body, raw or "")
         self._line(probe="preview", symbol=sym, at=at, wire_ms=_wire_ms(r), total_ms=total,
                    http=r.status_code, ok=err is None and not fields["rejects"], error=err,
-                   error_text=reason, retry_after=r.headers.get("Retry-After"), **fields)
+                   reasons=reason, retry_after=r.headers.get("Retry-After"), **fields)
         if r.status_code == 429:
             self._halt("Schwab answered 429 to a preview")
 

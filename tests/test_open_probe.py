@@ -350,7 +350,7 @@ def test_previews_at_the_listed_times_once_each_and_never_the_account_number():
     assert first["status"] == "ACCEPTED" and first["at"] == "09:29:30" and first["wire_ms"] == 123.0
     assert first["accepts"] == ["Order accepted"] and first["warns"] == ["Stop limit order may not fill"]
     assert first["rejects"] == [] and first["alerts"] == ["x: Account {n} reviewed"]
-    assert first["error"] is None and first["error_text"] is None
+    assert first["error"] is None and first["reasons"] is None
     text = json.dumps(sink.lines)
     assert ACCOUNT_NUMBER not in text and HASH not in text and "orderLegs" not in text
 
@@ -400,7 +400,7 @@ def test_a_refused_preview_keeps_schwabs_reason_without_the_account_number():
     run(probe, clock, et(9, 29, 31))
     (line,) = sink.probes("preview")
     assert line["http"] == 400 and line["ok"] is False and line["error"] == "http_4xx"
-    assert line["error_text"] == ["Order rejected for account {n}", "Invalid stop for {n}",
+    assert line["reasons"] == ["Order rejected for account {n}", "Invalid stop for {n}",
                                   "A STOP_LIMIT parent cannot have a STOP child", "Only a title", "Only a message"]
     assert ACCOUNT_NUMBER not in json.dumps(sink.lines)
 
@@ -411,8 +411,8 @@ def test_a_refused_preview_with_a_text_body_keeps_its_first_200_characters():
     probe, sink, _ = make(clock, client=_refusing(clock, RawAnswer(400, text)))
     run(probe, clock, et(9, 29, 31))
     (line,) = sink.probes("preview")
-    assert line["error_text"] == [op._text(text[:200])]
-    assert line["error_text"][0].startswith("Bad Request: account {n} cannot take this order.")
+    assert line["reasons"] == [op._text(text[:200])]
+    assert line["reasons"][0].startswith("Bad Request: account {n} cannot take this order.")
     assert ACCOUNT_NUMBER not in json.dumps(sink.lines) and line["readable"] is False
 
 
