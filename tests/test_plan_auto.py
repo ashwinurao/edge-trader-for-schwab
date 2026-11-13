@@ -644,6 +644,20 @@ def test_refund_removes_the_reservation(rig):
     assert rig.plan._calls_used() == 0 and list(rig.plan.sends) == []
 
 
+def test_a_partial_refund_keeps_the_rest_of_the_reservation_and_its_time(rig):
+    """Step 8 engineer, 2026-11-13: a send refused after Schwab's quote refunds 4 of its 5 calls and
+    keeps the quote call. The refund used to look for an entry of exactly 4 and was lost."""
+    arm(rig)
+    rig.clock.t = et(9, 31, 0)
+    assert rig.plan.spend("AAAA", orders=1, calls=5) == ""
+    t0 = rig.plan.sends[-1][0]
+    rig.clock.advance(1)
+    rig.plan.refund("AAAA", orders=1, calls=4)
+    assert list(rig.plan.sends) == [(t0, 1)] and rig.plan._calls_used() == 1
+    rig.clock.advance(59.5)                              # it leaves the window at its own time
+    assert rig.plan._calls_used() == 0
+
+
 def test_a_quote_older_than_5_s_leaves_the_pick_for_the_day(rig, monkeypatch):
     """break_entry.prepare refuses a Schwab quote older than MAX_QUOTE_AGE_MS (5 s, R-03) before any
     order request. The plan does not try again: that pick is left (2026-11-13 11:00 ET probe: the
