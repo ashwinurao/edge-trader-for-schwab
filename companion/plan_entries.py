@@ -929,7 +929,8 @@ class PlanDesk:
         cancel goes through Trader.cancel_entry, which reads the order back until Schwab says
         CANCELED with nothing filled. Only then `recheck()` runs, with no lock held (it may read the
         tape and reserve the send's bounds): ("", "") to go on, or (why, code) with code
-        "disarmed", "watch" (the fast watch ended during the cancel), "traded" or another word. Then the click's checks run again on a fresh order
+        "disarmed", "watch" (the fast watch ended during the cancel), "traded" or another word
+        ("held" is the desk's own, from Flat all's hold). Then the click's checks run again on a fresh order
         list, Step 2's final row in `view` must agree with the tape (as place_auto; None or {} means no
         row check, and the desk never asks Edge Scanner here), and Trader.submit sends.
 
@@ -939,6 +940,11 @@ class PlanDesk:
         action ends, and `wait()` runs once per tick while the lock stays busy: "" to look again, or
         why to stop (the row then says the cancel went through and nothing rests). When the lock is
         free, recheck() and the checks run again before the send.
+
+        Flat all's hold (`held()`, Step 9): first of all, before the cancel, the answer is `held` with
+        no record written and no line logged. After the confirmed cancel it is checked on each pass,
+        before the busy wait, and again under the lock just before the send: nothing is placed and
+        the row says "Cancelled by the armed plan, nothing rests." with the hold's reason.
 
         Returns {"ok", "ticker", "side", "kind", "stage", "code", "error", "red", "unclear",
         "throttled", "filled", "again", "busy", "cancel_not_sent", "not_sent", "cancel", "send",
@@ -976,6 +982,13 @@ class PlanDesk:
             return done(error="A flip or re-level needs a side and a kind.")
         what = "flip" if kind == "flip" else "re-level"
         count = "flips" if kind == "flip" else "relevels"
+        held = self.held()
+        if held:
+            # Flat all is running (Step 9's hold, companion/plan_flat.py): no new entry, so no cancel
+            # that would need one. First, before the cancel, with no record written and no line
+            # logged (architect, 2026-11-13 17:42 UTC, after Step 9 merged).
+            out.update(code="held", error=held)
+            return out
         if self.trader_busy():
             # Another order action holds Trader's lock: nothing would reach Schwab. Before the claim,
             # so no record is written and removed and no line is logged on each try; the plan waits a
@@ -1052,7 +1065,13 @@ class PlanDesk:
         # on a later step: the executor treats a FLIPPING row as ended.
         waiting = ""
         while True:
-            if self.trader_busy():
+            held = self.held()
+            if held:
+                # Flat all started during the cancel: nothing new goes while it runs, and the batch
+                # disarms the plan first (Step 6's before_batch). Checked before the busy wait, since
+                # the batch's own cancels hold Trader's lock (architect, 17:42 UTC).
+                why, code = held, "held"
+            elif self.trader_busy():
                 if not waiting:
                     stamp("busy_from")
                     waiting = (f"The armed plan cancelled the {old.lower()} entry. It places the {side.lower()} "
@@ -1094,6 +1113,10 @@ class PlanDesk:
                     return done(stage="recheck", code="click" if now_rec.get("origin") != "auto" else "row",
                                 error=f"cancelled by the armed plan; {why}, so the plan placed nothing and leaves it")
                 if not why:
+                    held = self.held()                    # a batch that started during the recheck
+                    if held:
+                        why, code = held, "held"
+                if not why:
                     try:
                         blocked = self._blocked_names()
                     except Exception:
@@ -1110,6 +1133,7 @@ class PlanDesk:
                         return done(stage="recheck", code="disagree", error=text, red=True)
                 if why:
                     text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
+                            f"Cancelled by the armed plan, nothing rests. {why}" if code == "held" else
                             f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
                             if code in ("traded", "busy", "watch") else
                             f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
