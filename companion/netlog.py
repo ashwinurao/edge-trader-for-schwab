@@ -17,17 +17,21 @@ every line has ts (UTC, milliseconds), kind and app. Kinds written here:
   removed), http, wire_ms (requests' `elapsed`, send to answer headers), bytes, date (the vendor's
   Date header), retry_after, thread, and call + attempt when a call is open on the thread.
 - call: one per call as our code sees it, written when it ends: asked (when our code decided to
-  call), wait_ms with its parts wait_pause_ms (our 429 pause), wait_throttle_ms (the poller's
-  limiter), wait_client_ms (inside schwabdev before the request left: its lock and token check),
-  wire_ms, read_ms (answer headers to the client returning: the body download), total_ms,
-  attempts, http, ok, error (a class: timeout_connect, timeout_read, tls, dns, refused, reset,
+  call), wait_ms (asked until the first request left) with its parts wait_pause_ms (our 429 pause),
+  wait_throttle_ms (the poller's limiter) and wait_client_ms (the rest: mostly schwabdev's lock and
+  token check), wire_ms, between_ms (between attempts: 0, nothing retries), after_ms (answer headers
+  to the client returning: the body download), total_ms. With an answer, wait + wire + between +
+  after = total, as in Edge Scanner's file; with none, the split is None. Then attempts, http, ok,
+  error (a class: timeout_connect, timeout_read, tls, dns, refused, reset,
   http_429, http_4xx, http_5xx, other), error_text (200 characters, ids removed), items, data_ts
   and data_age_ms (quotes only: Schwab's newest quoteTime/tradeTime), purpose, req.
 - inflight: a call still open after 2, 5, 10, 30 and 60 s (the only trace of a call that hangs).
 - skip: a call our code chose not to send (a status read during a 429 pause).
 - pause: start and end of the 429 pause. token: an access token renewal seen by a call.
-- route and refusal: each request to a named route of ours, and an order action that answered
-  without sending anything. lag: once a minute, thread and event-loop lag, CPU, memory, queue.
+- route and refusal: a request to a named route of ours (a polled GET only when it took 100 ms
+  or more or did not answer 200), and an order action that answered without sending anything.
+- lag: once a minute, thread and event-loop lag, CPU, memory, queue, and the polled routes of the
+  minute (routes: n, p95_ms, max_ms).
 - note: app start.
 It never holds tokens, app keys, account numbers or hashes, request or answer bodies, or our order
 prices and sizes (a refusal's text has its digits replaced by #).
@@ -74,6 +78,11 @@ ET = ZoneInfo("America/New_York")
 INFLIGHT_AT = (2, 5, 10, 30, 60)          # seconds: when an open call gets an `inflight` line
 SESSION_FROM = (9, 25)                     # ET: the summary's "today" window starts at the 09:25 scan
 RECENT = 2_000                             # last calls kept per vendor and endpoint (5-minute window)
+# A polled GET of ours (the dashboard asks /api/state every second per tab) writes its own route
+# line only when this slow or not answered 200; every one still goes to the summary and to the
+# minute's `lag` line (routes: n, p95_ms, max_ms). Architect review of PR #22, 2026-11-13.
+ROUTE_LINE_MS = 100
+MINUTE_ROUTE_CAP = 20_000                  # route timings kept per route for one lag line
 DAY_CAP = 50_000                           # timings kept per vendor and endpoint since 09:25 ET
 WRITES = frozenset({"place_order", "replace_order", "cancel_order"})   # calls that change an order
 
@@ -255,6 +264,11 @@ def _ensure_watcher() -> None:
 def _emit_rolled(kind: str, **fields) -> None:
     """emit(), and the same line to the summary's stats. Never raises."""
     emit(kind, **fields)
+    _to_rollup(kind, fields)
+
+
+def _to_rollup(kind: str, fields: dict) -> None:
+    """Only the summary's stats (and the minute's route stats), no line. Never raises."""
     try:
         if enabled():
             _rollq.put_nowait((time.time(), kind, fields))
@@ -537,6 +551,10 @@ def _ms(x) -> float | None:
     return None if x is None else round(max(0.0, x) * 1000, 1)
 
 
+def _r1(ms) -> float | None:
+    return None if ms is None else round(float(ms), 1)
+
+
 def _finish(c: _Call, exc) -> None:
     end = _mono()
     if c.skipped:
@@ -547,18 +565,27 @@ def _finish(c: _Call, exc) -> None:
         c.failed(exc)
     back = c.t_back if c.t_back is not None else end
     send = c.t_send if c.t_send is not None else c.t0 + sum(c.waits.values()) / 1000
-    client = (c.first_out - send) if c.first_out is not None else None
     parts = {f"wait_{k}_ms": round(v, 1) for k, v in c.waits.items()}
-    wait = sum(c.waits.values()) + (max(0.0, client) * 1000 if client is not None else 0.0)
+    # Split as Edge Scanner's scanner/netlog.py does (one format, architect review 2026-11-13), when
+    # an answer came: wait (asked until the first request left) + wire (sum over attempts) + between
+    # (gaps between attempts: 0 here, nothing retries) + after (last answer's headers until the client
+    # returned: the body download) = total. wait_client_ms is wait minus our own pause and throttle:
+    # schwabdev's lock and token check. No answer: wait and the split are unknown (None).
+    wait = between = after = client = None
+    if c.first_out is not None:
+        wait = max(0.0, c.first_out - c.t0) * 1000
+        client = max(0.0, wait - sum(c.waits.values()))
+        between = max(0.0, (c.last_in - c.first_out) * 1000 - c.wire_ms)
+        after = max(0.0, back - c.last_in) * 1000
     if c.error is None:
         c.error = http_class(c.http)
     rec = {"id": c.id, "vendor": c.vendor, "endpoint": c.endpoint, "purpose": c.purpose,
            "asked": c.asked,
-           "wait_ms": round(wait, 1) if (c.waits or client is not None) else None,
+           "wait_ms": _r1(wait),
            "wait_pause_ms": None, "wait_throttle_ms": None, **parts,
-           "wait_client_ms": _ms(client),
+           "wait_client_ms": _r1(client),
            "wire_ms": round(c.wire_ms, 1) if c.attempts else None,
-           "read_ms": _ms(back - c.last_in) if c.last_in is not None else None,
+           "between_ms": _r1(between), "after_ms": _r1(after),
            "total_ms": _ms(back - c.t0), "attempts": c.attempts, "http": c.http,
            "ok": c.error is None, "error": c.error, "error_text": c.error_text, "items": c.items,
            "data_ts": (datetime.fromtimestamp(c.data_ts / 1000, timezone.utc).isoformat(timespec="milliseconds")
@@ -575,7 +602,7 @@ def _finish(c: _Call, exc) -> None:
             after = tok._access_token_issued
             if after != before:
                 emit("token", vendor=c.vendor, how="seen_after_call", ok=True,
-                     ms=_ms(client) if client is not None else _ms(back - send),
+                     ms=_r1(client) if client is not None else _ms(back - send),
                      left_before_s=round(left), endpoint=c.endpoint, purpose=c.purpose, thread=c.thread)
             elif left < 61:        # schwabdev renews under 61 s left; unchanged means it did not
                 emit("token", vendor=c.vendor, how="due_unchanged_after_call", ok=False, ms=None,
@@ -606,6 +633,14 @@ _RATE = (("rl_limit", ("X-RateLimit-Limit", "RateLimit-Limit")),
          ("rl_reset", ("X-RateLimit-Reset", "RateLimit-Reset")))
 
 
+def _int(v):
+    """A whole-number header as an int (as Edge Scanner writes it), anything else as text."""
+    try:
+        return int(str(v).strip())
+    except (TypeError, ValueError):
+        return str(v)[:40]
+
+
 def answered(vendor: str, method: str, url: str, http, wire_ms: float, headers=None) -> None:
     """One HTTP answer: its line, and the call open on this thread counts it. Never raises."""
     try:
@@ -621,7 +656,7 @@ def answered(vendor: str, method: str, url: str, http, wire_ms: float, headers=N
             for name in names:
                 v = h.get(name)
                 if v is not None:
-                    rec[field] = str(v)[:40]
+                    rec[field] = _int(v)
                     break
         c = getattr(_tl, "call", None)
         if isinstance(c, _Call):
@@ -731,7 +766,8 @@ def _lag_line(samples, cpu_s) -> dict:
     rec = {"thread_lag_max_ms": round(max(samples), 1) if samples else None,
            "thread_lag_p95_ms": _pct(samples, 95), "loop_lag_max_ms": loop,
            "threads": threading.active_count(), "cpu_s": round(cpu_s, 3), "rss_mb": _rss_mb(),
-           "queue": _q.qsize(), "dropped": dropped, "inflight": len(_open), "token_left_s": _token_left()}
+           "queue": _q.qsize(), "dropped": dropped, "inflight": len(_open), "token_left_s": _token_left(),
+           "routes": _minute_route_stats()}
     _last_lag = {"ts": _utc_iso(), **rec}
     emit("lag", **rec)
     return rec
@@ -799,6 +835,21 @@ def start(text: str):
 
 _roll_lock = threading.Lock()
 _roll: dict = {}              # (vendor, endpoint) or ("route", route) -> bounded stats
+_minute_routes: dict = {}     # polled route -> [count, timings] since the last lag line
+
+
+def _polled(route, method) -> bool:
+    """A GET that is not an order action: the screens poll these."""
+    return method == "GET" and route not in ACTIONS
+
+
+def _minute_route_stats() -> dict:
+    """The polled routes since the last lag line, and start a new minute."""
+    global _minute_routes
+    with _roll_lock:
+        taken, _minute_routes = _minute_routes, {}
+    return {route: {"n": n, "p95_ms": _pct(ms, 95), "max_ms": round(max(ms), 1) if ms else None}
+            for route, (n, ms) in sorted(taken.items())}
 
 
 def _new_roll() -> dict:
@@ -813,6 +864,12 @@ def _rollup_add(epoch: float, kind: str, rec: dict) -> None:
     et = datetime.fromtimestamp(epoch, ET)
     if kind == "route":       # ok: answered 200, and for an order action, did what was asked
         key = ("route", str(rec.get("route")))
+        if _polled(rec.get("route"), rec.get("method")) and isinstance(rec.get("ms"), (int, float)):
+            with _roll_lock:
+                m = _minute_routes.setdefault(str(rec.get("route")), [0, []])
+                m[0] += 1
+                if len(m[1]) < MINUTE_ROUTE_CAP:
+                    m[1].append(rec["ms"])
         ok = rec["ok"] if isinstance(rec.get("ok"), bool) else rec.get("http") == 200
         err = None if ok else (http_class(rec.get("http")) or "refused")
         wire, wait = rec.get("ms"), None
@@ -903,7 +960,9 @@ ACTIONS = frozenset({"/api/ticket/submit", "/api/ticket/cancel", "/api/ticket/ca
                      "/api/position/cancel_orders", "/api/position/close", "/api/position/move_stop",
                      "/api/position/partial", "/api/position/set_target", "/api/position/trail",
                      "/api/spread/submit", "/api/spread/cancel", "/api/spread/close", "/api/spread/target",
-                     "/api/spread/cancel_target", "/api/spread/stop"})
+                     "/api/spread/cancel_target", "/api/spread/stop",
+                     # the plan row buttons (PR #19, companion/plan_entries.py): ok, error, ticker
+                     "/api/opening-plan/place", "/api/opening-plan/cancel", "/api/opening-plan/flip"})
 BODY_CAP = 65_536
 
 
@@ -920,8 +979,11 @@ def _json(raw):
         return None
 
 
-def _slug(text: str) -> str:
-    """A short stable code for a refusal: its first words up to the first stop, no digits."""
+def _slug(text: str, symbol: str | None = None) -> str:
+    """A short stable code for a refusal: its first words up to the first stop, without digits or
+    the symbol (the plan buttons start theirs with it: "NVDA: the last click is still running.")."""
+    if symbol:
+        text = re.sub(rf"(?i)\b{re.escape(symbol)}\b:?\s*", "", text)
     head = re.split(r"[:.;(]", text, maxsplit=1)[0].lower()
     words = re.findall(r"[a-z]+", head)
     return "_".join(words[:6]) or "refused"
@@ -989,14 +1051,19 @@ class _RouteWatch:
                             or ("; ".join(map(str, errs)) if isinstance(errs, list) else "") or "")
                     text = _DIGITS.sub("#", shape_text(text, 400))[:200]
                     plan = ans.get("plan") if isinstance(ans.get("plan"), dict) else {}
-                    sym = ask.get("symbol") or ask.get("underlying") or ans.get("symbol") or plan.get("symbol")
+                    sym = (ask.get("symbol") or ask.get("underlying") or ask.get("ticker") or ans.get("symbol")
+                           or ans.get("ticker") or plan.get("symbol"))
+                    sym = str(sym).upper().strip()[:40] if sym else None
                     code = ans.get("code") if isinstance(ans.get("code"), str) else None
                     if code is None:
                         code = f"http_{self.http}" if self.http != 200 else (
-                            status if isinstance(status, str) and status else _slug(text))
-                    emit("refusal", action=self.purpose, symbol=str(sym).upper().strip()[:40] if sym else None,
+                            status if isinstance(status, str) and status else _slug(text, sym))
+                    emit("refusal", action=self.purpose, symbol=sym,
                          code=str(code)[:60], text=text, route=self.route, req=self.req)
-            _emit_rolled("route", **fields)
+            if _polled(self.route, self.method) and fields["ms"] < ROUTE_LINE_MS and self.http == 200:
+                _to_rollup("route", fields)       # in the summary and the minute's lag line only
+            else:
+                _emit_rolled("route", **fields)
         except Exception:
             pass
 
@@ -1073,9 +1140,11 @@ _warn_listener = None
 
 
 def keep_warnings(folder: Path | None = None) -> logging.Handler | None:
-    """WARNING and above, from every logger that reaches the root, also to the daily file. In
-    server mode the container's own log is deleted by every rebuild. The caller's thread only
-    queues the line. Never raises."""
+    """WARNING and above, from every logger that reaches the root, also to the daily file, and
+    uvicorn's own errors once start() adds the handler. data/companion.log already keeps INFO and
+    above in the data folder, which a rebuild keeps; this file adds the split by UTC day and
+    uvicorn's errors, which otherwise reach only the container's log (deleted by every rebuild).
+    The caller's thread only queues the line. Never raises."""
     global _warn_handler, _warn_listener
     try:
         if _warn_handler is not None:

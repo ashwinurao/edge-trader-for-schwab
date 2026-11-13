@@ -468,8 +468,9 @@ def main() -> None:
         handlers = [logging.FileHandler(LOG, encoding="utf-8"), logging.StreamHandler(sys.stderr)]
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # WARNING and above also to data/logs/edge-trader-YYYY-MM-DD.log (netlog.py): one file per UTC
-    # day, kept by a rebuild, which deletes the container's own log.
+    # WARNING and above also to data/logs/edge-trader-YYYY-MM-DD.log (netlog.py). companion.log
+    # already keeps INFO and above; this adds one file per UTC day and uvicorn's errors, which
+    # otherwise reach only the container's log, deleted by every rebuild.
     netlog.keep_warnings()
     logging.getLogger("companion").info("Edge Trader %s starting (pid %s)%s", __version__, os.getpid(),
                                         " in DEMO mode" if DEMO else "")

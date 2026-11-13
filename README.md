@@ -55,16 +55,24 @@ name are refused). It needs no account and sends no telemetry.
   quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
   `skip` line for a read the 429 pause held back, `pause` lines for the pause's start and end, a `token`
   line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
-  web server wake, CPU, memory, the token's time left).
-  Each request to the state, fills, Opening plan, ticket, position and spread routes gets a `route` line
-  with its duration and an id that its `call` lines carry too, so a click and its Schwab calls line up. An
-  order action that sends nothing writes a `refusal` line with the message you saw, its digits replaced by
-  `#`. No tokens, keys, account numbers, request or answer bodies, order prices or sizes. Nothing in the
-  app reads it back to decide anything. About 40 to 70 MB a day while the app runs; nothing deletes it yet.
+  web server wake, CPU, memory, the token's time left, and the count, p95 and slowest time of each route
+  the screens poll that minute).
+  Each click on a ticket, position, spread or Opening plan button gets a `route` line with its duration and
+  an id that its `call` lines carry too, so a click and its Schwab calls line up. A read the screens poll
+  (the state every second, fills, the Opening plan) gets its own `route` line only when it takes 100 ms or
+  more or does not answer 200. An order action that sends nothing, Opening plan Place, Cancel and Flip
+  included, writes a `refusal` line with the message you saw, its digits replaced by `#`. Call and answer
+  lines use the same fields as Edge Scanner's record. No tokens, keys, account numbers, request or answer
+  bodies, order prices or sizes. Nothing in the app reads it back to decide anything. About 40 MB a day
+  while the app runs (most of it the poller's account and order reads, all day), plus about 1 MB for each
+  hour a position or working order is quoted and about 1.4 MB for each hour the Opening plan page reads
+  Edge Scanner. Nothing deletes it yet.
   `GET /api/netlog/summary` shows, from memory, each vendor and endpoint's count, errors and p50/p95/max
   times for the last 5 minutes and since 09:25 ET, the calls in flight, the pause and the last lag line.
-- Warnings and errors in `data/logs/edge-trader-YYYY-MM-DD.log` (UTC date), next to `data/companion.log`.
-  On a home server a rebuild deletes the container's own log; this file stays.
+- Warnings and errors in `data/logs/edge-trader-YYYY-MM-DD.log` (UTC date). `data/companion.log` already
+  keeps INFO and above in the same data folder, which a rebuild on a home server keeps. This file adds one
+  file per day and the web server's own errors, which otherwise reach only the container's log, and a
+  rebuild deletes that.
 
 ### What leaves your computer
 

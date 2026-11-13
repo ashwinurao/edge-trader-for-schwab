@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from starlette.concurrency import run_in_threadpool
 
@@ -110,9 +111,10 @@ def test_wait_parts_add_up_for_a_paused_call(rig):
     (c,) = rig.rec.lines("call")
     assert c["vendor"] == "schwab" and c["endpoint"] == "account_details" and c["purpose"] == "other"
     assert c["wait_pause_ms"] == 5000.0 and c["wait_throttle_ms"] is None
-    assert c["wait_client_ms"] == 300.0 and c["wire_ms"] == 120.0 and c["read_ms"] == 50.0
-    assert c["wait_ms"] == c["wait_pause_ms"] + c["wait_client_ms"] == 5300.0
-    assert c["total_ms"] == c["wait_ms"] + c["wire_ms"] + c["read_ms"] == 5470.0
+    assert c["wait_client_ms"] == 300.0 and c["wire_ms"] == 120.0 and c["after_ms"] == 50.0
+    assert c["between_ms"] == 0.0 and c["wait_ms"] == c["wait_pause_ms"] + c["wait_client_ms"] == 5300.0
+    assert c["total_ms"] == c["wait_ms"] + c["wire_ms"] + c["between_ms"] + c["after_ms"] == 5470.0
+    assert "read_ms" not in c          # renamed after_ms, as in Edge Scanner's file
     assert c["attempts"] == 1 and c["http"] == 200 and c["ok"] is True and c["error"] is None
     assert c["asked"].endswith("+00:00") and c["ts"].endswith("+00:00") and c["app"] == "edge-trader"
     (a,) = rig.rec.lines("answer")
@@ -136,7 +138,7 @@ def test_wait_parts_add_up_for_a_throttled_poll(rig):
     (c,) = rig.rec.lines("call")
     assert c["purpose"] == "poller" and c["endpoint"] == "orders_today"
     assert c["wait_throttle_ms"] == 2000.0 and c["wait_pause_ms"] is None
-    assert c["wait_client_ms"] == 120.0 and c["wire_ms"] == 80.0 and c["read_ms"] == 0.0
+    assert c["wait_client_ms"] == 120.0 and c["wire_ms"] == 80.0 and c["after_ms"] == 0.0
     assert c["wait_ms"] == 2120.0 and c["total_ms"] == 2200.0 and c["items"] == 2
 
 
@@ -156,15 +158,23 @@ def test_wait_parts_of_a_plain_call_are_the_client_alone(rig):
 
 
 def test_a_call_with_two_answers_counts_two_attempts(rig):
-    """The first order of the day builds the client: linked accounts, then the order itself."""
+    """The first order of the day builds the client: linked accounts (40 ms in schwabdev, 90 ms on
+    the wire), 30 ms between, the order (210 ms on the wire), 20 ms for the body."""
+    clock = rig.clock
+
     def fn():
+        clock.sleep(0.04 + 0.09)
         netlog.answered("schwab", "GET", "https://api.schwabapi.com/trader/v1/accounts/accountNumbers", 200, 90.0)
+        clock.sleep(0.03 + 0.21)
         netlog.answered("schwab", "POST", ACCOUNT_URL + "/orders", 201, 210.0)
+        clock.sleep(0.02)
         return Resp(201)
 
     rig.t._logged("place_order", fn)
     (c,) = rig.rec.lines("call")
     assert c["attempts"] == 2 and c["wire_ms"] == 300.0 and c["http"] == 201
+    assert (c["wait_ms"], c["between_ms"], c["after_ms"], c["total_ms"]) == (40.0, 30.0, 20.0, 390.0)
+    assert c["wait_ms"] + c["wire_ms"] + c["between_ms"] + c["after_ms"] == c["total_ms"]
     assert [a["attempt"] for a in _mine(rig.rec.lines("answer"), c["id"])] == [1, 2]
 
 
@@ -378,19 +388,80 @@ def test_a_refused_click_writes_one_refusal_and_a_sent_one_none(rec):
     assert "189.78" not in text and "189.70" not in text and ORDER_ID not in text
 
 
-def test_route_lines_carry_req_and_the_calls_made_under_them_carry_the_same(rec):
+def test_route_lines_carry_req_and_the_calls_made_under_them_carry_the_same(rec, monkeypatch):
+    rolled = []
+    monkeypatch.setattr(netlog, "_to_rollup", lambda kind, fields: rolled.append((kind, fields)))
     c = TestClient(_tiny_app())
     c.post("/api/ticket/submit", json={"symbol": "NVDA"}, headers={"X-Edge-Req": "abc-1", "X-Edge-App": "edge-scanner"})
     c.get("/api/state")
-    route_submit, route_state = rec.lines("route")
+    (route_submit,) = rec.lines("route")       # the fast poll of /api/state writes no line of its own
     assert route_submit["req"] == "abc-1" and route_submit["from"] == "edge-scanner"
     assert route_submit["method"] == "POST" and route_submit["http"] == 200 and route_submit["ms"] >= 0
     calls = rec.lines("call")
     assert {(x["endpoint"], x["req"], x["purpose"]) for x in calls if x["req"] == "abc-1"} == {
         ("ticket_quote", "abc-1", "ticket_submit"), ("place_order", "abc-1", "ticket_submit")}
+    (route_state,) = [f for k, f in rolled if k == "route" and f["route"] == "/api/state"]
     (state_call,) = [x for x in calls if x["endpoint"] == "account_details"]
     assert state_call["req"] == route_state["req"] and len(route_state["req"]) == 12
     assert state_call["purpose"] == "state"
+
+
+def _polled_app(clock):
+    """GET routes that take the time the query asks for, on the record's fake clock."""
+    app = FastAPI()
+
+    @app.get("/api/state")
+    def state(ms: float = 0.0):
+        clock.sleep(ms / 1000)
+        return {"ok": 1}
+
+    @app.get("/api/fills")
+    def fills():
+        return JSONResponse({"error": "store busy"}, status_code=503)
+
+    @app.post("/api/opening-plan/risk")
+    def risk():
+        return {"ok": True}
+
+    app.add_middleware(netlog.RouteTimer)
+    return app
+
+
+def test_a_polled_get_writes_its_line_only_when_slow_or_not_200(rec, monkeypatch):
+    """Architect review of PR #22: /api/state is asked every second per tab, so a fast 200 goes to
+    the summary and the minute's lag line only. 100 ms or more, or any other answer, writes a line;
+    a POST always does."""
+    clock = Clock()
+    monkeypatch.setattr(netlog, "_mono", clock.monotonic)
+    rolled = []
+    monkeypatch.setattr(netlog, "_to_rollup", lambda kind, fields: rolled.append((kind, fields)))
+    c = TestClient(_polled_app(clock))
+    c.get("/api/state", params={"ms": 99.9})
+    c.get("/api/state", params={"ms": 100})
+    c.get("/api/fills")
+    c.post("/api/opening-plan/risk")
+    lines = [(x["route"], x["method"], x["http"], x["ms"]) for x in rec.lines("route")]
+    assert lines == [("/api/state", "GET", 200, 100.0), ("/api/fills", "GET", 503, 0.0),
+                     ("/api/opening-plan/risk", "POST", 200, 0.0)]
+    assert [(f["route"], f["ms"]) for k, f in rolled if k == "route"] == [
+        ("/api/state", 99.9), ("/api/state", 100.0), ("/api/fills", 0.0), ("/api/opening-plan/risk", 0.0)]
+
+
+def test_the_lag_line_counts_the_polled_routes_of_the_minute(rec, monkeypatch):
+    monkeypatch.setattr(netlog, "_roll", {})
+    monkeypatch.setattr(netlog, "_minute_routes", {})
+    now = datetime(2026, 11, 13, 14, 40, tzinfo=timezone.utc).timestamp()
+    for ms in range(1, 21):                       # 20 polls, 1..20 ms
+        netlog._rollup_add(now, "route", {"route": "/api/state", "method": "GET", "http": 200, "ms": float(ms)})
+    netlog._rollup_add(now, "route", {"route": "/api/fills", "method": "GET", "http": 503, "ms": 4.0})
+    netlog._rollup_add(now, "route", {"route": "/api/ticket/submit", "method": "POST", "http": 200, "ms": 340.0,
+                                      "ok": True})
+    line = netlog._lag_line([], 0.0)
+    # Nearest rank: p95 of 1..20 is the ceil(19.0) = 19th value. POSTs are not polls: not here.
+    assert line["routes"] == {"/api/fills": {"n": 1, "p95_ms": 4.0, "max_ms": 4.0},
+                              "/api/state": {"n": 20, "p95_ms": 19.0, "max_ms": 20.0}}
+    assert netlog._lag_line([], 0.0)["routes"] == {}       # the next minute starts empty
+    assert netlog.summary(now=now)["routes"]["/api/state"]["since_0925_et"]["count"] == 20
 
 
 def test_the_real_app_times_its_routes_and_records_a_refused_submit(rec):
@@ -402,7 +473,40 @@ def test_the_real_app_times_its_routes_and_records_a_refused_submit(rec):
     (ref,) = rec.lines("refusal")
     assert (ref["action"], ref["code"], ref["symbol"]) == ("ticket_submit", "missing_ticket_id", "NVDA")
     routes = {x["route"] for x in rec.lines("route")}
-    assert {"/api/ticket/submit", "/api/netlog/summary"} <= routes
+    assert "/api/ticket/submit" in routes and "/api/netlog/summary" not in routes   # a fast GET: no line
+
+
+def test_a_refused_plan_button_is_a_refusal_named_by_its_ticker(rec):
+    """The plan row buttons (PR #19, companion/plan_entries.py) answer ok, error and ticker."""
+    app = FastAPI()
+
+    @app.post("/api/opening-plan/place")
+    async def place(request: Request):
+        b = await request.json()
+        return {"ok": False, "ticker": b["ticker"].upper(), "error": f"{b['ticker'].upper()}: the last click is still running."}
+
+    @app.post("/api/opening-plan/flip")
+    async def flip(request: Request):
+        await request.json()
+        return {"ok": False, "ticker": "AMD", "error": "AMD: 1 of 1 flips used today (max_flips_per_row in playbook.json)."}
+
+    @app.post("/api/opening-plan/cancel")
+    async def cancel(request: Request):
+        await request.json()
+        return {"ok": False, "error": "TSLA has no resting entry to cancel."}
+
+    app.add_middleware(netlog.RouteTimer)
+    c = TestClient(app)
+    c.post("/api/opening-plan/place", json={"ticker": "nvda", "side": "LONG"})
+    c.post("/api/opening-plan/flip", json={"ticker": "AMD"})
+    c.post("/api/opening-plan/cancel", json={"ticker": "tsla"})
+    got = [(x["action"], x["symbol"], x["code"], x["text"]) for x in rec.lines("refusal")]
+    assert got == [
+        ("opening_plan_place", "NVDA", "the_last_click_is_still_running", "NVDA: the last click is still running."),
+        ("opening_plan_flip", "AMD", "of_flips_used_today",
+         "AMD: # of # flips used today (max_flips_per_row in playbook.json)."),
+        ("opening_plan_cancel", "TSLA", "has_no_resting_entry_to_cancel", "TSLA has no resting entry to cancel.")]
+    assert [(x["ok"], x["sent"]) for x in rec.lines("route")] == [(False, 0)] * 3
 
 
 def test_a_guard_refusal_is_a_refusal_with_its_status(rec):
@@ -546,7 +650,11 @@ def test_the_update_check_is_a_github_call(rec, monkeypatch):
     assert (c["vendor"], c["endpoint"], c["purpose"], c["ok"], c["wire_ms"]) == (
         "github", "releases_latest", "update_check", True, 42.0)
     (a,) = rec.lines("answer")
-    assert a["rl_remaining"] == "59" and a["rl_limit"] == "60"
+    assert a["rl_remaining"] == 59 and a["rl_limit"] == 60      # whole numbers as ints, as Edge Scanner writes
+
+
+def test_a_rate_limit_header_that_is_not_a_whole_number_stays_text():
+    assert (netlog._int(" 120 "), netlog._int("1.5"), netlog._int("soon")) == (120, "1.5", "soon")
 
 
 def test_the_sign_in_exchange_is_a_call_without_the_code(rec):
