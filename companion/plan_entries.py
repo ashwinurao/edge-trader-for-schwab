@@ -20,6 +20,9 @@ Every send is the user's click (CONTRIBUTING rule 1):
   (cancel not confirmed, any fill) places nothing and turns the row red. Never two entries
   resting for one name. At most max_flips_per_row flips per row per day (playbook.json).
 
+Brief 25 (companion/plan_side.py): Place and Flip go beside the user's own trades on the same side
+of the name and refuse on the other side, or when the side is not clear or a read is old.
+
 Step 6 (brief 16 item 5) adds the armed plan's twins, place_auto and cancel_auto, called by
 companion/plan_auto (off unless EDGE_TRADER_PLAN_AUTO=1, and only after Ash's Arm click): the same
 claim, Trader.submit / Trader.cancel_entry, records and refusals as the clicks, with the numbers
@@ -49,7 +52,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, plan_size, trading
+from . import break_entry, plan_side, plan_size, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -74,6 +77,8 @@ DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
 # Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
 # other working order on this name" from the poller's order list, so it never sends on an old one.
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
+# The armed send's two waits (_auto_refusal): no pick may go on this reading, or only this name waits.
+WAIT_ALL, WAIT_NAME = "all", "name"
 # The armed plan's cancel twin waits on an old list too (architect's live-test notes N1, 2026-11-13).
 ORDERS_OLD_AUTO_CANCEL = "Schwab's order list is old. The armed plan cancels nothing until it is fresh."
 ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
@@ -132,13 +137,19 @@ class PlanDesk:
                  armed: Optional[Callable[[], bool]] = None,
                  market_open: Optional[Callable[[], bool]] = None, demo: bool = False,
                  orders_fresh: Optional[Callable[[], bool]] = None, stage: Any = plan_size.DEFAULT,
-                 hold: Optional[Callable[[], str]] = None) -> None:
+                 hold: Optional[Callable[[], str]] = None,
+                 positions: Optional[Callable[[], Mapping]] = None,
+                 positions_fresh: Optional[Callable[[], bool]] = None) -> None:
         """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today")).
         `stage` is the playbook's size stage (companion/plan_size.py, Step 9); the default is 1 share.
-        `hold` returns why no new entry may go now, or "" (see add_hold)."""
+        `hold` returns why no new entry may go now, or "" (see add_hold). `positions` returns the
+        poller's net shares per name and `positions_fresh` whether that read is fresh
+        (Poller._fresh("account")): the side rule of brief 25 (companion/plan_side.py) reads them."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
         self.stage = plan_size.parse_stage(stage)
         self._orders_fresh_fn = orders_fresh or (lambda: True)
+        self._positions_fn = positions or (lambda: {})
+        self._positions_fresh_fn = positions_fresh or (lambda: True)
         self._armed = armed or (lambda: bool(trader.armed))
         self._market_open = market_open or (lambda: trading.market_open())
         self.demo = demo
@@ -384,8 +395,38 @@ class PlanDesk:
                    text=d["text"])
         return out
 
+    def _positions_read(self) -> tuple[Mapping, bool]:
+        """The poller's positions and whether they are fresh. Unreadable: old (when unsure, refuse)."""
+        try:
+            return dict(self._positions_fn() or {}), bool(self._positions_fresh_fn())
+        except Exception:
+            log.exception("opening plan: positions could not be read")
+            return {}, False
+
+    def _beside(self, ticker: str, side: str, rec: Mapping, orders: list[dict], fresh: bool) -> str:
+        """Brief 25 rule B: a new entry goes beside the user's own trades on the same side and is
+        refused on the other side or when the side is not clear (companion/plan_side.py). The row's
+        own entry and its stop are the plan's, never the user's."""
+        positions, pfresh = self._positions_read()
+        ps = plan_side.plan_shares(rec, orders)
+        code, text = plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ps.ids, ps.held)
+        return "" if code == plan_side.OK else text
+
+    def _manual_line(self, ticker: str, rec: Mapping, orders: list[dict]) -> str:
+        """Brief 25 rule F: "You also hold M T by hand" or "You also have a working order on T"."""
+        positions, pfresh = self._positions_read()
+        if not pfresh:
+            return ""
+        ps = plan_side.plan_shares(rec, orders)
+        try:
+            return plan_side.manual(ticker, positions, orders, ps.ids, ps.held).line()
+        except Exception:
+            return ""
+
     def _foreign(self, ticker: str, rec: Mapping, orders: list[dict]) -> Optional[dict]:
-        """A working order on this name that this row did not send (the ticket, thinkorswim)."""
+        """A working order on this name that this row did not send (the ticket, thinkorswim).
+        Not used by Place, Flip or Step 6's armed send since brief 25 (the side rule: _beside and
+        _auto_refusal); kept for the branches of Steps 7 and 8 (ET PRs #28 and #25) until they move."""
         own = rec.get("order_id")
         for o in orders:
             if o.get("orderId") == own or o.get("status") not in LIVE:
@@ -407,9 +448,11 @@ class PlanDesk:
             return ORDERS_OLD
         if state == SENT and not entry["done"]:
             return f"{ticker} already has an entry today."
-        f = self._foreign(ticker, rec, orders)
-        if f is not None:
-            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+        # Brief 25: the user's own same-side orders and shares no longer refuse ("One entry per name"
+        # until then); the other side, or a side that is not clear, does.
+        why = self._beside(ticker, side, rec, orders, fresh)
+        if why:
+            return why
         return self._send_refusal(view, ticker, side, blocked)
 
     def _flip_refusal(self, view, ticker, rec, entry, orders, blocked, fresh: bool = True) -> str:
@@ -424,6 +467,10 @@ class PlanDesk:
         used = int(rec.get("flips") or 0)
         if used >= self.flips:
             return f"{ticker}: {used} of {self.flips} flips used today (max_flips_per_row in playbook.json)."
+        # Brief 25: refused before the cancel when the user is on the flip's new side's other side.
+        why = self._beside(ticker, OTHER[rec.get("side") or "LONG"], rec, orders, fresh)
+        if why:
+            return why
         return self._send_refusal(view, ticker, OTHER[rec.get("side") or "LONG"], blocked)
 
     @staticmethod
@@ -471,7 +518,8 @@ class PlanDesk:
                            for k in ("LONG", "SHORT")},
                  "cancel": self._cancel_refusal(entry, fresh),
                  "flip_to": OTHER[entry["side"]].lower() if entry["side"] in OTHER else None,
-                 "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh)}
+                 "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh),
+                 "manual": self._manual_line(ticker, rec, orders)}
             out["rows"].append(r)
         return out
 
@@ -653,11 +701,10 @@ class PlanDesk:
             except Exception:
                 blocked = None                       # refuses: "not confirmed"
             # The same list checks as Place (architect's review of PR #19): a fresh order list, and
-            # no other working order on the name (the cancelled entry is not working any more).
-            f = self._foreign(ticker, {"order_id": oid}, orders) if fresh else None
+            # since brief 25 the side rule for the new side (the cancelled entry is the plan's).
             why = (ORDERS_OLD if not fresh else
-                   f"a working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
-                   if f is not None else self._send_refusal(view, ticker, new, blocked))
+                   self._beside(ticker, new, {"order_id": oid, "side": old}, orders, fresh)
+                   or self._send_refusal(view, ticker, new, blocked))
             if why:
                 self._put(ticker, state=NONE, order_id=None,
                           text=f"Cancelled the {old.lower()} entry. Did not place the {new.lower()}: {why}")
@@ -672,33 +719,48 @@ class PlanDesk:
 
     # ---- the armed plan's twins (Step 6, brief 16 item 5) ------------------------------------
 
-    def _auto_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
-                      blocked: Optional[set], fresh: bool) -> str:
+    def _auto_refusal(self, ticker: str, side: str, rec: Mapping, entry: Mapping, orders: list[dict],
+                      blocked: Optional[set], fresh: bool) -> tuple[str, str]:
         """Place's row checks without Step 2's view: the tape's own tests (executor.py) replace
         "the row's first minute is final and fresh". The plan sends only on an empty row.
         A hold comes first (Flat all's batch, Step 9; a hold that cannot be read refuses): the
-        automatic twins do not go through _send_refusal (architect, 2026-11-13 16:25 UTC)."""
+        automatic twins do not go through _send_refusal (architect, 2026-11-13 16:25 UTC).
+        Returns (why, wait), ("", "") when the send may go. `wait` is "" for a refusal (the plan
+        leaves the pick for the day), WAIT_ALL when no pick may go on this reading (an old order
+        list or account read) and WAIT_NAME when only this name waits (its side is not clear)."""
         held = self.held()
         if held:
-            return held
+            return held, ""
         if rec.get("origin") == "click":
-            return CLICK_TAKES_ROW
+            return CLICK_TAKES_ROW, ""
         if rec:
-            return f"{ticker} already has an entry record today ({rec.get('state')})."
+            return f"{ticker} already has an entry record today ({rec.get('state')}).", ""
         if not self._armed():
-            return "ARM is off on the dashboard."
+            return "ARM is off on the dashboard.", ""
         if not self._market_open():
-            return "The market is closed."
+            return "The market is closed.", ""
         if not fresh:
-            return ORDERS_OLD
-        f = self._foreign(ticker, rec, orders)
-        if f is not None:
-            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+            return ORDERS_OLD, WAIT_ALL
         if blocked is None:
-            return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
+            return ("An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the "
+                    "dashboard."), ""
         if ticker in blocked:
-            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
-        return ""
+            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve.", ""
+        # Brief 25 rule B, in place of "one entry per name" (Ash, 2026-11-13 20:01:19 UTC, and his card
+        # pick "Plan trades beside you", 20:04:42 UTC; architect, 21:31 UTC): the plan's entry goes
+        # beside the user's own trades on the same side, never on the other side, and waits while the
+        # side is not clear. The row is empty here, so the plan holds no share of the name.
+        positions, pfresh = self._positions_read()
+        try:
+            ps = plan_side.plan_shares(rec, orders)
+            code, text = plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ps.ids, ps.held)
+        except Exception as e:                       # when unsure, send nothing
+            code, text = plan_side.NOT_CLEAR, f"Could not read your {ticker} position and orders ({e}). Nothing was sent."[:300]
+        if code == plan_side.OK:
+            return "", ""
+        if code == plan_side.OTHER_SIDE:
+            return text, ""
+        return text, WAIT_ALL if text in (plan_side.ORDERS_OLD, plan_side.POSITIONS_OLD) else WAIT_NAME
 
     def _row_disagrees(self, view: Optional[Mapping], ticker: str, side: str, o: Mapping) -> str:
         """Step 2's row, when its 09:30 bar is final: its trigger and stop within one cent of the
@@ -754,12 +816,13 @@ class PlanDesk:
                 return self._refuse(ticker, f"Not sent: {e}."[:300], not_sent=True)
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why = self._auto_refusal(ticker, rec, entry, orders, blocked, fresh)
+            why, wait = self._auto_refusal(ticker, side, rec, entry, orders, blocked, fresh)
             if why:
-                # An old order list is a wait, not a refusal for the day: `again` (not `busy`), so the
-                # pick tries on a later reading until the watch ends; nothing is ever sent on an old
-                # list (architect's live-test notes N1, 2026-11-13 20:12 UTC).
-                return self._refuse(ticker, why, not_sent=True, again=why == ORDERS_OLD)
+                # An old order list (or account read) is a wait, not a refusal for the day: `again`
+                # (not `busy`), so the pick tries on a later reading until the watch ends; nothing is
+                # ever sent on an old list (architect's live-test notes N1, 2026-11-13 20:12 UTC). A
+                # side that is not clear (brief 25) is a wait of this name only: `this_name`.
+                return self._refuse(ticker, why, not_sent=True, again=bool(wait), this_name=wait == WAIT_NAME)
             shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
             if shares < 1:
                 return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
@@ -1285,11 +1348,14 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         # Invented entries so the screen shows each state; every click is still refused.
         recs, orders = demo_entries()
         desk = PlanDesk(trader, view, lambda: orders, flips, now=now,
-                        armed=lambda: True, market_open=lambda: True, demo=True, stage=stage)
+                        armed=lambda: True, market_open=lambda: True, demo=True, stage=stage,
+                        positions=lambda: dict(plan_flat.DEMO_POSITIONS))
         desk._mem = {desk._key(): recs}
     else:
         desk = PlanDesk(trader, view, poller._merged_orders, flips, now=now,
-                        orders_fresh=lambda: poller._fresh("orders_today"), stage=stage)
+                        orders_fresh=lambda: poller._fresh("orders_today"), stage=stage,
+                        positions=lambda: plan_side.account_positions(poller.account),
+                        positions_fresh=lambda: poller._fresh("account"))
         try:
             desk.recover()
         except Exception as e:
@@ -1334,13 +1400,23 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
 
 def demo_entries() -> tuple[dict, list[dict]]:
     """`--demo` only: AAAA has a resting long entry (Cancel and Flip work), BBBB's flip stopped on a
-    fill (red). Order ids and fills are invented; nothing reaches Schwab."""
+    fill (red), CCCC's long filled 1 share beside 100 bought by hand (brief 25). Order ids and fills are invented; nothing reaches Schwab."""
     recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0},
+            # Brief 25: CCCC's long filled 1 share and its stop works; 100 more were bought by hand.
+            "CCCC": {"state": SENT, "side": "LONG", "ticket_id": "demo-cccc", "order_id": 9003, "flips": 0},
             "BBBB": {"state": RED, "side": "SHORT", "ticket_id": "demo-bbbb", "order_id": 9002, "flips": 1,
                      "text": "Flip stopped: 1 shares filled before the cancel. Its stop is live. Nothing new "
                              "was placed. Check the BBBB order and position in thinkorswim."}}
     orders = [{"orderId": 9001, "status": "WORKING", "filledQuantity": 0, "orderStrategyType": "TRIGGER",
                "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "AAAA"}}]},
               {"orderId": 9002, "status": "FILLED", "filledQuantity": 1, "orderStrategyType": "TRIGGER",
-               "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "BBBB"}}]}]
+               "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "BBBB"}}]},
+              {"orderId": 9003, "status": "FILLED", "filledQuantity": 1, "orderStrategyType": "TRIGGER",
+               "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
+                   {"quantity": 1, "price": 71.85, "time": "2026-11-13T14:31:20+0000"}]}],
+               "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "CCCC"}}],
+               "childOrderStrategies": [{"orderId": 9004, "status": "WORKING", "orderType": "STOP", "quantity": 1,
+                                         "stopPrice": 71.19, "orderStrategyType": "SINGLE",
+                                         "orderLegCollection": [{"instruction": "SELL", "quantity": 1,
+                                                                 "instrument": {"symbol": "CCCC"}}]}]}]
     return recs, orders

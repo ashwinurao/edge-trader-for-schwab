@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from . import break_entry, netlog, schwab
+from . import break_entry, netlog, read_retry, schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -439,9 +439,24 @@ class Trader:
         try:
             r = fn()
         except Exception as e:
-            call.failed(e)
+            pause = self.cooldown_left() if self.cooldown_left else 0.0
+            if not read_retry.may_try_again(endpoint, e, pause):
+                call.failed(e)
+                self.store.log_request(endpoint, started, False, None, repr(e)[:300])
+                raise
+            # Brief 26 (Ash's go, 2026-11-13 20:01 UTC): a quote or order read whose connection
+            # dropped before any answer is sent once more, at once. Never an order (read_retry.py).
+            call.retried(e)
             self.store.log_request(endpoint, started, False, None, repr(e)[:300])
-            raise
+            started = now_iso()
+            if self.on_request:
+                self.on_request(None)
+            try:
+                r = fn()
+            except Exception as e2:
+                call.failed(e2)
+                self.store.log_request(endpoint, started, False, None, repr(e2)[:300])
+                raise
         call.returned(r)
         if r.status_code == 429 and self.on_request:
             self.on_request(r.headers.get("Retry-After") or "30")

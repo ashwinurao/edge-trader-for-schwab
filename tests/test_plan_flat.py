@@ -145,7 +145,8 @@ def fr(tmp_path, monkeypatch):
     view = Plan()
     view.rows = four_rows()
     orders = lambda: list(b.orders.values())                                  # noqa: E731
-    desk = plan_entries.PlanDesk(t, view, orders, plan_entries.max_flips(), now=lambda: NOW)
+    desk = plan_entries.PlanDesk(t, view, orders, plan_entries.max_flips(), now=lambda: NOW,
+                                 positions=lambda: dict(b.pos))     # brief 25's side rule reads them
 
     class R:
         pass
@@ -153,13 +154,16 @@ def fr(tmp_path, monkeypatch):
     r.mono = [0.0]
     r.fresh = [True, True]
     r.cooldown = [0.0]
+    # When the positions were last read (brief 25: Flat all cancels a plan stop only on a read taken
+    # flat.positions_after_fill_seconds after the fill). Default: a minute after FILL_TIME.
+    r.pos_at = [datetime.fromisoformat(FILL_TIME.replace("+0000", "+00:00")) + timedelta(seconds=60)]
 
     def brackets():
         o = orders()
         return t.brackets(o, pending_orders(o, set()), dict(b.pos), all(r.fresh))
     r.flat = plan_flat.PlanFlat(t, desk, orders, lambda: dict(b.pos), lambda: set(), lambda: tuple(r.fresh),
                                 brackets, time(10, 0), 3.0, cooldown=lambda: r.cooldown[0],
-                                mono=lambda: r.mono[0])
+                                mono=lambda: r.mono[0], positions_at=lambda: r.pos_at[0], fill_margin=10.0)
     r.trader, r.broker, r.view, r.desk = t, b, view, desk
     return r
 
@@ -195,12 +199,25 @@ def test_the_list_for_each_kind_of_row(fr):
     items = fr.flat.items()
     assert [it["ticker"] for it in items] == list(TICKERS)       # rank order
     got = {it["ticker"]: (it["action"], it["order_id"], it["shares"]) for it in items}
-    assert got == {"AAAA": ("close", a, 1.0), "BBBB": ("cancel", b_, None),
-                   "CCCC": ("nothing", c, None), "DDDD": ("nothing", d, None)}
+    # Brief 25 rule D: a filled row closes the plan's own shares by its stop (order id: the stop), and
+    # a row whose account holds none while the plan's stop works cancels that stop.
+    stop_a, stop_c = (fr.broker.orders[x]["childOrderStrategies"][0]["orderId"] for x in (a, c))
+    assert got == {"AAAA": ("close_plan", stop_a, 1.0), "BBBB": ("cancel", b_, None),
+                   "CCCC": ("cancel_stop", stop_c, None), "DDDD": ("nothing", d, None)}
     t = by_ticker(items)
-    assert t["AAAA"]["text"] == "Close 1 share (long) at the market."
+    assert t["AAAA"]["text"] == "Close the plan's 1 share at the market."
     assert t["BBBB"]["text"] == f"Cancel the unfilled long entry (order {b_})."
-    assert "closed already" in t["CCCC"]["text"] and "ended CANCELED" in t["DDDD"]["text"]
+    assert t["CCCC"]["text"] == f"The account holds no CCCC: cancel the plan's stop (order {stop_c})."
+    assert "ended CANCELED" in t["DDDD"]["text"]
+
+
+def test_a_closed_row_whose_stop_is_gone_is_nothing(fr):
+    # Before brief 25 this was the list test's CCCC: filled, closed since, nothing working.
+    c = place(fr, "CCCC")
+    fr.broker.fill_entry(c, stop_live=False)
+    fr.broker.pos["CCCC"] = 0.0
+    it = by_ticker(fr.flat.items())["CCCC"]
+    assert it["action"] == "nothing" and "closed already" in it["text"]
 
 
 def test_a_row_without_an_entry_is_nothing_even_when_shares_are_held(fr):
@@ -209,8 +226,8 @@ def test_a_row_without_an_entry_is_nothing_even_when_shares_are_held(fr):
     assert it["action"] == "nothing" and "not from the plan" in it["text"]
 
 
+# Brief 25: "more than the plan's entry filled" is no longer refused (see the rule D tests below).
 @pytest.mark.parametrize("held,why", [
-    (2.0, "more than the 1 the plan's entry filled"),
     (-1.0, "the other side of the plan's long entry"),
 ])
 def test_a_larger_or_opposite_position_is_refused_for_that_row(fr, held, why):
@@ -253,7 +270,7 @@ def test_a_recorded_entry_still_counts_when_edge_scanner_shows_no_rows(fr):
     fr.view.picks_age = 600                                      # old data still lists the rows
     fr.view.rows = []                                            # and now no rows at all
     (it,) = [x for x in fr.flat.items() if x["ticker"] == "AAAA"]
-    assert it["action"] == "close" and it["rank"] is None
+    assert it["action"] == "close_plan" and it["rank"] is None
 
 
 # ---------------------------------------------------------------- the batch
@@ -309,8 +326,8 @@ def test_a_list_that_differs_sends_nothing(fr):
     assert "list changed" in fr.flat.run(shown)["error"] and mutating(fr) == []
 
 
+# ARM off is no longer a batch refusal (brief 27): see the "Flat all with ARM off" tests below.
 @pytest.mark.parametrize("knob,text", [
-    ("arm", "ARM is off"),
     ("market", "market is closed"),
     ("orders", "order list is old"),
     ("positions", "positions are old"),
@@ -321,9 +338,7 @@ def test_each_batch_refusal_sends_nothing(fr, monkeypatch, knob, text):
     fr.broker.fill_entry(a)
     items = fr.flat.items()
     fr.broker.calls.clear()
-    if knob == "arm":
-        fr.trader.arm(False)
-    elif knob == "market":
+    if knob == "market":
         monkeypatch.setattr(trading, "market_open", lambda now=None: False)
     elif knob == "orders":
         fr.fresh[0] = False
@@ -499,12 +514,13 @@ def test_before_batch_runs_first_before_the_list_is_rebuilt(fr, monkeypatch):
     assert r["ok"] and order[:2] == ["before", "list"]
 
 
-def test_before_batch_runs_even_when_the_batch_is_refused(fr):
+def test_before_batch_runs_even_when_the_batch_is_refused(fr, monkeypatch):
+    # Refused for the market: since brief 27 ARM off no longer refuses a batch.
     called = []
     fr.flat.before_batch = lambda: called.append(1)
-    fr.trader.arm(False)
+    monkeypatch.setattr(trading, "market_open", lambda now=None: False)
     r = fr.flat.run([])
-    assert not r["ok"] and "ARM is off" in r["error"] and called == [1]
+    assert not r["ok"] and "market is closed" in r["error"] and called == [1]
 
 
 def test_a_before_batch_that_raises_does_not_stop_the_batch(fr, caplog):
@@ -538,7 +554,7 @@ def test_a_preview_view_with_buying_power_is_never_read_or_written(fr, caplog):
                              "buying_power": {"state": "OK", "day_trading": 987654.32,
                                               "buying_power": 876543.21, "equity": 765432.10}}
     st = fr.flat.state()
-    assert [(i["ticker"], i["action"], i["rank"]) for i in st["items"]] == [("AAAA", "close", None)]
+    assert [(i["ticker"], i["action"], i["rank"]) for i in st["items"]] == [("AAAA", "close_plan", None)]
     r = fr.flat.run(expected(st["items"]))
     assert r["ok"] and fr.broker.pos["AAAA"] == 0
     seen = json.dumps(st) + json.dumps(r) + json.dumps(fr.flat.last()) + caplog.text
@@ -555,7 +571,9 @@ def test_an_etf_position_closes_like_shares(fr):
     assert r["ok"] and fr.broker.pos["AAAA"] == 0
 
 
-def test_arm_turning_off_during_the_batch_stops_the_rest(fr):
+def test_arm_turning_off_during_the_batch_does_not_stop_the_rest(fr):
+    # Brief 27: Flat all needs no ARM, so a disarm mid-batch (Step 6 wires its Disarm to
+    # before_batch) does not leave the plan's shares open.
     a, b_ = place(fr, "AAAA"), place(fr, "BBBB")
     fr.broker.fill_entry(a)
     real = fr.desk.cancel
@@ -566,8 +584,81 @@ def test_arm_turning_off_during_the_batch_stops_the_rest(fr):
         return out
     fr.desk.cancel = cancel_then_disarm
     r = fr.flat.run(expected(fr.flat.items()))
-    res = {x["ticker"]: (x["result"], x["text"]) for x in r["batch"]["rows"]}
-    assert res["BBBB"][0] == "done" and res["AAAA"] == ("not_sent", "Not sent: ARM turned off during the batch.")
+    res = {x["ticker"]: x["result"] for x in r["batch"]["rows"]}
+    assert r["ok"] and res["BBBB"] == "done" and res["AAAA"] == "done"
+    assert fr.broker.pos["AAAA"] == 0 and not fr.trader.armed
+
+
+# ---------------------------------------------------------------- Flat all with ARM off (brief 27)
+# Ash's go: "3 yes" (project thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC) to
+# "Should Flat all work with ARM off? (yes, it only removes risk)". Live 2026-11-13 19:52:15 UTC, right
+# after a restart (which turns ARM off), Flat all refused a resting CBRS entry for ARM.
+
+def test_arm_off_after_a_restart_flat_all_cancels_the_resting_entry(fr):
+    b_ = place(fr, "BBBB")
+    fr.trader.arm(False)                                   # a restart turns ARM off
+    st = fr.flat.state()
+    assert st["refusal"] == ""
+    assert by_ticker(st["items"])["BBBB"]["action"] == "cancel"
+    fr.broker.calls.clear()
+    r = fr.flat.run(expected(st["items"]))
+    assert r["ok"], r
+    assert mutating(fr) == [("cancel", b_)]
+    assert {x["ticker"]: x["result"] for x in r["batch"]["rows"]}["BBBB"] == "done"
+    assert not fr.trader.armed                             # Flat all never turns ARM on
+
+
+def test_arm_off_flat_all_closes_a_filled_plan_share(fr):
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    fr.trader.arm(False)
+    items = fr.flat.items()
+    assert by_ticker(items)["AAAA"]["action"] == "close_plan"
+    r = fr.flat.run(expected(items))
+    assert r["ok"], r
+    assert fr.broker.pos["AAAA"] == 0 and not fr.trader.armed
+
+
+def test_arm_off_and_the_market_closed_refuses_for_the_market(fr, monkeypatch):
+    place(fr, "BBBB")
+    items = fr.flat.items()
+    fr.trader.arm(False)
+    monkeypatch.setattr(trading, "market_open", lambda now=None: False)
+    fr.broker.calls.clear()
+    r = fr.flat.run(expected(items))
+    assert not r["ok"] and r["error"] == "The market is closed (9:30 to 16:00 ET). Nothing was sent."
+    assert fr.flat.state()["refusal"] == r["error"]
+    assert mutating(fr) == []
+
+
+def test_arm_off_place_and_flip_still_refuse_for_arm(fr):
+    place(fr, "BBBB")
+    fr.trader.arm(False)
+    n = len(fr.broker.placed)
+    fr.broker.calls.clear()
+    p = fr.desk.place("AAAA", "LONG", LONG)
+    f = fr.desk.flip("BBBB", SHORT)
+    assert not p["ok"] and "ARM is off" in p["error"]
+    assert not f["ok"] and "ARM is off" in f["error"]
+    assert len(fr.broker.placed) == n and mutating(fr) == []
+
+
+def test_arm_off_the_hold_still_refuses_new_entries_during_a_batch(fr):
+    a, b_ = place(fr, "AAAA"), place(fr, "BBBB")
+    fr.broker.fill_entry(a)
+    fr.trader.arm(False)
+    items = fr.flat.items()
+    gate = threading.Event()
+    fr.broker.gate = gate
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("batch", fr.flat.run(expected(items))))
+    th.start()
+    wait_for_gate(fr)
+    p = fr.desk.place("CCCC", "LONG", LONG)
+    gate.set()
+    th.join(5)
+    assert not p["ok"] and p["error"] == plan_flat.HOLD
+    assert out["batch"]["ok"] and not fr.trader.armed
 
 
 def test_the_button_stands_out_from_two_minutes_before_the_flat_time(fr):
@@ -666,7 +757,9 @@ def test_add_stop_refusals(fr, monkeypatch):
     assert len(fr.broker.placed) == n0
 
 
-def test_a_partly_covered_row_is_red_but_add_stop_refuses(fr):
+def test_shares_bought_by_hand_beside_a_covered_plan_row_do_not_turn_it_red(fr):
+    # Brief 25 rule E (changed expectation): until brief 25 the 3 shares bought elsewhere turned the
+    # row red ("3 of 20 shares have no stop") with Add stop refused. They are the user's, not the plan's.
     fr.desk.stage = plan_size.parse_stage(0.10)
     a = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 17})["order_id"]
     fr.broker.fill_entry(a, stop_live=True)                        # 17 held, stop for 17
@@ -674,8 +767,7 @@ def test_a_partly_covered_row_is_red_but_add_stop_refuses(fr):
     fr.flat.cover()
     fr.mono[0] = 5.0
     c = fr.flat.cover()["AAAA"]
-    assert c["red"] and c["text"] == "3 of 20 shares have no stop."
-    assert "set the rest's stop in thinkorswim" in c["add_stop"]
+    assert c["state"] == "covered" and not c["red"] and (c["held"], c["covered"]) == (17.0, 17.0)
     n0 = len(fr.broker.placed)
     assert not fr.flat.add_stop("AAAA", {"shares": 3, "stop": "41.92"})["ok"] and len(fr.broker.placed) == n0
 
