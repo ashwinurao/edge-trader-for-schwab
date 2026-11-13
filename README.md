@@ -154,7 +154,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Floating windows:** small always-on-top Entry and Manage windows to keep next to your charts.
 - **Opening plan (optional, display only):** with `EDGE_SCANNER_URL` set, an "Opening plan" button
   opens a screen with one row per OV pick of the day (ranks 1 to 4) from Edge Scanner: the 09:30 ET
-  minute's high and low (marked "so far" until the bar is final), the long entry one cent above the
+  minute's high and low (marked "so far" until the bar is final, or "not confirmed" while it is Edge
+  Scanner's early 09:30 bar from Alpaca's snapshot), the long entry one cent above the
   high and the short entry one cent below the low, each with its stop at the other side, the risk per
   share, the shares for the risk per pick you type (rounded down, inside the ticket's 10,000-share and
   $250,000 caps), and which side the minute's close is nearer. On a calm SPY day (RV20 at or below
