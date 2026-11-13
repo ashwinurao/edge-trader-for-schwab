@@ -610,7 +610,7 @@ def test_steps_read_the_plan_view_before_the_tape_never_between_reading_and_send
         def read(self):
             events.append(("tape", rig.clock.now()))
             return tape.read()
-    rig.plan._view, rig.desk._view, rig.plan.tape = timed_view, timed_view, TimedTape()
+    rig.plan._view, rig.plan._row_view, rig.desk._view, rig.plan.tape = timed_view, timed_view, timed_view, TimedTape()
     real_place = rig.broker.place_order
 
     def place(h, order):
@@ -718,15 +718,236 @@ def test_no_answer_freezes_the_pick_disarms_and_the_name_stays_blocked(rig):
     assert {r["ticker"]: r["entry"]["state"] for r in rig.desk.state()["rows"]}["DDDD"] == plan_entries.UNKNOWN
 
 
-def test_trader_lock_busy_is_not_an_order_and_the_pick_tries_again(rig):
+def _spy(rig, name):
+    """Counts the desk twin's calls, each with whether Trader's lock was held then."""
+    real, tries = getattr(rig.desk, name), []
+
+    def twin(ticker, *a, **kw):
+        tries.append((ticker, rig.trader._send_lock.locked()))
+        return real(ticker, *a, **kw)
+    setattr(rig.desk, name, twin)
+    return tries
+
+
+def _hold_lock(rig, start, seconds):
+    """Trader's lock held for `seconds` on the fake clock (a click's ticket send, or Flat all), with
+    the worker stepping as run() does. Each step while it is held must not count as an action."""
+    rig.trader._send_lock.acquire()
+    rig.clock.t = start
+    try:
+        while rig.clock.t < start + timedelta(seconds=seconds):
+            assert not rig.plan.safe_step()           # never an action: the worker waits one tick
+            rig.clock.advance(rig.plan.armed_rules.every_seconds)
+    finally:
+        rig.trader._send_lock.release()
+
+
+def test_a_busy_trader_lock_ends_the_step_and_waits_one_tick(rig):
+    """Architect's review 1 of PR #27 (2026-11-13 16:45 UTC): "nothing reached Schwab, try later" is
+    not an action. While a click holds Trader's lock the step ends, no other pick tries on that
+    reading, and the worker waits one tick (every_seconds 0.25). Held 2 s: at most 9 tries, one log
+    line, no row record written and removed, nothing spent; then the picks go out in order."""
     arm(rig)
-    rig.trader._send_lock.acquire()                      # a click is running on the ticket
+    tries = _spy(rig, "place_auto")
+    saves, real_save = [], rig.desk._save
+
+    def save(recs):
+        if rig.trader._send_lock.locked():
+            saves.append(copy.deepcopy(recs))
+        return real_save(recs)
+    rig.desk._save = save
+    calls = len(rig.broker.calls)
+    _hold_lock(rig, et(9, 31, 0.1), 2.0)
+    busy = [t for t, held in tries if held]
+    assert 1 <= len(busy) <= 9 and set(busy) == {"DDDD"}     # the nearest pick only, one try a tick
+    assert rig.broker.placed == [] and len(rig.broker.calls) == calls and rig.sent == []
+    assert rig.desk.records() == {} and saves == []          # the lock is checked before the claim
+    assert rig.plan.orders_day == 0 and rig.plan.bounds_left("DDDD")["calls_minute"] == 40
+    assert lines(rig, "send_start") == []
+    said = lines(rig, "busy")
+    assert [x["ticker"] for x in said] == ["DDDD"] and said[0]["what"] == "send"
+    assert {p["ticker"]: p["note"] for p in rig.plan.panel()["picks"]}["DDDD"] == plan_entries.TRADER_BUSY
+    run(rig, et(9, 31, 5))
+    assert placed(rig) == NEAREST_FIRST and len(lines(rig, "busy")) == 1
+    assert {p["ticker"]: p["note"] for p in rig.plan.panel()["picks"]}["DDDD"] == ""
+
+
+def test_a_lock_taken_after_the_check_is_busy_too_and_the_row_is_as_before(rig):
+    """The check before the claim is a hint: a click can take Trader's lock just after it. Then
+    Trader.submit refuses before any request ("Another submission is in progress"), the desk puts
+    the row back as it was, and the worker treats it as the same busy lock."""
+    arm(rig)
+    rig.desk.trader_busy = lambda: False
+    rig.trader._send_lock.acquire()
     rig.clock.t = et(9, 31, 0.1)
-    assert rig.plan.safe_step()                          # refused before any request
-    assert rig.broker.placed == [] and rig.plan.orders_day == 0 and rig.desk.records() == {}
+    assert not rig.plan.safe_step()
     rig.trader._send_lock.release()
+    assert rig.broker.placed == [] and rig.desk.records() == {} and rig.plan.orders_day == 0
+    assert [x["ticker"] for x in lines(rig, "busy")] == ["DDDD"]
     run(rig, et(9, 31, 3))
     assert placed(rig) == NEAREST_FIRST
+
+
+def test_a_busy_lock_at_the_watch_end_waits_a_tick_and_the_cancel_still_goes(rig):
+    """The same for a watch-end cancel: the attempt for that order id is not used up, nothing is
+    logged as a cancel, and each entry is cancelled and confirmed once the lock is free."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    ids = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}
+    tries = _spy(rig, "cancel_auto")
+    _hold_lock(rig, et(9, 35, 0), 2.0)
+    busy = [t for t, held in tries if held]
+    assert 1 <= len(busy) <= 9 and set(busy) == {"DDDD"}
+    assert rig.broker.cancelled == [] and lines(rig, "cancel_start") == []
+    said = lines(rig, "busy")
+    assert [x["ticker"] for x in said] == ["DDDD"] and said[0]["what"] == "cancel"
+    run(rig, et(9, 35, 15))
+    assert sorted(rig.broker.cancelled) == sorted(ids.values())
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "AAAA", "BBBB", "CCCC"]
+    p = rig.plan.panel()
+    assert not p["armed"] and "fast watch ended" in p["disarmed"]["why"] and p["resting"] == []
+
+
+def test_a_cancel_the_desk_refuses_leaves_the_pick_and_does_not_spin(rig):
+    """A cancel the desk refuses for another reason (no resting plan entry on the row) reached
+    nothing at Schwab either. It used to forget the attempt and count as an action, so the worker
+    asked again at once, forever. Now the attempt is used and the plan leaves the pick."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    tries = []
+
+    def cancel_auto(ticker, why="", log=None):
+        tries.append(ticker)
+        return {"ok": False, "ticker": ticker, "error": "No resting entry of the armed plan on this row.",
+                "not_sent": True}
+    rig.desk.cancel_auto = cancel_auto
+    run(rig, et(9, 35, 2), start=et(9, 35, 0))
+    assert sorted(tries) == sorted(PICKS) and rig.broker.cancelled == []
+    left = {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}
+    assert all(left[s].startswith("not cancelled: No resting entry") for s in PICKS)
+
+
+def test_place_auto_never_asks_edge_scanner(rig):
+    """The armed twin takes Step 2's view from the executor; with none it skips the row check rather
+    than asking Edge Scanner's picks route (review 1 of PR #27)."""
+    rig.clock.t = et(9, 31, 0.1)
+    asked = []
+
+    def ask():
+        asked.append(rig.clock.now())
+        return rig.view()
+    rig.desk._view = ask
+    o = engine.order_for("long", Decimal("42.48"), Decimal("41.92"), Decimal(100), engine.rules_from(PB_RAW))
+    r = rig.desk.place_auto("AAAA", "LONG", o)
+    assert r["ok"] and placed(rig) == ["AAAA"] and asked == []
+
+
+# ---------------------------------------------------------------- the row check reads the last answer
+
+def feed_app(rig, bars=None):
+    """routes.register with a fake GET that takes its whole 1.5 s limit on the fake clock (Edge
+    Scanner's picks route just after 09:31:00, playbook feed.timeout_seconds) and counts each ask.
+    The worker's row check reads app.state.opening_plan_view_cached, as register() wires it."""
+    from companion.opening_plan import routes as R
+    asks = []
+    bars = {**{s: (v[1], v[2], v[3]) for s, v in PICKS.items()}, **(bars or {})}
+
+    def get(url, timeout):
+        asks.append(url)
+        rig.clock.advance(1.5)
+        if url.endswith("/api/v2/clock"):
+            return {"spy_rv": {"rv20": 12.3, "through": "2026-11-12", "calm": False, "calm_max": 10.5}}
+        return answer([es_pick(PICKS[s][0], s, *bars[s]) for s in PICKS])
+    app = FastAPI()
+    store = Store(rig.tmp / "feed.db")
+    store.set_setting(R.RISK_KEY, "100")
+    R.register(app, store, lambda r: None, env={"EDGE_SCANNER_URL": ENV["EDGE_SCANNER_URL"]}, now=rig.clock.now,
+               get=get)
+    rig.plan._row_view = app.state.opening_plan_view_cached
+    return app, asks
+
+
+def test_a_slow_picks_route_never_delays_a_step(rig):
+    """Architect's review 1 of PR #27: the worker never makes the picks GET. The page asked at
+    09:30:57 (3 s on the fake clock); the steps from 09:31:00.1 ask nothing, and all four sends
+    leave on that first reading's second, with the row check run on the page's last answer."""
+    arm(rig)
+    app, asks = feed_app(rig)
+    rig.clock.t = et(9, 30, 57)
+    assert app.state.opening_plan_view()["state"] == "OK"
+    asked = len(asks)
+    assert asked == 2
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert len(asks) == asked
+    assert placed(rig) == NEAREST_FIRST and [t for _, t in rig.broker.at] == [et(9, 31, 0.1)] * 4
+    assert lines(rig, "row_check_skipped") == []
+
+
+def test_a_cached_final_row_that_disagrees_still_turns_the_row_red(rig):
+    arm(rig)
+    app, asks = feed_app(rig, bars={"BBBB": (20.50, 19.95, 20.10)})   # 5 cents from the tape's low
+    rig.clock.t = et(9, 30, 57)
+    app.state.opening_plan_view()
+    asked = len(asks)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert len(asks) == asked and placed(rig) == ["DDDD", "AAAA", "CCCC"]
+    e = {r["ticker"]: r["entry"] for r in rig.desk.state()["rows"]}["BBBB"]
+    assert e["red"] and "disagree" in e["text"]
+
+
+def test_no_cached_answer_sends_on_the_tape_alone_and_says_the_check_was_skipped(rig):
+    """Neither the page nor the shadow has fetched the picks: the sends go on the open tape alone
+    (BBBB's disagreeing row was never fetched, so it is not seen) and the log says so once."""
+    arm(rig)
+    app, asks = feed_app(rig, bars={"BBBB": (20.50, 19.95, 20.10)})
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert asks == [] and placed(rig) == NEAREST_FIRST
+    skipped = lines(rig, "row_check_skipped")
+    assert len(skipped) == 1 and skipped[0]["why"].startswith("no answer from Edge Scanner's picks route yet")
+
+
+def test_an_old_cached_answer_skips_the_row_check(rig):
+    """Older than feed.stale_after_seconds (6): the page last fetched at 09:30:51.5."""
+    arm(rig)
+    app, asks = feed_app(rig, bars={"BBBB": (20.50, 19.95, 20.10)})
+    rig.clock.t = et(9, 30, 50)
+    app.state.opening_plan_view()
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    skipped = lines(rig, "row_check_skipped")
+    assert len(skipped) == 1 and "s old" in skipped[0]["why"] and skipped[0]["source"]["ok_at_et"] == "09:30:51"
+
+
+def test_the_row_check_skip_is_said_once_per_reason(rig):
+    arm(rig)
+    views = {"v": {}}
+    rig.plan._row_view = lambda: views["v"]
+    rig.clock.t = et(9, 30, 59.9)
+    rig.knobs["fresh"] = True
+    for v in ({}, {}, "ok", "ok", "old", "old", {}):
+        views["v"] = rig.view() if v == "ok" else ({**rig.view(), "stale": True} if v == "old" else v)
+        rig.clock.t = et(9, 31, 0.1)
+        rig.plan._row_check_view()
+    assert [x["event"] for x in lines(rig) if x["event"].startswith("row_check")] == \
+        ["row_check_skipped", "row_check_back", "row_check_skipped", "row_check_skipped"]
+
+
+def test_decision_lines_carry_the_read_times_and_a_slow_step_says_so(rig):
+    """Review 1 item 3: where each step's time went, on the first armed morning."""
+    arm(rig)
+    tape = rig.tape
+
+    class SlowTape:
+        def read(self):
+            rig.clock.advance(0.15)
+            return tape.read()
+    rig.plan.tape = SlowTape()
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    d = lines(rig, "decision")
+    assert d and all(x["tape_ms"] == 150.0 and "view_ms" in x for x in d)
+    slow = lines(rig, "slow_step")
+    assert [x["ticker"] for x in slow] == NEAREST_FIRST
+    assert all(x["tape_ms"] == 150.0 and x["before_handler_ms"] >= 150.0 for x in slow)
 
 
 # ---------------------------------------------------------------- the watch end

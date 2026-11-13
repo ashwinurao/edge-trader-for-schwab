@@ -81,3 +81,5 @@ class DemoFeed:
     def read(self) -> tuple[Reading, Reading]:
         at = self._now() - timedelta(seconds=0.4)
         return Reading(picks_answer(at), at, ""), Reading(clock_answer(at), at, "")
+
+    peek = read                            # nothing is asked in demo, so peek and read agree

@@ -93,7 +93,8 @@ name are refused). It needs no account and sends no telemetry.
   the same reader, so with the shadow log on as well it is still at most one read every 0.25 seconds:
   once when its Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
   the end of the watch (at the latest 09:35:45 ET). Before each send it also checks the pick's row against the
-  OV picks read above (at most every 2 seconds), even with the screen closed.
+  last OV picks answer that the Opening plan screen or the shadow log fetched. It never asks Edge Scanner's
+  picks route itself.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -443,7 +444,14 @@ log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one att
 waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never flips, chases,
 exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
-stop, that row turns red and nothing is sent for it.
+stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
+Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
+waits on Edge Scanner's picks route, which is at its slowest just after 09:31:00. With the screen closed
+and the shadow log off, or an answer older than 6 seconds (`feed.stale_after_seconds` in the playbook),
+the check is skipped, the sends go on the tape alone, and the log says so once (`row_check_skipped`).
+Keep the Opening plan screen open, or the shadow log on, while armed.
+When a click, a ticket send or Flat all is using Edge Trader's one order lock, the plan sends and
+cancels nothing: it waits 0.25 s, reads the tape again and tries then. The pick's line says so once.
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
@@ -453,6 +461,9 @@ today, or when the tape is stamped ahead of Edge Trader's clock. It stops and di
 **Disarm** click (one click, checked before every send and cancel); an unclear Schwab answer (that pick
 is left and the row follows its ticket, as after a click); a cancel Schwab does not confirm (the row
 turns red); a reached bound; ARM turned off on the dashboard; an old order list; or an unexpected error.
+An old order list means one failed read of Schwab's order list, or no good read for 15 seconds (3 times
+the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in `companion/poller.py`). Such a
+disarm is not for the day, but the Arm window has closed by then, so the plan is over for that morning.
 A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
 pick and is never retried. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
@@ -471,7 +482,10 @@ the poller's 32 to 50 a minute is 103 to 121 against Schwab's 120. That top need
 all ten read-backs and every send to find an open close.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
-time, the decision, the send's start and its answer with their times. It holds no account number, token
+time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
+start and its answer with their times. A step that took over 100 ms before its action adds a
+`slow_step` line. A busy order lock adds one `busy` line per pick, and a skipped row check one
+`row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
 or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
 

@@ -3,7 +3,10 @@
 Each step, from armed.act_from_et (09:31:00 ET) while armed:
 1. Whole-plan checks: the dashboard's ARM, Schwab's 429 pause, Schwab's order list fresh. Any one
    failing disarms (a 429 for the day).
-2. Read the open tape (brief 15, companion/opening_plan/tape.py) and test it (`usable`, and data
+2. Take Step 2's view from the feed's last answer (never asking Edge Scanner: the page and the
+   shadow fetch it) for the row check; when it is missing or older than feed.stale_after_seconds
+   the row check is skipped and the log says so once. Then read the open tape (brief 15,
+   companion/opening_plan/tape.py) and test it (`usable`, and data
    stamped more than armed.clock_ahead_seconds after our clock: the clock looks behind). An
    unusable reading acts on nothing price-based: the picks go to the engine without a price, so
    only the time-based cancels can still come.
@@ -11,7 +14,9 @@ Each step, from armed.act_from_et (09:31:00 ET) while armed:
    pick's real entry (PlanDesk.auto_entry: the row record joined with Schwab's order list).
 4. engine.decide, then give the decisions to their handlers (handlers.py) nearest to the trigger
    first, in R. One order action per reading: after a send or a cancel the next step takes a new
-   reading and decides again, so a later pick never goes out on an earlier pick's reading.
+   reading and decides again, so a later pick never goes out on an earlier pick's reading. A busy
+   Trader lock (a click, a ticket send or Flat all) is not an action: the step ends, no other pick
+   tries on that reading, and the next step comes one tick later.
 5. At the watch end the engine says would_cancel for each unfilled plan entry; once none is left
    the plan disarms ("the fast watch ended").
 
@@ -57,6 +62,9 @@ ACTION_KINDS = ("would_place", "would_cancel", "would_flip", "would_relevel")
 NOT_ON = {"would_flip": "flip is not on: the entry stays",
           "would_relevel": "re-level is not on: the entry stays"}
 FAR = Decimal(10 ** 9)
+# A step that took longer than this from its first read to its handler logs one "slow_step" line
+# (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC).
+SLOW_STEP_MS = 100.0
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -115,17 +123,21 @@ class AutoPlan:
 
     `tape.read()` gives brief 15's reading (companion/opening_plan/tape.py EsTape); `usable(reading,
     now)` -> (bool, why) is tape.usable with the playbook's tape rules. `view()` is the
-    Opening plan's view (Step 2), `orders()` the poller's top-level orders, `orders_fresh()` and
-    `cooldown_left()` the poller's. Tests pass fakes and a fake clock (`now`).
+    Opening plan's view (Step 2), which may ask Edge Scanner (the Arm dialog and its checks);
+    `row_view()` is the same view from the feed's last answer, never asking (each step's row
+    check; register passes routes' opening_plan_view_cached; None: tests use `view` for both).
+    `orders()` is the poller's top-level orders, `orders_fresh()` and `cooldown_left()` the
+    poller's. Tests pass fakes and a fake clock (`now`).
     """
 
     def __init__(self, desk, trader, playbook: Mapping, tape, usable: Callable[[Any], tuple],
                  view: Callable[[], dict], orders: Callable[[], list], orders_fresh: Callable[[], bool],
                  cooldown_left: Callable[[], float], env: Mapping[str, str] = os.environ,
                  registry: Optional[Registry] = None, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 out_dir: Path = OUT_DIR, demo: bool = False) -> None:
+                 out_dir: Path = OUT_DIR, demo: bool = False, row_view: Optional[Callable[[], dict]] = None) -> None:
         self.desk, self.trader, self.tape, self._usable = desk, trader, tape, usable
         self._view, self._orders, self._orders_fresh, self._cooldown = view, orders, orders_fresh, cooldown_left
+        self._row_view = row_view or view
         self.env, self._now, self.out_dir, self.demo = env, now, Path(out_dir), demo
         self.rules = engine.rules_from(playbook)
         self.armed_rules = armed_rules_from(playbook)
@@ -147,6 +159,9 @@ class AutoPlan:
         self.sends: deque = deque()             # (monotonic seconds, calls) of the plan's sends
         self.onces: set = set()
         self.last_reading: dict = {}
+        self.busy_picks: dict[str, str] = {}   # ticker -> "send" or "cancel" while Trader's lock is busy
+        self._busy_step = False
+        self.row_check = ""                     # why the row check is skipped now ("" when it runs)
         self.problem = ""
         self._mono = _time.monotonic
         self._stop = threading.Event()
@@ -294,6 +309,27 @@ class AutoPlan:
         with self._lock:
             self.onces.discard(key)
 
+    def busy(self, ticker: str, what: str) -> None:
+        """Trader's order lock was busy, so nothing reached Schwab. Not an action: the step ends,
+        no other pick tries on that reading and the worker waits one tick (architect's review 1 of
+        fork PR #27, 2026-11-13 16:45 UTC). Said once per pick while it lasts, not once per try."""
+        with self._lock:
+            self._busy_step = True
+            first = ticker not in self.busy_picks
+            self.busy_picks[ticker] = what
+            if first:
+                self.notes.setdefault(ticker, {})["note"] = plan_entries.TRADER_BUSY
+        if first:
+            self.log("busy", ticker, what=what, why=plan_entries.TRADER_BUSY)
+
+    def _busy_over(self, ticker: str) -> None:
+        with self._lock:
+            if self.busy_picks.pop(ticker, None) is None:
+                return
+            n = self.notes.setdefault(ticker, {})
+            if n.get("note") == plan_entries.TRADER_BUSY:
+                n["note"] = ""
+
     # ---- one step -----------------------------------------------------------------------------
 
     def _roll_day(self, now: datetime) -> None:
@@ -302,6 +338,7 @@ class AutoPlan:
             if self.day != day:
                 self.day, self.state, self.left, self.notes, self.known = day, None, {}, {}, {}
                 self.orders_pick, self.orders_day, self.onces = Counter(), 0, set()
+                self.busy_picks, self.row_check = {}, ""
                 self.sends.clear()
 
     def _read(self, now: datetime) -> tuple[Any, bool, str]:
@@ -404,7 +441,34 @@ class AutoPlan:
             return f"the plan could not check the account state ({type(e).__name__})", False
         return "", False
 
-    def _note_decisions(self, decisions: list[dict], er: Mapping) -> None:
+    def _row_check_view(self) -> dict:
+        """Step 2's view for the row check, from the feed's last answer: never a GET to Edge Scanner
+        (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC: from 09:31:00 that route is at
+        its slowest). Missing, old (older than feed.stale_after_seconds) or not OK: {} skips the
+        row check, and the log says so once until the reason changes."""
+        why, code = "", ""
+        try:
+            view = self._row_view() or {}
+        except Exception as e:
+            view, why, code = {}, f"the plan view does not read ({type(e).__name__})", "error"
+        if not why:
+            age = (view.get("source") or {}).get("age_s")
+            if not view or view.get("state") == "NO_ANSWER":
+                why, code = "no answer from Edge Scanner's picks route yet", "missing"
+            elif view.get("stale"):
+                why, code = f"Edge Scanner's last picks answer is {age} s old", "old"
+            elif view.get("state") != "OK":
+                why, code = view.get("message") or f"the plan view says {view.get('state')}", str(view.get("state"))
+        with self._lock:
+            was, self.row_check = self.row_check, code
+        if code and code != was:
+            self.log("row_check_skipped", None, why=f"{why}. The sends go on the open tape alone until it is back.",
+                     source=view.get("source"))
+        elif was and not code:
+            self.log("row_check_back", None, source=view.get("source"))
+        return {} if code else view
+
+    def _note_decisions(self, decisions: list[dict], er: Mapping, timing: Optional[Mapping] = None) -> None:
         for d in decisions:
             sym = d.get("symbol")
             key = (d.get("kind"), d.get("code"), d.get("side"), d.get("trigger"))
@@ -414,7 +478,8 @@ class AutoPlan:
                 n["last_key"] = key
                 n["decision"] = {"kind": d.get("kind"), "why": d.get("why"), "at_et": _et(er["received"])}
             if not same:
-                self.log("decision", sym, reading_t=er["received"], **{k: v for k, v in d.items() if k != "symbol"})
+                self.log("decision", sym, reading_t=er["received"], **(timing or {}),
+                         **{k: v for k, v in d.items() if k != "symbol"})
 
     def step(self) -> bool:
         """One reading and at most one order action. True when it acted (the next step comes at once)."""
@@ -432,10 +497,14 @@ class AutoPlan:
         day = now.astimezone(ET).date()
         if now < datetime.combine(day, self.armed_rules.act_from_et, tzinfo=ET):
             return False
-        # Step 2's view first, then the tape: a view read can wait on an Edge Scanner GET, and it
-        # must never fall between the reading and the send (architect's review, 2026-11-13 16:21 UTC).
-        view = self._safe_view()
+        # Step 2's view first, then the tape, so nothing falls between the reading and the send
+        # (architect's review, 2026-11-13 16:21 UTC). The view is the feed's last answer: the worker
+        # never asks Edge Scanner's picks route (review 1, 16:45 UTC).
+        t0 = self._mono()
+        view = self._row_check_view()
+        t1 = self._mono()
         reading, ok, why = self._read(now)
+        t2 = self._mono()
         if not ok:
             self.say("*", "tape", f"no price-based action: {why}")
         er = self._engine_reading(reading, ok, now, why)
@@ -446,7 +515,9 @@ class AutoPlan:
         state, decisions = engine.decide(state, er, self.rules)
         with self._lock:
             self.state = state
-        self._note_decisions(decisions, er)
+        # Where each step's time goes (review 1 item 3): the first armed morning shows it.
+        timing = {"view_ms": round((t1 - t0) * 1000, 1), "tape_ms": round((t2 - t1) * 1000, 1)}
+        self._note_decisions(decisions, er, timing)
         picks = {p["symbol"]: p for p in er["picks"]}
         acts = [d for d in decisions if d.get("kind") in ACTION_KINDS and d.get("symbol") in picks]
         watch_over = now >= self.arming.watch_end(day)
@@ -466,7 +537,19 @@ class AutoPlan:
                 continue
             if not self.armed():
                 return False
-            if h(Lane(self, d, picks[sym], er, view=view)):
+            before = (self._mono() - t0) * 1000
+            if before > SLOW_STEP_MS:
+                self.log("slow_step", sym, kind=d["kind"], before_handler_ms=round(before, 1), **timing,
+                         reading_t=er["received"])
+            with self._lock:
+                self._busy_step = False
+            acted = h(Lane(self, d, picks[sym], er, view=view))
+            with self._lock:
+                busy, self._busy_step = self._busy_step, False
+            if busy:
+                return False                    # nothing reached Schwab: wait one tick, then a new reading
+            if acted:
+                self._busy_over(sym)
                 return True
         if watch_over:
             self.disarm(f"the fast watch ended at {self.armed_rules.watch_until_et:%H:%M} ET")
@@ -705,10 +788,13 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         playbook = json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
         if tape is None and not demo:
             tape, usable = _tape_parts((env.get("EDGE_SCANNER_URL") or "").strip(), playbook)
+        # The row check reads the feed's last answer only (routes.py opening_plan_view_cached); an
+        # app without it gets no row check rather than a worker that asks Edge Scanner.
+        row_view = getattr(app.state, "opening_plan_view_cached", None) or (lambda: {})
         plan = AutoPlan(desk, trader, playbook, tape, usable or (lambda r, now: (False, "no tape")),
                         app.state.opening_plan_view, poller._merged_orders,
                         (lambda: True) if demo else (lambda: poller._fresh("orders_today")),
-                        poller.cooldown_left, env=env, now=now, out_dir=out_dir, demo=demo)
+                        poller.cooldown_left, env=env, now=now, out_dir=out_dir, demo=demo, row_view=row_view)
     except Exception as e:
         # A bad playbook never stops Edge Trader: no armed plan, and the log says why.
         log.error("armed plan is off: %s", e)
