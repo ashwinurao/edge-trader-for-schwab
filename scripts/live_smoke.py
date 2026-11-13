@@ -748,13 +748,19 @@ def sc_ticket_fill(r: Run) -> None:
     sign = 1 if side == "LONG" else -1
     r.must_be_clean(r.sym)
     r.arm(True)
-    q = r.quote(r.sym)
-    r.note("QUOTE", **q)
     near = Decimal(str(r.a.near))
-    trig = d2(q["ask"]) + near if side == "LONG" else d2(q["bid"]) - near
-    stop = trig - Decimal(str(r.a.stop_away)) * sign
-    req = r.break_req(r.sym, side, trig, stop)
-    ans, secs = r.submit(req, f"{side} fill")
+    for attempt in (1, 2, 3):
+        q = r.quote(r.sym)
+        r.note("QUOTE", **q)
+        trig = d2(q["ask"]) + near if side == "LONG" else d2(q["bid"]) - near
+        stop = trig - Decimal(str(r.a.stop_away)) * sign
+        req = r.break_req(r.sym, side, trig, stop)
+        ans, secs = r.submit(req, f"{side} fill, try {attempt}")
+        if ans.get("ok") is True or "already through" not in str(ans.get("error") or "") or attempt == 3:
+            break
+        # The price reached the level between the quote and the click: the right refusal, try again.
+        r.note("THROUGH_BEFORE_THE_CLICK", attempt=attempt, error=ans.get("error"))
+        time.sleep(2)
     r.must(f"{side}: Schwab accepted the break entry", ans.get("ok") is True and bool(ans.get("order_id")),
            got=r.pick(ans))
     oid = ans["order_id"]
@@ -930,15 +936,21 @@ def sc_plan_fill_flat(r: Run) -> None:
     1-share fill, the attached stop must work, Flat all closes it. Uses the row up for the day."""
     if r.flat() is None:
         raise Stop("Flat all is off (no /api/opening-plan/flat)")
-    e, info, side, _ = r.find_row(nearest=True)
-    if not info:
-        r.check("a plan row could be used (a pick's price inside its range and near a level)", False)
-        return
-    t, exp = info["ticker"], info["sides"][side]["expected"]
-    sign = 1 if side == "LONG" else -1
-    r.note("ROW_CHOSEN", **info, side=side)
-    r.arm(True)
-    ans, _ = r.place(t, side, exp, "place the near side")
+    for attempt in (1, 2, 3):
+        e, info, side, _ = r.find_row(nearest=True)
+        if not info:
+            r.check("a plan row could be used (a pick's price inside its range and near a level)", False)
+            r.arm(False)
+            return
+        t, exp = info["ticker"], info["sides"][side]["expected"]
+        sign = 1 if side == "LONG" else -1
+        r.note("ROW_CHOSEN", **info, side=side)
+        r.arm(True)
+        ans, _ = r.place(t, side, exp, f"place the near side, try {attempt}")
+        if ans.get("ok") is True or "already through" not in str(ans.get("error") or "") or attempt == 3:
+            break
+        r.note("THROUGH_BEFORE_THE_CLICK", attempt=attempt, error=ans.get("error"))
+        time.sleep(2)
     r.must("Place accepted by Schwab", ans.get("ok") is True and bool(ans.get("order_id")), got=r.pick(ans))
     oid = ans["order_id"]
     t_sent = time.monotonic()
@@ -1182,8 +1194,10 @@ def sc_restart_after(r: Run) -> None:
         raise Stop("no entry was left resting by restart_before")
     t, oid = m["ticker"], m["order_id"]
     r.touched.add(t)
-    st = r.state()
-    arm_off = r.check("ARM is off after the restart", r.trading(st).get("armed") is False, trading=r.trading(st))
+    # Just after a restart /api/state has no trading block until the first poll (seen 2026-11-13).
+    tr, waited = r.wait(lambda: (lambda x: x if x.get("armed") is not None else None)(r.trading()), 30, 0.5)
+    r.note("TRADING_BLOCK_AFTER_RESTART", waited_s=round(waited, 1), trading=tr)
+    arm_off = r.check("ARM is off after the restart", bool(tr) and tr.get("armed") is False, trading=tr)
     if m.get("kind") == "ticket":
         rows, waited = r.wait(lambda: [o for o in r.orders(t) if oid in (o["order_id"], o["group_id"])], 30, 1.0)
         r.check("the entry still rests at Schwab and shows after the restart", bool(rows), waited_s=round(waited, 1),
@@ -1356,7 +1370,7 @@ def main() -> int:
                     help="plan_fill_flat: the level must be at most this far from the price")
     ap.add_argument("--wait-row", type=float, default=0.0,
                     help="plan scenarios: wait up to this many seconds (once per run) for a usable row")
-    ap.add_argument("--near", type=float, default=0.03, help="ticket_fill: the level's distance from the quote")
+    ap.add_argument("--near", type=float, default=0.08, help="ticket_fill: the level's distance from the quote")
     ap.add_argument("--stop-away", type=float, default=1.00, help="ticket_fill: the stop's distance from the level")
     ap.add_argument("--fill-wait", type=float, default=180.0, help="ticket_fill: seconds to wait for the fill")
     ap.add_argument("--close-test-share", action="store_true",
