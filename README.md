@@ -46,6 +46,10 @@ name are refused). It needs no account and sends no telemetry.
 - Everything the app records: positions, orders, fills, the action log and your settings, in `data/companion.db`.
   Your fills (without the account number) can be read at `/api/fills` by apps that reach Edge Trader's
   address, such as Trading Journal AI on the same server (see "Running on a home server").
+- A timing record of Schwab's answers in `data/netlog/YYYY-MM-DD.jsonl` (UTC date): one line per answer with
+  the time, the method, the path with account and order ids removed, the status, the time on the wire and
+  Schwab's own clock. No tokens, account numbers or order details. Nothing in the app reads it back
+  (`companion/netlog.py`).
 
 ### What leaves your computer
 
@@ -308,6 +312,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
+| `EDGE_TRADER_NETLOG` | `0` turns off the timing record of Schwab's answers in `data/netlog/`. On by default. |
 
 ## Good to know
 
