@@ -337,8 +337,9 @@ sends one request to Schwab when you click it; nothing is sent without a click.
 - **Place long break / Place short break** sends the break entry (a stop-limit entry with its stop
   attached, `companion/break_entry.py`) for that pick: trigger one cent past the 09:30 ET minute, stop at
   the other side, built from the server's own latest row, never from the page's prices. The page sends
-  what it showed; if the server's row differs, nothing is sent. Shares are capped at
-  `BREAK_MAX_SHARES` (1, the test stage); the row shows the plan size next to it.
+  what it showed; if the server's row differs, nothing is sent. The shares sent are the size stage's
+  (see "Size stage" below): 1 share by default, and the row says so next to the plan size, for example
+  "1 share (plan size 175)" or "25%: 43 of 175 shares".
 - **Cancel** cancels the row's resting, unfilled entry through the dashboard's own Cancel entry path.
 - **Flip** cancels the resting entry, waits until Schwab confirms it CANCELED with nothing filled, and
   only then places the other side. Just before that send it checks again that Schwab's order list is
@@ -370,6 +371,55 @@ If Edge Trader restarts while a click is running, the next start settles the row
 If `companion/opening_plan/playbook.json` cannot be read or has no `buttons.max_flips_per_row`, the
 buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
 
+**Size stage of the plan entries (Step 9, `companion/plan_size.py`).** `size.stage` in
+`companion/opening_plan/playbook.json` decides how many shares a plan entry (Place, Flip) sends:
+- `"1_share"`, the default and the test stage: 1 share, whatever the plan size;
+- `0.10`, `0.25`, `0.50` or `1.0`: the plan size times the stage, rounded down, at least 1, inside the
+  ticket's 10,000-share and $250,000 limits. With a plan size of 175: 17, 43, 87 and 175 shares.
+
+Any other value turns the plan buttons off, like any bad playbook, and the log says why. A stage
+above 1 share also needs `EDGE_TRADER_PLAN_FLAT=1` (the cover watch below), or the buttons stay off.
+The size is decided on the server only: the page sends the shares it showed, and a difference
+refuses. The ticket's own Break entry stays at `BREAK_MAX_SHARES` (1); only a plan entry may go above
+it, by its stage, which the server passes inside itself (`break_entry.plan_cap`), never from a
+request. Raising the stage is its own one-line PR that quotes Ash's go for that stage.
+
+**Flat all and the cover watch (Step 9, off by default).** With `EDGE_TRADER_PLAN_FLAT=1` as well as
+both plan button switches, the Opening plan gets a **Flat all** button and the cover watch
+(`companion/plan_flat.py`). Without it there is no button, no route and no cover line. Nothing is sent
+by the clock: every order is your click.
+- **Flat all** opens a list of what will happen to each plan row: "cancel the unfilled entry", "close
+  N shares at the market", "nothing", or refused with the reason. **Confirm** sends that list back.
+  The server builds it again from its own state (the rows' records, Schwab's orders and positions
+  from the poller); any difference refuses the whole batch and sends nothing: "The list changed since
+  the page showed it. Nothing was sent. Look again."
+- Then it works one row at a time in rank order: all cancels first, then the closes, through the
+  dashboard's own Cancel entry and Close paths, each under their own one-at-a-time lock, never
+  retried. Each row ends **done**, **refused** (with the reason) or **unclear** (red: check
+  thinkorswim). A refused or unclear row does not stop the others. A 429 from Schwab, or the app's
+  429 pause, stops the batch: the rows not reached say "Not sent: Schwab is throttling". The last
+  batch of the day stays on the screen, with one line per row.
+- It closes only what the plan's own entries opened: the row's entry filled today, the account is on
+  the same side and holds no more shares of that name than the entry filled. A larger or opposite
+  position is refused for that row ("Close it on the dashboard"). So is an entry that is partly filled
+  and still working.
+- It refuses when entries are not armed, the market is closed, Schwab's order list or positions are
+  old, Schwab is throttling, or a batch is already running. A name blocked by an unclear order is
+  refused for that row only.
+- From 2 minutes before the playbook's flat time (`exit.flat_et`, 10:00 ET) the button turns red and
+  says the flat time.
+- **Cover watch:** for each plan row that holds shares, the dashboard's own stop protection of the
+  row's ticket (PROTECTED, PARTIAL, NO_STOP). Shares without a working stop for longer than
+  `cover.grace_seconds` (3 s, a start number Ash has not approved) turn the row red: "N of M shares
+  have no stop", with one **Add stop** button. The click sends a stop for those shares at the row's
+  stop price (the stop its entry was sent with) through the dashboard's own Set stop path, with that
+  path's refusals; it needs entries armed. That path creates a stop only when the position has none,
+  so a row whose position is partly covered stays red and says to set the rest in thinkorswim.
+  Nothing is added automatically.
+
+Not confirmed at Schwab: whether the stop attached to a break entry starts working on the entry's
+first partial fill. The cover watch is there for that case.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -397,6 +447,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
+| `EDGE_TRADER_PLAN_FLAT` | `1`, together with the plan buttons' switches, adds Flat all and the cover watch (Add stop) to the Opening plan. Needed for any size stage above 1 share. Off by default. |
 
 ## Good to know
 
