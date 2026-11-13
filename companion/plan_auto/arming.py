@@ -96,6 +96,7 @@ class Facts:
     open_rows: list = field(default_factory=list)   # [(ticker, why)] rows with an entry working, unclear or red
     tape: str = ""                # "" when the tape route answered usably, else why not
     blocked_today: str = ""       # a disarm for the day (429, error): why
+    size_stage: str = ""          # "" at the 1-share stage, else the stage's label (plan_size.label)
 
 
 def refusals(f: Facts, rules: ArmedRules) -> list[str]:
@@ -129,6 +130,12 @@ def refusals(f: Facts, rules: ArmedRules) -> list[str]:
         out.append(f"{ticker} already has an entry ({why}). The plan arms only on clean rows.")
     if f.tape:
         out.append(f"The open tape does not answer: {f.tape}.")
+    if f.size_stage:
+        # The armed plan sends 1 share (break_entry.BREAK_MAX_SHARES); Step 9's size stage is for the
+        # clicks' entries. An armed size above 1 share is a later decision of Ash's (architect,
+        # 2026-11-13 17:42 UTC).
+        out.append(f"The size stage is {f.size_stage}. The armed plan sends 1 share only, so it arms only at "
+                   "the 1-share stage (size.stage \"1_share\" in playbook.json).")
     return out
 
 

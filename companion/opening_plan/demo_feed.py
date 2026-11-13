@@ -11,9 +11,13 @@ Before 09:25 ET (EDGE_TRADER_PLAN_DEMO_ET=09:10:00 starts the demo clock there, 
 answer has no frozen picks and a preview instead, re-ranked each minute as Edge Scanner's
 preview is; from 09:25 ET the picks above are frozen. The buying power line shows invented
 numbers (demo_account), never an account's.
+
+EDGE_TRADER_PLAN_DEMO_RV20 sets the demo's SPY RV20 (default 9.80, a calm day), so the demo can
+show a full-size day too, with its estimated shares (brief 22).
 """
 from __future__ import annotations
 
+import math
 import time as _time
 from datetime import datetime, time, timedelta, timezone
 from typing import Callable
@@ -23,6 +27,8 @@ from .plan import ET
 
 DEMO_START_ET = time(9, 31, 5)
 DEMO_ET_ENV = "EDGE_TRADER_PLAN_DEMO_ET"     # demo only: the time of day the demo clock starts at
+DEMO_RV20_ENV = "EDGE_TRADER_PLAN_DEMO_RV20"  # demo only: the SPY RV20 the demo's clock answer gives
+DEMO_RV20 = 9.8
 FREEZE_ET = time(9, 25)
 PREVIEW_FROM_ET = time(9, 0)
 
@@ -63,7 +69,8 @@ def picks_answer(now: datetime) -> dict:
          "levels": {"atr": 5.8, "pm_high": 129.34, "pm_low": 117.16, "last": 126.3},
          "first_minute": None},
         {"rank": 5, "ticker": "EEEE", "top": False, "metrics": _metric(None),
-         "levels": {"atr": 2.2}, "first_minute": {"open": 55.4, "high": 55.6, "low": 55.2, "close": 55.5}},
+         "levels": {"atr": 2.2, "pm_high": 56.1, "pm_low": 54.25, "last": 55.38},
+         "first_minute": {"open": 55.4, "high": 55.6, "low": 55.2, "close": 55.5}},
     ]
     day = {"has_picks": True, "reason_code": "", "reason": "", "trading_date": today,
            "frozen_at": frozen.strftime("%Y-%m-%dT%H:%M:%SZ"), "warmup_state": "READY",
@@ -103,24 +110,34 @@ def demo_account(now: datetime) -> dict:
             "ok_at": now - timedelta(seconds=1.2), "private": False}
 
 
-def clock_answer(now: datetime) -> dict:
+def demo_rv20(text: str | None) -> float:
+    """The demo's SPY RV20 from EDGE_TRADER_PLAN_DEMO_RV20, or 9.80 when unset or not a number above 0."""
+    try:
+        rv = float(text) if text else DEMO_RV20
+    except ValueError:
+        return DEMO_RV20
+    return rv if math.isfinite(rv) and rv > 0 else DEMO_RV20
+
+
+def clock_answer(now: datetime, rv20: float = DEMO_RV20) -> dict:
     """The shape of Edge Scanner's GET /api/v2/clock answer, its spy_rv part (scanner/spy_rv.py)."""
     prior = now.astimezone(ET).date() - timedelta(days=1)
     while prior.weekday() >= 5:
         prior -= timedelta(days=1)
-    return {"spy_rv": {"rv20": 9.8, "through": prior.isoformat(), "calm": True, "calm_max": 10.5}}
+    return {"spy_rv": {"rv20": rv20, "through": prior.isoformat(), "calm": rv20 <= 10.5, "calm_max": 10.5}}
 
 
 class DemoFeed:
     """Stands in for feed.Feed in demo mode: invented answers, 0.4 s old, never a request."""
 
-    def __init__(self, now: Callable[[], datetime]) -> None:
+    def __init__(self, now: Callable[[], datetime], rv20: float = DEMO_RV20) -> None:
         self._now = now
+        self._rv20 = rv20
 
     def read(self) -> tuple[Reading, Reading]:
         at = self._now() - timedelta(seconds=0.4)
         before_freeze = at.astimezone(ET).time() < FREEZE_ET
         body = preview_answer(at) if before_freeze else picks_answer(at)
-        return Reading(body, at, ""), Reading(clock_answer(at), at, "")
+        return Reading(body, at, ""), Reading(clock_answer(at, self._rv20), at, "")
 
     peek = read                            # nothing is asked in demo, so peek and read agree

@@ -73,8 +73,11 @@ def test_a_preview_before_the_freeze_shows_the_previews_top_rows_marked_not_lock
     assert pv["text"] == PREVIEW_TEXT and pv["trading_date"] == "2026-11-13"
     assert pv["as_of_et"] == "09:10:00" and pv["previewed_at_et"] == "09:10:04" and pv["as_of_age_s"] == 20.0
     assert [(r["rank"], r["ticker"]) for r in pv["rows"]] == [(1, "AAAA"), (2, "BBBB"), (3, "CCCC"), (4, "DDDD")]
-    assert pv["rows"][0] == {"rank": 1, "ticker": "AAAA", "top": True, "atr": 2.4, "pm_high": 42.82,
-                             "pm_low": 39.94, "last": 42.1, "preview": True, "text": PREVIEW_TEXT}
+    # Brief 22 added the row's estimate in its own key (tests/test_opening_plan_estimate.py); the rest is as before.
+    first = {k: v for k, v in pv["rows"][0].items() if k != "estimate"}
+    assert first == {"rank": 1, "ticker": "AAAA", "top": True, "atr": 2.4, "pm_high": 42.82,
+                     "pm_low": 39.94, "last": 42.1, "preview": True, "text": PREVIEW_TEXT}
+    assert pv["rows"][0]["estimate"]["kind"] == "estimate"
     assert pv["rows"][3]["atr"] is None             # missing stays missing, never zero
     assert all(r["preview"] is True and r["text"] == PREVIEW_TEXT for r in pv["rows"])
     assert v["picks"] is None
@@ -268,8 +271,6 @@ def test_the_demo_freezes_its_picks_at_09_25():
     assert [r["ticker"] for r in a.body["preview"]["picks"]] != [r["ticker"] for r in b.body["preview"]["picks"]]
 
 
-def test_the_view_never_logs_and_the_page_marks_every_preview_row():
-    html = (Path(R.__file__).parent / "static" / "opening_plan.html").read_text(encoding="utf-8")
-    assert "Preview, not locked" in html and 'id="bp"' in html
-    src = (Path(P.__file__)).read_text(encoding="utf-8")
-    assert "netlog" not in src and "log." not in src
+# test_the_view_never_logs_and_the_page_marks_every_preview_row moved to
+# tests/test_opening_plan_estimate.py (brief 22 item 5): a behaviour test that serves the plan and
+# catches every log and netlog line replaces the reading of plan.py's source.

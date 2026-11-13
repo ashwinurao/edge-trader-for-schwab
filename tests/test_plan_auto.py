@@ -18,13 +18,14 @@ import json
 import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from decimal import Decimal
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from companion import break_entry, netlog, plan_entries, trading
+from companion import break_entry, netlog, plan_entries, plan_flat, plan_size, trading
 from companion.opening_plan import engine
 from companion.opening_plan import plan as P
 from companion.opening_plan import tape as T
@@ -958,18 +959,35 @@ def test_the_panel_shows_a_skipped_row_check_while_armed_and_drops_it_when_it_is
 
 # Made-up balances (brief 21: never real values in a test).
 BAL = {"equity": 81234.57, "buyingPower": 162469.14, "dayTradingBuyingPower": 324938.28}
+# Made-up numbers that give the balance away, in the shapes main 670191f (#31) puts on each row:
+# row["estimate"] (its bp_max is day-trading buying power over the ranks and the price) and
+# row["buying_power_note"]. Five digits, so no time or price in a log line can match them.
+EST = {"kind": "estimate", "show": "typical", "state": "FULL", "calm": False, "full": None, "half": None,
+       "used": {"risk": 8765.43, "about": 24683, "fewer": 13579, "more": 35791, "headline": 24683,
+                "limited_by": "estimate", "capped": None},
+       "bp_max": {"state": "OK", "shares": 73191,
+                  "text": "Buying power allows 73,191 at full margin: a quarter of day-trading buying power at 42.37."},
+       "text": "Estimate. $8,765.43 at risk."}
+BP_NOTE = {"long": 61247, "short": 61239, "text": "Buying power allows at most 61,247 long and 61,239 short at full margin."}
+EST_NUMBERS = (8765.43, 24683, 13579, 35791, 73191, 61247, 61239)
 
 
 def test_no_balance_reaches_the_armed_plans_log(rig):
     """Brief 21's hard rule (architect, 2026-11-13 17:12 UTC): since main 9f15270 (#30) Step 2's view
-    carries buying power in dollars. The worker keeps the view in memory only: no line it logs, from
-    the Arm click through sends, a red row, a skipped row check, the 09:35 cancels and the disarm,
-    holds one of those numbers."""
+    carries buying power in dollars, and since 670191f (#31) each row carries an estimate and a
+    buying power note derived from it (architect, 17:48 UTC). The worker keeps the view in memory
+    only: no line it logs, from the Arm click through sends, a red row, a skipped row check, the
+    09:35 cancels and the disarm, holds one of those numbers."""
     def with_balances():
         v = rig.view()
         v["buying_power"] = P.buying_power({"balances": BAL, "ok_at": rig.clock.now()}, rig.clock.now())
+        v["estimate"] = P.estimate_header(P.load_playbook())
+        v["rows"] = [{**r, "estimate": copy.deepcopy(EST), "buying_power_note": dict(BP_NOTE)} for r in v["rows"]]
         return v
-    assert with_balances()["buying_power"]["equity"] == 81234.57          # the view does carry them
+    v = with_balances()
+    assert v["buying_power"]["equity"] == 81234.57                         # the view does carry them
+    assert all(r["estimate"]["bp_max"]["shares"] == 73191 and r["buying_power_note"]["long"] == 61247
+               for r in v["rows"]) and len(v["rows"]) == 4
     rig.plan._view = rig.plan._row_view = with_balances
     rig.view.bars["BBBB"] = (20.50, 19.95, 20.10)                          # BBBB's row turns red
     arm(rig)
@@ -981,7 +999,7 @@ def test_no_balance_reaches_the_armed_plans_log(rig):
     assert {"arm", "decision", "send_start", "send_answer", "leave", "row_check_skipped", "cancel_start",
             "cancel_answer", "disarm"} <= events
     text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
-    for n in BAL.values():
+    for n in tuple(BAL.values()) + EST_NUMBERS:
         for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
             assert form not in text
 
@@ -1471,6 +1489,210 @@ def test_engine_flip_with_a_real_entry_follows_the_rows_count():
 def test_engine_entry_on_hold_acts_on_nothing_price_based():
     st, out = engine.decide(None, reading(et(9, 31, 1), 42.37, {"state": "none"}, hold="the tape is old"), RULES)
     assert [d["code"] for d in out] == [engine.STALE] and out[0]["why"] == "the tape is old"
+
+
+# ---------------------------------------------------------------- Flat all and the size stage (Step 9)
+
+def with_flat(rig, wire=True):
+    """Step 9's PlanFlat (companion/plan_flat.py) on the rig's desk; these rows only ever rest, so no
+    positions. With `wire`, the armed plan is registered as app.py does it, after
+    plan_entries.register put Flat all on app.state: Flat all's before_batch is the plan's own."""
+    orders = lambda: list(rig.broker.orders.values())          # noqa: E731
+    flat = plan_flat.PlanFlat(rig.trader, rig.desk, orders, lambda: {}, lambda: set(), lambda: (True, True),
+                              lambda: [], dtime(10, 0), 3.0)
+    if not wire:
+        return flat
+    app = FastAPI()
+    app.state.opening_plan_desk, app.state.opening_plan_view = rig.desk, rig.view
+    app.state.opening_plan_view_cached = rig.view
+    app.state.opening_plan_now = rig.clock.now
+    app.state.opening_plan_flat = flat
+    knobs = rig.knobs
+
+    class Poller:
+        _merged_orders = staticmethod(orders)
+        cooldown_left = staticmethod(lambda: knobs["cooldown"])
+
+        def _fresh(self, name):
+            return knobs["fresh"]
+    plan = X.register(app, rig.trader, Poller(), lambda r: None, env=ENV, tape=rig.tape,
+                      usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
+    plan._mono = rig.clock.mono
+    rig.plan = plan
+    rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
+    return flat
+
+
+def flat_list(flat):
+    """The list as the page shows it, sent back with the click (PlanFlat._same)."""
+    return [{k: it[k] for k in ("ticker", "action", "order_id", "shares")} for it in flat.items()]
+
+
+def no_red(rig):
+    return [t for t, r in rig.desk.records().items() if r.get("state") == plan_entries.RED] == []
+
+
+def test_a_step_inside_a_flat_all_batch_sends_nothing_and_spends_nothing(rig):
+    """Architect, 2026-11-13 17:42 UTC: while a Flat all batch runs, place_auto sends nothing and
+    spends nothing from the bounds. Flat all's hold (PlanDesk.held) comes first in _auto_refusal.
+    Here the plan is not wired to Flat all, so it is still armed when its step lands in the batch."""
+    flat = with_flat(rig, wire=False)
+    arm(rig)
+    rig.clock.t = et(9, 31, 0.1)
+    want, real_items, held = flat_list(flat), flat.items, []
+
+    def items():                                    # the batch runs from here (its hold is on)
+        held.append(rig.desk.held())
+        for _ in range(8):
+            if not rig.plan.safe_step():           # the worker's steps, while the batch runs
+                break
+        return real_items()
+    flat.items = items
+    assert flat.run(want)["ok"]
+    assert held == [plan_flat.HOLD] and rig.desk.held() == ""
+    assert rig.broker.placed == [] and rig.sent == [] and rig.desk.records() == {}
+    assert rig.plan.orders_day == 0 and rig.plan.bounds_left("DDDD")["calls_minute"] == 40
+    assert lines(rig, "send_start") == []
+    left = {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}
+    assert left["DDDD"] == f"not sent: {plan_flat.HOLD}"
+
+
+def test_a_hold_that_cannot_be_read_refuses_the_armed_send(rig):
+    """When unsure, refuse: a hold that raises refuses too (PlanDesk.held)."""
+    def broken():
+        raise RuntimeError("no state")
+    rig.desk.add_hold(broken)
+    arm(rig)
+    rig.clock.t = et(9, 31, 0.1)
+    rig.plan.safe_step()
+    assert rig.broker.placed == [] and rig.plan.orders_day == 0
+    assert {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}["DDDD"].startswith(
+        "not sent: Could not check whether new entries are held")
+
+
+def test_a_flat_all_click_disarms_the_plan_before_its_list_is_built(rig):
+    """executor.register wires PlanFlat.before_batch to the plan's Disarm (architect, 17:42 UTC). The
+    batch builds its list with the plan already disarmed, and afterwards the plan cancels nothing:
+    Flat all's own list did the cancels."""
+    flat = with_flat(rig)
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    ids = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}
+    want, real_items, armed = flat_list(flat), flat.items, []
+
+    def items():
+        armed.append(rig.plan.arming.is_armed(rig.clock.now()))
+        return real_items()
+    flat.items = items
+    rig.clock.t = et(9, 32, 0)
+    r = flat.run(want)
+    assert armed == [False]
+    assert r["ok"] and [x["result"] for x in r["batch"]["rows"]] == [plan_flat.DONE] * 4
+    assert sorted(rig.broker.cancelled) == sorted(ids.values())
+    p = rig.plan.panel()
+    assert not p["armed"] and p["disarmed"]["why"] == X.FLAT_ALL_CLICK == "the Flat all click"
+    assert [x["why"] for x in lines(rig, "disarm")] == ["the Flat all click"]
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert sorted(rig.broker.cancelled) == sorted(ids.values()) and lines(rig, "cancel_start") == []
+
+
+def test_the_wiring_keeps_a_before_batch_already_there(rig):
+    flat = with_flat(rig, wire=False)
+    calls = []
+    flat.before_batch = lambda: calls.append("earlier")
+    app = FastAPI()
+    app.state.opening_plan_desk, app.state.opening_plan_view = rig.desk, rig.view
+    app.state.opening_plan_now, app.state.opening_plan_flat = rig.clock.now, flat
+
+    class Poller:
+        _merged_orders = staticmethod(lambda: [])
+        cooldown_left = staticmethod(lambda: 0.0)
+
+        def _fresh(self, name):
+            return True
+    plan = X.register(app, rig.trader, Poller(), lambda r: None, env=ENV, tape=rig.tape,
+                      usable=lambda r, now: (True, ""), out_dir=rig.tmp / "a", start=False)
+    rig.clock.t = et(9, 30, 0)
+    assert plan.click_arm({"playbook": plan.playbook_name, "bounds": plan.armed_rules.bounds()})["ok"]
+    flat.before_batch()
+    assert calls == ["earlier"] and not plan.arming.is_armed(rig.clock.now())
+
+
+def test_flat_all_while_a_plan_send_holds_traders_lock(rig):
+    """Architect, 17:42 UTC: Flat all clicked while the plan's send holds Trader's lock. The rows that
+    meet the lock are refused in words, not retried and not red; a second click does the rest. The
+    send that was out lands; the plan, disarmed by the click, sends nothing more."""
+    flat = with_flat(rig)
+    arm(rig)
+    first = []
+
+    def hook(n):
+        if n == 3:                                   # BBBB's send is out
+            assert rig.trader._send_lock.locked()
+            first.append(flat.run(flat_list(flat)))
+    rig.broker.after_place = hook
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert placed(rig) == ["DDDD", "AAAA", "BBBB"]
+    assert [x["why"] for x in lines(rig, "disarm")] == [X.FLAT_ALL_CLICK]
+    rows = {x["ticker"]: x for x in first[0]["batch"]["rows"]}
+    assert not first[0]["ok"] and rig.broker.cancelled == []
+    for t in ("AAAA", "DDDD"):
+        assert rows[t]["result"] == plan_flat.REFUSED and rows[t]["text"].startswith(
+            "Another order action is in progress")
+    assert rows["BBBB"]["result"] == plan_flat.REFUSED and "still running" in rows["BBBB"]["text"]
+    assert rows["CCCC"]["result"] == plan_flat.NOTHING
+    assert plan_flat.UNCLEAR not in {x["result"] for x in rows.values()} and no_red(rig)
+    ids = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"] if r["entry"]["order_id"]}
+    assert sorted(ids) == ["AAAA", "BBBB", "DDDD"]
+    second = flat.run(flat_list(flat))
+    assert second["ok"] and sorted(rig.broker.cancelled) == sorted(ids.values()) and no_red(rig)
+    assert lines(rig, "cancel_start") == [] and placed(rig) == ["DDDD", "AAAA", "BBBB"]
+
+
+def test_flat_all_while_a_plan_cancel_holds_traders_lock(rig):
+    """The same while the plan's 09:35 cancel holds Trader's lock: every row meets the lock and is
+    refused, the plan's own cancel lands, and a second click cancels the other three."""
+    flat = with_flat(rig)
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    ids = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}
+    first, real_cancel = [], rig.broker.cancel_order
+
+    def cancel_order(h, oid):
+        if not first:                                # the plan's first cancel (DDDD) is out
+            assert rig.trader._send_lock.locked()
+            first.append(flat.run(flat_list(flat)))
+        return real_cancel(h, oid)
+    rig.broker.cancel_order = cancel_order
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD"] and rig.broker.cancelled == [ids["DDDD"]]
+    assert [x["why"] for x in lines(rig, "disarm")] == [X.FLAT_ALL_CLICK]    # the click, not the watch end
+    rows = first[0]["batch"]["rows"]
+    assert not first[0]["ok"] and [x["result"] for x in rows] == [plan_flat.REFUSED] * 4
+    assert all(x["text"].startswith("Another order action is in progress") for x in rows) and no_red(rig)
+    second = flat.run(flat_list(flat))
+    got = {x["ticker"]: x["result"] for x in second["batch"]["rows"]}
+    assert second["ok"] and got == {"AAAA": plan_flat.DONE, "BBBB": plan_flat.DONE, "CCCC": plan_flat.DONE,
+                                    "DDDD": plan_flat.NOTHING}
+    assert sorted(rig.broker.cancelled) == sorted(ids.values()) and no_red(rig)
+
+
+def test_arm_is_refused_unless_the_size_stage_is_1_share(rig):
+    """The armed plan sends 1 share (break_entry.BREAK_MAX_SHARES) whatever Step 9's size stage says:
+    the Arm click is refused in words at any other stage (architect, 17:42 UTC)."""
+    want = ('The size stage is 25%. The armed plan sends 1 share only, so it arms only at the 1-share stage '
+            '(size.stage "1_share" in playbook.json).')
+    rig.clock.t = et(9, 30, 0)
+    rig.desk.stage = plan_size.parse_stage(0.25)
+    r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
+    assert not r["ok"] and r["refusals"] == [want] and not rig.plan.arming.is_armed(rig.clock.now())
+    assert rig.plan.panel(check=True)["refusals"] == [want]
+    rig.desk.stage = plan_size.ONE_SHARE
+    t = arm(rig)["terms"]
+    assert t["shares"] == 1 and "1 share, its stop attached." in t["will"][0]
+    assert "Send more than 1 share: the size stage is for your clicks only." in t["will_not"]
+    assert "Act after a Flat all click: the click disarms it first, and Flat all does the cancels." in t["will_not"]
 
 
 # ---------------------------------------------------------------- the netlog records the clicks

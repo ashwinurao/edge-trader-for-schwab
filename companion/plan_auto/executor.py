@@ -43,7 +43,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import break_entry, plan_entries
+from .. import break_entry, plan_entries, plan_size
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
@@ -67,6 +67,7 @@ FAR = Decimal(10 ** 9)
 # A step that took longer than this from its first read to its handler logs one "slow_step" line
 # (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC).
 SLOW_STEP_MS = 100.0
+FLAT_ALL_CLICK = "the Flat all click"
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:
@@ -624,11 +625,17 @@ class AutoPlan:
             dashboard_arm, fresh = bool(self.trader.armed), bool(self._orders_fresh())
         except Exception:
             dashboard_arm, fresh = False, False
+        try:
+            stage = getattr(self.desk, "stage", plan_size.ONE_SHARE)
+            size_stage = "" if stage == plan_size.ONE_SHARE else plan_size.label(stage)
+        except Exception as e:
+            size_stage = f"not readable ({type(e).__name__})"
         return Facts(now=now, switches=enabled(self.env) or self.demo, playbook_loaded=self.playbook_name,
                      playbook_named=str(playbook or ""), bounds_shown=bounds_shown,
                      bounds_now=self.armed_rules.bounds(), dashboard_arm=dashboard_arm, risk=risk,
                      calm=calm if isinstance(calm, bool) else None, picks_today=picks_today, orders_fresh=fresh,
-                     open_rows=open_rows, tape=tape, blocked_today=self.arming.blocked_today(now)), view
+                     open_rows=open_rows, tape=tape, blocked_today=self.arming.blocked_today(now),
+                     size_stage=size_stage), view
 
     def terms(self, view: Optional[Mapping] = None) -> dict:
         """What the Arm dialog lists: exactly what the plan will and will not do, and the bounds."""
@@ -653,6 +660,8 @@ class AutoPlan:
                     if PAST_TRIGGER not in kinds else CHASE_ARM_NOT_TEXT,
                     "Act on an old or late tape, an old order list, an unclear order, or after any disarm.",
                     "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",
+                    f"Send more than {break_entry.BREAK_MAX_SHARES} share: the size stage is for your clicks only.",
+                    "Act after a Flat all click: the click disarms it first, and Flat all does the cancels.",
                     "Survive a restart: arming is in memory only."]
         return {"playbook": self.playbook_name, "picks": [r.get("ticker") for r in (view or {}).get("rows") or []],
                 "shares": break_entry.BREAK_MAX_SHARES, "risk": (view.get("risk") or {}).get("per_pick") if view else None,
@@ -848,6 +857,18 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         guard(request)
         return JSONResponse(_jsonable(await run_in_threadpool(plan.click_disarm)))
 
+    # Step 9's Flat all (companion/plan_flat.py) calls before_batch first, before it builds its
+    # list: the plan disarms, so no automatic send or cancel starts once Flat all is clicked, and
+    # Flat all's own list does the cancels (architect, 2026-11-13 17:42 UTC).
+    flat = getattr(app.state, "opening_plan_flat", None)
+    if flat is not None:
+        before = getattr(flat, "before_batch", None)
+
+        def before_batch() -> None:
+            plan.disarm(FLAT_ALL_CLICK)
+            if before is not None:
+                before()
+        flat.before_batch = before_batch
     app.state.opening_plan_auto = plan
     if start and not demo:
         plan.start()

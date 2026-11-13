@@ -713,3 +713,27 @@ def test_a_preview_row_never_gets_a_button_or_a_send(rig):
         assert not r["ok"] and r["error"] == "Preview, not locked. Picks freeze at 09:25 ET."
     assert not rig.desk.flip("AAAA", LONG)["ok"]
     assert rig.sent == [] and rig.broker.calls == [] and rig.broker.placed == []
+
+
+def test_a_row_with_an_estimate_and_no_final_bar_never_gets_a_button_or_a_send(rig):
+    """Brief 22: from the freeze to the 09:30 minute a row carries estimated shares (row["estimate"],
+    with a made-up buying power behind it). The estimate is never a size: no send numbers, Place
+    and Flip refuse, and nothing reaches the broker."""
+    at = datetime(2026, 11, 13, 9, 26, 0, tzinfo=ET).astimezone(timezone.utc)
+    rows = [{"rank": 1, "ticker": "AAAA", "top": True, "metrics": [],
+             "levels": {"atr": 2.4, "pm_high": 42.82, "pm_low": 39.94, "last": 42.1}, "first_minute": None}]
+    account = {"balances": {"equity": 52340.18, "buyingPower": 104680.36, "dayTradingBuyingPower": 209360.72},
+               "ok_at": at - timedelta(seconds=2), "private": False}
+    clock = {"spy_rv": {"rv20": 12.3, "through": "2026-11-12", "calm": False, "calm_max": 10.5}}
+    rig.desk._view = lambda: P.build_view(answer(rows), at, "", clock, at, "", P.parse_risk(100), at, PB,
+                                          account=account)
+    v = rig.desk._view()
+    assert v["state"] == P.OK and v["rows"][0]["estimate"]["used"]["about"] == 154   # 100 / (0.27 x 2.40)
+    st = rig.desk.state()["rows"][0]
+    assert st["send"] == {"long": None, "short": None}
+    assert st["place"]["long"] and st["place"]["short"]
+    for side, expected in (("LONG", {**LONG, "shares": 154}), ("SHORT", {**SHORT, "shares": 154})):
+        r = rig.desk.place("AAAA", side, expected)
+        assert not r["ok"] and r["error"] == "Waits for the 09:30 ET minute."
+    assert not rig.desk.flip("AAAA", {**LONG, "shares": 154})["ok"]
+    assert rig.sent == [] and rig.broker.calls == [] and rig.broker.placed == []

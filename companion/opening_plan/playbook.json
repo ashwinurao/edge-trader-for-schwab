@@ -18,10 +18,41 @@
   "size": {
     "calm_rv20_max": 10.5,
     "calm_multiplier": 0.5,
-    "rv20_through_max_days": 4
+    "rv20_through_max_days": 4,
+    "stage": "1_share",
+    "_stage_about": "Step 9 size stage (companion/plan_size.py, brief 19): what a plan entry sends. \"1_share\" (the default, the test stage) sends 1 share; 0.10, 0.25, 0.50 or 1.0 send floor(plan shares x stage), at least 1, inside the ticket's limits. Nothing else is allowed. Raising it is its own one-line PR that quotes Ash's go for that stage (who, when, where). A stage above 1 share needs EDGE_TRADER_PLAN_FLAT=1 (the cover watch) and every point of README section \"Before any stage above 1 share\", including the rule for a stop under entry.min_stop_atr, which Ash decides.",
+    "estimate": {
+      "_about": "Brief 22: estimated shares on the plan rows before the 09:30 minute exists, display only (companion/opening_plan/plan.py estimate_row). Shares = risk used / (ATR x a typical first-minute range), at the row's last price. From the 2026 study /mnt/project-files/ov-research/allocation/pm_bar_break_trades.parquet, column or1_risk_atr: OV's top 4, 835 picks on 209 days (2026-01-02 to 2026-10-30), median 0.268, quartiles 0.193 and 0.373. Never a size: no button or send reads it.",
+      "show": {
+        "value": "range",
+        "note": "Ash's pick, 2026-11-13 17:38:49 UTC, on the card \"Choose how the plan estimates shares before the first minute exists\" in the thread \"Review OV picks desk architecture\": \"About N, usually L to H\" (each row at a typical first minute of 0.27 x ATR with the usual range 0.19 to 0.37 x ATR, plus the most that buying power allows). Allowed: range (about N, usually N1 to N2), cautious (one number at wide_atr) or none (no estimate)"
+      },
+      "first_minute_atr": {
+        "value": 0.27,
+        "note": "Ash's pick, 2026-11-13 17:38:49 UTC, on the card \"Choose how the plan estimates shares before the first minute exists\" in the thread \"Review OV picks desk architecture\": \"About N, usually L to H\" (each row at a typical first minute of 0.27 x ATR with the usual range 0.19 to 0.37 x ATR, plus the most that buying power allows)",
+        "why": "the study's median first-minute range over ATR, 0.268"
+      },
+      "wide_atr": {
+        "value": 0.37,
+        "note": "Ash's pick, 2026-11-13 17:38:49 UTC, on the card \"Choose how the plan estimates shares before the first minute exists\" in the thread \"Review OV picks desk architecture\": \"About N, usually L to H\" (each row at a typical first minute of 0.27 x ATR with the usual range 0.19 to 0.37 x ATR, plus the most that buying power allows)",
+        "why": "the study's upper quartile, 0.373: a wider first minute, fewer shares"
+      },
+      "narrow_atr": {
+        "value": 0.19,
+        "note": "Ash's pick, 2026-11-13 17:38:49 UTC, on the card \"Choose how the plan estimates shares before the first minute exists\" in the thread \"Review OV picks desk architecture\": \"About N, usually L to H\" (each row at a typical first minute of 0.27 x ATR with the usual range 0.19 to 0.37 x ATR, plus the most that buying power allows)",
+        "why": "the study's lower quartile, 0.193: a narrower first minute, more shares"
+      }
+    }
   },
   "exit": {
     "flat_et": "10:00"
+  },
+  "cover": {
+    "_about": "Step 9 partial-fill cover watch (companion/plan_flat.py, brief 19 Part C), only with EDGE_TRADER_PLAN_FLAT=1. A plan row whose shares have no working stop for longer than this turns red with an Add stop button (the user's click). Display only: nothing is sent by the clock.",
+    "grace_seconds": {
+      "value": 3,
+      "note": "start number, not approved by Ash"
+    }
   },
   "buttons": {
     "_about": "Step 4 row buttons (companion/plan_entries.py), only with EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1. Start value from the fast-open design (max 3 flips), not yet approved by Ash.",

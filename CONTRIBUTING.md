@@ -25,13 +25,14 @@ These decide most review questions:
    the other side (a flip, at most 3 a row a day, counted with the Flip button) or the same side
    from a moved 09:30 bar (a re-level, at most once a pick a day), each only after Schwab confirms
    the cancel with nothing filled, so never two entries at once. It never retries, exits or moves a
-   stop, and chases only with Step 8's own switch; one Disarm click stops it, and an unclear answer,
-   a 429 or a reached bound disarms it. A Place, Flip or Cancel click on a row makes that row the
-   user's for the day, and the plan never acts on it again (`PlanDesk._put_click`). Its capped chase
-   (Step 8, `EDGE_TRADER_PLAN_AUTO_CHASE=1`) sends, for a pick already at or past its trigger, one
-   limit entry at the trigger plus the cap with its stop attached, once per pick a day; the plan
-   cancels it like its other entries. Ash's go for this exception is quoted in the pull request that
-   adds it. Any other change that would act without a click will not be merged.
+   stop, and chases only with Step 8's own switch; one Disarm click stops it, so does a Flat all
+   click (before Flat all builds its list), and an unclear answer, a 429 or a reached bound disarms
+   it. It arms only at the 1-share size stage. A Place, Flip or Cancel click on a row makes that
+   row the user's for the day, and the plan never acts on it again (`PlanDesk._put_click`). Its
+   capped chase (Step 8, `EDGE_TRADER_PLAN_AUTO_CHASE=1`) sends, for a pick already at or past its
+   trigger, one 1-share limit entry at the trigger plus the cap with its stop attached, once per
+   pick a day; the plan cancels it like its other entries. Ash's go for this exception is quoted in
+   the pull request that adds it. Any other change that would act without a click will not be merged.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working
