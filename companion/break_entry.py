@@ -10,6 +10,17 @@ The numbers below are START values that Ash has not approved (brief 05); raising
 is a later PR with his go. An Opening plan entry may go above it only by its size stage
 (plan_cap, Step 9), which the server sets; the ticket's own Break entry stays at BREAK_MAX_SHARES.
 
+When a click is refused on price (make_plan, prepare):
+- already through the level: a long whose ask is at or above its level, a short whose bid is at or
+  below its level (no chase by click);
+- the stop on the wrong side of the market: a long whose bid is at or below its stop, a short whose
+  ask is at or above its stop. It is the limit bracket's own stop check (bracket.py), said in this
+  entry's words since brief 29 (finding 1 of the 2026-11-13 live test). So a break entry is sent only
+  while the price is between its stop and its level;
+- Schwab's quote is not real-time, or older than MAX_QUOTE_AGE_MS (5 s).
+The Opening plan rows say the first two before the click when Edge Trader already holds a recent
+price for the name (companion/plan_price.py); the click checks Schwab's quote again either way.
+
 Not confirmed (the first real answer is a 1-share click): whether Schwab accepts a STOP_LIMIT
 parent with an attached STOP child, whether the child starts on the first partial fill, and
 where a buy stop-limit already past its stop goes. That is why a price already through the
@@ -166,6 +177,18 @@ def make_plan(req: dict, q: dict) -> Plan:
     if not long and bid is not None and Decimal(str(bid)) <= trig:
         return _bad(req, f"Price is already through the break level: bid {fmt(Decimal(str(bid)))} is at or below "
                          f"{fmt(trig)}.")
+    # Brief 29 part A (finding 1 of the 2026-11-13 live test): the stop must rest on the right side
+    # of the market, so a break entry goes only while the price is between its stop and its level.
+    # The rule is the limit bracket's own (bracket.plan's stop check, unchanged below); only the
+    # words are this entry's. Checked only on a usable quote, so a bad quote keeps plan()'s words.
+    b, a = _price(bid), _price(ask)
+    if b is not None and a is not None and b.is_finite() and a.is_finite() and 0 < b <= a:
+        if long and st >= b:
+            return _bad(req, f"The bid {fmt(b)} is at or below this entry's stop {fmt(st)}. A long break entry "
+                             f"is sent only while the price is between its stop {fmt(st)} and its level {fmt(trig)}")
+        if not long and st <= a:
+            return _bad(req, f"The ask {fmt(a)} is at or above this entry's stop {fmt(st)}. A short break entry "
+                             f"is sent only while the price is between its level {fmt(trig)} and its stop {fmt(st)}")
     # The rest is the limit bracket's own sizing and checks, entered at the limit (worst fill), so
     # one share's risk is limit to stop.
     p = plan(req.get("symbol") or "", side, st, 0, req.get("r") or 0, bid, ask, entry="limit",
