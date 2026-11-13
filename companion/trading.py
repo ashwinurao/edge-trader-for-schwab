@@ -2480,7 +2480,10 @@ class Trader:
             return None
         entry = (legs[0].get("instruction"), (legs[0].get("instrument") or {}).get("symbol"),
                  num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")),
-                 num(o.get("stopPrice")))           # a break entry's level (None for the others)
+                 # A break entry's level (Step 3), so an unknown break matches only an order at its
+                 # own level. Only a STOP_LIMIT parent has one: any other entry stays None even if
+                 # Schwab echoes a stopPrice on it, so older tickets keep matching as before.
+                 num(o.get("stopPrice")) if o.get("orderType") == "STOP_LIMIT" else None)
         if o.get("orderStrategyType") == "SINGLE":
             # An entry sent without stop or target: only an opening order can be a ticket's entry.
             return ((entry, ()) if not o.get("childOrderStrategies") and entry[0] in OPENING_INSTRUCTIONS | {"BUY"}

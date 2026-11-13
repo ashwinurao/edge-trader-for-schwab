@@ -351,3 +351,10 @@ def test_old_tickets_still_match_their_orders():
     assert Trader._shape(sent) is not None and Trader._shape(live) == Trader._shape(sent)
     assert Trader._shape(sent)[0][-1] is None
     assert Trader._matches(live, {"request": sent})
+
+
+def test_a_limit_parent_echoed_with_a_stop_price_still_matches_its_ticket():
+    sent = json.loads(GOLDEN.read_text())[0]["order"]            # mid long: a LIMIT parent
+    assert sent["orderType"] == "LIMIT"
+    echo = {**sent, "orderId": 78, "status": "WORKING", "stopPrice": 0.0}
+    assert Trader._shape(echo) == Trader._shape(sent) and Trader._matches(echo, {"request": sent})
