@@ -1536,7 +1536,11 @@ class PlanDesk:
             if cancelled_order_id is not None:
                 ids |= plan_side.plan_ids(int(cancelled_order_id), orders)
             return plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ids, ps.held)
-        except Exception as e:
+        except Exception as e:                       # when unsure, refuse (CONTRIBUTING rule 4)
+            # The server log tells a rule that raised from a side that is not clear, as Step 7's
+            # _swap_side (architect's review 5 of PR #25, 2026-11-13 23:53 UTC); the plan's own log
+            # line stays "the side rule said not_clear".
+            _log.exception("armed plan: the chase's side rule failed for %s", ticker)
             return plan_side.NOT_CLEAR, f"Could not read your {ticker} position and orders ({e}). Nothing was sent."[:300]
 
     def chase_wait(self, ticker: str, side: str, cancelled_order_id: Any, why: str,

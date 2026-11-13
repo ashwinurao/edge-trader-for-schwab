@@ -587,7 +587,7 @@ def test_ash_on_both_sides_of_the_name_the_chase_waits_and_goes_once_it_is_clear
 
 
 @pytest.mark.parametrize("part", ["manual_refusal", "plan_shares"])
-def test_a_side_rule_that_cannot_be_read_sends_nothing_and_waits(rig, monkeypatch, part):
+def test_a_side_rule_that_cannot_be_read_sends_nothing_and_waits(rig, monkeypatch, caplog, part):
     """When unsure, refuse (brief 25; architect, 2026-11-13 23:30 UTC): the side rule raising is "not
     clear" (_chase_beside). No Schwab call and no try; only this pick waits (the other picks go on);
     the log keeps the code, the page the words. Once the rule reads again, the chase goes."""
@@ -604,6 +604,9 @@ def test_a_side_rule_that_cannot_be_read_sends_nothing_and_waits(rig, monkeypatc
                                    "Nothing was sent."}
     assert rig.host.busy_logged == [{"why": "the side rule said not_clear", "side_rule": "not_clear",
                                      "side": "long"}] * 2
+    # The server log tells the raise from a side that is not clear, with its traceback (review 5).
+    failed = [r for r in caplog.records if "the chase's side rule failed for AAAA" in r.getMessage()]
+    assert len(failed) == 2 and all(r.exc_info and "the side rule broke" in str(r.exc_info[1]) for r in failed)
     monkeypatch.setattr(plan_side, part, real)
     assert rig.host.handle("would_place", tape(42.51)) is True
     assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
