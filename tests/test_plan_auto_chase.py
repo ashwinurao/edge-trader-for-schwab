@@ -84,6 +84,7 @@ class Host:
         self.armed_seq = None               # a list of answers for armed(), then True
         self.disarms, self.logs, self.said, self.left, self.reds, self.busies = [], [], [], {}, {}, []
         self.waits = []                     # the reason of each busy() (Step 6's Lane.busy(what, why))
+        self.ends = []                      # each busy()'s end_step (Step 6 2ca2073)
         self.orders_pick, self.orders_day, self.calls = 1, 4, 40
         self.reads = []                     # queued answers for reread(); else the lane's own pick again
         self.seen = set()
@@ -145,9 +146,10 @@ class Host:
     def forget(self, key):
         self.seen.discard(key)
 
-    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY):
+    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY, end_step=True):
         self.busies.append((ticker, what))
         self.waits.append(why)
+        self.ends.append(end_step)          # False: only this pick waits (Step 6's brief 25 wait)
 
     # ---- helpers for the tests: one decision, or one engine step --------------------------------
 

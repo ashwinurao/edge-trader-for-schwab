@@ -70,7 +70,8 @@ def test_the_arm_dialog_lists_the_chase_only_with_its_switch(rig):
     on = started_with(rig, CHASE_ENV).plan.terms()
     assert on["will"] == off["will"] + [C.ARM_TEXT] and H.PAST_TRIGGER in on["handlers"]
     assert C.ARM_NOT_TEXT in on["will_not"]
-    assert not any("left to you" in x for x in on["will_not"])
+    # Step 6's own "left to you" line goes; its brief 25 line (the other side of a name you trade) stays.
+    assert "Send when the price is already at or past the trigger: that pick is left to you." not in on["will_not"]
     # Review 3 of PR #25, must 1: the chase adds its order to each pick and, without the flip, takes
     # the day's from armed.orders_per_day_with_chase. Nothing else in the bounds changes.
     assert {k: v for k, v in on["bounds"].items() if k not in ("orders_per_pick", "orders_per_day")} == \
