@@ -24,6 +24,7 @@ import copy
 import json
 import time as _time
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,12 +82,14 @@ class Host:
     def __init__(self, desk, trace, env=ON):
         self.desk, self.trace, self.env = desk, trace, dict(env)
         self.rules = RULES
-        self.armed_rules = SimpleNamespace(calls_per_send=4, calls_per_cancel=12)
+        self.armed_rules = SimpleNamespace(calls_per_send=4, calls_per_cancel=12, every_seconds=0.25,
+                                           watch_until_et=dt_time(9, 35))
         self.registry = handlers.default_registry()
         self.is_armed = True
         self.tape = []                  # what reread() answers, in order; the last one repeats
         self.left = {"orders_pick": 5, "orders_day": 20, "calls_minute": 40}
         self.said, self.gone, self.disarms, self.logs, self.keys = [], [], [], [], set()
+        self.busied = []
 
     def armed(self):
         self.trace.append(("armed",))
@@ -145,6 +148,9 @@ class Host:
 
     def forget(self, key):
         self.keys.discard(key)
+
+    def busy(self, ticker, what):
+        self.busied.append(what)
 
 
 def tape_pick(last, high=42.48, low=41.92, final=True, age=0.1, entry=None):
@@ -207,10 +213,11 @@ def decide(r, last, high=42.48, low=41.92, final=True, age=0.1):
 
 
 def lane(r, kind="would_flip", last=42.10, high=42.48, low=41.92, decision=None):
+    """As the executor builds it, with Step 2's view from the feed's last answer (Step 6)."""
     pick, reading, out = decide(r, last, high, low)
     if decision is None:
         decision = next(d for d in out if d["kind"] == kind)
-    return handlers.Lane(r.host, decision, pick, reading)
+    return handlers.Lane(r.host, decision, pick, reading, view=r.desk._view())
 
 
 def run(r, kind="would_flip", last=42.10, high=42.48, low=41.92, tape=None, decision=None):
@@ -570,18 +577,173 @@ def test_one_automatic_cancel_attempt_per_order_id(r):
     assert len(r.broker.cancelled) == cancels
 
 
-def test_a_cancel_refused_by_traders_lock_keeps_the_attempt(r):
+def saves(r, monkeypatch):
+    """Counts the desk's record writes."""
+    n = []
+    real = r.desk._save
+    monkeypatch.setattr(r.desk, "_save", lambda recs: n.append(1) or real(recs))
+    return n
+
+
+def test_a_busy_order_line_before_the_cancel_writes_nothing_and_waits_a_tick(r, monkeypatch):
+    # Architect's review 1 of Step 6 (2026-11-13 16:45 UTC, must 1): "nothing reached Schwab, try
+    # later" is not an action. The lock is looked at before the row is claimed, so no record is
+    # written and removed, and no line is logged; the step ends (lane.busy) and the worker waits.
     oid = place_long(r)
+    wrote = saves(r, monkeypatch)
     r.trader._send_lock.acquire()                 # a click is sending on another name
     try:
-        assert run(r) is False
+        assert run(r) is True
     finally:
         r.trader._send_lock.release()
+    assert r.host.busied == ["cancel"] and wrote == [] and r.host.logs == []
     got = rec(r)
     assert got["state"] == plan_entries.SENT and got["flips"] == 0 and r.host.keys == set()
-    assert r.broker.cancelled == []
+    nothing_at_schwab(r)
     # The engine says would_flip again on the next reading, and this time it goes.
     assert run(r) is True and r.broker.cancelled == [oid]
+
+
+def test_a_busy_order_line_met_at_the_cancel_itself_is_busy_too(r, monkeypatch):
+    # The lock taken between trader_busy() and Trader.cancel_entry: Trader refuses before any
+    # request. The row is as before, the attempt is not used, and nothing is logged.
+    place_long(r)
+    monkeypatch.setattr(r.desk, "trader_busy", lambda: False)
+    r.trader._send_lock.acquire()
+    try:
+        assert run(r) is True
+    finally:
+        r.trader._send_lock.release()
+    assert r.host.busied == ["cancel"] and r.host.logs == [] and r.host.keys == set()
+    got = rec(r)
+    assert got["state"] == plan_entries.SENT and got["flips"] == 0 and r.broker.cancelled == []
+
+
+def busy_after_the_cancel(r, monkeypatch, ticks=8, on_tick=None):
+    """A click takes Trader's lock just as the flip's cancel is confirmed, for `ticks` waits of
+    armed.every_seconds (8 x 0.25 s = 2 s). Returns what each wait saw."""
+    seen, clicked = [], []
+    real_cancel = r.trader.cancel_entry
+
+    def cancel_then_click(oid):
+        got = real_cancel(oid)
+        r.trader._send_lock.acquire()
+        clicked.append(1)
+        return got
+    monkeypatch.setattr(r.trader, "cancel_entry", cancel_then_click)
+    looks = []
+    real_busy = r.desk.trader_busy
+    monkeypatch.setattr(r.desk, "trader_busy", lambda: (looks.append(1) if clicked else None) or real_busy())
+
+    def tick(s):
+        if not clicked:
+            return                                   # Trader.cancel_entry's own read-back waits
+        assert s == 0.25
+        seen.append({"state": rec(r)["state"], "text": rec(r)["text"]})
+        if on_tick is not None:
+            on_tick(len(seen))
+        if len(seen) == ticks and r.trader._send_lock.locked():
+            r.trader._send_lock.release()
+    monkeypatch.setattr(trading.time, "sleep", tick)
+    return seen, looks
+
+
+def test_a_busy_order_line_after_the_cancel_waits_then_places(r, monkeypatch):
+    # The cancel went through, so nothing rests: the flip waits for the click's action a tick at a
+    # time, says so once, and when the lock is free checks the tape and the row again, then sends.
+    place_long(r)
+    seen, looks = busy_after_the_cancel(r, monkeypatch)
+    rereads = []
+    real_reread = r.host.reread
+    r.host.reread = lambda t: rereads.append(len(seen)) or real_reread(t)
+    assert run(r) is True
+    assert len(seen) == 8 and len(looks) <= 9                   # lock held 2 s: at most 9 looks
+    assert seen[0] == {"state": plan_entries.FLIPPING, "text": "The armed plan cancelled the long entry. "
+                       "It places the short when the order action in progress ends."}
+    assert seen[-1] == seen[0]                                   # one row line, not one per try
+    assert [c for c, _ in r.host.said] == ["flip_busy"]          # one panel line
+    assert rereads[-1] == 8                                      # a new reading after the wait
+    assert len(r.broker.placed) == 2 and rec(r)["side"] == "SHORT"
+    assert rec(r)["text"] == "Flipped by the armed plan (1 of 3)."
+    line = flip_log(r)
+    assert line["ok"] and {"busy_from", "busy_until"} <= set(line["times"])
+    assert [e for e, t, f in r.host.logs] == ["flip_auto"]      # one log line for the whole flip
+
+
+def test_the_wait_after_the_cancel_stops_when_the_plan_is_disarmed(r, monkeypatch):
+    place_long(r)
+
+    def disarm(n):
+        if n == 3:
+            r.host.is_armed = False
+    seen, looks = busy_after_the_cancel(r, monkeypatch, on_tick=disarm)
+    try:
+        assert run(r) is True
+    finally:
+        if r.trader._send_lock.locked():
+            r.trader._send_lock.release()
+    assert len(seen) == 3 and len(r.broker.placed) == 1
+    assert rec(r)["state"] == plan_entries.NONE
+    assert rec(r)["text"] == ("Cancelled the long entry by the armed plan; the plan was disarmed while another "
+                              "order action ran, so nothing rests.")
+    assert r.host.gone == [rec(r)["text"]]
+    assert ("spend", 1, 4) not in r.broker.calls                 # nothing was reserved for the send
+
+
+def test_the_wait_after_the_cancel_stops_at_the_watch_end(r, monkeypatch):
+    place_long(r)
+    clock = [NOW]
+    monkeypatch.setattr(r.desk, "_now", lambda: clock[0])
+    r.host.armed_rules.watch_until_et = (NOW + timedelta(seconds=0.5)).astimezone(engine.ET).time()
+
+    def later(n):
+        clock[0] += timedelta(seconds=0.25)
+    seen, looks = busy_after_the_cancel(r, monkeypatch, ticks=99, on_tick=later)
+    try:
+        assert run(r) is True
+    finally:
+        if r.trader._send_lock.locked():
+            r.trader._send_lock.release()
+    assert len(seen) == 2 and len(r.broker.placed) == 1 and rec(r)["state"] == plan_entries.NONE
+    assert "the fast watch ended while another order action ran" in rec(r)["text"]
+
+
+def test_a_send_refused_by_traders_lock_after_the_look_waits_and_goes_once(r, monkeypatch):
+    # The lock is taken between trader_busy() and Trader.submit: Trader refuses before recording
+    # the ticket, so no request left. The row goes back to FLIPPING, the reservation is given back,
+    # and the same request goes when the lock is free.
+    place_long(r)
+    seen = []
+    real_busy = r.desk.trader_busy
+    looks, clicked = [], []
+    real_cancel = r.trader.cancel_entry
+
+    def cancel_then_click(oid):
+        got = real_cancel(oid)
+        r.trader._send_lock.acquire()
+        clicked.append(1)
+        return got
+
+    def blind_once():
+        looks.append(1)
+        return False if len(looks) == 2 else real_busy()   # the first look after the cancel misses it
+
+    def tick(s):
+        if not clicked:
+            return                                   # Trader.cancel_entry's own read-back waits
+        seen.append(rec(r)["state"])
+        r.trader._send_lock.release()
+    monkeypatch.setattr(r.trader, "cancel_entry", cancel_then_click)
+    monkeypatch.setattr(r.desk, "trader_busy", blind_once)
+    monkeypatch.setattr(trading.time, "sleep", tick)
+    left = dict(r.host.left)
+    assert run(r) is True
+    assert seen == [plan_entries.FLIPPING]
+    assert [c for c in r.broker.calls if c[0] in ("spend", "refund")] == [("spend", 1, 4), ("refund", 1, 4),
+                                                                            ("spend", 1, 4)]
+    assert r.host.left["orders_pick"] == left["orders_pick"] - 1
+    assert len(r.broker.placed) == 2 and rec(r)["side"] == "SHORT" and rec(r)["state"] == plan_entries.SENT
+    assert r.sent[-1] == r.sent[-2]                              # the same request, once at Schwab
 
 
 # ---------------------------------------------------------------- Schwab says no
@@ -832,6 +994,22 @@ def test_relevel_when_step_2s_row_disagrees_turns_the_row_red(r):
     got = rec(r)
     assert got["state"] == plan_entries.RED and "disagree" in got["text"]
     assert ("refund", 1, 4) in r.broker.calls and r.host.gone
+
+
+def test_without_step_2s_view_the_send_half_goes_on_the_tape_alone(r, monkeypatch):
+    # Architect's review 1 of Step 6 (must 2): the worker never asks Edge Scanner. With no usable
+    # cached answer the executor hands an empty view, and the row check is skipped, never fetched.
+    oid = place_long(r)
+    r.quote.update(bid=42.39, ask=42.41)              # Step 2's row still has the 42.48 bar
+    monkeypatch.setattr(r.desk, "_view", lambda: pytest.fail("the flip asked for Step 2's view"))
+    pick, reading, out = decide(r, 42.40, 42.60)
+    d = next(x for x in out if x["kind"] == "would_relevel")
+    ln = handlers.Lane(r.host, d, pick, reading, view={})
+    r.host.tape = [(tape_pick(42.40, 42.60), True, "")]
+    assert flip.on_relevel(ln) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 2
+    got = rec(r)
+    assert got["state"] == plan_entries.SENT and got["text"].startswith("Re-levelled by the armed plan")
 
 
 def test_no_relevel_when_filled_and_the_row_says_the_range_changed_after_the_fill(r):
@@ -1277,10 +1455,10 @@ def test_the_send_half_uses_the_steps_own_step_2_view(r, monkeypatch):
     # the send half checks the row against it, so no Edge Scanner GET falls between them.
     place_long(r)
     view = r.desk._view()
-    reads = []
-    monkeypatch.setattr(r.desk, "_view", lambda: reads.append(1) or view)
     ln = lane(r)
     ln.view = view
+    reads = []
+    monkeypatch.setattr(r.desk, "_view", lambda: reads.append(1) or view)
     r.host.tape = [(tape_pick(42.10), True, "")]
     assert flip.on_flip(ln) is True
     assert reads == [] and rec(r)["side"] == "SHORT"

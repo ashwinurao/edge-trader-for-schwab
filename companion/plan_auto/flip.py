@@ -32,6 +32,14 @@ pick ends with no order and says why. An order bound already used up stops the f
 cancel: the entry then stays. With this switch on, orders per pick is 1 + max flips + re-levels
 and orders per day is armed.orders_per_day_with_flips (armed_with_flips, brief 17 item 5).
 
+Trader's lock busy (another order action, a click or a Flat all; architect's review 1 of Step 6,
+2026-11-13 16:45 UTC, must 1). Before the cancel: nothing reached Schwab, so the step ends with
+lane.busy("cancel"), no other pick tries on that reading, the worker waits a tick and the next
+reading decides again; no record is written. After the confirmed cancel: nothing rests, so the
+flip waits for the lock a tick (armed.every_seconds) at a time, the row and the panel say so once,
+and when the lock is free the recheck and the desk's checks run again before the send. It stops
+waiting when the plan is disarmed or the fast watch ends; nothing rests then.
+
 When unsure, stop acting (brief 14 rule 3): an unclear cancel or a 429 turns the row red and
 disarms (a 429 for the day); a fill during the cancel turns the row red and the plan leaves the
 pick (any fill ends flips); no answer to the place freezes the pick and disarms; a 4xx is never
@@ -40,11 +48,13 @@ Step 8's chase may take it (handlers.PAST_TRIGGER), else the row says nothing re
 """
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Mapping, Optional
 
+from ..opening_plan.engine import ET
 from . import FLIP_FLAG
 from .handlers import PAST_TRIGGER, Lane, Registry, _dec, outcome, past_trigger
 
@@ -232,6 +242,11 @@ def _swap(lane: Lane, kind: str) -> bool:
     def recheck() -> tuple[str, str]:
         """After the confirmed cancel, no lock held: still armed, a new usable reading, the same
         range, the new side's trigger not yet traded, and the send's bounds reserved."""
+        if spent["send"]:
+            # Trader's lock was taken just before the last send, which never left: give its order and
+            # calls back before this look reserves them again.
+            lane.refund(orders=1, calls=calls)
+            spent["send"] = False
         if not lane.armed():
             return "the plan was disarmed before the new side was placed", "disarmed"
         p2, ok2, why2 = lane.reread()
@@ -254,6 +269,23 @@ def _swap(lane: Lane, kind: str) -> bool:
         spent["send"] = True
         return "", ""
 
+    told = {"busy": False}
+
+    def wait() -> str:
+        """After the confirmed cancel, Trader's lock is busy (a click's order action): one tick, then
+        the desk looks again. The pick's panel line says so once. Stops when the plan is disarmed or
+        the fast watch ends (no flip after it, Step 6's executor)."""
+        if not lane.armed():
+            return "the plan was disarmed while another order action ran"
+        if lane.desk._now().astimezone(ET).time() >= lane.armed_rules.watch_until_et:
+            return "the fast watch ended while another order action ran"
+        if not told["busy"]:
+            told["busy"] = True
+            lane.say(f"{kind}_busy", f"cancelled the {old_side} entry; the {side} goes when the order action "
+                                     "in progress ends")
+        time.sleep(float(lane.armed_rules.every_seconds))
+        return ""
+
     keys: list[str] = []
 
     def may_cancel(order_id: int) -> bool:
@@ -263,13 +295,18 @@ def _swap(lane: Lane, kind: str) -> bool:
     r = lane.desk.flip_auto(
         ticker, side.upper(), o, kind=kind, limit=limit, rng=rng, recheck=recheck, may_cancel=may_cancel,
         log=lane.log, times={"reading": _iso((lane.pick or {}).get("received") or lane.reading.get("received")),
-                             "decision": _iso(decided)}, view=getattr(lane, "view", None))
+                             "decision": _iso(decided)}, view=getattr(lane, "view", None), wait=wait)
     stage = r.get("stage")
     if spent["send"] and (stage == "recheck" or r.get("not_sent")):
         lane.refund(orders=1, calls=calls)        # reserved, then refused before any request left
     if stage == "refused":
         if r.get("cancel_not_sent") and keys:
             lane.host.forget(keys[-1])            # Trader's lock was busy: nothing reached Schwab
+        if r.get("busy"):
+            # Nothing reached Schwab: the step ends, no other pick tries on this reading, and the
+            # worker waits a tick (architect's review 1 of Step 6, must 1; Step 6's lane.busy).
+            lane.busy("cancel")
+            return True
         if not r.get("again"):
             lane.say(f"{kind}_refused", str(r.get("error") or "refused"))
         return False
