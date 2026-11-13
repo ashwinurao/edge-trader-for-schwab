@@ -613,3 +613,74 @@ def test_flip_does_not_place_when_the_order_list_goes_old_after_the_cancel(rig, 
     monkeypatch.setattr(rig.trader, "cancel_entry", cancel_then_old)
     r = rig.desk.flip("AAAA", SHORT)
     assert not r["ok"] and plan_entries.ORDERS_OLD in r["error"] and len(rig.broker.placed) == 1
+
+
+# ---------------------------------------------------------------- architect's second review of PR #19
+
+def red_after_restart(rig):
+    """A flip cut off by a restart before its cancel reached Schwab: the row is red, the entry rests."""
+    rig.desk.place("AAAA", "LONG", LONG)
+    oid = row(rig)["entry"]["order_id"]
+    rig.desk._put("AAAA", state=plan_entries.FLIPPING, flips=1)
+    make_app(rig, env=BOTH)
+    return oid
+
+
+def test_a_red_row_with_a_resting_entry_offers_cancel(rig):
+    oid = red_after_restart(rig)
+    r = row(rig)
+    assert r["entry"]["red"] and r["entry"]["resting"] and r["cancel"] == ""
+    assert "restarted during a flip" in r["entry"]["text"]
+    assert r["entry"]["order_text"] == "Resting at Schwab (WORKING), nothing filled."
+    # Place and Flip stay refused on the red row.
+    assert r["place"]["long"] and r["place"]["short"] and r["flip"]
+    # The click cancels through cancel_entry, and the row stays red with nothing left to cancel.
+    assert rig.desk.cancel("AAAA")["ok"] and rig.broker.cancelled == [oid]
+    r = row(rig)
+    assert r["entry"]["red"] and "stays stopped" in r["entry"]["text"] and r["cancel"]
+    assert r["entry"]["order_text"] == "" and len(rig.broker.placed) == 1
+
+
+def test_a_red_row_whose_entry_filled_does_not_offer_cancel(rig):
+    oid = red_after_restart(rig)
+    rig.broker.orders[oid].update(status="FILLED", filledQuantity=1)
+    r = row(rig)
+    assert r["entry"]["red"] and not r["entry"]["resting"] and r["cancel"]
+    assert "1 filled" in r["entry"]["order_text"]
+
+
+def test_a_red_row_whose_entry_is_partly_filled_does_not_offer_cancel(rig):
+    oid = red_after_restart(rig)
+    rig.broker.orders[oid].update(filledQuantity=1)            # still WORKING
+    assert row(rig)["cancel"]
+
+
+def test_a_red_row_whose_order_is_missing_does_not_offer_cancel(rig):
+    oid = red_after_restart(rig)
+    del rig.broker.orders[oid]
+    r = row(rig)
+    assert r["entry"]["red"] and not r["entry"]["resting"] and r["cancel"]
+
+
+def test_a_red_row_on_an_old_order_list_does_not_offer_cancel(rig):
+    red_after_restart(rig)
+    rig.desk._orders_fresh_fn = lambda: False
+    r = row(rig)
+    assert r["entry"]["red"] and r["cancel"] == plan_entries.ORDERS_OLD_CANCEL
+
+
+def test_a_red_row_from_a_fill_during_the_flip_does_not_offer_cancel(rig):
+    rig.desk.place("AAAA", "LONG", LONG)
+
+    def filled(h, o):
+        rig.broker.orders[o].update(status="FILLED", filledQuantity=1)
+        return Resp(200)
+    rig.broker.cancel_order = filled
+    assert rig.desk.flip("AAAA", SHORT)["red"]
+    r = row(rig)
+    assert r["entry"]["red"] and r["cancel"] and "filled before the cancel" in r["entry"]["text"]
+
+
+def test_the_page_shows_the_order_under_the_red_text():
+    page = (plan_entries.Path(plan_entries.__file__).parent / "opening_plan" / "static" / "opening_plan.html").read_text()
+    assert 'if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);' in page

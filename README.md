@@ -316,13 +316,34 @@ sends one request to Schwab when you click it; nothing is sent without a click.
   `BREAK_MAX_SHARES` (1, the test stage); the row shows the plan size next to it.
 - **Cancel** cancels the row's resting, unfilled entry through the dashboard's own Cancel entry path.
 - **Flip** cancels the resting entry, waits until Schwab confirms it CANCELED with nothing filled, and
-  only then places the other side. If the cancel is not confirmed or anything filled, nothing new is
-  placed, the row turns red and says what to check, and the row sends nothing more that day. At most
-  `max_flips_per_row` flips per row a day (3, in `companion/opening_plan/playbook.json`).
+  only then places the other side. Just before that send it checks again that Schwab's order list is
+  fresh and shows no other working order on the name. If the cancel is not confirmed or anything
+  filled, nothing new is placed, the row turns red and says what to check, and the row sends nothing
+  more that day. At most `max_flips_per_row` flips per row a day (3, in
+  `companion/opening_plan/playbook.json`).
 
 Place and Flip refuse, with the reason on the button, when entries are not armed, the market is closed,
 the 09:30 minute is not final, Edge Scanner's data is old, the calm flag is not known, an earlier order
 on the name is unclear, or the row already has an entry that is working, unclear or filled.
+
+They also refuse when Schwab's order list is old, meaning the last read failed or is older than three
+polling intervals: "Schwab's order list is old. Nothing is sent until it is fresh." A banner says so.
+Cancel still works on a sent entry.
+
+A red row keeps Place and Flip off for the day. When Schwab's order list shows the row's entry, a line
+under the red text gives its status (for example "Resting at Schwab (WORKING), nothing filled."). Cancel works on it only while the order list is fresh and shows
+the entry resting with nothing filled. Any fill, an order the list does not show, or an old list keeps
+Cancel off. After a cancel the row stays red.
+
+If Edge Trader restarts while a click is running, the next start settles the row:
+- **Sending:** the row shows the entry as not confirmed: "Edge Trader restarted while this entry was
+  being sent. Check thinkorswim, then press Resolve." It then follows its ticket, like any unclear
+  order. If no ticket was written, nothing left Edge Trader and the row is free again.
+- **Flipping:** the row turns red ("Edge Trader restarted during a flip"), because the cancel may or
+  may not have reached Schwab. Use Cancel on the row, the ticket or thinkorswim for that name today.
+
+If `companion/opening_plan/playbook.json` cannot be read or has no `buttons.max_flips_per_row`, the
+buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
 
 ## Updating to a new release
 

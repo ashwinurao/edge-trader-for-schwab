@@ -65,6 +65,8 @@ DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
 # Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
 # other working order on this name" from the poller's order list, so it never sends on an old one.
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
+ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
+                     "Use the dashboard or thinkorswim.")
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
 
 
@@ -267,33 +269,49 @@ class PlanDesk:
         oid = rec.get("order_id")
         return next((o for o in orders if oid is not None and o.get("orderId") == oid), None)
 
+    @staticmethod
+    def _describe(o: Mapping) -> dict:
+        """The poller's view of one order, in words."""
+        status, filled = o.get("status"), _num(o.get("filledQuantity"))
+        d = {"order_status": status, "filled": filled, "resting": False, "ended": False}
+        if filled is None:
+            d["text"] = "Schwab does not report a fill count for it. Check thinkorswim."
+        elif filled > 0 or status == "FILLED":
+            d["text"] = f"{filled:g} filled. Manage the position on the dashboard."
+        elif status in LIVE:
+            d.update(resting=True, text=f"Resting at Schwab ({status}), nothing filled.")
+        elif status in DONE_UNFILLED:
+            why = o.get("statusDescription") or ""
+            d.update(ended=True, text=f"Ended {status} with nothing filled." + (f" Schwab: {why}" if why else ""))
+        else:
+            d["text"] = f"Schwab shows {status}. Check thinkorswim."
+        return d
+
     def _entry_state(self, rec: Mapping, orders: list[dict]) -> dict:
         """The row's entry: this file's record joined with the poller's view of the order."""
         state = rec.get("state") or NONE
         out = {"state": state, "side": rec.get("side"), "order_id": rec.get("order_id"),
                "order_status": None, "filled": None, "text": rec.get("text") or "", "red": state == RED,
-               "resting": False, "done": state == NONE}
+               "resting": False, "done": state == NONE, "order_text": ""}
+        if state == RED and rec.get("order_id"):
+            # A red row keeps its red text; its entry's status goes on its own line under it. A
+            # restart can cut a flip off before its cancel, so the entry may still rest (architect's
+            # second review of PR #19).
+            o = self._order(rec, orders)
+            if o is not None:
+                d = self._describe(o)
+                out.update(order_status=d["order_status"], filled=d["filled"], resting=d["resting"],
+                           order_text=d["text"])
+            return out
         if state != SENT:
             return out
         o = self._order(rec, orders)
         if o is None:
             out["text"] = out["text"] or "Sent. Waiting for Schwab's order list to show it."
             return out
-        status, filled = o.get("status"), _num(o.get("filledQuantity"))
-        out.update(order_status=status, filled=filled)
-        if filled is None:
-            out["text"] = "Schwab does not report a fill count for it. Check thinkorswim."
-        elif filled > 0 or status == "FILLED":
-            out["text"] = f"{filled:g} filled. Manage the position on the dashboard."
-        elif status in LIVE:
-            out["resting"] = True
-            out["text"] = f"Resting at Schwab ({status}), nothing filled."
-        elif status in DONE_UNFILLED:
-            out["done"] = True
-            why = o.get("statusDescription") or ""
-            out["text"] = f"Ended {status} with nothing filled." + (f" Schwab: {why}" if why else "")
-        else:
-            out["text"] = f"Schwab shows {status}. Check thinkorswim."
+        d = self._describe(o)
+        out.update(order_status=d["order_status"], filled=d["filled"], resting=d["resting"], done=d["ended"],
+                   text=d["text"])
         return out
 
     def _foreign(self, ticker: str, rec: Mapping, orders: list[dict]) -> Optional[dict]:
@@ -338,6 +356,21 @@ class PlanDesk:
             return f"{ticker}: {used} of {self.flips} flips used today (max_flips_per_row in playbook.json)."
         return self._send_refusal(view, ticker, OTHER[rec.get("side") or "LONG"], blocked)
 
+    @staticmethod
+    def _cancel_refusal(entry: Mapping, fresh: bool) -> str:
+        """Why the page's Cancel is off, or "" when it works. A sent entry can be cancelled even on an
+        old order list (cancelling only removes risk). A red row's entry only when the list is fresh
+        and shows it resting with nothing filled: the row is red because the state is unclear
+        (architect's second review of PR #19). cancel_entry reads Schwab again before it cancels."""
+        if entry["state"] == SENT:
+            ok = entry["order_id"] and not entry["done"] and not (entry["filled"] or 0) > 0
+            return "" if ok else "Nothing to cancel."
+        if entry["state"] == RED and entry["order_id"]:
+            if not fresh:
+                return ORDERS_OLD_CANCEL
+            return "" if entry["resting"] else "Nothing resting to cancel. Check thinkorswim."
+        return "Nothing to cancel."
+
     # ---- what the page shows ----------------------------------------------------------------
 
     def state(self) -> dict:
@@ -364,8 +397,7 @@ class PlanDesk:
                  "send": {k.lower(): self._numbers(row, k) for k in ("LONG", "SHORT")},
                  "place": {k.lower(): self._place_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
                            for k in ("LONG", "SHORT")},
-                 "cancel": "" if entry["state"] == SENT and entry["order_id"] and not entry["done"]
-                           and not (entry["filled"] or 0) > 0 else "Nothing to cancel.",
+                 "cancel": self._cancel_refusal(entry, fresh),
                  "flip_to": OTHER[entry["side"]].lower() if entry["side"] in OTHER else None,
                  "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh)}
             out["rows"].append(r)
