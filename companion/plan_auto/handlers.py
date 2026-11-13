@@ -30,6 +30,20 @@ What a Lane gives a handler (names fixed with Step 7's thread, 2026-11-13):
 - red(reason): the row turns red for the day (Step 4's RED) and the plan leaves the pick.
 - disarm(reason, for_day=False): the whole plan disarms; for_day stops a new Arm today (a 429).
 - delegate(kind) -> None when no handler for `kind` is on, else that handler's answer.
+- once(key) -> True the first time this key is seen today (one automatic cancel per order id).
+
+The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces brief 16's counts):
+- A send counts its worst case, armed.calls_per_send = 4: the quote in break_entry.prepare, the
+  POST, and the two status reads after a 201 (fork PR #15). armed.calls_per_minute (start 40)
+  counts sends only and refuses sends only: spend(orders=1, calls=calls_per_send) before each.
+- A cancel is never refused by the calls bound, whatever its reason. Its worst case is
+  armed.calls_per_cancel = 12 (Trader.cancel_entry: one read, the cancel, up to ten read-backs),
+  logged with it. Its bound is structural: one automatic cancel attempt per order id, never
+  repeated (once("cancel:<order id>")). An unclear cancel turns the row red and disarms.
+- Cancels and sends go one at a time, nearest to the trigger first, each after a Disarm check.
+- A flip (Step 7) is a cancel (never refused) then a send (checked). When the send half is
+  refused, the pick ends with no order and says why.
+tests/test_plan_auto.py pins both worst cases against break_entry.prepare and Trader.cancel_entry.
 
 Step 6 registers would_place and would_cancel (default_registry). A decision kind with no handler
 on (would_flip until Step 7) is said once: "<kind> is not on: nothing done".
@@ -99,6 +113,8 @@ class LaneHost(Protocol):
     def leave(self, ticker: str, reason: str) -> None: ...
     def red(self, ticker: str, reason: str) -> None: ...
     def disarm(self, reason: str, for_day: bool = False) -> None: ...
+    def once(self, key: str) -> bool: ...
+    def forget(self, key: str) -> None: ...
 
 
 class Lane:
@@ -146,6 +162,9 @@ class Lane:
 
     def disarm(self, reason: str, for_day: bool = False) -> None:
         self.host.disarm(reason, for_day=for_day)
+
+    def once(self, key: str) -> bool:
+        return self.host.once(key)
 
     def delegate(self, kind: str) -> Optional[bool]:
         h = self.host.registry.get(kind, self.host.env)
@@ -220,26 +239,28 @@ def on_place(lane: Lane) -> bool:
 
 def on_cancel(lane: Lane) -> bool:
     """would_cancel: cancel the plan's unfilled entry through the desk and wait for the confirmed
-    cancel (Trader.cancel_entry reads it back). Not confirmed, or a fill appeared: the row turns red."""
+    cancel (Trader.cancel_entry reads it back). Never refused by the calls bound; one attempt per
+    order id. Not confirmed, or a fill appeared: the row turns red and the plan disarms."""
     entry = lane.entry
-    if entry.get("state") != "working":
+    oid = entry.get("order_id")
+    if entry.get("state") != "working" or not oid:
         return False                           # filled, ended or never sent: nothing to cancel
-    calls = int(lane.armed_rules.calls_per_cancel)
-    if lane.spend(orders=0, calls=calls):
-        return False
     if not lane.armed():
-        lane.refund(calls=calls)
         return False
+    key = f"cancel:{oid}"
+    if not lane.once(key):
+        return False                           # tried once already: never repeated
     r = lane.desk.cancel_auto(lane.ticker, str(lane.decision.get("why") or ""), log=lane.log)
     if r.get("not_sent"):
-        lane.refund(calls=calls)               # Trader's lock was busy: the engine asks again next reading
+        lane.host.forget(key)                  # Trader's lock was busy: nothing reached Schwab
         return True
     if r.get("ok"):
         return True
-    if r.get("status") == "RATE_LIMITED" or "HTTP 429" in str(r.get("error") or ""):
+    if "HTTP 429" in str(r.get("error") or "") or r.get("status") == "RATE_LIMITED":
         lane.disarm("Schwab throttled the plan's cancel (HTTP 429)", for_day=True)
     lane.red(f"The armed plan's cancel was not confirmed: {r.get('error') or r.get('status')}. "
              f"Check the {lane.ticker} order and position in thinkorswim.")
+    lane.disarm(f"the {lane.ticker} cancel was not confirmed")
     return True
 
 

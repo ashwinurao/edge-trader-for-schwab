@@ -20,6 +20,12 @@ Every send is the user's click (CONTRIBUTING rule 1):
   (cancel not confirmed, any fill) places nothing and turns the row red. Never two entries
   resting for one name. At most max_flips_per_row flips per row per day (playbook.json).
 
+Step 6 (brief 16 item 5) adds the armed plan's twins, place_auto and cancel_auto, called by
+companion/plan_auto (off unless EDGE_TRADER_PLAN_AUTO=1, and only after Ash's Arm click): the same
+claim, Trader.submit / Trader.cancel_entry, records and refusals as the clicks, with the numbers
+from the open tape's final range. Their records carry origin "auto"; the page says "sent by the
+armed plan" on the row.
+
 When unsure, refuse (CONTRIBUTING rule 4): ARM off, market closed, the first minute not final,
 old data, the calm flag unknown, the name blocked by an unclear order, or an entry already
 working, unclear or filled on the row. Nothing is retried. No lock of this file is held across a
@@ -292,7 +298,8 @@ class PlanDesk:
         state = rec.get("state") or NONE
         out = {"state": state, "side": rec.get("side"), "order_id": rec.get("order_id"),
                "order_status": None, "filled": None, "text": rec.get("text") or "", "red": state == RED,
-               "resting": False, "done": state == NONE, "order_text": ""}
+               "resting": False, "done": state == NONE, "order_text": "",
+               "origin": rec.get("origin"), "kind": rec.get("kind")}
         if state == RED and rec.get("order_id"):
             # A red row keeps its red text; its entry's status goes on its own line under it. A
             # restart can cut a flip off before its cancel, so the entry may still rest (architect's
@@ -587,6 +594,217 @@ class PlanDesk:
                 self._put(ticker, state=NONE, order_id=None, text=f"Cancelled the {old.lower()} entry. {why}")
                 return self._refuse(ticker, f"Cancelled the {old.lower()} entry. {why}", cancel=c)
         return {**self._send(ticker, new, req), "cancel": c}
+
+
+    # ---- the armed plan's twins (Step 6, brief 16 item 5) ------------------------------------
+
+    def _auto_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
+                      blocked: Optional[set], fresh: bool) -> str:
+        """Place's row checks without Step 2's view: the tape's own tests (executor.py) replace
+        "the row's first minute is final and fresh". The plan sends only on an empty row."""
+        if rec:
+            return f"{ticker} already has an entry record today ({rec.get('state')})."
+        if not self._armed():
+            return "ARM is off on the dashboard."
+        if not self._market_open():
+            return "The market is closed."
+        if not fresh:
+            return ORDERS_OLD
+        f = self._foreign(ticker, rec, orders)
+        if f is not None:
+            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+        if blocked is None:
+            return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
+        if ticker in blocked:
+            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        return ""
+
+    @staticmethod
+    def _row_disagrees(view: Optional[Mapping], ticker: str, side: str, o: Mapping) -> str:
+        """Step 2's row, when its 09:30 bar is final: its trigger and stop within one cent of the
+        tape's (brief 16 item 5). "" when they agree or the row is not final."""
+        row = PlanDesk._find_row(view or {}, ticker)
+        if row is None or (row.get("bar") or {}).get("state") != "FINAL":
+            return ""
+        n = PlanDesk._numbers(row, side)
+        if n is None:
+            return ""
+        cent = Decimal("0.01")
+        trig, stop = Decimal(str(o["trigger"])), Decimal(str(o["stop"]))
+        if abs(Decimal(n["trigger"]) - trig) > cent or abs(Decimal(n["stop"]) - stop) > cent:
+            return (f"The open tape and Edge Scanner's 09:30 bar disagree for {ticker}: tape trigger {trig} stop "
+                    f"{stop}, plan row trigger {n['trigger']} stop {n['stop']}. The armed plan sent nothing for it.")
+        return ""
+
+    def place_auto(self, ticker: str, side: str, o: Mapping, pick: Optional[Mapping] = None,
+                   view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None) -> dict:
+        """Place's twin for the armed plan: Step 3's break entry from the open tape's final range.
+        `o` is engine.order_for of that range (trigger, stop, cap, shares); shares are capped by
+        BREAK_MAX_SHARES. Answers Trader.submit's dict, plus `not_sent` when no request left
+        (then `again` says whether the pick may try on a later reading: only Trader's own lock)."""
+        ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
+        log = log or (lambda event, **kw: None)
+        if self.demo:
+            return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
+        if side not in OTHER:
+            return self._refuse(ticker, "Pick long or short.", not_sent=True)
+        orders = self._orders()
+        fresh = self._orders_fresh()
+        if view is None:
+            try:
+                view = self._view()
+            except Exception:
+                view = None
+        with self._lock:
+            try:
+                recs = self._load()
+                self._settle(recs)
+                blocked = self._blocked_names()
+            except Exception as e:
+                return self._refuse(ticker, f"Not sent: {e}."[:300], not_sent=True)
+            rec = recs.get(ticker) or {}
+            entry = self._entry_state(rec, orders)
+            why = self._auto_refusal(ticker, rec, entry, orders, blocked, fresh)
+            if why:
+                return self._refuse(ticker, why, not_sent=True)
+            shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
+            if shares < 1:
+                return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
+            red = self._row_disagrees(view, ticker, side, o)
+            if red:
+                self._put(ticker, state=RED, side=side, origin="auto", kind="break", order_id=None,
+                          text=red, red_why=f"{ticker}: the tape and the plan row disagree. Use the ticket or "
+                                            "thinkorswim for it today.")
+                return self._refuse(ticker, red, not_sent=True, red=True)
+            try:
+                req = break_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, cap=o["cap"])
+            except ValueError as e:
+                return self._refuse(ticker, f"Could not build the order: {e}", not_sent=True)
+            sent_at = self._now().isoformat(timespec="milliseconds")
+            rng = {"high": None if pick is None else str(pick.get("high")),
+                   "low": None if pick is None else str(pick.get("low"))}
+            self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
+                      kind="break", range=rng, sent_at=sent_at, flips=int(rec.get("flips") or 0),
+                      sent={"ticket_id": req["ticket_id"], "trigger": req["trigger"], "limit": req["limit"],
+                            "stop": req["stop"], "shares": shares},
+                      text=f"Sending the {side.lower()} break entry (armed plan).")
+        log("send_start", side=side.lower(), trigger=req["trigger"], limit=req["limit"], stop=req["stop"],
+            shares=shares, plan_shares=int(o["shares"]), ticket_id=req["ticket_id"])
+        logging.getLogger("companion.plan_auto").warning(
+            "ARMED PLAN %s %s break: trigger %s limit %s stop %s, %s sh", side, ticker, req["trigger"],
+            req["limit"], req["stop"], shares)
+        r = self._send(ticker, side, req)
+        log("send_answer", ok=bool(r.get("ok")), status=r.get("status"), order_id=r.get("order_id"),
+            ticket_id=req["ticket_id"])
+        if self.trader.store.get_ticket(req["ticket_id"]) is None:
+            # Trader.submit refused before recording the intent: no request left (CONTRIBUTING rule 4).
+            again = str(r.get("error") or "").startswith("Another submission is in progress")
+            with self._lock:
+                recs = self._load()
+                if again:
+                    recs.pop(ticker, None)       # Trader's lock was busy (a click): the row is as before
+                    self._save(recs)
+            return {**r, "not_sent": True, "again": again}
+        return r
+
+    def cancel_auto(self, ticker: str, why: str = "", log: Optional[Callable[..., None]] = None) -> dict:
+        """Cancel's twin for the armed plan: only the plan's own resting entry, through
+        Trader.cancel_entry (which reads it back until Schwab says CANCELED with nothing filled).
+        `not_sent` when Trader's lock was busy (nothing reached Schwab)."""
+        ticker = str(ticker or "").upper().strip()
+        log = log or (lambda event, **kw: None)
+        if self.demo:
+            return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
+        with self._lock:
+            try:
+                rec = self._load().get(ticker) or {}
+            except Exception as e:
+                return self._refuse(ticker, f"Not cancelled: {e}."[:300], not_sent=True)
+            oid = rec.get("order_id")
+            if rec.get("origin") != "auto" or rec.get("state") != SENT or not oid:
+                return self._refuse(ticker, "No resting entry of the armed plan on this row.", not_sent=True)
+        log("cancel_start", order_id=oid, why=why)
+        try:
+            r = self.trader.cancel_entry(int(oid))
+        except Exception as e:
+            r = {"ok": False, "error": f"Cancel failed: {e}"[:300]}
+        log("cancel_answer", ok=bool(r.get("ok")), status=r.get("status"), order_id=oid)
+        if not r.get("ok") and str(r.get("error") or "").startswith("Another order action is in progress"):
+            return {**r, "ticker": ticker, "not_sent": True}
+        if r.get("ok"):
+            with self._lock:
+                self._put(ticker, state=NONE, order_id=None,
+                          text=f"Cancelled by the armed plan, nothing filled{': ' + why if why else ''}.")
+        return {**r, "ticker": ticker}
+
+    def red_auto(self, ticker: str, text: str) -> None:
+        """The armed plan turns a row red for the day (an unconfirmed cancel, the tape and the row
+        disagreeing). Its entry's Cancel works as on any red row."""
+        ticker = str(ticker or "").upper().strip()
+        with self._lock:
+            self._put(ticker, state=RED, text=text,
+                      red_why=f"{ticker}: the armed plan stopped on this row. Use the ticket or thinkorswim for it today.")
+
+    @staticmethod
+    def _order_numbers(o: Mapping) -> dict:
+        """A break entry's own prices as Schwab lists it: trigger (stopPrice), limit (price), stop
+        (the attached STOP child's stopPrice). Missing values are None."""
+        def find_stop(node):
+            for ch in node.get("childOrderStrategies") or []:
+                if ch.get("orderType") == "STOP" and ch.get("stopPrice") is not None:
+                    return ch.get("stopPrice")
+                hit = find_stop(ch)
+                if hit is not None:
+                    return hit
+            return None
+        return {"trigger": o.get("stopPrice"), "limit": o.get("price"), "stop": find_stop(o)}
+
+    def auto_entry(self, ticker: str, recs: Mapping, orders: list[dict]) -> dict:
+        """The pick's real entry for the engine (engine.py "entry"): none, working, filled, ended,
+        unclear; and for the executor, hand (a click's entry: the plan leaves it), busy and red."""
+        rec = recs.get(ticker) or {}
+        if not rec:
+            return {"state": "none"}
+        base = {"origin": rec.get("origin"), "kind": rec.get("kind") or "break", "side": str(rec.get("side") or "").lower(),
+                "order_id": rec.get("order_id"), "flips": int(rec.get("flips") or 0), "sent_at": rec.get("sent_at"),
+                "wait_from": rec.get("wait_from"), "high": (rec.get("range") or {}).get("high"),
+                "low": (rec.get("range") or {}).get("low"), "text": rec.get("text") or ""}
+        if rec.get("origin") != "auto":
+            return {**base, "state": "hand"}
+        state = rec.get("state")
+        if state in BUSY:
+            return {**base, "state": "busy"}
+        if state == UNKNOWN:
+            return {**base, "state": "unclear"}
+        if state == RED:
+            return {**base, "state": "red"}
+        if state != SENT:
+            return {**base, "state": "ended"}
+        sent = rec.get("sent") or {}
+        nums = ({k: sent.get(k) for k in ("trigger", "limit", "stop")}
+                if sent.get("ticket_id") == rec.get("ticket_id") else {})
+        o = self._order(rec, orders)
+        if o is None:
+            # Accepted with an order id; the poller's list does not show it yet.
+            return {**base, **nums, "shares": sent.get("shares"), "state": "working" if nums else "busy"}
+        d = self._describe(o)
+        if d["filled"] is None:
+            return {**base, "state": "unclear"}
+        if d["filled"] > 0 or d["order_status"] == "FILLED":
+            return {**base, "state": "filled", "filled": d["filled"]}
+        if d["ended"]:
+            return {**base, "state": "ended"}
+        if not d["resting"]:
+            return {**base, "state": "unclear"}
+        got = {k: v for k, v in self._order_numbers(o).items() if v is not None}
+        return {**base, **nums, **got, "shares": sent.get("shares"), "state": "working"}
+
+    def records(self) -> dict:
+        """Today's row records (a copy), after the UNKNOWN rows follow their tickets."""
+        with self._lock:
+            recs = self._load()
+            self._settle(recs)
+            return json.loads(json.dumps(recs))
 
 
 def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
