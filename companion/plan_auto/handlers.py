@@ -281,4 +281,6 @@ def default_registry() -> Registry:
     reg = Registry()
     reg.register("would_place", on_place)
     reg.register("would_cancel", on_cancel)
+    from . import flip                    # Step 7 (brief 17): behind EDGE_TRADER_PLAN_AUTO_FLIP
+    flip.register(reg)
     return reg

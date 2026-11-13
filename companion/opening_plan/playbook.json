@@ -164,6 +164,10 @@
     "clock_ahead_seconds": {
       "value": 0.25,
       "note": "start number, not approved by Ash; data stamped more than this after our clock makes the reading unusable (the clock looks behind)"
+    },
+    "relevels_per_pick": {
+      "value": 1,
+      "note": "start number, not approved by Ash; Step 7 (brief 17): how often the armed plan may cancel and place the same side again when the 09:30 bar moves the range by more than one cent. Flips use automatic.max_flips, shared with the row's Flip button"
     }
   }
 }

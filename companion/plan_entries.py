@@ -54,6 +54,7 @@ from .orders import LIVE
 from .pnl import ET
 
 log = logging.getLogger("companion.plan_entries")
+_log = log                  # flip_auto takes a `log` argument (the armed plan's JSON log)
 
 FLAG = break_entry.FLAG
 BUTTONS_FLAG = "EDGE_TRADER_PLAN_BUTTONS"
@@ -831,6 +832,233 @@ class PlanDesk:
             recs = self._load()
             self._settle(recs)
             return json.loads(json.dumps(recs))
+
+    # ---- Step 7: the armed plan's flip and re-level (brief 17) -------------------------------
+
+    def _swap_refusal(self, ticker: str, side: str, kind: str, rec: Mapping, entry: Mapping,
+                      orders: list[dict], blocked: Optional[set], fresh: bool, limit: int) -> str:
+        """Why the armed plan may not cancel this row's entry to place `side` now, or ""."""
+        what = "flip" if kind == "flip" else "re-level"
+        if entry["state"] in BUSY:
+            return f"{ticker}: the last action is still running."
+        if entry["state"] == RED:
+            return rec.get("red_why") or f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
+        if entry["state"] == UNKNOWN:
+            return f"{ticker}: the last entry's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        if not fresh:
+            return ORDERS_OLD
+        if entry["state"] != SENT or not entry["resting"]:
+            return f"{ticker} has no resting, unfilled entry to {what}."
+        if rec.get("origin") != "auto":
+            # When unsure, refuse (CONTRIBUTING rule 4): an entry sent by a click stays the user's.
+            return f"{ticker}'s entry was placed by a click: the armed plan does not {what} it."
+        if rec.get("kind") == "chase":
+            return f"{ticker}'s entry was chased: a chased entry is never flipped or re-levelled (brief 18)."
+        old = rec.get("side")
+        if old not in OTHER or side != (OTHER[old] if kind == "flip" else old):
+            return f"{ticker}: a {what} of the {str(old).lower()} entry can't place {side.lower()}."
+        used = int(rec.get("flips" if kind == "flip" else "relevels") or 0)
+        if used >= limit:
+            return (f"{ticker}: {used} of {limit} flips used today (automatic.max_flips in playbook.json)."
+                    if kind == "flip" else
+                    f"{ticker}: {used} of {limit} re-levels used today (armed.relevels_per_pick in playbook.json).")
+        return self._swap_send_refusal(ticker, rec.get("order_id"), orders, blocked)
+
+    def _swap_send_refusal(self, ticker: str, own_id: Any, orders: list[dict], blocked: Optional[set]) -> str:
+        """The click's send rules that are not about Step 2's row (the tape's own tests replace
+        those, brief 16 item 5): ARM, regular hours, an unclear order, another working order."""
+        if not self._armed():
+            return "ARM is off on the dashboard."
+        if not self._market_open():
+            return "The market is closed."
+        f = self._foreign(ticker, {"order_id": own_id}, orders)
+        if f is not None:
+            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+        if blocked is None:
+            return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
+        if ticker in blocked:
+            return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        return ""
+
+    def _paused(self) -> bool:
+        """The app's 429 pause (the poller sets Trader.cooldown_left)."""
+        try:
+            left = self.trader.cooldown_left() if self.trader.cooldown_left else 0
+            return bool(left and left > 0)
+        except Exception:
+            return False
+
+    def flip_auto(self, ticker: str, side: str, o: Mapping, kind: str = "flip", limit: int = 0,
+                  rng: Optional[Mapping] = None,
+                  recheck: Callable[[], tuple[str, str]] = lambda: ("", ""),
+                  may_cancel: Callable[[int], bool] = lambda order_id: True,
+                  log: Optional[Callable[..., None]] = None, times: Optional[dict] = None) -> dict:
+        """Flip's twin for the armed plan (Step 7, brief 17 item 2), and the re-level (item 4).
+
+        kind "flip" cancels the row's resting entry and places the other side; "relevel" places
+        the same side again from a new range. `o` is the new entry from the tape's range
+        (engine.order_for: trigger, stop, cap, shares; shares capped by BREAK_MAX_SHARES), `rng`
+        that range ({"high", "low"}), `limit` the flips (automatic.max_flips) or re-levels
+        (armed.relevels_per_pick) allowed. Flips share one count per row per day with the click's Flip.
+
+        `may_cancel(order_id)` is asked once, just before the claim: the plan's one automatic
+        cancel attempt per order id (architect's ruling, 2026-11-13 15:47 UTC, brief 14). The
+        cancel goes through Trader.cancel_entry, which reads the order back until Schwab says
+        CANCELED with nothing filled. Only then `recheck()` runs, with no lock held (it may read the
+        tape and reserve the send's bounds): ("", "") to go on, or (why, code) with code
+        "disarmed", "traded" or another word. Then the click's checks run again on a fresh order
+        list, Step 2's final row must agree with the tape (as place_auto), and Trader.submit sends.
+
+        Returns {"ok", "ticker", "side", "kind", "stage", "code", "error", "red", "unclear",
+        "throttled", "filled", "again", "cancel_not_sent", "not_sent", "cancel", "send", "times"}.
+        stage: "refused" (nothing reached Schwab), "cancel" (the cancel did not confirm: the row is
+        red), "recheck" (cancelled, nothing placed), "send" (Trader.submit answered, in "send";
+        `not_sent` when it refused before any request left)."""
+        ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
+        times = dict(times or {})
+        out = {"ok": False, "ticker": ticker, "side": side, "kind": kind, "stage": "refused", "code": "",
+               "error": "", "red": False, "unclear": False, "throttled": False, "filled": False,
+               "again": False, "cancel_not_sent": False, "not_sent": False, "cancel": None, "send": None,
+               "times": times}
+
+        def done(**kw) -> dict:
+            out.update(kw)
+            if log is not None:
+                try:
+                    # The lane's log names the ticker itself; no order body goes in (brief 14 rule 9).
+                    log(f"{kind}_auto", **{k: v for k, v in out.items() if k not in ("ticker", "cancel", "send")},
+                        cancel_status=(out["cancel"] or {}).get("status"),
+                        send_status=(out["send"] or {}).get("status"),
+                        new_order_id=(out["send"] or {}).get("order_id"))
+                except Exception:
+                    _log.exception("could not log the armed plan's %s", kind)
+            return out
+
+        def stamp(name: str) -> None:
+            times[name] = self._now().isoformat(timespec="milliseconds")
+
+        if self.demo:
+            return done(error="Demo mode: no orders and no Schwab calls.")
+        if side not in OTHER or kind not in ("flip", "relevel"):
+            return done(error="A flip or re-level needs a side and a kind.")
+        what = "flip" if kind == "flip" else "re-level"
+        count = "flips" if kind == "flip" else "relevels"
+        orders = self._orders()
+        fresh = self._orders_fresh()
+        with self._lock:
+            try:
+                recs = self._load()
+                self._settle(recs)
+                blocked = self._blocked_names()
+            except Exception as e:
+                return done(error=f"Not done: {e}."[:300])
+            rec = recs.get(ticker) or {}
+            entry = self._entry_state(rec, orders)
+            why = self._swap_refusal(ticker, side, kind, rec, entry, orders, blocked, fresh, limit)
+            if why:
+                return done(error=why, again=(why == ORDERS_OLD or entry["state"] in BUSY))
+            try:
+                shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
+                if shares < 1:
+                    raise ValueError("0 shares at this risk")
+                req = break_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, cap=o["cap"])
+            except (KeyError, TypeError, ValueError) as e:
+                return done(error=f"Could not build the {side.lower()} order: {e}")
+            old, oid = rec["side"], int(rec["order_id"])
+            used = int(rec.get(count) or 0)
+            if not may_cancel(oid):
+                return done(error=f"The armed plan already tried to cancel {ticker}'s order {oid} once. "
+                                  "It stays as it is; its Cancel button works.")
+            # Counted from the claim, as the click's Flip: a flip that stops half-way still used one.
+            self._put(ticker, state=FLIPPING, **{count: used + 1},
+                      text=f"The armed plan is {'flipping to ' + side.lower() if kind == 'flip' else 're-levelling'}: "
+                           f"cancelling the {old.lower()} entry.")
+        _log.warning("OPENING PLAN armed %s %s: cancel %s entry %s, then %s", what, ticker, old, oid, side)
+        stamp("cancel_start")
+        try:
+            c = self.trader.cancel_entry(oid)
+        except Exception as e:
+            c = {"ok": False, "error": f"Cancel failed: {e}"[:300]}
+        stamp("cancel_answered")
+        out["cancel"] = c
+        if not c.get("ok"):
+            err = str(c.get("error") or c.get("status") or "no answer")
+            with self._lock:
+                if err.startswith("Another order action is in progress"):
+                    # Refused before any request (Trader's own lock): nothing changed at Schwab.
+                    self._put(ticker, state=SENT, **{count: used}, text="")
+                    return done(error=f"Not done: {err} The {old.lower()} entry still rests.", again=True,
+                                cancel_not_sent=True)
+                filled = "filled before the cancel" in err
+                throttled = "HTTP 429" in err or self._paused()
+                # Nothing sent ("Could not read the order", "Not cancelled:") or a fill: clear
+                # answers. Anything else may or may not have cancelled at Schwab: unclear.
+                clear = filled or err.startswith("Could not read the order") or err.startswith("Not cancelled:")
+                text = (f"The armed plan's {what} stopped: {err.rstrip('.')}. Nothing new was placed. Check the "
+                        f"{ticker} order and position in thinkorswim.")
+                self._put(ticker, state=RED, text=text, red_why=None)
+            return done(stage="cancel", error=text, red=True, filled=filled, throttled=throttled,
+                        unclear=throttled or not clear)
+        stamp("cancel_confirmed")
+        # Confirmed: Schwab says CANCELED with nothing filled. Check again before the new side.
+        try:
+            why, code = recheck()
+        except Exception as e:                        # a bug in the caller: never place on it
+            _log.exception("armed plan recheck failed")
+            why, code = f"the check before placing failed ({e})", "error"
+        stamp("recheck_done")
+        orders = self._orders()
+        fresh = self._orders_fresh()
+        try:
+            view = self._view() if not why else None   # may ask Edge Scanner: no lock held
+        except Exception:
+            view = None
+        with self._lock:
+            if not why:
+                try:
+                    blocked = self._blocked_names()
+                except Exception:
+                    blocked = None                    # refuses: "not confirmed"
+                why = ORDERS_OLD if not fresh else self._swap_send_refusal(ticker, oid, orders, blocked)
+                code = "orders_old" if not fresh else ("refused" if why else "")
+            if not why:
+                red = self._row_disagrees(view, ticker, side, o)
+                if red:
+                    text = f"Cancelled the {old.lower()} entry by the armed plan. {red}"
+                    self._put(ticker, state=RED, order_id=None, text=text,
+                              red_why=f"{ticker}: the tape and the plan row disagree. Use the ticket or "
+                                      "thinkorswim for it today.")
+                    return done(stage="recheck", code="disagree", error=text, red=True)
+            if why:
+                text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
+                        f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
+                        if code == "traded" else
+                        f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
+                self._put(ticker, state=NONE, order_id=None, text=text)
+                return done(stage="recheck", code=code, error=text)
+            stamp("send_start")
+            self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
+                      kind="break", range=dict(rng) if rng else rec.get("range"), sent_at=times["send_start"],
+                      wait_from=None,
+                      sent={"ticket_id": req["ticket_id"], "trigger": req["trigger"], "limit": req["limit"],
+                            "stop": req["stop"], "shares": shares},
+                      text=f"The armed plan cancelled the {old.lower()} entry; sending the {side.lower()} break entry.")
+        _log.warning("OPENING PLAN armed %s %s %s break: trigger %s limit %s stop %s, %s sh", what, side, ticker,
+                     req["trigger"], req["limit"], req["stop"], shares)
+        r = self._send(ticker, side, req)
+        stamp("answered")
+        not_sent = self.trader.store.get_ticket(req["ticket_id"]) is None
+        with self._lock:
+            if r.get("ok") and r.get("order_id"):
+                text = (f"Flipped by the armed plan ({used + 1} of {limit})." if kind == "flip" else
+                        f"Re-levelled by the armed plan: the range is now {(rng or {}).get('high')} / "
+                        f"{(rng or {}).get('low')}.")
+                self._put(ticker, text=text)
+            elif (self._load().get(ticker) or {}).get("state") == NONE:
+                self._put(ticker, text=f"Cancelled the {old.lower()} entry by the armed plan. The {side.lower()} "
+                                       f"was not placed: {r.get('error') or r.get('status')}")
+        return done(stage="send", ok=bool(r.get("ok") and r.get("order_id")), send=r, not_sent=not_sent,
+                    error=r.get("error") or "")
 
 
 def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
