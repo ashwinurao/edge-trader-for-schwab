@@ -23,7 +23,9 @@ The rule (the engine's numbers, playbook.json "automatic", start numbers Ash has
 It acts only when: armed; this switch on; no chase yet today for the pick; nothing resting or filled
 on the row; a tape reading taken just before is usable and still past the level; the range is the
 same; Schwab's order list is fresh; the bounds allow one more order (for a rejected entry's pick,
-checked first: without room the pick is left and the plan stays armed). PlanDesk.chase_auto and
+checked first: without room the pick is left and the plan stays armed). This switch adds
+CHASES_PER_ROW to the pick's order bound and, with the flip switch off, takes the day's from
+armed.orders_per_day_with_chase (armed_with_chase; architect's review 3 of PR #25, must 1). PlanDesk.chase_auto and
 Trader.submit check again at the send. A passing reason waits for a later reading: an old order
 list or a busy order lock (no Schwab call, nothing counted; architect's live test notes N1 and N4,
 2026-11-13), an old quote or the price back inside the level at Schwab's quote (one call, at most
@@ -50,6 +52,7 @@ _throttle; architect's live test notes N1).
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping, Optional
@@ -78,13 +81,38 @@ THROUGH_REJECTED = ("The stop price must be above the current ask for buy stop o
                     "for sell stop orders.")
 
 # One line of the Arm dialog's "It will" (Registry.arm_texts), shown only when this switch is on.
-ARM_TEXT = ("When a pick has already traded at or past its trigger (EDGE_TRADER_PLAN_AUTO_CHASE=1): send one "
+ARM_TEXT = ("When a pick has already traded at or past its trigger (EDGE_TRADER_PLAN_AUTO_CHASE=1), also after "
+            "Schwab rejected the plan's entry because the price was already through: send one "
             "limit entry at the trigger plus the cap (0.15 x risk per share, 2 cents to 0.15% of the price), "
             "its stop attached, at most once per pick a day. Past the cap it rests, and the plan cancels it "
             "after the pullback wait. The limit never moves.")
 # The line that replaces Step 6's "Send when the price is already at or past the trigger" in the Arm
 # dialog's "It will not" when this switch is on (executor.AutoPlan.terms).
 ARM_NOT_TEXT = "Chase a pick twice in a day, move a chase's limit, or fill a chase worse than its cap."
+
+
+def armed_with_chase(armed: Any, playbook: Mapping, flips: bool) -> Any:
+    """The armed bounds with this switch on (architect's review 3 of PR #25, must 1, 2026-11-13
+    20:44 UTC). A chase after Schwab rejected the pick's entry as already through (offers, N2; Ash,
+    2026-11-13 20:01:19 UTC, "4 - yes") is the pick's second order, so it needs room:
+    - orders per pick = the bound without the chase + plan_entries.CHASES_PER_ROW: Step 6's 1 + 1 = 2,
+      or with the flip switch on Step 7's 5 + 1 = 6;
+    - orders per day = armed.orders_per_day_with_chase (start 8: four entries and at most four chases
+      after a rejection) with the flip switch off. With it on the day keeps Step 7's
+      armed.orders_per_day_with_flips; nothing is added to it.
+    The Arm dialog shows the result and the click confirms it (ArmedRules.bounds). A send that would
+    pass a bound still disarms (AutoPlan.spend, brief 16 item 6)."""
+    per_day = armed.orders_per_day
+    if not flips:
+        raw = (playbook.get("armed") or {}).get("orders_per_day_with_chase")
+        v = raw.get("value") if isinstance(raw, Mapping) else raw
+        if v is None or isinstance(v, bool):
+            raise ValueError("playbook armed: orders_per_day_with_chase is missing (EDGE_TRADER_PLAN_AUTO_CHASE=1)")
+        per_day = int(v)
+        if per_day < armed.orders_per_day:
+            raise ValueError("playbook armed: orders_per_day_with_chase is below orders_per_day")
+    return replace(armed, orders_per_pick=armed.orders_per_pick + plan_entries.CHASES_PER_ROW,
+                   orders_per_day=per_day)
 
 
 def _iso(t: Optional[datetime]) -> Optional[str]:
@@ -141,13 +169,14 @@ def on_chase(lane: Lane) -> bool:
         return first                               # taken: Step 7 adds no "the chase did not go" line
 
     if rejected:
-        # The rejected entry used one of the pick's orders, so the chase is the pick's second: it needs
-        # room in both order bounds. Without it the pick is left and the plan stays armed; a bound
-        # reached by a send still disarms (spend, brief 16 item 6).
+        # The rejected entry used one of the pick's orders, so the chase is the pick's second. The
+        # switch adds CHASES_PER_ROW to the pick's bound (armed_with_chase, review 3 must 1), so the
+        # pick has room; the day may not. Without room the pick is left and the plan stays armed; a
+        # send that would pass a bound still disarms (spend, brief 16 item 6).
         b, r = lane.bounds, lane.armed_rules
         full = ("" if b["orders_pick"] >= 1 and b["orders_day"] >= 1 else
-                f"the pick's orders are used (armed.orders_per_pick {r.orders_per_pick})" if b["orders_pick"] < 1 else
-                f"the day's orders are used (armed.orders_per_day {r.orders_per_day})")
+                f"the pick's orders are used (orders per pick {r.orders_per_pick})" if b["orders_pick"] < 1 else
+                f"the day's orders are used (orders per day {r.orders_per_day})")
         if full:
             lane.leave(f"no chase: {full}; {REJECTED_LEFT}")
             return False
@@ -216,7 +245,7 @@ def on_chase(lane: Lane) -> bool:
             # notes N4). Said once per pick by the executor. A pick Step 7 handed over waits too.
             if handed:
                 lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
-            lane.busy("send")
+            lane.busy("chase")                     # names the action in the busy line (review 3, ask 2)
             return True
         if r.get("again") and not r.get("quoted"):
             # Schwab's order list was too old (ORDERS_OLD): no Schwab call, nothing counted. An old list
@@ -225,7 +254,7 @@ def on_chase(lane: Lane) -> bool:
             # reading the same old list again at once. A pick Step 7 handed over waits as well.
             if handed:
                 lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
-            lane.busy("send", str(r.get("error") or why))
+            lane.busy("chase", str(r.get("error") or why))
             return True
         if r.get("again"):
             # An old quote or the price back inside at Schwab's quote: one call, a try counted. It was
@@ -336,5 +365,5 @@ def offers(host: Any, picks: Mapping, left: Mapping, watch_over: bool) -> list:
     return out
 
 
-__all__ = ["on_chase", "offers", "rejected_through", "ARM_TEXT", "ARM_NOT_TEXT", "CHASE_SEND_CALLS_WORST",
+__all__ = ["on_chase", "offers", "rejected_through", "armed_with_chase", "ARM_TEXT", "ARM_NOT_TEXT", "CHASE_SEND_CALLS_WORST",
            "HANDED_LEFT", "REJECTED_LEFT", "THROUGH_REJECTED", "PAST_TRIGGER"]

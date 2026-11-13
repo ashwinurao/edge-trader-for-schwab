@@ -208,6 +208,10 @@
       "value": 8,
       "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_FLIP=1 (Step 7, companion/plan_auto/flip.py): the day's 4 entries and 4 flips or re-levels in all. Orders per pick then becomes orders_per_pick + automatic.max_flips + relevels_per_pick (brief 17 item 5)"
     },
+    "orders_per_day_with_chase": {
+      "value": 8,
+      "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_CHASE=1 and the flip switch off (Step 8, companion/plan_auto/chase.py armed_with_chase; architect's review 3 of PR #25, 2026-11-13 20:44 UTC): the day's 4 entries and at most 4 chases after Schwab rejected an entry as already through (Ash, 2026-11-13 20:01:19 UTC, \"4 - yes\"). With the chase switch on, orders per pick becomes orders_per_pick + CHASES_PER_ROW (1 + 1 = 2), or with the flip switch on as well Step 7's bound + 1 (5 + 1 = 6), and the day then keeps orders_per_day_with_flips"
+    },
     "swap_recheck_seconds": {
       "value": 1.5,
       "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_FLIP=1 (Step 7, companion/plan_auto/flip.py): after a flip's or re-level's confirmed cancel, how long the send half reads the tape again, a tick (every_seconds) apart, while the new reading is unusable or its price stale; then nothing rests (architect's notes on PR #28, 2026-11-13 16:50 UTC)",

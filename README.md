@@ -757,9 +757,13 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   between the plan's quote and Schwab's check (seen live on 2026-11-13, 4 s after the 201). Ash's
   answer of 2026-11-13 20:01 UTC lets the chase take that pick as already through: the same chase,
   same cap, once a pick a day, only inside the fast watch, and only while the price is still at or
-  past the level. It is the pick's second order, so it needs room in `armed.orders_per_pick` and
-  `armed.orders_per_day`; without room (Step 6 alone has 1 order a pick) the pick is left, "Schwab
-  rejected the plan's entry and nothing rests", and the plan stays armed. Any other rejection ends
+  past the level. It is the pick's second order, so the chase switch adds one order to each pick's
+  bound (`armed.orders_per_pick` 1 + 1 = 2; with Step 7's flip switch on, 5 + 1 = 6) and, with the
+  flip switch off, takes the day's bound from `armed.orders_per_day_with_chase` (8, a start number in
+  `companion/opening_plan/playbook.json`; with the flip on the day stays
+  `armed.orders_per_day_with_flips`). The Arm dialog shows these bounds and the click confirms them.
+  When the day has no room left the pick is left, "Schwab rejected the plan's entry and nothing
+  rests", and the plan stays armed; a send that would pass a bound still disarms. Any other rejection ends
   the pick as before, and a rejected chase is never sent again. Every rejected plan entry is one
   `entry_rejected` line in the plan's log with the day's counts, also with the chase switch off.
 - Just before the send the plan reads the tape again: the reading must be usable, still at or past

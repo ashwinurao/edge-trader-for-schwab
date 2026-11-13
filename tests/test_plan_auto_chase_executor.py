@@ -14,11 +14,13 @@ from datetime import datetime, timedelta
 import pytest
 
 from companion import plan_entries, plan_flat
+from companion.opening_plan import tape as T
 from companion.plan_auto import CHASE_FLAG
+from companion.plan_auto import executor as X
 from companion.plan_auto import chase as C
 from companion.plan_auto import handlers as H
-from test_plan_auto import (ENV, NEAREST_FIRST, PICKS, _hold_lock, _spy, arm, et, lines, placed,  # noqa: F401
-                            rig, run, want_req, without_id)                                # (rig: Step 6's fixture)
+from test_plan_auto import (ENV, NEAREST_FIRST, PB_RAW, PICKS, TAPE_RULES, _hold_lock, _spy, arm, et,  # noqa: F401
+                            lines, placed, rig, run, want_req, without_id)                 # (rig: Step 6's fixture)
 from test_trading import Resp
 
 CHASE_ENV = {**ENV, CHASE_FLAG: "1"}
@@ -27,13 +29,26 @@ CHASE_AAAA = {"symbol": "AAAA", "side": "LONG", "entry": "chase", "trigger": "42
               "stop_type": "fixed", "expected_limit": "42.55", "expected_qty": 1, "expected_target": 0}
 
 
+def started_with(rig, env, playbook=PB_RAW):
+    """The same desk, broker, tape and clock with a worker started with these switches, as the server
+    starts it: the order bounds come from the switches at the start (AutoPlan.__init__)."""
+    orders = lambda: list(rig.broker.orders.values())
+    plan = X.AutoPlan(rig.desk, rig.trader, playbook, rig.tape, lambda rd, now: T.usable(rd, TAPE_RULES, now=now),
+                      rig.view, orders, lambda: rig.knobs["fresh"], lambda: rig.knobs["cooldown"], env=dict(env),
+                      now=rig.clock.now, out_dir=rig.tmp / "auto")
+    plan._mono = rig.clock.mono
+    rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
+    rig.plan = plan
+    return rig
+
+
 @pytest.fixture
 def crig(rig, monkeypatch):
-    """Step 6's rig with the chase switch on, for the worker and for chase_entry.prepare (os.environ)."""
+    """Step 6's rig started with the chase switch on, for the worker and for chase_entry.prepare
+    (os.environ)."""
     for k, v in CHASE_ENV.items():
         monkeypatch.setenv(k, v)
-    rig.plan.env = dict(CHASE_ENV)
-    return rig
+    return started_with(rig, CHASE_ENV)
 
 
 def order_of(rig, sym):
@@ -52,12 +67,48 @@ def test_the_arm_dialog_lists_the_chase_only_with_its_switch(rig):
     off = rig.plan.terms()
     assert C.ARM_TEXT not in off["will"] and H.PAST_TRIGGER not in off["handlers"]
     assert "Send when the price is already at or past the trigger: that pick is left to you." in off["will_not"]
-    rig.plan.env = dict(CHASE_ENV)
-    on = rig.plan.terms()
+    on = started_with(rig, CHASE_ENV).plan.terms()
     assert on["will"] == off["will"] + [C.ARM_TEXT] and H.PAST_TRIGGER in on["handlers"]
     assert C.ARM_NOT_TEXT in on["will_not"]
     assert not any("left to you" in x for x in on["will_not"])
-    assert on["bounds"] == off["bounds"]                    # the chase adds no bound to confirm
+    # Review 3 of PR #25, must 1: the chase adds its order to each pick and, without the flip, takes
+    # the day's from armed.orders_per_day_with_chase. Nothing else in the bounds changes.
+    assert {k: v for k, v in on["bounds"].items() if k not in ("orders_per_pick", "orders_per_day")} == \
+        {k: v for k, v in off["bounds"].items() if k not in ("orders_per_pick", "orders_per_day")}
+
+
+A = PB_RAW["armed"]
+
+
+@pytest.mark.parametrize("flip,chase,per_pick,per_day", [
+    (False, False, 1, 4),          # Step 6 alone: armed.orders_per_pick, armed.orders_per_day
+    (False, True, 2, 8),           # + CHASES_PER_ROW; armed.orders_per_day_with_chase
+    (True, False, 5, 8),           # Step 7: 1 + max_flips 3 + relevels_per_pick 1; orders_per_day_with_flips
+    (True, True, 6, 8),            # Step 7's 5 + CHASES_PER_ROW; the day keeps orders_per_day_with_flips
+])
+def test_the_arm_dialog_shows_the_order_bounds_each_switch_gives(rig, flip, chase, per_pick, per_day):
+    """Architect's review 3 of PR #25, must 1 (2026-11-13 20:44 UTC), after Ash's "4 - yes" (project
+    thread, 2026-11-13 20:01:19 UTC): with the chase on, a pick Schwab rejected as already through has
+    room for its chase. The dialog shows the bounds and the Arm click confirms them."""
+    env = {**(FLIP_ON if flip else ENV), **({CHASE_FLAG: "1"} if chase else {})}
+    plan = started_with(rig, env).plan
+    b = plan.terms()["bounds"]
+    assert (b["orders_per_pick"], b["orders_per_day"]) == (per_pick, per_day)
+    assert plan.armed_rules.bounds() == b and plan.arming.rules.bounds() == b
+    assert A["orders_per_day_with_chase"]["value"] == 8 and plan_entries.CHASES_PER_ROW == 1
+    assert "start number, not approved by Ash" in A["orders_per_day_with_chase"]["note"]
+    arm(rig)                                                 # the click confirms exactly these bounds
+
+
+def test_the_chase_bounds_refuse_a_playbook_without_the_day_number_or_one_below_the_day(rig):
+    pb = copy.deepcopy(PB_RAW)
+    del pb["armed"]["orders_per_day_with_chase"]
+    with pytest.raises(ValueError, match="orders_per_day_with_chase is missing"):
+        started_with(rig, CHASE_ENV, pb)
+    started_with(rig, {**FLIP_ON, CHASE_FLAG: "1"}, pb)     # with the flip on the day is Step 7's: not read
+    pb["armed"]["orders_per_day_with_chase"] = {"value": 3}
+    with pytest.raises(ValueError, match="orders_per_day_with_chase is below orders_per_day"):
+        started_with(rig, CHASE_ENV, pb)
 
 
 # ---- the chase through the worker --------------------------------------------------------------
@@ -251,7 +302,7 @@ def test_a_lock_held_2_s_the_chase_waits_a_tick_and_goes_after_the_release(crig)
     assert rig.broker.placed == [] and rig.sent == [] and rig.desk.records() == {} and saves == []
     assert rig.desk._chase_tries == {} and rig.plan.orders_day == 0
     assert lines(rig, "chase_send_start") == [] and lines(rig, "chase_decision") != []
-    assert [(x["ticker"], x["what"]) for x in lines(rig, "busy")] == [("AAAA", "send")]
+    assert [(x["ticker"], x["what"]) for x in lines(rig, "busy")] == [("AAAA", "chase")]
     run(rig, et(9, 31, 5))
     assert placed(rig)[0] == "AAAA" and order_of(rig, "AAAA")[0]["orderType"] == "LIMIT"
     assert sorted(placed(rig)) == sorted(PICKS) and len(lines(rig, "busy")) == 1
@@ -411,12 +462,11 @@ LEFT_HANDED = "the plan's entry was cancelled and nothing rests"
 
 @pytest.fixture
 def fcrig(frig, monkeypatch):  # noqa: F811
-    """Step 7's rig (the worker with its flip on) with the chase switch on as well."""
+    """Step 7's rig (the worker with its flip on) started with the chase switch on as well."""
     env = {**FLIP_ON, CHASE_FLAG: "1"}
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    frig.plan.env = env
-    return frig
+    return started_with(frig, env)
 
 
 def short_trades_during_the_cancel(rig, price=41.88, during=None):
@@ -671,7 +721,7 @@ def test_after_a_flip_an_old_order_list_waits_and_the_next_fresh_reading_chases(
     assert rig.broker.calls[calls:].count(("quote", "AAAA")) == 1           # no quote on the old list
     assert "AAAA" not in rig.plan.left and rig.desk.chase_waits() == {}
     (w,) = [x for x in lines(rig, "wait") if x["ticker"] == "AAAA"]          # Step 6's wait line, once
-    assert (w["what"], w["why"]) == ("send", plan_entries.ORDERS_OLD)
+    assert (w["what"], w["why"]) == ("chase", plan_entries.ORDERS_OLD)
 
 
 def test_after_a_flip_an_old_order_list_until_the_watch_ends_sends_nothing_and_says_why(fcrig):
@@ -841,18 +891,53 @@ def test_a_rejection_seen_after_the_watch_end_gets_no_chase(fcrig):
     assert len(rejected_lines(rig, "AAAA")) == 1
 
 
-def test_without_room_in_the_pick_order_bound_the_rejected_pick_is_left_and_the_plan_stays_armed(crig):
-    """Without the flip switch armed.orders_per_pick is 1 and the rejected entry used it: no chase, and
-    no disarm for it (the chase checks the bounds first; a bound reached by a send still disarms)."""
+def test_with_the_chase_on_and_the_flip_off_a_rejected_through_entry_is_chased_once(crig):
+    """Review 3 of PR #25, must 1. Before it, armed.orders_per_pick 1 was used by the rejected entry and
+    the pick was left ("no chase: the pick's orders are used"); this test replaces that one. Now the
+    chase switch adds CHASES_PER_ROW to the pick, so the chase is its second order, and no pick ever
+    gets a third: a rejected chase ends the pick, and a send past the bound still disarms."""
     rig = crig
     ids = all_four_rest(rig)
     reject(rig, ids["AAAA"])
     rig.tape.prices["AAAA"] = 42.51
     run(rig, et(9, 31, 8))
-    assert len(rig.broker.placed) == 4 and not lines(rig, "chase_decision") and not lines(rig, "bound")
-    assert rig.plan.left["AAAA"] == ("no chase: the pick's orders are used (armed.orders_per_pick 1); "
-                                     + C.REJECTED_LEFT)
-    assert rig.plan.armed() and not lines(rig, "disarm")
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_AAAA]
+    assert len(rig.broker.placed) == 5 and not lines(rig, "bound") and rig.plan.armed()
+    (d,) = lines(rig, "chase_decision")
+    assert d["after"] == "rejected" and "AAAA" not in rig.plan.left
+    assert (rig.plan.orders_pick["AAAA"], rig.plan.orders_day) == (2, 5)
+    assert rig.plan.bounds_left("AAAA")["orders_pick"] == 0
+    reject(rig, rig.desk.records()["AAAA"]["order_id"])     # Schwab rejects the chase too: no third order
+    run(rig, et(9, 31, 20))
+    assert len(rig.broker.placed) == 5 and rig.plan.orders_pick["AAAA"] == 2 and rig.plan.armed()
+    assert [x["kind"] for x in rejected_lines(rig, "AAAA")] == ["break", "chase"]
+    assert rig.plan.spend("AAAA", orders=1) == "orders per pick (2) reached for AAAA"
+    assert not rig.plan.armed() and [x["why"] for x in lines(rig, "bound")] == ["orders per pick (2) reached for AAAA"]
+
+
+THROUGH = {"AAAA": 42.51, "BBBB": 19.98, "CCCC": 71.87, "DDDD": 9.98}     # each past its trigger, inside its cap
+
+
+def test_with_the_chase_on_the_days_order_bound_holds(rig, monkeypatch):
+    """armed.orders_per_day_with_chase bounds the day: at 6, four entries leave room for two chases.
+    The other two rejected picks are left before any send, and the plan stays armed."""
+    for k, v in CHASE_ENV.items():
+        monkeypatch.setenv(k, v)
+    pb = copy.deepcopy(PB_RAW)
+    pb["armed"]["orders_per_day_with_chase"] = {"value": 6}
+    rig = started_with(rig, CHASE_ENV, pb)
+    assert rig.plan.terms()["bounds"]["orders_per_day"] == 6
+    ids = all_four_rest(rig)
+    for sym, oid in ids.items():
+        reject(rig, oid)
+        rig.tape.prices[sym] = THROUGH[sym]
+    run(rig, et(9, 31, 8))
+    chased = [r["symbol"] for r in rig.sent if r.get("entry") == "chase"]
+    assert len(chased) == 2 and len(rig.broker.placed) == 6 and rig.plan.orders_day == 6
+    left = {s: rig.plan.left.get(s) for s in THROUGH if s not in chased}
+    assert left == {s: "no chase: the day's orders are used (orders per day 6); " + C.REJECTED_LEFT for s in left}
+    assert len(left) == 2 and not lines(rig, "bound") and rig.plan.armed()
+    assert [x["through_today"] for x in rejected_lines(rig)] == [1, 2, 3, 4]
 
 
 def test_with_the_chase_switch_off_a_rejection_is_only_counted(rig):

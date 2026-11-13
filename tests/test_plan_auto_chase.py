@@ -458,7 +458,7 @@ def test_not_on_an_old_order_list_and_it_waits(rig):
     nothing_sent(rig)
     assert rig.quotes == [] and rig.host.left == {} and (rig.host.orders_pick, rig.host.calls) == (1, 40)
     assert rec(rig) == {} and rig.desk._chase_tries == {}            # the row is as it was, no try used
-    assert rig.host.busies == [("AAAA", "send")] and rig.host.waits == [plan_entries.ORDERS_OLD]
+    assert rig.host.busies == [("AAAA", "chase")] and rig.host.waits == [plan_entries.ORDERS_OLD]
     rig.fresh[0] = True
     assert rig.host.handle("would_place", tape(42.51)) is True
     assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
@@ -593,7 +593,7 @@ def test_a_held_trader_lock_writes_nothing_and_uses_no_chase_or_try(rig):
             assert rig.host.handle("would_place", tape(42.51)) is True
     finally:
         rig.trader._send_lock.release()
-    assert rig.host.busies == [("AAAA", "send")] * (ARMED.chase_quote_tries + 1)
+    assert rig.host.busies == [("AAAA", "chase")] * (ARMED.chase_quote_tries + 1)
     nothing_sent(rig)
     assert rig.quotes == [] and rec(rig) == {} and rig.desk.records() == {}
     assert (rig.host.orders_pick, rig.host.calls) == (1, 40) and rig.host.left == {}
@@ -611,7 +611,7 @@ def test_losing_the_race_for_trader_lock_puts_the_row_back_and_uses_no_try(rig, 
         assert rig.host.handle("would_place", tape(42.51)) is True
     finally:
         rig.trader._send_lock.release()
-    assert rig.host.busies == [("AAAA", "send")] and rig.quotes == [] and rig.desk.records() == {}
+    assert rig.host.busies == [("AAAA", "chase")] and rig.quotes == [] and rig.desk.records() == {}
     assert rig.desk._chase_tries == {} and (rig.host.orders_pick, rig.host.calls) == (1, 40)
     assert rig.broker.placed == []
 
