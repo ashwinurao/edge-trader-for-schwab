@@ -318,7 +318,10 @@ class PlanDesk:
         out = {"state": state, "side": rec.get("side"), "order_id": rec.get("order_id"),
                "order_status": None, "filled": None, "text": rec.get("text") or "", "red": state == RED,
                "resting": False, "done": state == NONE, "order_text": "",
-               "origin": rec.get("origin"), "kind": rec.get("kind")}
+               "origin": rec.get("origin"), "kind": rec.get("kind"),
+               # Step 7: "Flipped by the armed plan (2 of 3)." while that flip's order is the row's.
+               "auto_text": (rec.get("auto_note") or "") if rec.get("auto_note_for") is not None
+               and str(rec.get("auto_note_for")) == str(rec.get("order_id")) else ""}
         if state == RED and rec.get("order_id"):
             # A red row keeps its red text; its entry's status goes on its own line under it. A
             # restart can cut a flip off before its cancel, so the entry may still rest (architect's
@@ -1053,7 +1056,9 @@ class PlanDesk:
                 text = (f"Flipped by the armed plan ({used + 1} of {limit})." if kind == "flip" else
                         f"Re-levelled by the armed plan: the range is now {(rng or {}).get('high')} / "
                         f"{(rng or {}).get('low')}.")
-                self._put(ticker, text=text)
+                # The row's own line (brief 17 item 6): kept for this order only, since _entry_state
+                # shows Schwab's status as the text of a sent row.
+                self._put(ticker, text=text, auto_note=text, auto_note_for=r.get("order_id"))
             elif (self._load().get(ticker) or {}).get("state") == NONE:
                 self._put(ticker, text=f"Cancelled the {old.lower()} entry by the armed plan. The {side.lower()} "
                                        f"was not placed: {r.get('error') or r.get('status')}")

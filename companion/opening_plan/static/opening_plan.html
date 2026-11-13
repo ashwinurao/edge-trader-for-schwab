@@ -165,7 +165,7 @@ function notes(r) {
   if (e) {
     const st = e.entry, m = said[r.ticker];
     if (m) out.push(`<div class="${m.ok ? "mutline" : "badline"}">${esc(m.text)}</div>`);
-    if (st.origin === "auto" && st.state !== "NONE") out.push(`<div class="${st.red ? "badline" : "warnline"}">Sent by the armed plan.</div>`);
+    if (st.origin === "auto" && st.state !== "NONE") out.push(`<div class="${st.red ? "badline" : "warnline"}">${esc(st.auto_text || "Sent by the armed plan.")}</div>`);
     // Ruling of 2026-11-13 16:17 UTC: a click takes the row for the day (only said when the armed plan is on).
     if (st.origin === "click" && auto) out.push(`<div class="mutline">Yours since your click. The armed plan leaves this row for today.</div>`);
     if (st.text && !(m && m.text === st.text)) out.push(`<div class="${st.red ? "badline" : "mutline"}">${esc(st.text)}</div>`);

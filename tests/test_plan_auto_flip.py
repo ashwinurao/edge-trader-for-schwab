@@ -2,8 +2,10 @@
 PlanDesk.flip_auto, engine.py would_relevel), against the fake broker of tests/test_trading.py
 through the Step 4 rig of tests/test_plan_entries.py. Nothing here talks to Schwab or Edge Scanner.
 
-The executor (Step 6's companion/plan_auto/executor.py) is not on this branch yet: `Host` below
-stands in for it, with the LaneHost names fixed in companion/plan_auto/handlers.py.
+Most tests drive the handlers through `Host`, a stand-in for Step 6's executor with a knob for each
+case (the LaneHost names in companion/plan_auto/handlers.py). The last part runs whole flips and
+re-levels through the executor itself (companion/plan_auto/executor.py) on Step 6's rig of
+tests/test_plan_auto.py: fake clock, fake open tape, the fake broker.
 
 Hand-worked numbers for AAAA (09:30 bar high 42.48, low 41.92; risk per pick $100; full size), as in
 tests/test_plan_entries.py:
@@ -715,10 +717,10 @@ def test_relevel_cancels_and_places_the_same_side_from_the_new_range(r):
     assert without_id(r.sent[-1]) == RELEVEL_REQ
     got = rec(r)
     assert (got["state"], got["side"], got["relevels"], got.get("flips")) == (plan_entries.SENT, "LONG", 1, 0)
-    assert got["range"] == {"high": "42.6", "low": "41.92"}
-    assert got["text"] == "Re-levelled by the armed plan: the range is now 42.6 / 41.92."
+    assert got["range"] == {"high": "42.60", "low": "41.92"}
+    assert got["text"] == "Re-levelled by the armed plan: the range is now 42.60 / 41.92."
     e = entry(r)
-    assert (e["state"], Decimal(str(e["trigger"])), e["high"], e["relevels"]) == ("working", Decimal("42.61"), "42.6", 1)
+    assert (e["state"], Decimal(str(e["trigger"])), e["high"], e["relevels"]) == ("working", Decimal("42.61"), "42.60", 1)
 
 
 def test_relevel_only_once(r):
@@ -862,12 +864,13 @@ def test_engine_no_relevel_once_triggered():
     assert _kinds(got) == [("would_place", None), ("no_action", "past_cap")]
 
 
-def test_engine_after_a_fill_says_the_range_changed_once():
+def test_engine_after_an_estimated_fill_decides_nothing_more():
+    # Shadow mode: the fill is an estimate, so a later range change is not said (the open tape's
+    # replay test pins "filled: nothing more is decided"). A real fill says it (the test above).
     got = _run([PLACE, _reading("09:31:01.000", _pick(50.03, "09:31:00.900")),
                 _reading("09:31:02.000", _pick(50.05, "09:31:01.900", high=50.10)),
                 _reading("09:31:03.000", _pick(50.06, "09:31:02.900", high=50.10))])
-    assert _kinds(got) == [("would_place", None), ("would_fill", None), ("no_action", "range_after_fill")]
-    assert got[2]["range_from"] == {"high": 50.0, "low": 49.0} and got[2]["range_to"] == {"high": 50.1, "low": 49.0}
+    assert _kinds(got) == [("would_place", None), ("would_fill", None)]
 
 
 def test_engine_no_relevel_when_the_new_trigger_already_traded():
@@ -899,7 +902,10 @@ def test_engine_relevel_with_a_real_entry_counts_the_rows_relevels():
 
 
 def test_every_armed_number_is_marked_as_not_approved():
-    assert PLAYBOOK["armed"]["relevels_per_pick"] == {"value": 1, "note": "start number, not approved by Ash"}
+    a = PLAYBOOK["armed"]
+    assert a["relevels_per_pick"]["value"] == 1 and a["orders_per_day_with_flips"]["value"] == 8
+    for key in ("relevels_per_pick", "orders_per_day_with_flips"):
+        assert a[key]["note"].startswith("start number, not approved by Ash")
 
 
 # ---------------------------------------------------------------- what Trader.cancel_entry's pace costs a flip
@@ -953,3 +959,182 @@ def test_timeline_of_a_cancel_that_never_confirms_at_0_4_s_a_call(r, monkeypatch
     assert run(r) is True
     assert offsets(flip_log(r)) == {"cancel_start": 0.0, "cancel_answered": 7.3}
     assert rec(r)["state"] == plan_entries.RED and len(r.broker.placed) == 1
+
+
+# ---------------------------------------------------------------- through Step 6's executor (tests/test_plan_auto.py)
+
+from test_plan_auto import ENV as AUTO_ENV  # noqa: E402
+from test_plan_auto import PB_RAW, TAPE_RULES, arm, et  # noqa: E402
+from test_plan_auto import lines as plan_lines  # noqa: E402
+from test_plan_auto import placed as placed_names  # noqa: E402
+from test_plan_auto import rig  # noqa: E402,F401  (Step 6's rig fixture)
+from test_plan_auto import run as run_plan  # noqa: E402
+
+from companion.opening_plan import tape as T  # noqa: E402
+from companion.plan_auto import executor as X  # noqa: E402
+
+FLIP_ON = {**AUTO_ENV, FLIP_FLAG: "1"}
+
+
+@pytest.fixture
+def frig(rig):  # noqa: F811
+    """Step 6's rig with this step's switch on: the same desk, broker, tape and clock."""
+    orders = lambda: list(rig.broker.orders.values())
+    plan = X.AutoPlan(rig.desk, rig.trader, PB_RAW, rig.tape, lambda rd, now: T.usable(rd, TAPE_RULES, now=now),
+                      rig.view, orders, lambda: rig.knobs["fresh"], lambda: rig.knobs["cooldown"], env=FLIP_ON,
+                      now=rig.clock.now, out_dir=rig.tmp / "auto")
+    plan._mono = rig.clock.mono
+    rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
+    working = []
+
+    def one_entry_per_name(n):
+        # Never two entries working for one name (brief 17 item 2), checked after every place.
+        by_name = {}
+        for o in rig.broker.orders.values():
+            if o.get("status") in trading.LIVE:
+                sym = o["orderLegCollection"][0]["instrument"]["symbol"]
+                by_name[sym] = by_name.get(sym, 0) + 1
+        working.append(max(by_name.values()))
+        assert max(by_name.values()) == 1, by_name
+    rig.broker.after_place = one_entry_per_name
+    rig.plan, rig.working = plan, working
+    return rig
+
+
+def all_four_rest(r):
+    arm(r)
+    run_plan(r, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed_names(r) == ["DDDD", "AAAA", "BBBB", "CCCC"]
+    return {o["orderLegCollection"][0]["instrument"]["symbol"]: oid for oid, o in r.broker.orders.items()}
+
+
+def row(r, ticker="AAAA"):
+    return {x["ticker"]: x for x in r.desk.state()["rows"]}[ticker]
+
+
+def test_executor_switch_off_keeps_step_6s_bounds_and_dialog(rig):  # noqa: F811
+    terms = rig.plan.terms()
+    b = rig.plan.armed_rules.bounds()
+    assert (b["orders_per_pick"], b["orders_per_day"]) == (1, 4)
+    assert terms["will_not"][0] == "Flip, chase, exit, move a stop or resend."
+    assert not [w for w in terms["will"] if "Flip" in w or "Re-level" in w]
+
+
+def test_executor_switch_on_shows_what_flips_and_relevels_may_do_and_the_bounds(frig):
+    terms = frig.plan.terms()
+    b = terms["bounds"]
+    # Brief 17 item 5: 1 entry + automatic.max_flips 3 + armed.relevels_per_pick 1 = 5 a pick;
+    # armed.orders_per_day_with_flips 8 a day.
+    assert (b["orders_per_pick"], b["orders_per_day"]) == (5, 8)
+    flip_line, relevel_line = terms["will"][-2:]
+    assert flip_line.startswith("Flip (EDGE_TRADER_PLAN_AUTO_FLIP=1)") and "flip line (0.6 of the way" in flip_line
+    assert "At most 3 flips a pick a day, counted with the row's Flip button" in flip_line
+    assert relevel_line.startswith("Re-level") and "at most once a pick a day" in relevel_line
+    assert terms["will_not"][0] == "Chase, exit, move a stop or resend."
+    assert terms["handlers"] == ["would_place", "would_cancel", "would_flip", "would_relevel"]
+
+
+def test_executor_flips_a_resting_entry_end_to_end(frig):
+    ids = all_four_rest(frig)
+    frig.tape.prices["AAAA"] = 42.14                  # past AAAA's flip line 42.144, untriggered
+    frig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    run_plan(frig, et(9, 31, 6))
+    assert frig.broker.cancelled == [ids["AAAA"]]
+    last = frig.broker.placed[-1]
+    leg = last["orderLegCollection"][0]
+    assert (leg["instrument"]["symbol"], leg["instruction"], leg["quantity"]) == ("AAAA", "SELL_SHORT", 1)
+    assert (last["stopPrice"], last["price"]) == ("41.91", "41.85")
+    assert len(frig.broker.placed) == 5 and max(frig.working) == 1
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.SENT and got["origin"] == "auto" and got["side"] == "SHORT"
+    assert got["flips"] == 1 and got["text"] == "Flipped by the armed plan (1 of 3)."
+    assert row(frig)["entry"]["auto_text"] == "Flipped by the armed plan (1 of 3)."
+    (line,) = [x for x in plan_lines(frig) if x["event"] == "flip_auto"]
+    assert line["ok"] and set(line["times"]) >= {"reading", "decision", "cancel_start", "cancel_confirmed",
+                                                   "send_start", "answered"}
+    used = frig.plan.panel()["used"]
+    assert used["orders_pick"]["AAAA"] == 2 and used["orders_day"] == 5
+    # The engine follows the new short entry: no flip back while the price stays below 42.256.
+    run_plan(frig, et(9, 31, 9))
+    assert len(frig.broker.placed) == 5 and frig.plan.arming.is_armed(frig.clock.now())
+
+
+def test_executor_relevels_a_resting_entry_end_to_end(frig):
+    ids = all_four_rest(frig)
+    frig.tape.ranges["AAAA"] = (42.60, 41.92)         # the bars request's 09:30 bar: high 12 cents up
+    frig.view.bars["AAAA"] = (42.60, 41.92, 42.40)
+    frig.tape.prices["AAAA"] = 42.40
+    run_plan(frig, et(9, 31, 6))
+    assert frig.broker.cancelled == [ids["AAAA"]]
+    last = frig.broker.placed[-1]
+    assert last["orderLegCollection"][0]["instruction"] == "BUY" and (last["stopPrice"], last["price"]) == ("42.61", "42.67")
+    got = frig.desk.records()["AAAA"]
+    assert got["relevels"] == 1 and got["text"] == "Re-levelled by the armed plan: the range is now 42.60 / 41.92."
+    assert row(frig)["entry"]["auto_text"] == got["text"]
+    # Once only (armed.relevels_per_pick 1): a second move is said, not acted on.
+    frig.tape.ranges["AAAA"] = (42.70, 41.92)
+    frig.view.bars["AAAA"] = (42.70, 41.92, 42.40)
+    run_plan(frig, et(9, 31, 9))
+    assert len(frig.broker.placed) == 5 and len(frig.broker.cancelled) == 1
+    assert any(x.get("code") == engine.RELEVEL_REFUSED for x in plan_lines(frig, "decision") if x["ticker"] == "AAAA")
+
+
+def test_executor_no_flip_when_the_days_orders_are_used(frig):
+    ids = all_four_rest(frig)
+    frig.plan.orders_day = 8                           # armed.orders_per_day_with_flips used up
+    frig.tape.prices["AAAA"] = 42.14
+    frig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    run_plan(frig, et(9, 31, 6))
+    assert frig.broker.cancelled == [] and len(frig.broker.placed) == 4
+    assert frig.broker.orders[ids["AAAA"]]["status"] == "WORKING"   # the entry stays
+    notes = [x for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == "flip_no_orders"]
+    assert len(notes) == 1 and "the entry stays" in notes[0]["text"]
+    assert frig.plan.arming.is_armed(frig.clock.now())
+
+
+def test_executor_no_flip_with_the_switch_off(rig):  # noqa: F811
+    # Step 6's own test (test_no_flip_handler_says_so_once) with this code in the build.
+    arm(rig)
+    run_plan(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.tape.prices["AAAA"] = 42.14
+    run_plan(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [] and len(rig.broker.placed) == 4
+
+
+def test_the_row_line_is_kept_only_for_the_flips_own_order():
+    desk = plan_entries.PlanDesk.__new__(plan_entries.PlanDesk)
+    rec = {"state": plan_entries.RED, "order_id": 7, "auto_note": "Flipped by the armed plan (2 of 3).",
+           "auto_note_for": 7, "origin": "auto"}
+    assert desk._entry_state(rec, [])["auto_text"] == "Flipped by the armed plan (2 of 3)."
+    assert desk._entry_state({**rec, "order_id": 8}, [])["auto_text"] == ""
+    assert desk._entry_state({**rec, "auto_note_for": None}, [])["auto_text"] == ""
+
+
+def test_the_page_shows_the_rows_flip_line_in_place_of_sent_by_the_armed_plan():
+    page = (X.PLAYBOOK_FILE.parent / "static" / "opening_plan.html").read_text()
+    assert '${esc(st.auto_text || "Sent by the armed plan.")}' in page
+
+
+@pytest.mark.parametrize("flip_on", [False, True])
+def test_demo_shows_the_flip_only_with_its_switch(rig, tmp_path, flip_on):  # noqa: F811
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    recs, _orders = plan_entries.demo_entries()
+    rig.desk.demo, rig.desk._mem = True, {rig.desk._key(): recs}
+    app.state.opening_plan_desk, app.state.opening_plan_view = rig.desk, rig.view
+    app.state.opening_plan_now = rig.clock.now
+
+    class Poller:
+        _merged_orders = staticmethod(lambda: [])
+        cooldown_left = staticmethod(lambda: 0.0)
+    env = {k: v for k, v in AUTO_ENV.items() if k != SCANNER_URL}
+    if flip_on:
+        env[FLIP_FLAG] = "1"
+    plan = X.register(app, rig.trader, Poller(), lambda rq: None, demo=True, env=env, out_dir=tmp_path / "a")
+    st = TestClient(app).get("/api/opening-plan/auto").json()
+    assert st["demo"] and plan.thread is None and rig.broker.placed == []
+    aaaa = row(rig)["entry"]
+    assert aaaa["auto_text"] == ("Flipped by the armed plan (1 of 3)." if flip_on else "")
+    assert st["bounds"]["orders_per_pick"] == (5 if flip_on else 1)
+    assert any(w.startswith("Flip (") for w in plan.terms()["will"]) is flip_on

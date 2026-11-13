@@ -29,7 +29,8 @@ Bounds (architect's ruling, 2026-11-13 15:47 UTC, brief 14): the cancel is never
 calls bound; its bound is one automatic cancel attempt per order id (lane.once). The send half is
 checked (lane.spend: one order and armed.calls_per_send calls). When the send half is refused, the
 pick ends with no order and says why. An order bound already used up stops the flip before the
-cancel: the entry then stays.
+cancel: the entry then stays. With this switch on, orders per pick is 1 + max flips + re-levels
+and orders per day is armed.orders_per_day_with_flips (armed_with_flips, brief 17 item 5).
 
 When unsure, stop acting (brief 14 rule 3): an unclear cancel or a 429 turns the row red and
 disarms (a 429 for the day); a fill during the cancel turns the row red and the plan leaves the
@@ -39,9 +40,10 @@ Step 8's chase may take it (handlers.PAST_TRIGGER), else the row says nothing re
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from . import FLIP_FLAG
 from .handlers import PAST_TRIGGER, Lane, Registry, _dec, outcome, past_trigger
@@ -52,10 +54,54 @@ CENT = Decimal("0.01")
 OTHER = {"long": "short", "short": "long"}
 
 
+def _g(x: Any) -> str:
+    return format(float(x), "g")
+
+
+def arm_flip(rules: Any) -> str:
+    """The Arm dialog's line for the flip (brief 17 item 6: what it may do and how often)."""
+    if rules is None or int(rules.max_flips) < 1:
+        return ""
+    return (f"Flip (EDGE_TRADER_PLAN_AUTO_FLIP=1): when a plan entry rests unfilled, its trigger has not traded "
+            f"and the price reaches its flip line ({_g(rules.flip_line)} of the way to the other level), cancel "
+            "it, wait for Schwab to confirm the cancel with nothing filled, then place the other side from the "
+            f"same range, 1 share, its stop attached. At most {rules.max_flips} flips a pick a day, counted with "
+            "the row's Flip button. An unclear cancel or any fill places nothing and turns the row red.")
+
+
+def arm_relevel(rules: Any) -> str:
+    """The Arm dialog's line for the re-level; nothing when armed.relevels_per_pick is 0."""
+    if rules is None or int(rules.relevels_per_pick) < 1:
+        return ""
+    n = int(rules.relevels_per_pick)
+    return ("Re-level (the same switch): when Edge Scanner's 09:30 bars request moves the range by more than one "
+            "cent from the one a resting plan entry was built on, and that entry has not filled or triggered, "
+            "cancel it, confirm, and place the same side from the new range; at most "
+            f"{'once' if n == 1 else f'{n} times'} a pick a day. After a fill nothing moves: the row says the "
+            "range changed.")
+
+
 def register(reg: Registry) -> None:
     """Both handlers, behind EDGE_TRADER_PLAN_AUTO_FLIP (with Step 6's switches)."""
-    reg.register(FLIP, on_flip, switch=FLIP_FLAG)
-    reg.register(RELEVEL, on_relevel, switch=FLIP_FLAG)
+    reg.register(FLIP, on_flip, switch=FLIP_FLAG, arm_text=arm_flip)
+    reg.register(RELEVEL, on_relevel, switch=FLIP_FLAG, arm_text=arm_relevel)
+
+
+def armed_with_flips(armed: Any, rules: Any, playbook: Mapping) -> Any:
+    """The armed bounds with this step on (brief 17 item 5): a pick may send its entry, its flips
+    and its re-levels, so orders per pick = armed.orders_per_pick + automatic.max_flips +
+    armed.relevels_per_pick (1 + 3 + 1 = 5); the day may send armed.orders_per_day_with_flips
+    (start 8: the 4 entries and 4 flips or re-levels in all). With this switch off the executor
+    keeps Step 6's numbers. The Arm dialog shows the result, and the click confirms it."""
+    raw = (playbook.get("armed") or {}).get("orders_per_day_with_flips")
+    per_day = raw.get("value") if isinstance(raw, Mapping) else raw
+    if per_day is None or isinstance(per_day, bool):
+        raise ValueError("playbook armed: orders_per_day_with_flips is missing (EDGE_TRADER_PLAN_AUTO_FLIP=1)")
+    per_day = int(per_day)
+    if per_day < armed.orders_per_day:
+        raise ValueError("playbook armed: orders_per_day_with_flips is below orders_per_day")
+    return replace(armed, orders_per_pick=armed.orders_per_pick + int(rules.max_flips) + int(rules.relevels_per_pick),
+                   orders_per_day=per_day)
 
 
 def on_flip(lane: Lane) -> bool:
@@ -86,6 +132,11 @@ def _stale(pick: Mapping, rules) -> str:
     if age > rules.stale_after_seconds:
         return f"the price is {age:.1f} s old"
     return ""
+
+
+def _cents(d: Decimal) -> str:
+    """A price as the row shows it: 42.60, not 42.6 (a sub-cent price keeps its digits)."""
+    return str(d.quantize(CENT)) if d == d.quantize(CENT) else str(d)
 
 
 def _range(pick: Mapping) -> Optional[tuple[Decimal, Decimal]]:
@@ -170,7 +221,7 @@ def _swap(lane: Lane, kind: str) -> bool:
         lane.say(f"{kind}_no_orders", f"no order left for a {what} (orders per pick or per day): the entry stays")
         return False
     high, low = _range(pick)
-    rng = {"high": str(high), "low": str(low)}
+    rng = {"high": _cents(high), "low": _cents(low)}
     limit = lane.rules.max_flips if kind == "flip" else lane.rules.relevels_per_pick
     calls = int(lane.armed_rules.calls_per_send)
     spent = {"send": False}

@@ -165,6 +165,10 @@
       "value": 0.25,
       "note": "start number, not approved by Ash; data stamped more than this after our clock makes the reading unusable (the clock looks behind)"
     },
+    "orders_per_day_with_flips": {
+      "value": 8,
+      "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_FLIP=1 (Step 7, companion/plan_auto/flip.py): the day's 4 entries and 4 flips or re-levels in all. Orders per pick then becomes orders_per_pick + automatic.max_flips + relevels_per_pick (brief 17 item 5)"
+    },
     "relevels_per_pick": {
       "value": 1,
       "note": "start number, not approved by Ash; Step 7 (brief 17): how often the armed plan may cancel and place the same side again when the 09:30 bar moves the range by more than one cent. Flips use automatic.max_flips, shared with the row's Flip button"

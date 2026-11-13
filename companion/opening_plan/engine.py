@@ -235,7 +235,9 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
     entry = pick.get("entry") if isinstance(pick.get("entry"), Mapping) else None
     if entry is not None:
         _follow(ps, entry, pick, reading, rules)
-    if ps["state"] == FILLED and rules.relevels_per_pick > 0:
+    if ps["state"] == FILLED and entry is not None and rules.relevels_per_pick > 0:
+        # Only for a real fill: after an estimated (shadow) fill nothing more is decided
+        # (tests/test_opening_plan_tape.py, the settled bar that moved the range).
         _range_after_fill(st, out, sym, ps, pick, now, entry)
     if ps["state"] in (FILLED, DONE):
         return
@@ -503,9 +505,9 @@ def _relevel(st: dict, out: list, sym: str, ps: dict, pick: Mapping, last: Decim
 
 
 def _range_after_fill(st: dict, out: list, sym: str, ps: dict, pick: Mapping, now: datetime,
-                      entry: Optional[Mapping] = None) -> None:
-    """Step 7: a fill came first, so nothing moves (the plan never moves a stop); say it once.
-    With a real entry the range it was built on is the record's own, when it has one."""
+                      entry: Mapping) -> None:
+    """Step 7: a real entry filled first, so nothing moves (the plan never moves a stop); say it
+    once. The range it was built on is the record's own, when it has one."""
     built = {"high": ps.get("high"), "low": ps.get("low")}
     if entry is not None and _dec(entry.get("high")) is not None and _dec(entry.get("low")) is not None:
         built = {"high": _dec(entry.get("high")), "low": _dec(entry.get("low"))}

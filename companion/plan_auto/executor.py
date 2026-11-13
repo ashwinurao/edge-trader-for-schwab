@@ -41,8 +41,9 @@ from starlette.concurrency import run_in_threadpool
 from .. import break_entry, plan_entries
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
-from . import AUTO_FLAG, BUTTONS_FLAG, enabled
+from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
+from .flip import armed_with_flips
 from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
 
 log = logging.getLogger("companion.plan_auto")
@@ -128,6 +129,9 @@ class AutoPlan:
         self.armed_rules = armed_rules_from(playbook)
         self.playbook_name = str(playbook.get("name") or "")
         self.registry = registry or default_registry()
+        if any(self.registry.get(k, env) is not None for k in ("would_flip", "would_relevel")):
+            # Brief 17 item 5: a flip or a re-level is an order too (companion/plan_auto/flip.py).
+            self.armed_rules = armed_with_flips(self.armed_rules, self.rules, playbook)
         self.arming = Arming(self.armed_rules)
         # Guards the fields below. Never held across a call to Schwab or Edge Scanner.
         self._lock = threading.Lock()
@@ -628,6 +632,10 @@ def fill_demo(plan: AutoPlan) -> None:
         recs = plan.desk._mem[plan.desk._key()]
         recs["AAAA"].update(origin="auto", kind="break", sent_at=_iso(armed_at + timedelta(seconds=330)))
         recs["BBBB"].update(origin="auto", kind="break")
+        if plan.registry.get("would_flip", plan.env) is not None:
+            # Step 7: AAAA's resting long reads as flipped by the armed plan from a short.
+            recs["AAAA"].update(flips=1, auto_note=f"Flipped by the armed plan (1 of {plan.rules.max_flips}).",
+                                auto_note_for=recs["AAAA"].get("order_id"))
     except Exception:
         pass
     at = lambda s: (datetime.combine(day, plan.armed_rules.act_from_et, tzinfo=ET) + timedelta(seconds=s)).strftime("%H:%M:%S")
@@ -672,6 +680,10 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
                           and env.get(BUTTONS_FLAG) == "1")
     if desk is None or not on:
         return None
+    if demo and not enabled(env):
+        # Demo has no Edge Scanner address. A later step's own switch (Step 7's flip) still shows
+        # what it would add; every click is refused in demo and the worker never starts.
+        env = {**env, SCANNER_URL: "demo"}
     now = now or getattr(app.state, "opening_plan_now", None) or (lambda: datetime.now(timezone.utc))
     try:
         playbook = json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
