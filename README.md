@@ -53,8 +53,9 @@ name are refused). It needs no account and sends no telemetry.
   Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
   quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
-  `skip` line for a read the 429 pause held back, `pause` lines for the pause's start and end, a `token`
-  line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
+  `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
+  `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
+  pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
   web server wake, CPU, memory, the token's time left, and the count, p95 and slowest time of each route
   the screens poll that minute).
   Each click on a ticket, position, spread or Opening plan button gets a `route` line with its duration and
@@ -136,7 +137,14 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Dashboard:** open positions (day trades and carried positions apart) with open P&L, live R, stop
   and target, protection (FULL, PARTIAL, NO STOP SEEN) and P&L at the stop; working orders including
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
-  STALE, DISCONNECTED) that disables every order button when data is not current.
+  STALE, DISCONNECTED) that disables every order button when data is not current. The account and
+  order list are read every 5 s, marks every 3 s and fills every 10 s. While a ticket window has
+  focus or after a click, marks come every 6 s instead of 3, so the account and order list keep
+  their pace within the app's limit of 70 Schwab calls a minute (`MAX_PER_MIN`,
+  `companion/poller.py`). With up to two clicks a minute marks and fills never show as old; with
+  three clicks close together marks can be up to 15 s old for a moment and show as old (after 9 s).
+  In heavier order traffic (30 or more order calls a minute) marks, fills and realized P&L can show
+  as old until it eases (`companion/poll_budget.py`).
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
   market, ask, bid or your own limit price (Lmt), one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill

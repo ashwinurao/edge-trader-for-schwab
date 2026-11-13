@@ -14,9 +14,24 @@ using the same Schwab login):
                                      ~54
     ticket quotes (outside this limiter) every 5 s while a ticket window has focus, else every
     30 s: up to ~12 more. Order actions are on top, at most one at a time.
-Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN),
-schwabdev's internal retries are disabled (companion/schwab.py), and a 429 pauses
-ALL companion requests. Each endpoint keeps its own last-success time.
+Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN, 70 calls in
+any 60 s, order traffic included), schwabdev's internal retries are disabled (companion/schwab.py),
+and a 429 pauses ALL companion requests. Each endpoint keeps its own last-success time.
+
+When order traffic is busy (brief 24, companion/poll_budget.py), the account and order reads go
+first: they wait only when the minute is full, as before (the 59-day sweep lets the 5 s reads go
+ahead of it then, for up to 60 s). Transactions, quotes, corrections and hours slow down or give way,
+unless an Auto B/E or a spread stop with Send needs them. What the trader sees:
+- a quiet minute (5 order calls or fewer): every poll as before;
+- a ticket window in focus, or up to two clicks a minute: position marks every 6 s instead of 3,
+  fills every 10 s as before; neither shows as old;
+- three clicks close together (still below 30 order calls a minute): marks up to 15 s old for a
+  moment, shown as old after 9 s; fills within 20 s, the account and order list within 11 s;
+- heavier traffic: marks, fills and realized P&L keep their old time and show as old until the
+  traffic eases.
+One netlog `skip` line per poll interval records each read not sent. Order traffic never waits for
+the poller. `hold_later` lets a caller that knows a burst is coming hold the later polls ahead of
+time (fills still come every 15 s).
 """
 from __future__ import annotations
 
@@ -27,7 +42,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from . import netlog, schwab
+from . import netlog, poll_budget, schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, fills_from_transactions, session_day
 from .store import Store, now_iso
@@ -85,6 +100,11 @@ class Poller:
         self.last_rebuild: str | None = None
         self._next = {k: 0.0 for k in INTERVALS}
         self._sent: deque[float] = deque()
+        self._order_sent: deque[float] = deque()   # the order path's sends alone (brief 24)
+        self._hold_until = 0.0                     # hold_later: LATER polls give way until then
+        self._skip_logged: dict[str, float] = {}   # one skip line per poll per interval
+        self._urgent: frozenset[str] = frozenset() # LATER polls a stop-moving reader needs now
+        self._later = False                        # a LATER poll is running: its calls never wait
         self._cooldown_until = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()       # set by a sign-in from the dashboard
@@ -117,23 +137,35 @@ class Poller:
 
     # ---- requests --------------------------------------------------------
 
-    def _throttle(self) -> None:
-        """Block until a request fits under MAX_PER_MIN and any 429 cooldown is over."""
+    def _throttle(self, may_wait: bool = True) -> bool:
+        """Block until a request fits under MAX_PER_MIN and any 429 cooldown is over. With
+        may_wait False (a LATER poll, brief 24) return False at once instead of waiting."""
         while not self._stop.is_set():
             now = time.monotonic()
-            while self._sent and now - self._sent[0] > 60:
+            # A send counts for 60 s, then leaves: `>=` matches the wait below (sent[0] + 60 - now).
+            # With `>`, a send exactly 60 s old stayed in the count while the wait read 0, and every
+            # call went out however full the minute was (brief 24, tests/test_poll_budget.py).
+            while self._sent and now - self._sent[0] >= 60:
                 self._sent.popleft()
             wait = max(self._cooldown_until - now,
                        (self._sent[0] + 60 - now) if len(self._sent) >= MAX_PER_MIN else 0)
             if wait <= 0:
                 self._sent.append(now)
-                return
+                return True
+            if not may_wait:
+                return False
             self._stop.wait(min(wait, 1.0))
+        return True
 
     def note_external_request(self, retry_after=None) -> None:
         """Order traffic from the trader: counted in the same per-minute window (without blocking
         an order), and a 429 on it pauses the poller's own requests."""
-        self._sent.append(time.monotonic())
+        now = time.monotonic()
+        self._sent.append(now)
+        if retry_after is None:       # the trader reports a 429 a second time, with its Retry-After
+            self._order_sent.append(now)
+            while self._order_sent and now - self._order_sent[0] >= 60:
+                self._order_sent.popleft()
         if retry_after is not None:
             wait = _retry_after(str(retry_after))
             self._cooldown_until = time.monotonic() + wait
@@ -141,6 +173,54 @@ class Poller:
 
     def cooldown_left(self) -> float:
         return max(0.0, self._cooldown_until - time.monotonic())
+
+    def hold_later(self, seconds: float, why: str) -> None:
+        """Hold the LATER polls (transactions, quotes, corrections, hours) for this long, for a
+        caller that knows a burst of order calls is coming (brief 24; the armed plan, in its own
+        PR). The account and order reads are never held. A shorter hold never cuts a longer one."""
+        self._hold_until = max(self._hold_until, time.monotonic() + max(0.0, float(seconds)))
+        log.info("later polls held %.0f s: %s", seconds, why)
+
+    def _give_way(self, name: str) -> bool:
+        """Ask the budget (poll_budget.py) whether a due poll gives way now. Each time it does,
+        one netlog skip line, at most one per poll interval, so the record counts the reads not sent."""
+        now = time.monotonic()
+        try:
+            # tuple() copies deques that click threads append to (note_external_request). Under the
+            # GIL that copy is safe: 8.7 million copies against three writer threads on Python
+            # 3.11.18 raised nothing (review 1 of PR #33). If it ever raises, the poll goes as
+            # before brief 24, never the loop's 5 s error wait.
+            why = poll_budget.give_way(name, now, tuple(self._sent), tuple(self._order_sent), MAX_PER_MIN,
+                                       self._hold_until, self._urgent, self._age(name), INTERVALS.get(name))
+        except Exception:
+            log.exception("poll budget failed for %s; the poll goes", name)
+            why = None
+        if why is None:
+            self._skip_logged.pop(name, None)
+            return False
+        if now >= self._skip_logged.get(name, 0.0):
+            self._skip_logged[name] = now + INTERVALS.get(name, 5)
+            self._skip(name, why)
+        return True
+
+    def _age(self, name: str) -> float | None:
+        ok_at = (self.fresh.get(name) or {}).get("ok_at")
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ok_at)).total_seconds() if ok_at else None
+
+    def _goes_first(self, name: str) -> bool:
+        """True when a LATER poll may wait in the limiter like a FIRST poll (poll_budget.goes_first).
+        On any error it is True: the poll goes and waits as before brief 24."""
+        try:
+            return poll_budget.goes_first(name, time.monotonic(), tuple(self._order_sent), self._hold_until,
+                                          self._age(name), INTERVALS.get(name))
+        except Exception:
+            log.exception("poll budget failed for %s; the poll goes", name)
+            return True
+
+    @staticmethod
+    def _skip(name: str, why: str) -> None:
+        with netlog.call("schwab", name, "poller") as call:
+            call.skip(why)
 
     def _call(self, name: str, fn):
         """One HTTP request. Returns parsed JSON, or None on any failure (never raises). Its waits,
@@ -150,7 +230,11 @@ class Poller:
 
     def _call_logged(self, name: str, fn, call):
         t_wait = time.monotonic()
-        self._throttle()
+        if not self._throttle(may_wait=not self._later):
+            # A LATER poll never waits in the limiter (brief 24): it gives way and its data keeps
+            # its old time. The next pass asks again.
+            call.skip("pause_429" if self.cooldown_left() > 0 else "minute_full")
+            return None
         call.waited("throttle", (time.monotonic() - t_wait) * 1000)
         call.sending()
         started = now_iso()
@@ -433,9 +517,19 @@ class Poller:
             ticket_pnl(st["brackets"], st.get("positions") or [], st.get("closed") or [])
             self._add_r_and_log(st, today, txns)
             self._auto_be(st)
+            self._urgent = poll_budget.urgent_polls(st.get("positions"), st.get("spreads"),
+                                                    self._auto_be_pending())
         self._trail_estimates(st)
         with self._lock:
             self.state = st
+
+    def _auto_be_pending(self) -> bool:
+        """A ticket of today still has Auto B/E PENDING, filled or not (brief 24: its quotes and
+        transactions go first, so the +1R move is not held back)."""
+        start = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        store = self.trader.store
+        return any((store.auto_be(t["ticket_id"]) or {}).get("state") == "PENDING"
+                   for t in store.tickets_since(start.isoformat()))
 
     def _trail_estimates(self, st: dict) -> None:
         """Where each Schwab trailing stop sits now. Schwab's own stop price when it reports one;
@@ -601,12 +695,18 @@ class Poller:
                 changed = False
                 for name, every in INTERVALS.items():
                     if time.monotonic() >= self._next[name]:
+                        if self._give_way(name):      # brief 24: asked again on the next pass
+                            continue
                         self._next[name] = time.monotonic() + every
+                        self._later = (name not in poll_budget.FIRST and name not in self._urgent
+                                       and not self._goes_first(name))
                         try:
                             changed |= self._poll(name)
                         except Exception as e:
                             self.fresh[name]["error"] = repr(e)[:200]
                             log.exception("poll %s failed", name)
+                        finally:
+                            self._later = False
                 if changed:
                     try:
                         self._rebuild()
