@@ -43,7 +43,7 @@ ANSWER_KEYS = ("ok", "status", "order_id", "ticket_id", "error", "duplicate", "b
 ORDER_KEYS = ("order_id", "group_id", "group_type", "role", "order_type", "instruction", "status", "live",
               "qty", "filled", "price", "stop", "cancellable", "transitional")
 BRACKET_KEYS = ("order_id", "ticket_id", "side", "qty", "limit_price", "stop", "entry_status", "status",
-                "protection", "stop_qty", "exposure", "filled", "detail")
+                "protection", "stop_qty", "exposure", "filled", "detail", "entry_reason")
 
 
 class Stop(Exception):
@@ -765,7 +765,8 @@ def sc_ticket_fill(r: Run) -> None:
         n = r.shares(r.sym, st)
         if n * sign >= 1:
             return {"shares": n, "orders": r.orders(r.sym, st)}
-        return None
+        b = entry_ended(r, r.sym, oid, st)
+        return {"ended": b} if b else None
     got, waited = r.wait(filled, r.a.fill_wait, 1.0)
     if not got:
         r.note("NO_FILL", waited_s=round(waited, 1), orders=r.orders(r.sym), quote=r.quote(r.sym))
@@ -776,10 +777,14 @@ def sc_ticket_fill(r: Run) -> None:
             r.check(f"{side}: nothing works on {r.sym} after the cancel", bool(gone))
             r.arm(False)
             return
-        r.note("CANCEL_LOST_TO_FILL", answer=r.pick(c))
-        got, waited2 = r.wait(filled, 20, 1.0)
+        r.note("CANCEL_REFUSED", answer=r.pick(c))
+        got, waited = r.wait(filled, 20, 1.0)
         if not got:
             raise Stop("the cancel was refused and no share shows: unclear")
+    if got.get("ended"):
+        ended_unfilled(r, r.sym, oid, side, got["ended"], waited)
+        r.arm(False)
+        return
     r.note("FILLED", seen_after_s=round(time.monotonic() - t_sent, 1), shares=got["shares"], orders=got["orders"])
     r.check(f"{side}: exactly 1 share filled", abs(got["shares"]) == 1, shares=got["shares"])
 
@@ -811,6 +816,24 @@ def sc_ticket_fill(r: Run) -> None:
             shares=r.shares(r.sym, st), orders=r.orders(r.sym, st))
     r.note("BRACKET_AFTER", brackets=[b for b in r.brackets(r.sym, st) if b.get("order_id") == oid])
     r.arm(False)
+
+
+def entry_ended(r: Run, sym: str, oid, st=None):
+    """Edge Trader's ticket record when Schwab ended the accepted entry with nothing filled
+    (REJECTED after acceptance, found live on 2026-11-13 18:49 UTC; CANCELED; EXPIRED)."""
+    b = next((b for b in r.brackets(sym, st) if b.get("order_id") == oid), None)
+    if b and not float(b.get("filled") or 0) and (
+            b.get("entry_status") in ("REJECTED", "CANCELED", "EXPIRED") or b.get("status") == "REJECTED"):
+        return b
+    return None
+
+
+def ended_unfilled(r: Run, sym: str, oid, side: str, b: dict, waited: float) -> None:
+    """Record it as a failed check, with Schwab's reason and the quote; nothing is left to cancel."""
+    r.open.pop(oid, None)
+    r.check(f"{side}: Schwab keeps the accepted entry working until it fills or is cancelled", False,
+            ended=b.get("entry_status") or b.get("status"), reason=b.get("entry_reason") or b.get("detail"),
+            seen_after_s=round(waited, 1), bracket=b, quote=r.quote(sym), orders=r.orders(sym, live_only=False))
 
 
 def wait_protected(r: Run, sym: str, oid):
@@ -921,8 +944,12 @@ def sc_plan_fill_flat(r: Run) -> None:
     t_sent = time.monotonic()
 
     def filled():
-        n = r.shares(t)
-        return {"shares": n} if n * sign >= 1 else None
+        st = r.state()
+        n = r.shares(t, st)
+        if n * sign >= 1:
+            return {"shares": n}
+        b = entry_ended(r, t, oid, st)
+        return {"ended": b} if b else None
     got, waited = r.wait(filled, r.a.fill_wait, 1.0)
     if not got:
         r.note("NO_FILL", waited_s=round(waited, 1), orders=r.orders(t), quote=r.quote(t))
@@ -933,10 +960,15 @@ def sc_plan_fill_flat(r: Run) -> None:
             r.check("nothing works on the name after the cancel", bool(gone))
             r.arm(False)
             return
-        r.note("CANCEL_LOST_TO_FILL", answer=r.pick(c))
-        got, _ = r.wait(filled, 20, 1.0)
+        r.note("CANCEL_REFUSED", answer=r.pick(c))
+        got, waited = r.wait(filled, 20, 1.0)
         if not got:
             raise Stop("the cancel was refused and no share shows: unclear")
+    if got.get("ended"):
+        ended_unfilled(r, t, oid, side, got["ended"], waited)
+        r.note("ROW_AFTER_ENDED", row=r.row_brief(r.row_of(r.entries(), t) or {}))
+        r.arm(False)
+        return
     r.note("FILLED", seen_after_s=round(time.monotonic() - t_sent, 1), shares=got["shares"],
            orders=r.orders(t, live_only=False))
     plan_fill_then_flat(r, t, side, oid, exp["stop"])
@@ -1225,6 +1257,20 @@ def sc_cleanup(r: Run) -> None:
            trading=r.trading(st))
 
 
+def sc_own(r: Run) -> None:
+    """Read only: what Edge Trader shows now for this test's own orders of today (the order rows
+    and the ticket record, with Schwab's reason when it rejected one after accepting it)."""
+    mine = r.mem.get("orders") or []
+    st = r.state()
+    for o in mine:
+        sym, oid = o.get("symbol"), o.get("order_id")
+        r.note("OWN_ORDER", symbol=sym, kind=o.get("kind"), order_id=oid,
+               orders=[x for x in r.orders(sym, st, live_only=False) if oid in (x["order_id"], x["group_id"])],
+               ticket=[b for b in r.brackets(sym, st) if b.get("order_id") == oid])
+    r.note("OWN_TOTAL", orders_placed=len(mine), orders_asked_for_today=r.mem.get("sends") or 0,
+           trading=r.trading(st))
+
+
 def sc_netlog(r: Run) -> None:
     """Read only: the timing of every Schwab call and of our own order routes since Edge Trader
     started (companion/netlog.py summary: counts, errors and milliseconds, no account numbers)."""
@@ -1252,7 +1298,7 @@ def sc_ticket_fill_short(r: Run) -> None:
     sc_ticket_fill(r)
 
 
-SCENARIOS = {"netlog": sc_netlog, "check": sc_check, "refusals": sc_refusals, "ticket_rest": sc_ticket_rest,
+SCENARIOS = {"netlog": sc_netlog, "own": sc_own, "check": sc_check, "refusals": sc_refusals, "ticket_rest": sc_ticket_rest,
              "ticket_fill": sc_ticket_fill, "ticket_fill_long": sc_ticket_fill_long,
              "ticket_fill_short": sc_ticket_fill_short, "plan_place_cancel": sc_plan_place_cancel,
              "plan_flip": sc_plan_flip, "plan_flat": sc_plan_flat, "plan_fill_flat": sc_plan_fill_flat,
