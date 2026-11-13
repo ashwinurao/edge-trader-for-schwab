@@ -11,14 +11,18 @@ A reading is what was known at one moment (`received`, an aware time): the risk 
 flag, and per pick its rank, the last trade price and that trade's own time (`last`, `last_at`),
 optionally `fresh_at` (the newer of the trade's and the quote's own times, from the open tape,
 companion/opening_plan/tape.py), the first minute's high and low and whether that range is final
-(`final`: the reading says it is the 09:30 bar), and optionally `hold` (a reason no price-based
-action may use this reading, e.g. the tape is not usable).
+(`final`: the reading says it is the 09:30 bar), optionally `range_disputed` (the snapshot's
+versions of the 09:30 bar disagree and the bars request has not answered: no new order, and a
+working entry waits for the bars bar) and optionally `hold` (a reason no price-based action may
+use this reading, e.g. the tape is not usable).
 
 The logic (design: project memory ov-fast-open-design and ov-entries-failure-rules; every number
 in playbook.json "automatic", each a start number Ash has not approved):
 - The range is final only when the reading says so (`final`: the 09:30 bar). Brief 15 dropped
   "a trade stamped 09:31 or later makes it final": on 2026-11-13 it made yesterday's day bar
   final. It waits at most range_final_wait_seconds past 09:31:00, then leaves the pick alone today.
+  A disputed range (`range_disputed`) is not final: no new order, the same deadline, and a working
+  entry neither fills nor flips until the bars request settles it (its time-based cancels run).
 - Side = the level nearer to the last trade. Entry = stop-limit: trigger one offset past the
   level, limit = trigger + cap, stop at the other side. cap = cap_r x risk per share, at most
   cap_max_pct_of_price % of the trigger, at least cap_min (the floor wins when they cross:
@@ -77,6 +81,11 @@ EVEN = "even"
 NO_SHARES = "no_shares"
 AFTER_WATCH = "after_watch"
 FLIP_REFUSED = "flip_refused"
+RANGE_DISPUTED = "range_disputed"
+DISPUTED_WHY = ("the snapshot's 09:30 bar changed by more than a cent; no order until the bars "
+                "request's 09:30 bar settles it")
+DISPUTED_WORKING_WHY = ("the snapshot's 09:30 bar changed by more than a cent; the working entry "
+                        "waits for the bars request's 09:30 bar")
 
 
 @dataclass(frozen=True)
@@ -229,6 +238,7 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
         age = (now - fresh_at).total_seconds()
         seen["fresh_age_s"] = round(age, 3)
     hold = pick.get("hold")
+    disputed = bool(pick.get("range_disputed"))
 
     if ps["state"] == WORKING:
         o = ps["order"]
@@ -244,6 +254,9 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
                 _act(st, out, sym, "would_cancel", f"no pullback to the limit {o['limit']} in "
                      f"{rules.pullback_wait_seconds:g} s", side=o["side"], **seen)
                 return
+        if disputed:
+            _say(st, out, sym, RANGE_DISPUTED, DISPUTED_WORKING_WHY, now, seen)
+            return
         if hold or last is None or age is None or age > rules.stale_after_seconds:
             _say(st, out, sym, STALE, hold or _stale_why(age, by_quote), now, seen)
             return
@@ -256,11 +269,21 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
         _say(st, out, sym, AFTER_WATCH, f"the fast watch ended at {rules.watch_until_et:%H:%M} ET "
              "before an entry; no order today", now, seen)
         return
+    bar_end = datetime.combine(day, rules.bar_start_et, tzinfo=ET) + timedelta(minutes=1)
+    if disputed:
+        # A disputed range is not final, so the same deadline applies (review 1 of brief 15).
+        if (now - bar_end).total_seconds() >= rules.range_final_wait_seconds:
+            ps["state"] = DONE
+            _say(st, out, sym, RANGE_NOT_FINAL, f"range not final {rules.range_final_wait_seconds:g} s "
+                 "after 09:31:00 ET (the snapshot's 09:30 bar versions disagree and no bars-request "
+                 "bar settled them); no order today", now, seen)
+        else:
+            _say(st, out, sym, RANGE_DISPUTED, DISPUTED_WHY, now, seen)
+        return
     high, low = _dec(pick.get("high")), _dec(pick.get("low"))
     if high is None or low is None:
         _say(st, out, sym, NO_RANGE, "no first-minute range yet", now, seen)
         return
-    bar_end = datetime.combine(day, rules.bar_start_et, tzinfo=ET) + timedelta(minutes=1)
     if not pick.get("final"):
         if (now - bar_end).total_seconds() >= rules.range_final_wait_seconds:
             ps["state"] = DONE

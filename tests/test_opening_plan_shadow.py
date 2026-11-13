@@ -400,6 +400,18 @@ def test_shadow_is_off_unless_asked(tmp_path):
                               lambda c, n: None) is None
 
 
+@pytest.mark.parametrize("as_of, label", [("09:30:59", "minute so far"),
+                                           ("09:31:00", "snapshot 09:30 bar, not confirmed")])
+def test_the_feeds_early_0930_bar_is_labelled_not_confirmed_and_is_not_final(as_of, label):
+    # Edge Scanner PR #45 sends the snapshot's whole 09:30 bar with first_minute_as_of 09:31:00
+    # before its bar request confirms it; Edge Trader PR #26 shows it "not confirmed".
+    reading, ranges = shadow.es_reading(
+        Reading(es_answer({"open": 49.5, "high": 50.0, "low": 49.0, "close": 49.8}, as_of=as_of),
+                at("09:31:00.300"), ""), at("09:31:00.400"), Decimal("101"), False)
+    assert ranges["AAAA"] == {"high": 50.0, "low": 49.0, "final": False, "from": label}
+    assert reading["picks"][0]["final"] is False
+
+
 def test_shadow_writes_each_decision_with_times_and_ages(tmp_path):
     feed = FakeFeed()
     feed.answers = [(es_answer({"open": 49.5, "high": 50.0, "low": 49.0, "close": 49.8}, as_of="09:30:59"),

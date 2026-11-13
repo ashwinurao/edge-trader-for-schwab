@@ -92,7 +92,7 @@ name are refused). It needs no account and sends no telemetry.
   record can name it. The armed plan (`EDGE_TRADER_PLAN_AUTO=1`, below) reads the same open tape through
   the same reader, so with the shadow log on as well it is still at most one read every 0.25 seconds:
   once when its Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
-  the end of the watch (about 09:35:20 ET). Before each send it also checks the pick's row against the
+  the end of the watch (at the latest 09:35:45 ET). Before each send it also checks the pick's row against the
   OV picks read above (at most every 2 seconds), even with the screen closed.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
@@ -299,11 +299,16 @@ why (for example "price is 1.2 s old"). It has no button and no route, places, c
 nothing, and imports no order code. Its numbers are in `companion/opening_plan/playbook.json` under
 `automatic`, each a start number not approved yet. Each line says its `source`. With `tape` it carries
 `tape_seq`, `tape_age_s` (Edge Scanner's newest snapshot to the answer), `feed_age` (SPY's newest trade
-or quote to the answer), `tape_usable` and `tape_why`; when the tape is not usable the plan acts on no
-price, as the armed plan would not. When the tape has a problem (no answer, a failed or late read, no
-picks for today) the shadow falls back to the picks route, `source` is `picks feed` and `tape_problem`
+or quote to the answer), `tape_usable` and `tape_why`; when the tape is not usable (judged when the
+reading was handed out, not when the step began) the plan acts on no price, as the armed plan would
+not. Until the tape has given picks today, a tape problem (no answer, a failed or late read, no picks
+for today) makes the shadow fall back to the picks route: `source` is `picks feed` and `tape_problem`
 says why; that route has no price after 09:31, so the fallback mostly shows the first decision and then
-old prices. To run the plan over a whole morning again, replay Edge Scanner's opening-recorder file
+old prices. Its range says `minute so far`, `snapshot 09:30 bar, not confirmed` (Edge Scanner's early
+bar, not final until its bar request confirms it) or `09:30 bar`. Once the tape has given picks today, a tape problem is a hold instead, as the armed plan
+would do: `source` stays `tape`, `tape_problem` says why, every pick keeps the tape's last picks with
+no price action, and time-based cancels (the watch end, the pullback wait) still run. To run the plan
+over a whole morning again, replay Edge Scanner's opening-recorder file
 (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
 
     python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
@@ -325,6 +330,13 @@ shadow, the replay and later the armed plan:
   longer makes a range final.
 - When the bars request's bar differs from the range in use by more than one cent, its values replace
   it, and the range says `changed` with both.
+- When the snapshot's versions of the 09:30 bar differ in high or low by more than one cent and the
+  bars request has not answered, the range is disputed: not final, no high or low, and the range says
+  `disputed` with the versions. The plan places no new order from it (`range_disputed`, with the same
+  deadline as any range that is not final: `automatic.range_final_wait_seconds` in `playbook.json`, 3 s
+  after 09:31:00 ET, then no order today), and a working entry neither fills nor
+  flips until the bars request's bar settles it; its time-based cancels still run. Versions that
+  differ only in volume, count or vwap change nothing.
 - A price is fresh by the newer of its trade's and its quote's own times (`fresh_at`): on 2026-11-13 a
   thin name's last trade was often 0.5 to 4 s old while its quote was current.
 - The reading is not usable when Edge Scanner's newest snapshot is older than 1.0 s, or SPY's newest
@@ -341,13 +353,13 @@ day's file, 2026-11-13, says no).
 | `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
 | `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_cancel` or `no_action`. |
 | `symbol`, `why` | The pick, and the reason in words. |
-| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `range_disputed`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `after_watch`, `no_range` or `no_picks`. |
 | `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
 | `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
 | `fill` | On `would_fill`: the trade price seen inside the order's band. |
 | `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
 | `fresh_age_s` | How old the newer of that trade and its quote was at `t`: the age the plan judges freshness by. |
-| `range` | The first minute's high and low, whether it was final, and where it came from (`snapshot minute bar` or `09:30 bar`, the bars request); `changed` with the old and new range when the bars request moved it. |
+| `range` | The first minute's high and low, whether it was final, and where it came from (`snapshot minute bar` or `09:30 bar`, the bars request); `changed` with the old and new range when the bars request moved it; `disputed` with the snapshot's versions while they disagree and the bars request has not answered. |
 
 A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
 with no `would_place` line never got an order, and its last `no_action` says why.
@@ -433,7 +445,9 @@ resends, and flips or chases only with that step's own switch. Without the cappe
 pick whose price is already at or past its trigger is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it.
-A filled entry is yours to manage, as with a click.
+A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
+that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
+your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
 
 It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
 today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
@@ -441,8 +455,11 @@ today, or when the tape is stamped ahead of Edge Trader's clock. It stops and di
 is left and the row follows its ticket, as after a click); a cancel Schwab does not confirm (the row
 turns red); a reached bound; ARM turned off on the dashboard; an old order list; or an unexpected error.
 A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
-pick and is never retried. After a disarm, entries already at Schwab stay: a red banner lists them,
-and each row's Cancel works. A restart never restores "armed".
+pick and is never retried. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
+up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
+at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
+Cancel. A restart never restores "armed".
 
 Its bounds are in `companion/opening_plan/playbook.json` under `armed`, each a start number Ash has not
 approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pick, 4 orders a day, and
