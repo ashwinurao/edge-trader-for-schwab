@@ -27,7 +27,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from . import schwab
+from . import netlog, schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, fills_from_transactions, session_day
 from .store import Store, now_iso
@@ -135,21 +135,33 @@ class Poller:
         an order), and a 429 on it pauses the poller's own requests."""
         self._sent.append(time.monotonic())
         if retry_after is not None:
-            self._cooldown_until = time.monotonic() + _retry_after(str(retry_after))
+            wait = _retry_after(str(retry_after))
+            self._cooldown_until = time.monotonic() + wait
+            netlog.pause("schwab", retry_after, wait)       # a record only (netlog.py)
 
     def cooldown_left(self) -> float:
         return max(0.0, self._cooldown_until - time.monotonic())
 
     def _call(self, name: str, fn):
-        """One HTTP request. Returns parsed JSON, or None on any failure (never raises)."""
+        """One HTTP request. Returns parsed JSON, or None on any failure (never raises). Its waits,
+        wire time and outcome also go to data/netlog/ (netlog.py): a record only."""
+        with netlog.call("schwab", name, "poller", clients=(self.client,)) as call:
+            return self._call_logged(name, fn, call)
+
+    def _call_logged(self, name: str, fn, call):
+        t_wait = time.monotonic()
         self._throttle()
+        call.waited("throttle", (time.monotonic() - t_wait) * 1000)
+        call.sending()
         started = now_iso()
         fr = self.fresh.setdefault(name, {"ok_at": None, "error": None, "interval": None})
         try:
             r = fn()
+            call.returned(r)
             if r.status_code == 429:
                 wait = _retry_after(r.headers.get("Retry-After"))
                 self._cooldown_until = time.monotonic() + wait
+                netlog.pause("schwab", r.headers.get("Retry-After"), wait)
                 fr["error"] = f"rate limited, all requests paused {wait:.0f}s"
                 self.store.log_request(name, started, False, 429, r.text[:300])
                 return None
@@ -159,10 +171,12 @@ class Poller:
                 return None
             data = r.json() if r.content else None
         except Exception as e:  # network, auth, permission, bad JSON
+            call.failed(e)
             fr["error"] = repr(e)[:200]
             self.store.log_request(name, started, False, None, repr(e)[:300])
             log.warning("%s failed: %r", name, e)
             return None
+        call.data(data)
         self.store.log_request(name, started, True, 200, None)
         return data
 

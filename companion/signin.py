@@ -26,7 +26,7 @@ from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import schwab
+from . import netlog, schwab
 
 log = logging.getLogger("companion.signin")
 
@@ -172,7 +172,9 @@ class SignIn:
             self.phase, self.message = "exchanging", "Signing in to Schwab..."
         cb = callback_url()
         try:
-            self._exchange(cb, received_url)
+            # Recorded in data/netlog/ (netlog.py): when, how long, ok or not. Never the code or tokens.
+            with netlog.call("schwab_oauth", "token", "signin"):
+                self._exchange(cb, received_url)
         except Exception as e:
             log.warning("sign-in failed: %s", e)
             with self._lock:
