@@ -668,7 +668,12 @@ class PlanDesk:
     def _auto_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
                       blocked: Optional[set], fresh: bool) -> str:
         """Place's row checks without Step 2's view: the tape's own tests (executor.py) replace
-        "the row's first minute is final and fresh". The plan sends only on an empty row."""
+        "the row's first minute is final and fresh". The plan sends only on an empty row.
+        A hold comes first (Flat all's batch, Step 9; a hold that cannot be read refuses): the
+        automatic twins do not go through _send_refusal (architect, 2026-11-13 16:25 UTC)."""
+        held = self.held()
+        if held:
+            return held
         if rec.get("origin") == "click":
             return CLICK_TAKES_ROW
         if rec:

@@ -502,7 +502,8 @@ by the clock: every order is your click.
   refused for that row only.
 - While a batch runs, no new plan entry goes: Place and Flip refuse with "Flat all is running: no new
   entries until it ends. Nothing was sent." Cancel still works. So Flat all never says "done" while a
-  new order rests. A batch first calls the hook Step 6 wires to its Disarm.
+  new order rests. A batch first disarms the armed plan (Step 6, below), before it builds its list,
+  and its hold refuses the armed plan's sends as well.
 - From 2 minutes before the playbook's flat time (`exit.flat_et`, 10:00 ET) the button turns red and
   says the flat time.
 - **Cover watch:** for each plan row that holds shares, the dashboard's own stop protection of the
@@ -546,8 +547,10 @@ the calm flag, what the plan will and will not do, and its bounds. **Arm with th
 with every reason listed, when: it is not a market day or outside that window; ARM is off on the
 dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
 or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
-answer; the bounds or the playbook changed since the dialog showed them; or the plan was disarmed for
-the day.
+answer; the bounds or the playbook changed since the dialog showed them; the plan was disarmed for
+the day; or the size stage (`size.stage`, above) is not 1 share. The armed plan sends 1 share whatever
+the stage: the stage is for your clicks only, so Arm is refused at any other stage ("The size stage is
+25%. The armed plan sends 1 share only, so it arms only at the 1-share stage").
 
 Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
@@ -571,12 +574,19 @@ cancels nothing: it waits 0.25 s, reads the tape again and tries then. The pick'
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
+A **Flat all** click disarms the plan first, before Flat all builds its list ("the Flat all click").
+After it the plan sends and cancels nothing: Flat all's own list does the cancels. A send the plan had
+already started lands; its row says "A click on this row is still running" in that batch, and a second
+Flat all click cancels it. While a batch runs, a plan send is refused like Place ("Flat all is
+running: …"): nothing reaches Schwab, nothing is spent from the bounds, and that pick is left for the
+day. A hold that cannot be read refuses too.
 
 It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
 today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
-**Disarm** click (one click, checked before every send and cancel); an unclear Schwab answer (that pick
-is left and the row follows its ticket, as after a click); a cancel Schwab does not confirm (the row
-turns red); a reached bound; ARM turned off on the dashboard; an old order list; or an unexpected error.
+**Disarm** click (one click, checked before every send and cancel); a **Flat all** click; an unclear
+Schwab answer (that pick is left and the row follows its ticket, as after a click); a cancel Schwab does
+not confirm (the row turns red); a reached bound; ARM turned off on the dashboard; an old order list;
+or an unexpected error.
 An old order list means one failed read of Schwab's order list, or no good read for 15 seconds (3 times
 the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in `companion/poller.py`). Such a
 disarm is not for the day, but the Arm window has closed by then, so the plan is over for that morning.

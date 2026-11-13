@@ -21,7 +21,8 @@ These decide most review questions:
    click that shows its bounds: from 09:31 ET it sends that day's Opening plan break entries at 1 share,
    one at a time, and cancels one that has not filled after the pullback wait or at the end of the
    fast watch, once per order. It never retries, flips, chases, exits or moves a stop; one Disarm
-   click stops it, and an unclear answer, a 429 or a reached bound disarms it. A Place, Flip or
+   click stops it, so does a Flat all click (before Flat all builds its list), and an unclear
+   answer, a 429 or a reached bound disarms it. It arms only at the 1-share size stage. A Place, Flip or
    Cancel click on a row makes that row the user's for the day, and the plan never acts on it again
    (`PlanDesk._put_click`). Ash's go for this exception is quoted in the
    pull request that adds it. Any other change that would act without a click will not be merged.
