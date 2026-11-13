@@ -12,6 +12,12 @@ with --private as the dashboard hides the account value.
 
 `rates` is the opening probe's store of today's margin rates (companion/preview_rates.py, brief
 23): view["preview_rates"] carries them, ratios and Schwab's texts only, never a dollar amount.
+
+The buying power cap (brief 23 PR B, companion/opening_plan/bp_cap.py): one CapLatch per server
+holds the day's fixed balances, and Ash's "Plan may use N % of buying power" is a setting
+(SHARE_KEY) saved like the Risk per pick, by POST /api/opening-plan/share under the same guard.
+Both POSTs answer with the cap's sentences. With --private the balances still size the rows; the
+screen hides every dollar of them.
 """
 from __future__ import annotations
 
@@ -24,15 +30,18 @@ from typing import Callable, Mapping, Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from .feed import ENV_VAR, Feed, Get, http_get
-from .plan import NOT_SET_UP, build_view, calm_reading, load_playbook, parse_risk
+from .bp_cap import CapLatch
+from .plan import NOT_SET_UP, build_view, calm_reading, load_playbook, parse_risk, parse_share
 
 log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).resolve().parent / "static"
 FEATURE = "openingplan"                         # the dashboard loads /features/openingplan.js
 RISK_KEY = "opening_plan_risk_per_pick"         # Edge Trader's settings table (store.py settings)
+SHARE_KEY = "opening_plan_buying_power_share"   # brief 23: "Plan may use N % of buying power"
 
 
 def stored_risk(store) -> Optional[Decimal]:
@@ -43,21 +52,29 @@ def stored_risk(store) -> Optional[Decimal]:
         return None
 
 
+def stored_share(store) -> Optional[int]:
+    """The saved "Plan may use" percent, or None (blank, or a value that no longer reads)."""
+    try:
+        return parse_share(store.get_setting(SHARE_KEY) or "")
+    except ValueError:
+        return None
+
+
 def account_reading(snapshot: Optional[Callable[[], Mapping]], private: bool) -> Optional[dict]:
     """{balances, ok_at, private} from the poller's state (view.py "balances", the poller's
-    freshness of "account"), or None when there is nothing to read. Never raises."""
-    if private:
-        return {"balances": None, "ok_at": None, "private": True}
+    freshness of "account"), or None when there is nothing to read. Never raises. With --private
+    the balances are still read for the buying power cap (brief 23); plan.buying_power() and the
+    cap hide them on the screen."""
     if snapshot is None:
-        return None
+        return {"balances": None, "ok_at": None, "private": True} if private else None
     try:
         snap = snapshot() or {}
         ok_at = (((snap.get("freshness") or {}).get("account") or {}).get("ok_at"))
         at = datetime.fromisoformat(str(ok_at).replace("Z", "+00:00")) if ok_at else None
         return {"balances": snap.get("balances"), "ok_at": at if at and at.utcoffset() is not None else None,
-                "private": False}
+                "private": bool(private)}
     except Exception:
-        return None
+        return {"balances": None, "ok_at": None, "private": True} if private else None
 
 
 def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
@@ -75,9 +92,12 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
         return []
     pb = load_playbook()
     bad_url = ""
+    latch = CapLatch()       # brief 23: the day's fixed balances, in memory
     if demo:
-        from .demo_feed import DEMO_ET_ENV, DEMO_RV20_ENV, DemoFeed, demo_account, demo_clock, demo_rv20
+        from .demo_feed import DEMO_ET_ENV, DEMO_RV20_ENV, DemoFeed, demo_account, demo_clock, demo_rates, demo_rv20
         now = now or demo_clock(env.get(DEMO_ET_ENV) or None)
+        if not url:
+            rates = demo_rates(now)      # invented rates; the demo never runs the probe
     now = now or (lambda: datetime.now(timezone.utc))
     feed = None
     if url:
@@ -106,17 +126,21 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
 
     def current_view() -> dict:
         at = now()
-        # The demo shows invented balances (demo_feed.demo_account); never the account's own.
-        account = demo_account(at) if demo and not url else account_reading(snapshot, private)
+        # The demo shows invented balances (demo_feed.demo_account); never the account's own. With
+        # --private it hides them like the real ones, so a private screenshot is real evidence (brief 23).
+        account = {**demo_account(at), "private": private} if demo and not url else account_reading(snapshot, private)
+        today = rates.today(at) if rates is not None else {}
+        ratios = rates.ratios(at) if rates is not None else {}
         if feed is None:
             view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb, account=account)
             view.update(state=NOT_SET_UP, message=f"The Opening plan is off: {bad_url}")
         else:
             picks, clock = feed.read()
             view = build_view(picks.body, picks.ok_at, picks.error, clock.body, clock.ok_at, clock.error,
-                              stored_risk(store), at, pb, account=account)
+                              stored_risk(store), at, pb, account=account, rates=today, ratios=ratios,
+                              share_pct=stored_share(store), latch=latch)
         view["demo"] = demo and not url
-        view["preview_rates"] = rates.today(at) if rates is not None else {}
+        view["preview_rates"] = today
         return view
 
     # A plain def: FastAPI runs it in a worker thread, so a slow Edge Scanner never blocks the server.
@@ -139,6 +163,28 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
         except ValueError as e:
             raise HTTPException(400, str(e))
         store.set_setting(RISK_KEY, "" if risk is None else str(risk))
-        return {"ok": True, "risk": None if risk is None else float(risk)}
+        return {"ok": True, "risk": None if risk is None else float(risk), **(await _cap_words())}
+
+    async def _cap_words() -> dict:
+        """The cap's sentences after a save (brief 23 item 3), from a fresh view (in a worker
+        thread: the view may ask Edge Scanner). Never raises."""
+        try:
+            cap = (await run_in_threadpool(current_view)).get("cap") or {}
+        except Exception:
+            cap = {}
+        return {"cap": [t for t in (cap.get("share_text"), cap.get("needs_text"), cap.get("risk_text")) if t]}
+
+    @app.post("/api/opening-plan/share")
+    async def opening_plan_share(request: Request):
+        """Save "Plan may use N % of buying power" (a setting, not an order). Blank goes back to the
+        playbook's default. A bad value is refused and nothing is saved."""
+        guard(request)
+        try:
+            share = parse_share((await request.json()).get("share"))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        store.set_setting(SHARE_KEY, "" if share is None else str(share))
+        return {"ok": True, "share": share if share is not None else pb.bp_default_share_pct,
+                "saved": share is not None, **(await _cap_words())}
 
     return [FEATURE]

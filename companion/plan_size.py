@@ -19,8 +19,9 @@ The size is decided on the server only. The page sends the shares it showed and 
 refuses (plan_entries.PlanDesk._same); the stage's result reaches the break entry's share cap
 through break_entry.plan_cap, never through a request field.
 
-`caps` is the hook for a later brief (a buying-power cap Ash asked for on 2026-11-13): each cap is
-(label, most shares), and the answer says which limit bound. No cap is passed yet.
+`caps`: each cap is (label, most shares), and the answer says which limit bound. Brief 23 passes
+the row's buying power cap here ("buying power", from companion/opening_plan/bp_cap.py through
+plan_entries.PlanDesk._sized); a stage above 1 share is refused until that cap is fixed for the day.
 
 Pure: no clock, network or files except load_stage, which reads the playbook.
 """

@@ -73,8 +73,9 @@ def test_a_preview_before_the_freeze_shows_the_previews_top_rows_marked_not_lock
     assert pv["text"] == PREVIEW_TEXT and pv["trading_date"] == "2026-11-13"
     assert pv["as_of_et"] == "09:10:00" and pv["previewed_at_et"] == "09:10:04" and pv["as_of_age_s"] == 20.0
     assert [(r["rank"], r["ticker"]) for r in pv["rows"]] == [(1, "AAAA"), (2, "BBBB"), (3, "CCCC"), (4, "DDDD")]
-    # Brief 22 added the row's estimate in its own key (tests/test_opening_plan_estimate.py); the rest is as before.
-    first = {k: v for k, v in pv["rows"][0].items() if k != "estimate"}
+    # Brief 22 added the row's estimate in its own key (tests/test_opening_plan_estimate.py) and brief
+    # 23 the row's buying power cap (tests/test_opening_plan_cap.py); the rest is as before.
+    first = {k: v for k, v in pv["rows"][0].items() if k not in ("estimate", "cap")}
     assert first == {"rank": 1, "ticker": "AAAA", "top": True, "atr": 2.4, "pm_high": 42.82,
                      "pm_low": 39.94, "last": 42.1, "preview": True, "text": PREVIEW_TEXT}
     assert pv["rows"][0]["estimate"]["kind"] == "estimate"

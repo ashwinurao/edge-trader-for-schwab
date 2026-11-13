@@ -12,6 +12,10 @@ answer has no frozen picks and a preview instead, re-ranked each minute as Edge 
 preview is; from 09:25 ET the picks above are frozen. The buying power line shows invented
 numbers (demo_account), never an account's.
 
+The buying power cap (brief 23) runs on invented margin rates (demo_rates): AAAA 30% both
+sides, BBBB 25% long and 30% short, CCCC 40% with an invented hard-to-borrow warn on the short,
+DDDD no preview (counted without margin).
+
 EDGE_TRADER_PLAN_DEMO_RV20 sets the demo's SPY RV20 (default 9.80, a calm day), so the demo can
 show a full-size day too, with its estimated shares (brief 22).
 """
@@ -106,8 +110,31 @@ def preview_answer(now: datetime) -> dict:
 
 def demo_account(now: datetime) -> dict:
     """Invented balances for the demo's buying power line, read 1.2 s ago."""
-    return {"balances": {"equity": 52340.18, "buyingPower": 104680.36, "dayTradingBuyingPower": 209360.72},
+    return {"balances": {"equity": 52340.18, "buyingPower": 104680.36, "dayTradingBuyingPower": 209360.72,
+                         "availableFunds": 52340.18},
             "ok_at": now - timedelta(seconds=1.2), "private": False}
+
+
+# Invented preview rates for the demo (brief 23): (ticker, side, af rate, a warn text or None).
+DEMO_RATES = (("AAAA", "LONG", 0.30, None), ("AAAA", "SHORT", 0.30, None),
+              ("BBBB", "LONG", 0.25, None), ("BBBB", "SHORT", 0.30, None),
+              ("CCCC", "LONG", 0.40, None),
+              ("CCCC", "SHORT", 0.40, "HARD_TO_BORROW: This security is hard to borrow; a fee applies."))
+
+
+def demo_rates(now: Callable[[], datetime]):
+    """A rate store filled with invented previews at 09:05:30 ET of the demo's day, so the cap and
+    the rows' rate lines show at once. Buying power and day-trading rates are 4 x the af rate."""
+    from ..preview_rates import PreviewRates
+    store = PreviewRates()
+    at = datetime.combine(now().astimezone(ET).date(), time(9, 5, 30), tzinfo=ET)
+    for ticker, side, af, warn in DEMO_RATES:
+        store.add({"symbol": ticker, "side": side, "at": "09:05:30", "http": 200, "ok": True, "status": "ACCEPTED",
+                   "warns": ["This security is considered easy to borrow at this time"] + ([warn] if warn else []),
+                   "af_rate": af, "af_rate_from": ["availableFunds", "x"],
+                   "bp_rate": af * 4, "bp_rate_from": ["buyingPower", "x"],
+                   "dt_rate": af * 4, "dt_rate_from": ["dayTradingBuyingPower", "x"]}, at)
+    return store
 
 
 def demo_rv20(text: str | None) -> float:

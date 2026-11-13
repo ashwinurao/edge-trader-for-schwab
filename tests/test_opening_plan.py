@@ -494,7 +494,8 @@ def test_route_serves_the_plan_and_saves_the_risk(tmp_path):
     assert v["state"] == P.OK and v["rows"][0]["shares"]["state"] == "SET_RISK" and v["demo"] is False
     assert c.post("/api/opening-plan/risk", json={"risk": "250"}).status_code == 403   # no X-Companion
     assert c.post("/api/opening-plan/risk", json={"risk": "-1"}, headers={"X-Companion": "1"}).status_code == 400
-    assert c.post("/api/opening-plan/risk", json={"risk": "250"}, headers={"X-Companion": "1"}).json() == {"ok": True, "risk": 250.0}
+    assert c.post("/api/opening-plan/risk", json={"risk": "250"}, headers={"X-Companion": "1"}).json() == {"ok": True, "risk": 250.0, "cap": []}
+    # Brief 23 added "cap": the buying power sentences after a save; none here (no balances).
     assert store.get_setting(R.RISK_KEY) == "250.00"
     assert c.get("/api/opening-plan").json()["rows"][0]["shares"]["used"] == {"long": 438, "short": 438}
     assert c.post("/api/opening-plan/risk", json={"risk": ""}, headers={"X-Companion": "1"}).json()["risk"] is None
@@ -502,10 +503,11 @@ def test_route_serves_the_plan_and_saves_the_risk(tmp_path):
     assert "Opening plan" in c.get("/features/openingplan.js").text
 
 
-def test_the_only_write_is_the_risk_setting(tmp_path):
+def test_the_only_writes_are_the_risk_and_share_settings(tmp_path):
+    # Brief 23 added the second setting, "Plan may use N % of buying power" (Ash, 2026-11-13 22:05 UTC).
     app, _, _ = _app(tmp_path, {"EDGE_SCANNER_URL": "http://192.168.1.10:8772"})
     posts = [r.path for r in app.routes if "POST" in (getattr(r, "methods", None) or set())]
-    assert posts == ["/api/opening-plan/risk"]
+    assert posts == ["/api/opening-plan/risk", "/api/opening-plan/share"]
 
 
 def test_bad_address_shows_why_and_asks_nothing(tmp_path):

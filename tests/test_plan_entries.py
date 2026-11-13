@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from companion import break_entry, plan_entries, trading
 from companion.opening_plan import plan as P
+from companion.opening_plan.bp_cap import CapLatch
 from companion.store import Store
 from companion.trading import Trader
 from test_trading import Broker, Resp
@@ -57,12 +58,26 @@ class Plan:
     def __init__(self):
         self.rows = [pick(1, "AAAA", 42.48, 41.92, 42.37), pick(2, "CCCC", 71.84, 71.20, 71.31, as_of="09:30:47")]
         self.rv, self.picks_age, self.risk = 12.3, 0.5, 100
+        # Brief 23: no balances by default, so the buying power cap is not known (nothing capped).
+        self.account, self.latch, self.share = None, None, None
+
+    def cap_fixed(self, available=10_000_000.0):
+        """Made-up balances, fresh at NOW, and a latch: the cap is fixed at the first view. At the
+        default it is far above every size, so a stage test sends the stage's size (brief 23).
+        The cap fixes only when every pick's bar is final, so CCCC's bar is made final here."""
+        for r in self.rows:
+            r.pop("first_minute_as_of", None)
+        bal = {"availableFunds": available, "buyingPower": 4 * available, "dayTradingBuyingPower": 4 * available}
+        self.account = {"balances": bal, "ok_at": NOW - timedelta(seconds=2), "private": False}
+        self.latch = CapLatch()
+        return self
 
     def __call__(self):
         clock = {"spy_rv": None if self.rv is None else
                  {"rv20": self.rv, "through": "2026-11-12", "calm": self.rv <= 10.5, "calm_max": 10.5}}
         return P.build_view(answer(self.rows), NOW - timedelta(seconds=self.picks_age), "", clock,
-                            NOW - timedelta(seconds=10), "", P.parse_risk(self.risk), NOW, PB)
+                            NOW - timedelta(seconds=10), "", P.parse_risk(self.risk), NOW, PB,
+                            account=self.account, share_pct=self.share, latch=self.latch)
 
 
 class PlanBroker(Broker):
