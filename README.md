@@ -300,7 +300,8 @@ reading was handed out, not when the step began) the plan acts on no price, as t
 not. Until the tape has given picks today, a tape problem (no answer, a failed or late read, no picks
 for today) makes the shadow fall back to the picks route: `source` is `picks feed` and `tape_problem`
 says why; that route has no price after 09:31, so the fallback mostly shows the first decision and then
-old prices. Once the tape has given picks today, a tape problem is a hold instead, as the armed plan
+old prices. Its range says `minute so far`, `snapshot 09:30 bar, not confirmed` (Edge Scanner's early
+bar, not final until its bar request confirms it) or `09:30 bar`. Once the tape has given picks today, a tape problem is a hold instead, as the armed plan
 would do: `source` stays `tape`, `tape_problem` says why, every pick keeps the tape's last picks with
 no price action, and time-based cancels (the watch end, the pullback wait) still run. To run the plan
 over a whole morning again, replay Edge Scanner's opening-recorder file

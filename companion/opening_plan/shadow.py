@@ -27,6 +27,10 @@ What Step 2's feed (the fallback) can and cannot say (Edge Scanner scanner/ov_pi
 - Before the 09:30 bar is in, `first_minute` is the minute so far and `first_minute_as_of` is the
   last trade's time, whole seconds ("HH:MM:SS" ET). The shadow takes that time as the trade's,
   so a price age can read up to 1 s too old.
+- With `first_minute_as_of` "09:31:00", `first_minute` is the whole 09:30 bar from Alpaca's
+  snapshot, before Edge Scanner's bar request confirms it (Edge Scanner PR #45, Edge Trader PR
+  #26). Its range says `snapshot 09:30 bar, not confirmed`, not `minute so far`, and it is not
+  final, as on the Opening plan screen.
 - Once the bar is in, `first_minute` is the 09:30 bar and there is no later price: the shadow
   takes the bar's close at 09:31:00, the latest its trade can be. So after 09:31 the price only
   ages, and the engine says `no_action: price is N s old` rather than act on it. Flips, chases
@@ -60,6 +64,7 @@ PLAYBOOK_FILE = Path(__file__).resolve().parent / "playbook.json"
 RISK_EVERY_SECONDS = 30.0
 IDLE_SECONDS = 20.0            # the longest sleep outside the window
 BAR_END_ET = time(9, 31)
+UNCONFIRMED = "snapshot 09:30 bar, not confirmed"     # Edge Scanner PR #45's early bar
 
 Risk = Callable[[], Optional[Decimal]]
 Calm = Callable[[Reading, datetime], Optional[bool]]
@@ -101,17 +106,21 @@ def es_reading(picks: Reading, now: datetime, risk: Optional[Decimal], calm: Opt
         if isinstance(fm, Mapping):
             p.update(high=fm.get("high"), low=fm.get("low"), last=fm.get("close"))
             as_of = row.get("first_minute_as_of")
+            label = "minute so far"
             if as_of:
                 try:
                     p["last_at"] = datetime.combine(today, time.fromisoformat(str(as_of)), tzinfo=engine.ET)
                 except ValueError:
                     p["last_at"] = None
+                if p["last_at"] == datetime.combine(today, BAR_END_ET, tzinfo=engine.ET):
+                    # The whole bar from the snapshot, not confirmed yet (plan.py, PR #26): still not final.
+                    label = UNCONFIRMED
             else:
                 p["final"] = True
                 p["last_at"] = datetime.combine(today, BAR_END_ET, tzinfo=engine.ET)
         reading["picks"].append(p)
         ranges[p["symbol"]] = {"high": p["high"], "low": p["low"], "final": p["final"],
-                               "from": "09:30 bar" if p["final"] else "minute so far"}
+                               "from": "09:30 bar" if p["final"] else label}
     return reading, ranges
 
 
