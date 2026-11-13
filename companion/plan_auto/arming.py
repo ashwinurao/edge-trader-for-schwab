@@ -97,6 +97,7 @@ class Facts:
     tape: str = ""                # "" when the tape route answered usably, else why not
     blocked_today: str = ""       # a disarm for the day (429, error): why
     size_stage: str = ""          # "" at the 1-share stage, else the stage's label (plan_size.label)
+    flat_unwired: str = ""        # why Flat all is on but its click would not disarm the plan (executor)
 
 
 def refusals(f: Facts, rules: ArmedRules) -> list[str]:
@@ -136,6 +137,8 @@ def refusals(f: Facts, rules: ArmedRules) -> list[str]:
         # 2026-11-13 17:42 UTC).
         out.append(f"The size stage is {f.size_stage}. The armed plan sends 1 share only, so it arms only at "
                    "the 1-share stage (size.stage \"1_share\" in playbook.json).")
+    if f.flat_unwired:
+        out.append(f.flat_unwired)
     return out
 
 
