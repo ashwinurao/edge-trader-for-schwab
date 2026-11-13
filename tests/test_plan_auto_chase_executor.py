@@ -128,6 +128,22 @@ def test_timeline_of_one_chase_at_0_4_s_a_call(crig):
     assert d["decided_at"] == "2026-11-13T14:31:00.100+00:00" and d["last_age_s"] == 0.05
 
 
+def test_with_the_row_check_off_the_chase_goes_on_the_tape_alone_and_the_panel_says_so(crig):
+    """Step 6's review 2 (2026-11-13 16:53 UTC): with no OV picks answer the row check is skipped and
+    the panel says "Row check off". The chase follows the same rule as the break entry, not a stricter
+    or a looser one."""
+    rig = crig
+    rig.plan._row_view = lambda: {}                         # page closed, shadow log off: no answer
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert sorted(placed(rig)) == sorted(PICKS)
+    (req,) = [without_id(r) for r in rig.sent if r["symbol"] == "AAAA"]
+    assert req == CHASE_AAAA
+    assert rig.plan.panel()["row_check_text"].startswith("Row check off: no answer from Edge Scanner's picks route yet.")
+    assert len(lines(rig, "row_check_skipped")) == 1
+
+
 def test_the_chase_reads_the_plan_view_before_the_tape_never_between_reading_and_send(crig):
     """Architect's review, 2026-11-13 16:21 UTC: Step 2's view can wait on an Edge Scanner GET, so
     the executor reads it at the start of the step and the chase hands lane.view to chase_auto. The
