@@ -71,6 +71,28 @@
   tr.red td { background: var(--red-bg); }
   .foot { padding: 0 16px 20px; color: var(--muted); font-size: 12px; line-height: 1.55; }
   .empty { padding: 26px 16px; color: var(--muted); }
+  /* Flat all and the cover watch (Step 9, companion/plan_flat.py) */
+  .btn.flat { border-color: rgba(229,83,75,.55); color: var(--red); }
+  .btn.flat.soon { background: var(--red); border-color: var(--red); color: #fff; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .ob.stop { border-color: rgba(229,83,75,.7); color: var(--red); margin: 0 0 0 8px; }
+  .dlg-bg { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: flex-start;
+            justify-content: center; padding: 60px 16px; z-index: 10; }
+  .dlg-bg.on { display: flex; }
+  .dlg { background: var(--panel); border: 1px solid var(--line-hi); border-radius: 10px; max-width: 640px; width: 100%;
+         padding: 16px 18px; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+  .dlg h2 { font-size: 16px; margin: 0 0 4px; }
+  .dlg table { min-width: 0; margin: 10px 0 12px; }
+  .dlg td { padding: 7px 8px; }
+  .dlg .act { font: 600 13px var(--sans); white-space: nowrap; }
+  .dlg .act.cancel, .dlg .act.close { color: var(--amber); }
+  .dlg .act.refuse { color: var(--red); }
+  .dlg .act.nothing { color: var(--muted); }
+  .dlg .row-btns { display: flex; gap: 10px; justify-content: flex-end; }
+  .btn.go { background: var(--red); border-color: var(--red); color: #fff; }
+  .flatline { font: 400 12px var(--sans); white-space: normal; }
+  .flatline.done { color: var(--green); } .flatline.nothing { color: var(--muted); }
+  .flatline.refused, .flatline.not_sent { color: var(--amber); } .flatline.unclear { color: var(--red); font-weight: 600; }
   /* The armed plan's panel (companion/plan_auto, Step 6): only when GET /api/opening-plan/auto answers. */
   .auto { margin: 10px 16px 0; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line-hi); background: var(--panel); }
   .auto.armed { border-color: rgba(229,83,75,.7); box-shadow: 0 0 0 1px rgba(229,83,75,.25) inset; }
@@ -80,14 +102,13 @@
   .auto .lines .tk { font-size: 13px; }
   .btn.arm { border-color: rgba(229,83,75,.7); color: var(--red); }
   .btn.disarm { border-color: rgba(214,165,43,.7); color: var(--amber); }
-  .btn:disabled { opacity: .4; cursor: not-allowed; }
   .ovl { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; z-index: 10; }
-  .dlg { width: min(680px, 94vw); max-height: 86vh; overflow: auto; background: var(--panel); border: 1px solid var(--line-hi); border-radius: 10px; padding: 16px 18px; }
-  .dlg h3 { margin: 0 0 8px; font-size: 16px; }
-  .dlg ul { margin: 4px 0 10px; padding-left: 18px; } .dlg li { margin: 2px 0; font-size: 13px; }
-  .dlg .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; margin-top: 10px; }
-  .dlg table { min-width: 0; } .dlg td { padding: 3px 10px 3px 0; border: none; font-size: 13px; }
-  .dlg .row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+  .ovl .dlg { max-width: none; width: min(680px, 94vw); max-height: 86vh; overflow: auto; background: var(--panel); border: 1px solid var(--line-hi); border-radius: 10px; padding: 16px 18px; }
+  .ovl .dlg h3 { margin: 0 0 8px; font-size: 16px; }
+  .ovl .dlg ul { margin: 4px 0 10px; padding-left: 18px; } .ovl .dlg li { margin: 2px 0; font-size: 13px; }
+  .ovl .dlg .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; margin-top: 10px; }
+  .ovl .dlg table { min-width: 0; margin: 0; } .ovl .dlg td { padding: 3px 10px 3px 0; border: none; font-size: 13px; }
+  .ovl .dlg .row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
   .bp { font: 500 12.5px var(--sans); color: var(--muted); }
   .bp b { font: 600 13px var(--mono); color: var(--text); }
   table.preview td { background: repeating-linear-gradient(135deg, transparent 0 10px, rgba(214,165,43,.05) 10px 20px); }
@@ -112,10 +133,19 @@
   <span class="bp" id="bp" title="Schwab's numbers from the account read Edge Trader already makes. On this screen only.">Buying power</span>
   <span class="sp"></span>
   <span class="mut msg" id="picks-txt"></span>
+  <span id="flat-slot"></span>
 </div>
 <div id="banners"></div>
 <div id="auto"></div>
 <div id="ovl"></div>
+<div class="dlg-bg" id="flat-dlg"><div class="dlg" role="dialog" aria-modal="true" aria-labelledby="flat-h">
+  <h2 id="flat-h">Flat all: end the plan's trades</h2>
+  <div class="mut msg">Cancels first, then closes, one row at a time in rank order, each through the dashboard's own Cancel entry and
+    Close paths. Nothing is retried. The server builds this list again and sends nothing if it differs.</div>
+  <div id="flat-list"></div>
+  <div class="row-btns"><button class="btn" type="button" id="flat-back">Back</button>
+    <button class="btn go" type="button" id="flat-go">Confirm Flat all</button></div>
+</div></div>
 <div class="wrap" id="wrap"></div>
 <div class="foot" id="foot"></div>
 <script>
@@ -130,6 +160,10 @@ let lastOk = 0, lastView = null, refresh = 2000, busy = false, typing = false;
 let entries = null, entriesOff = false;
 // The armed plan (companion/plan_auto, Step 6): only when the server has it (EDGE_TRADER_PLAN_AUTO=1); 404: no panel.
 let auto = null, autoOff = false, autoMsg = null;
+// Flat all and the cover watch (companion/plan_flat.py, Step 9): only when the server has them
+// (EDGE_TRADER_PLAN_FLAT=1 with the plan buttons); a 404 means no Flat all button and no cover lines.
+let flat = null, flatOff = false, flatShown = null, flatBusy = false, flatSaid = null;
+const STEP = {cancel: "cancel the unfilled entry", close: "close", nothing: "nothing", refuse: "refused"};
 const clicking = {}, said = {};
 const STALE_MS = 6000;   // the page's own check: no answer from Edge Trader for 6 s marks the view old
 
@@ -178,6 +212,13 @@ function notes(r) {
     // A red row's entry may still rest at Schwab: its status goes under the red text.
     if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);
   }
+  const cv = coverOf(r.ticker);
+  if (cv && cv.red) out.push(`<div class="badline">${esc(cv.text)}<button class="ob stop" data-act="add-stop" data-t="${esc(r.ticker)}"
+    ${cv.add_stop || clicking[r.ticker] ? "disabled" : ""} title="${esc(cv.add_stop || `Sends one stop for ${cv.uncovered} shares at ${cv.stop}`)}">Add stop ${esc(cv.stop)}</button>${
+    cv.add_stop ? `<span class="sub">${esc(cv.add_stop)}</span>` : ""}</div>`);
+  const fr = flatRowOf(r.ticker);
+  if (fr && fr.result !== "nothing") out.push(`<div class="flatline ${esc(fr.result)}">Flat all ${esc(flat.last.at_et)} ET: ${
+    esc(fr.result.replace("_", " "))} · ${esc(fr.text)}</div>`);
   if (b.state !== "FINAL" && b.state !== "SO_FAR" && b.text) out.push(`<div class="${b.state === "BAD" ? "badline" : "mutline"}">${esc(b.text)}</div>`);
   for (const k of ["long", "short"]) if (r[k] && r[k].capped) out.push(`<div class="badline">${k === "long" ? "Long" : "Short"} shares ${esc(r[k].capped)}.</div>`);
   if (r.under_min_stop) {
@@ -187,8 +228,21 @@ function notes(r) {
   } else if (r.under_min_stop === null && r.long) {
     out.push(`<div class="warnline">No ATR from Edge Scanner: the 2% minimum stop can't be checked.</div>`);
   }
-  const red = e && e.entry.red ? " red" : "";
+  const red = (e && e.entry.red) || redByFlat(r.ticker) ? " red" : "";
   return out.length ? `<tr class="notes${red}"><td></td><td colspan="${entries ? 11 : 10}">${out.join("")}</td></tr>` : "";
+}
+
+function coverOf(ticker) {
+  return flat && flat.cover ? flat.cover[ticker] : null;
+}
+
+function flatRowOf(ticker) {
+  return flat && flat.last && flat.last.rows ? flat.last.rows.find(x => x.ticker === ticker) : null;
+}
+
+function redByFlat(ticker) {
+  const cv = coverOf(ticker), fr = flatRowOf(ticker);
+  return !!((cv && cv.red) || (fr && fr.result === "unclear"));
 }
 
 function entryOf(ticker) {
@@ -205,8 +259,8 @@ function ordersCell(r) {
   const fl = e.flip_to || "";
   return `<td class="orders">${b("long", "place", "long", "Place long break", e.place.long)}${b("short", "place", "short", "Place short break", e.place.short)}<br>
     ${b("", "cancel", "", "Cancel", e.cancel)}${b(fl, "flip", fl, fl ? `Flip to ${fl}` : "Flip", e.flip)}
-    <span class="sub">${e.flips}/${entries.max_flips} flips · ${entries.break_max_shares} share, test stage${
-      e.send && e.send.long ? `; plan size ${sh(e.send.long.plan_shares)}` : ""}</span></td>`;
+    <span class="sub">${e.flips}/${entries.max_flips} flips · ${e.stage && e.stage.long ? esc(e.stage.long)
+      : `${entries.break_max_shares} share, test stage${e.send && e.send.long ? `; plan size ${sh(e.send.long.plan_shares)}` : ""}`}</span></td>`;
 }
 
 async function act(btn) {
@@ -234,7 +288,82 @@ async function act(btn) {
     tick();
   }
 }
-document.addEventListener("click", ev => { const btn = ev.target.closest("button.ob"); if (btn && !btn.disabled) act(btn); });
+document.addEventListener("click", ev => {
+  const btn = ev.target.closest("button.ob");
+  if (!btn || btn.disabled) return;
+  if (btn.dataset.act === "add-stop") addStop(btn); else act(btn);
+});
+
+async function addStop(btn) {
+  const t = btn.dataset.t, cv = coverOf(t);
+  if (!cv || clicking[t]) return;
+  clicking[t] = true; said[t] = {ok: true, text: `Adding a stop for ${cv.uncovered} shares at ${cv.stop}…`};
+  if (lastView) render(lastView, false);
+  try {
+    const r = await fetch("/api/opening-plan/add-stop", {method: "POST", headers: {"Content-Type": "application/json", "X-Companion": "1"},
+      body: JSON.stringify({ticker: t, expected: {shares: cv.uncovered, stop: cv.stop}})});   // what this page showed
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    said[t] = {ok: !!j.ok, text: j.ok ? (j.message || "Stop added.") : (j.error || "Refused.")};
+  } catch (err) {
+    said[t] = {ok: false, text: `No answer from Edge Trader (${err.message}). Check the position's stop on the dashboard before clicking again.`};
+  } finally {
+    clicking[t] = false;
+    tick();
+  }
+}
+
+function flatButton() {
+  const off = flat.running || flatBusy || Date.now() - lastOk > STALE_MS;
+  const why = flat.running ? "Flat all is running." : flat.refusal || flat.error || "";
+  return `<button class="btn flat${flat.stand_out ? " soon" : ""}" type="button" id="flat-open" ${off ? "disabled" : ""}
+    title="${esc(why || `Ends the plan's trades: cancels unfilled entries, then closes what they filled. Flat time ${flat.flat_et} ET; nothing is sent by the clock.`)}">${
+    flat.running || flatBusy ? "Flat all running…" : flat.stand_out ? `Flat all · flat time ${esc(flat.flat_et)} ET` : "Flat all"}</button>`;
+}
+
+function flatList() {
+  const items = flatShown || [];
+  const work = items.filter(x => x.action === "cancel" || x.action === "close").length;
+  const rows = items.map(x => `<tr><td class="n">${esc(x.rank ?? "–")}</td><td><span class="tk">${esc(x.ticker)}</span></td>
+    <td class="act ${esc(x.action)}">${x.action === "close" ? `close ${sh(x.shares)} sh at the market` : esc(STEP[x.action] || x.action)}</td>
+    <td class="mut msg">${esc(x.text)}</td></tr>`).join("");
+  const why = flat.refusal || flat.error || (work ? "" : "Nothing to cancel or close.");
+  $("flat-list").innerHTML = `<table><tbody>${rows || `<tr><td class="mut">No plan rows.</td></tr>`}</tbody></table>${
+    why ? `<div class="banner bad" style="margin:0 0 12px">${esc(why)}</div>` : ""}${
+    flatSaid ? `<div class="banner ${flatSaid.ok ? "info" : "bad"}" style="margin:0 0 12px">${esc(flatSaid.text)}</div>` : ""}`;
+  $("flat-go").disabled = !!why || flatBusy;
+  $("flat-go").textContent = flatBusy ? "Sending…" : `Confirm Flat all (${work} order action${work === 1 ? "" : "s"})`;
+}
+
+function openFlat() {
+  if (!flat) return;
+  flatShown = flat.items; flatSaid = null;
+  flatList();
+  $("flat-dlg").classList.add("on");
+}
+
+async function goFlat() {
+  if (!flatShown || flatBusy) return;
+  flatBusy = true; flatList();
+  const expected = flatShown.map(x => ({ticker: x.ticker, action: x.action, order_id: x.order_id, shares: x.shares}));
+  try {
+    const r = await fetch("/api/opening-plan/flat-all", {method: "POST", headers: {"Content-Type": "application/json", "X-Companion": "1"},
+                                                         body: JSON.stringify({expected})});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    if (j.batch) { $("flat-dlg").classList.remove("on"); flatShown = null; }
+    else { flatSaid = {ok: false, text: j.error || "Refused."}; if (j.items) flatShown = j.items; }
+  } catch (err) {
+    flatSaid = {ok: false, text: `No answer from Edge Trader (${err.message}). Check the dashboard and thinkorswim before clicking again.`};
+  } finally {
+    flatBusy = false;
+    await tick();
+    if (flatShown) flatList();
+  }
+}
+$("flat-back").onclick = () => { if (!flatBusy) { $("flat-dlg").classList.remove("on"); flatShown = null; } };
+$("flat-go").onclick = goFlat;
+document.addEventListener("click", ev => { if (ev.target.id === "flat-open" && !ev.target.disabled) openFlat(); });
 
 function row(r) {
   const b = r.bar || {};
@@ -243,7 +372,7 @@ function row(r) {
     ? `<span class="short">short (low)</span>` : r.nearer === "even" ? "even" : "–";
   const n = notes(r);
   const e = entryOf(r.ticker);
-  return `<tr class="${n ? "has-notes" : ""}${e && e.entry.red ? " red" : ""}">
+  return `<tr class="${n ? "has-notes" : ""}${(e && e.entry.red) || redByFlat(r.ticker) ? " red" : ""}">
     <td class="n">${esc(r.rank)}</td>
     <td><span class="tk">${esc(r.ticker)}</span></td>
     <td class="n">${px(r.atr)}</td>
@@ -288,7 +417,7 @@ function render(v, browserStale) {
   const mode = $("mode");
   if (entries) {
     mode.className = "pill warn";
-    mode.textContent = `Plan buttons ON · ${entries.break_max_shares} share test stage${entries.armed ? "" : " · ARM is off"}`;
+    mode.textContent = `Plan buttons ON · ${entries.size_stage || `${entries.break_max_shares} share`} stage${entries.armed ? "" : " · ARM is off"}`;
     mode.title = "Each button sends one order to Schwab when you click it (EDGE_TRADER_PLAN_BUTTONS=1). Nothing is sent without a click.";
   }
   $("clock").textContent = `${v.now_et} ET`;
@@ -322,6 +451,14 @@ function render(v, browserStale) {
   if (entries && entries.error) banners.push(`<div class="banner bad">${esc(entries.error)}</div>`);
   if (entries && entries.orders_old) banners.push(`<div class="banner bad">${esc(entries.orders_old)} Cancel still works.</div>`);
   if (auto && !auto.armed && auto.resting_text) banners.push(`<div class="banner bad">${esc(auto.resting_text)}</div>`);
+  if (flat && flat.last && flat.last.rows) {
+    const L = flat.last, n = k => L.rows.filter(x => x.result === k).length;
+    const parts = [["done", "done"], ["refused", "refused"], ["unclear", "unclear: check thinkorswim"], ["not_sent", "not sent"]]
+      .filter(([k]) => n(k)).map(([k, w]) => `${n(k)} ${w}`);
+    banners.push(`<div class="banner ${n("unclear") ? "bad" : L.ok ? "info" : "warn"}">${L.demo ? "Demo, invented: " : ""}Flat all at ${
+      esc(L.at_et)} ET took ${esc(L.seconds)} s: ${esc(parts.join(", ") || "nothing to do")}. Each row says how it ended.</div>`);
+  }
+  $("flat-slot").innerHTML = `${flat ? flatButton() : ""}`;
   $("banners").innerHTML = banners.join("");
   renderAuto();
   if (pv) {
@@ -342,8 +479,12 @@ function render(v, browserStale) {
     Calm SPY day (RV20 ≤ ${v.playbook.calm_rv20_max}): ${v.playbook.calm_multiplier}× the risk. Nearer side: which break the minute's close sits closer to.
     ${entries ? `With the plan buttons on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
     the server's own row (never this page's prices). Flip cancels first and places the other side only after Schwab confirms the cancel with nothing
-    filled; otherwise the row turns red and nothing more is sent from it today. At most ${entries.max_flips} flips per row a day.`
-    : "This screen places, changes and cancels nothing."}`;
+    filled; otherwise the row turns red and nothing more is sent from it today. At most ${entries.max_flips} flips per row a day.
+    Each send is the size stage in the Orders column (size.stage in playbook.json; 1 share until Ash raises it).`
+    : "This screen places, changes and cancels nothing."}${flat ? ` Flat all lists what it will do per row and sends it only on Confirm:
+    cancels first, then closes of what the plan's own entries filled, never retried; it stands out from 2 minutes before ${esc(flat.flat_et)} ET
+    and sends nothing by the clock. A row whose shares have no working stop for more than ${esc(flat.grace_seconds)} s turns red with
+    one Add stop button.` : ""}`;
 }
 
 async function tick() {
@@ -358,6 +499,7 @@ async function tick() {
     lastView = await r.json();
     await readEntries();
     await readAuto();
+    await readFlat();
     lastOk = Date.now();
     refresh = Math.max(1000, (lastView.playbook.refresh_seconds || 2) * 1000);
     render(lastView, false);
@@ -366,6 +508,17 @@ async function tick() {
     else $("banners").innerHTML = `<div class="banner bad">Edge Trader is not answering (${esc(e.message)}). No data.</div>`;
   } finally {
     busy = false;
+  }
+}
+
+async function readFlat() {
+  if (flatOff || !entries) { flat = null; return; }
+  try {
+    const r = await fetch("/api/opening-plan/flat", {cache: "no-store"});
+    if (r.status === 404) { flatOff = true; flat = null; return; }   // Flat all is off
+    flat = r.ok ? await r.json() : null;
+  } catch (e) {
+    flat = null;         // no answer: no Flat all button, rather than one on old state
   }
 }
 

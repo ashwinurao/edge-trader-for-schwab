@@ -29,8 +29,8 @@ architect's ruling of 2026-11-13 16:17 UTC): origin "click", the automatic keys 
 and each automatic twin checks the origin under the lock just before its own request.
 
 When unsure, refuse (CONTRIBUTING rule 4): ARM off, market closed, the first minute not final,
-old data, the calm flag unknown, the name blocked by an unclear order, or an entry already
-working, unclear or filled on the row. Nothing is retried. No lock of this file is held across a
+old data, the calm flag unknown, the name blocked by an unclear order, an entry already working,
+unclear or filled on the row, or a hold (PlanDesk.add_hold: Flat all's batch, Step 9). Nothing is retried. No lock of this file is held across a
 Schwab call: a click claims its row (SENDING, FLIPPING) under the lock, lets go, and then
 Trader.submit / Trader.cancel_entry run under their own one-at-a-time lock, as today.
 """
@@ -49,7 +49,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, trading
+from . import break_entry, plan_size, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -127,15 +127,41 @@ class PlanDesk:
                  flips: int, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  armed: Optional[Callable[[], bool]] = None,
                  market_open: Optional[Callable[[], bool]] = None, demo: bool = False,
-                 orders_fresh: Optional[Callable[[], bool]] = None) -> None:
-        """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today"))."""
+                 orders_fresh: Optional[Callable[[], bool]] = None, stage: Any = plan_size.DEFAULT,
+                 hold: Optional[Callable[[], str]] = None) -> None:
+        """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today")).
+        `stage` is the playbook's size stage (companion/plan_size.py, Step 9); the default is 1 share.
+        `hold` returns why no new entry may go now, or "" (see add_hold)."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
+        self.stage = plan_size.parse_stage(stage)
         self._orders_fresh_fn = orders_fresh or (lambda: True)
         self._armed = armed or (lambda: bool(trader.armed))
         self._market_open = market_open or (lambda: trading.market_open())
         self.demo = demo
         self._lock = threading.Lock()
         self._mem: Optional[dict] = {} if demo else None   # demo: records in memory, never the db
+        self._holds: list[Callable[[], str]] = [hold] if hold is not None else []
+
+    # ---- holds: no new entry while something else runs --------------------------------------
+
+    def add_hold(self, fn: Callable[[], str]) -> None:
+        """Add a check that returns why no new entry may go now, or "". Place and Flip (and every
+        send that goes through _send_refusal) refuse while any hold gives a reason; Cancel does not
+        look at holds, since a cancel only removes risk. Flat all holds new entries for the length
+        of its batch (companion/plan_flat.py; architect's review 1 of Step 9, 2026-11-13)."""
+        self._holds.append(fn)
+
+    def held(self) -> str:
+        """The first hold's reason, or "". A hold that cannot be read holds (when unsure, refuse)."""
+        for fn in list(self._holds):
+            try:
+                why = fn()
+            except Exception as e:
+                log.exception("opening plan: a hold could not be read")
+                return f"Could not check whether new entries are held ({e}). Nothing was sent."[:300]
+            if why:
+                return str(why)
+        return ""
 
     # ---- records (one JSON per ET day in the settings table) --------------------------------
 
@@ -242,21 +268,28 @@ class PlanDesk:
     def _find_row(view: Mapping, ticker: str) -> Optional[Mapping]:
         return next((r for r in view.get("rows") or [] if str(r.get("ticker") or "").upper() == ticker), None)
 
-    @staticmethod
-    def _numbers(row: Mapping, side: str) -> Optional[dict]:
+    def _sized(self, row: Mapping, side: str) -> tuple[Optional[dict], str]:
         """What a send for this row and side would be: trigger, stop, the plan's shares and the
-        shares sent (capped by BREAK_MAX_SHARES, the test stage). None when the row has no numbers."""
+        shares sent (the size stage's result, companion/plan_size.py; 1 share at the default
+        stage), and the stage in words. (None, "") when the row has no numbers."""
         s = row.get(side.lower())
         if not isinstance(s, Mapping):
-            return None
+            return None, ""
         trig, stop, shares = _dec(s.get("entry")), _dec(s.get("stop")), s.get("shares")
-        if trig is None or stop is None or not isinstance(shares, int) or isinstance(shares, bool):
-            return None
-        return {"trigger": str(trig.quantize(Decimal("0.01"))), "stop": str(stop.quantize(Decimal("0.01"))),
-                "plan_shares": shares, "shares": min(shares, break_entry.BREAK_MAX_SHARES)}
+        if trig is None or stop is None or not isinstance(shares, int) or isinstance(shares, bool) or shares < 0:
+            return None, ""
+        n, why = plan_size.shares(shares, self.stage, price=trig)
+        return ({"trigger": str(trig.quantize(Decimal("0.01"))), "stop": str(stop.quantize(Decimal("0.01"))),
+                 "plan_shares": shares, "shares": n}, why)
+
+    def _numbers(self, row: Mapping, side: str) -> Optional[dict]:
+        return self._sized(row, side)[0]
 
     def _send_refusal(self, view: Mapping, ticker: str, side: str, blocked: Optional[set]) -> str:
         """Why a new entry for this row and side can't go now, or "" when it can."""
+        held = self.held()
+        if held:
+            return held
         if not self._armed():
             return "ARM is off. Arm entries on the dashboard first."
         if not self._market_open():
@@ -410,6 +443,7 @@ class PlanDesk:
         fresh = self._orders_fresh()
         out = {"enabled": True, "demo": self.demo, "armed": self._armed(), "market_open": self._market_open(),
                "break_max_shares": break_entry.BREAK_MAX_SHARES, "max_flips": self.flips, "rows": [],
+               "size_stage": plan_size.label(self.stage),
                "error": "", "orders_old": "" if fresh else ORDERS_OLD}
         try:
             with self._lock:
@@ -425,6 +459,7 @@ class PlanDesk:
             entry = self._entry_state(rec, orders)
             r = {"ticker": ticker, "entry": entry, "flips": int(rec.get("flips") or 0),
                  "send": {k.lower(): self._numbers(row, k) for k in ("LONG", "SHORT")},
+                 "stage": {k.lower(): self._sized(row, k)[1] for k in ("LONG", "SHORT")},
                  "place": {k.lower(): self._place_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
                            for k in ("LONG", "SHORT")},
                  "cancel": self._cancel_refusal(entry, fresh),
@@ -465,9 +500,12 @@ class PlanDesk:
         return req, None
 
     def _send(self, ticker: str, side: str, req: dict) -> dict:
-        """Trader.submit, once, and the row's record from its answer. No lock held while it runs."""
+        """Trader.submit, once, and the row's record from its answer. No lock held while it runs.
+        The request was built here from the server's own row (_claim_send), so its share count is
+        the size stage's result: only that lets it past BREAK_MAX_SHARES (break_entry.plan_cap)."""
         try:
-            r = self.trader.submit(req)
+            with break_entry.plan_cap(req["qty"]):
+                r = self.trader.submit(req)
         except Exception as e:                       # Trader.submit reports its own errors; this is a bug
             log.exception("opening plan submit failed")
             r = {"ok": False, "status": UNKNOWN, "ticket_id": req["ticket_id"],
@@ -511,9 +549,10 @@ class PlanDesk:
                 return self._refuse(ticker, why)
         return self._send(ticker, side, req)
 
-    def cancel(self, ticker: str) -> dict:
+    def cancel(self, ticker: str, order_id: Optional[int] = None) -> dict:
         """Cancel the row's entry through the dashboard's own Cancel entry path. No arming needed:
-        cancelling an entry only removes risk (app.py /api/ticket/cancel)."""
+        cancelling an entry only removes risk (app.py /api/ticket/cancel). `order_id` is the entry
+        the caller saw (Flat all, companion/plan_flat.py): a different one on the row refuses."""
         ticker = str(ticker or "").upper().strip()
         if self.demo:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.")
@@ -529,6 +568,8 @@ class PlanDesk:
             oid = rec.get("order_id")
             if not oid or rec.get("state") not in (SENT, RED):
                 return self._refuse(ticker, "Nothing to cancel on this row.")
+            if order_id is not None and oid != order_id:
+                return self._refuse(ticker, f"The row's entry is now order {oid}, not {order_id}. Look again.")
             # The click takes the row before its request: whatever Schwab answers, the armed plan
             # leaves this row today (ruling of 2026-11-13 16:17 UTC).
             self._put_click(ticker)
@@ -647,14 +688,14 @@ class PlanDesk:
             return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
         return ""
 
-    @staticmethod
-    def _row_disagrees(view: Optional[Mapping], ticker: str, side: str, o: Mapping) -> str:
+    def _row_disagrees(self, view: Optional[Mapping], ticker: str, side: str, o: Mapping) -> str:
         """Step 2's row, when its 09:30 bar is final: its trigger and stop within one cent of the
-        tape's (brief 16 item 5). "" when they agree or the row is not final."""
-        row = PlanDesk._find_row(view or {}, ticker)
+        tape's (brief 16 item 5). "" when they agree or the row is not final. Only the trigger and
+        stop are compared; the shares are the armed plan's own (BREAK_MAX_SHARES)."""
+        row = self._find_row(view or {}, ticker)
         if row is None or (row.get("bar") or {}).get("state") != "FINAL":
             return ""
-        n = PlanDesk._numbers(row, side)
+        n = self._numbers(row, side)
         if n is None:
             return ""
         cent = Decimal("0.01")
@@ -859,8 +900,14 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
     if view is None or not enabled(env):
         return False
     now = now or getattr(app.state, "opening_plan_now", None) or (lambda: datetime.now(timezone.utc))
+    from . import plan_flat
     try:
         flips = max_flips()
+        stage = plan_size.load_stage()
+        if stage != plan_size.ONE_SHARE and not plan_flat.enabled(env):
+            # Brief 19 Part C: no stage above 1 share without the partial-fill cover watch.
+            raise ValueError(f"size.stage {plan_size.label(stage)} needs the cover watch "
+                             f"({plan_flat.FLAT_FLAG}=1)")
     except Exception as e:
         # A bad playbook never stops Edge Trader: no buttons, and the log says why.
         log.error("opening plan buttons are off: %s", e)
@@ -869,11 +916,11 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         # Invented entries so the screen shows each state; every click is still refused.
         recs, orders = demo_entries()
         desk = PlanDesk(trader, view, lambda: orders, flips, now=now,
-                        armed=lambda: True, market_open=lambda: True, demo=True)
+                        armed=lambda: True, market_open=lambda: True, demo=True, stage=stage)
         desk._mem = {desk._key(): recs}
     else:
         desk = PlanDesk(trader, view, poller._merged_orders, flips, now=now,
-                        orders_fresh=lambda: poller._fresh("orders_today"))
+                        orders_fresh=lambda: poller._fresh("orders_today"), stage=stage)
         try:
             desk.recover()
         except Exception as e:
@@ -911,6 +958,8 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         return await run_in_threadpool(desk.flip, b.get("ticker"), b.get("expected"))
 
     app.state.opening_plan_desk = desk
+    # Step 9: Flat all and the cover watch, only with EDGE_TRADER_PLAN_FLAT=1 as well (plan_flat.py).
+    plan_flat.register(app, trader, poller, guard, desk, demo=demo, env=env, now=now)
     return True
 
 

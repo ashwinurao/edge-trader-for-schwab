@@ -7,7 +7,8 @@ quantity, the target only if the ticket has one). Every send is the user's click
 
 Off unless EDGE_TRADER_BREAK_ENTRY=1, shares only, at most BREAK_MAX_SHARES (the test stage).
 The numbers below are START values that Ash has not approved (brief 05); raising the share cap
-is a later PR with his go.
+is a later PR with his go. An Opening plan entry may go above it only by its size stage
+(plan_cap, Step 9), which the server sets; the ticket's own Break entry stays at BREAK_MAX_SHARES.
 
 Not confirmed (the first real answer is a 1-share click): whether Schwab accepts a STOP_LIMIT
 parent with an attached STOP child, whether the child starts on the first partial fill, and
@@ -18,9 +19,11 @@ Request shape (Step 4 builds on it): `build_request(...)` returns the dict `Trad
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from .bracket import Plan, _price, _to_tick, bracket_order, fmt, plan, tick
@@ -31,6 +34,35 @@ CAP_R = Decimal("0.15")              # default limit offset: 0.15 x risk per sha
 CAP_MIN = Decimal("0.02")            # at least 2 cents
 CAP_MAX_PCT = Decimal("0.0015")      # at most 0.15% of the price (the 2-cent floor wins below $13.34)
 MAX_QUOTE_AGE_MS = 5_000             # R-03: the ticket has no quote-age rule, so this entry type gets one
+
+# Step 9 (brief 19): an Opening plan entry may go above BREAK_MAX_SHARES, but only by its size
+# stage's result (companion/plan_size.py), set by the server around the one send it wraps. A context
+# variable, never a request field: nothing a page sends can raise the cap.
+_plan_cap: contextvars.ContextVar = contextvars.ContextVar("break_entry_plan_cap", default=None)
+
+
+@contextmanager
+def plan_cap(shares: int):
+    """While inside, a break entry may have up to `shares` shares (the plan's size stage)."""
+    token = _plan_cap.set(int(shares))
+    try:
+        yield
+    finally:
+        _plan_cap.reset(token)
+
+
+def max_shares() -> int:
+    """The share cap for the break entry being checked now: BREAK_MAX_SHARES for the ticket's own
+    Break entry, the size stage's result for an Opening plan entry (plan_cap)."""
+    cap = _plan_cap.get()
+    return BREAK_MAX_SHARES if cap is None else max(BREAK_MAX_SHARES, cap)
+
+
+def _cap_text() -> str:
+    if _plan_cap.get() is None:
+        return (f"Break entries are capped at {BREAK_MAX_SHARES} share for now "
+                "(BREAK_MAX_SHARES in companion/break_entry.py)")
+    return f"This Opening plan entry is capped at {max_shares()} shares (its size stage, companion/plan_size.py)"
 
 
 def enabled() -> bool:
@@ -141,9 +173,8 @@ def make_plan(req: dict, q: dict) -> Plan:
              size_mode="qty", qty=req.get("qty"), target=req.get("targets", 0) not in (0, "0"))
     p.entry, p.trigger = "break", trig
     p.warnings = [w for w in p.warnings if not w.startswith("Your limit")]   # a break limit is above the ask by design
-    if p.ok and p.qty > BREAK_MAX_SHARES:
-        p.errors.append(f"Break entries are capped at {BREAK_MAX_SHARES} share for now "
-                        "(BREAK_MAX_SHARES in companion/break_entry.py).")
+    if p.ok and p.qty > max_shares():
+        p.errors.append(_cap_text() + ".")
         p.qty = 0
     return p
 
@@ -166,9 +197,8 @@ def prepare(trader, req: dict, now_ms: float | None = None) -> tuple[Plan | None
         exp_qty = qty = 0
     if lim is None or exp_limit is None or not lim.is_finite() or exp_limit != lim or qty < 1 or exp_qty != qty:
         return no("ticket is missing the displayed plan; review and click again")
-    if qty > BREAK_MAX_SHARES:
-        return no(f"Break entries are capped at {BREAK_MAX_SHARES} share for now "
-                  "(BREAK_MAX_SHARES in companion/break_entry.py). Nothing was sent.")
+    if qty > max_shares():
+        return no(_cap_text() + ". Nothing was sent.")
     q = trader.quote(req["symbol"], max_age=0)
     if q.get("realtime") is not True:
         return no("Schwab's quote is not real-time, so the break level cannot be checked. Nothing was sent.")
