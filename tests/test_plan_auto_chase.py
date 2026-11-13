@@ -603,6 +603,17 @@ def test_a_chase_send_costs_4_calls_and_5_at_worst(rig, monkeypatch, open_close,
     assert used == calls <= chase.CHASE_SEND_CALLS_WORST
 
 
+def test_the_calls_bound_counts_each_chase_at_its_worst_case_5():
+    """Architect's ruling (2026-11-13 16:02 UTC): armed.calls_per_send is the code's worst case, 5,
+    and the chase spends exactly that per send (on_chase: lane.spend(calls=calls_per_send))."""
+    assert ARMED.calls_per_send == chase.CHASE_SEND_CALLS_WORST == 5
+
+
+def test_the_calls_bound_spends_5_for_one_chase(rig):
+    rig.host.handle("would_place", tape(42.51))
+    assert len(rig.sent) == 1 and rig.host.calls == 40 - 5
+
+
 # ---- the page in --demo ----------------------------------------------------------------------
 
 def test_demo_shows_a_chase_row_only_with_the_chase_switch():

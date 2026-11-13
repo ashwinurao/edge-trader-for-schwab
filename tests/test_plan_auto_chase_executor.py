@@ -176,7 +176,7 @@ def test_no_answer_to_the_chase_freezes_the_pick_and_disarms(crig):
     assert row(rig, "AAAA")["entry"]["state"] == plan_entries.UNKNOWN
 
 
-# ---- Ash clicks Flip on a resting chase (architect, 2026-11-13 16:02 UTC: pin today's behaviour) --
+# ---- a click takes the row for the day (brief 14; architect's ruling 2026-11-13 16:17 UTC) -------
 
 def _resting_chase(rig):
     arm(rig)
@@ -185,13 +185,11 @@ def _resting_chase(rig):
     return row(rig, "AAAA")["entry"]["order_id"]
 
 
-def test_click_flip_on_a_resting_chase_cancels_it_then_places_the_short_break_entry(crig):
-    """What a click Flip does today on a chased row, not changed by Step 8. Step 4's flip cancels
-    the chase (LONG LIMIT 42.55, stop 41.92), waits for Schwab's CANCELED, then places the short
-    break entry from the Opening plan row: SELL_SHORT STOP_LIMIT trigger 41.91, limit 41.85, stop
-    42.48, 1 share. The row's record keeps origin "auto", kind "chase" and the chase's wait_from
-    (PlanDesk._put merges), so the row still shows the chase line, and the armed plan cancels the
-    clicked short entry 120 s after the CHASE was sent (09:33:00.1), as it would its own."""
+def test_click_flip_on_a_resting_chase_makes_the_short_entry_the_clicks(crig):
+    """Step 4's Flip cancels the chase (BUY LIMIT 42.55, stop 41.92), waits for Schwab's CANCELED,
+    then places the short break entry from the Opening plan row: SELL_SHORT STOP_LIMIT trigger 41.91,
+    limit 41.85, stop 42.48, 1 share. That entry is the click's: no chase line on the row, and the
+    plan cancels it neither at the chase's wait end (09:33:00.1) nor at the 09:35 watch end."""
     rig = crig
     chase_id = _resting_chase(rig)
     rig.tape.prices["AAAA"] = 42.30                         # back inside the range
@@ -206,28 +204,48 @@ def test_click_flip_on_a_resting_chase_cancels_it_then_places_the_short_break_en
     assert (o["orderType"], o["stopPrice"], o["price"], o["orderLegCollection"][0]["instruction"]) == \
         ("STOP_LIMIT", "41.91", "41.85", "SELL_SHORT")
     rec = rig.desk.records()["AAAA"]
-    assert (rec["origin"], rec["kind"], rec["side"], rec["flips"], rec["chases"]) == ("auto", "chase", "SHORT", 1, 1)
-    assert rec["wait_from"] == "2026-11-13T14:31:00.100+00:00"
+    assert (rec["origin"], rec["side"], rec["flips"]) == ("click", "SHORT", 1) and not rec.get("wait_from")
     e = row(rig, "AAAA")["entry"]
-    assert e["side"] == "SHORT" and e["resting"]
-    assert e["auto_text"] == ("Chased by the armed plan: limit 42.55, cap 0.06. It waits for a pullback until "
-                              "09:33:00 ET, then the plan cancels it.")
-    run(rig, et(9, 33, 5))
-    (c,) = [x for x in lines(rig, "cancel_start") if x["ticker"] == "AAAA"]
-    assert c["t"] == "2026-11-13T14:33:00.100Z" and rig.broker.cancelled == [chase_id, f["order_id"]]
-    assert "Cancelled by the armed plan" in row(rig, "AAAA")["entry"]["text"]
-    assert len(order_of(rig, "AAAA")) == 2                  # nothing else is sent for AAAA
+    assert e["side"] == "SHORT" and e["resting"] and e["auto_text"] == ""
+    run(rig, et(9, 33, 5))                                  # past the chase's wait end
+    assert rig.broker.cancelled == [chase_id]
+    run(rig, et(9, 35, 30), start=et(9, 35, 0))             # past the watch end
+    assert f["order_id"] not in rig.broker.cancelled
+    assert not [x for x in lines(rig, "cancel_start") if x["ticker"] == "AAAA" and x.get("order_id") == f["order_id"]]
+    assert len(order_of(rig, "AAAA")) == 2 and row(rig, "AAAA")["entry"]["resting"]
 
 
 def test_click_flip_on_a_resting_chase_above_the_high_cancels_it_and_places_nothing(crig):
     """With the price still above the 09:30 high (42.60 against 42.48), the flip's short break
-    entry is refused by Trader.submit (its stop 42.48 is under the ask): the chase is cancelled
-    and nothing new rests. The row says why."""
+    entry is refused by Trader.submit (its stop 42.48 is under the ask): the chase is cancelled,
+    nothing new rests, the row says why, and the plan does not chase it again."""
     rig = crig
     chase_id = _resting_chase(rig)
     f = rig.desk.flip("AAAA", row(rig, "AAAA")["send"]["short"])
     assert not f["ok"] and "stop 42.48 must be above the ask 42.61" in f["error"]
     assert f["cancel"]["status"] == "CANCELED" and rig.broker.cancelled == [chase_id]
-    assert len(order_of(rig, "AAAA")) == 1
     e = row(rig, "AAAA")["entry"]
     assert e["state"] == plan_entries.NONE and "Not sent: stop 42.48 must be above the ask 42.61" in e["text"]
+    run(rig, et(9, 34, 0))
+    assert len(order_of(rig, "AAAA")) == 1
+
+
+def test_no_chase_after_a_click_cancel(crig):
+    """The plan's break entry for AAAA rests; Ash cancels it by click; the price then runs past the
+    trigger. The row is the click's for the day: the plan does not chase it, and chase_auto itself
+    refuses it under the desk's lock."""
+    rig = crig
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    oid = row(rig, "AAAA")["entry"]["order_id"]
+    assert row(rig, "AAAA")["entry"]["origin"] == "auto"
+    c = rig.desk.cancel("AAAA")
+    assert c["ok"] and rig.broker.cancelled == [oid]
+    rig.tape.prices["AAAA"] = 42.51                         # past the trigger, inside the cap
+    run(rig, et(9, 32, 0))
+    assert len(order_of(rig, "AAAA")) == 1 and not lines(rig, "chase_send_start")
+    rules = rig.plan.armed_rules
+    o = rig.plan.order_for("AAAA", {"high": 42.48, "low": 41.92}, "long")
+    r = rig.desk.chase_auto("AAAA", "LONG", o, quote_tries=rules.chase_quote_tries)
+    assert r["not_sent"] and not r["again"] and "a click used this row today" in r["error"]
+    assert len(order_of(rig, "AAAA")) == 1

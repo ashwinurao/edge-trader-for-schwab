@@ -949,7 +949,9 @@ class PlanDesk:
     @staticmethod
     def _chase_text(rec: Mapping, entry: Mapping) -> str:
         """The row's line for a chase of the armed plan (brief 18 item 6), "" for anything else."""
-        if rec.get("kind") != "chase" or not rec.get("order_id"):
+        # Only the plan's own chase: a click on the row takes it for the day (brief 14, architect's
+        # ruling 2026-11-13 16:17 UTC), and its entry is then the click's, not "chased".
+        if rec.get("origin") != "auto" or rec.get("kind") != "chase" or not rec.get("order_id"):
             return ""
         sent = rec.get("sent") or {}
         text = f"Chased by the armed plan: limit {sent.get('limit')}, cap {sent.get('cap')}."
