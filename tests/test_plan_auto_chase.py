@@ -611,6 +611,9 @@ def test_losing_the_race_for_trader_lock_puts_the_row_back_and_uses_no_try(rig, 
 
 def test_after_a_flip_the_other_side_may_be_chased_once(rig):
     # Step 7 leaves the row like this after a confirmed cancel when the short trigger has traded.
+    # A unit case on a hand-built lane only: the hand-over itself (Step 7's new lane, the cancelled
+    # order still in an old list) runs on Step 7's real on_flip in test_plan_auto_chase_executor.py
+    # (architect's review 1 of PR #25, must 1).
     rig.desk._put("AAAA", state="NONE", side="LONG", origin="auto", kind="break", order_id=None, flips=1,
                   range={"high": "42.48", "low": "41.92"}, text="cancelled by the armed plan")
     rig.quote.update(bid=41.88, ask=41.90)

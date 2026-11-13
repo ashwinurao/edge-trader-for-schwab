@@ -516,3 +516,25 @@ def test_after_a_flip_with_the_chase_switch_off_step_7s_sentence_stays(frig):  #
     assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
     assert rig.plan.left["AAAA"] == LEFT_TRADED + " (the chase step is not on)"
     assert not lines(rig, "chase_decision")
+
+
+def test_no_balance_reaches_the_log_through_a_chase(fcrig):
+    """Step 6's rule since main 9f15270 (#30): the view carries buying power in dollars, and no armed
+    plan log line may hold one. The chase logs its decision, its send and Schwab's answer, after a
+    flip's hand-over too, from the tape reading and the request only."""
+    from test_plan_auto import BAL, P
+    rig = fcrig
+
+    def with_balances():
+        v = rig.view()
+        v["buying_power"] = P.buying_power({"balances": BAL, "ok_at": rig.clock.now()}, rig.clock.now())
+        return v
+    assert with_balances()["buying_power"]["equity"] == 81234.57
+    rig.plan._view = rig.plan._row_view = with_balances
+    short_trades_during_the_cancel(rig)
+    run(rig, et(9, 31, 6))
+    assert {"flip_auto", "chase_decision", "chase_send_start", "chase_send_answer"} <= {x["event"] for x in lines(rig)}
+    text = (rig.tmp / "auto" / "2026-11-13.jsonl").read_text()
+    for n in BAL.values():
+        for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
+            assert form not in text
