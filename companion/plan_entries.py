@@ -149,6 +149,10 @@ class PlanDesk:
         self._mem: Optional[dict] = {} if demo else None   # demo: records in memory, never the db
         self._chase_tries: dict[str, int] = {}          # Step 8: refused chase tries a row a day, in memory
         self._chase_tried_at: dict[str, datetime] = {}  # Step 8: when the last of them was refused (review 1 of #25)
+        # Step 8, the live test's notes of 2026-11-13 (N1, N2, N4), in memory like the tries: a chase
+        # a flip handed over that waits for a later reading, and the plan entries Schwab rejected.
+        self._chase_waits: dict[str, dict] = {}
+        self._rejects: dict[str, dict[str, bool]] = {}
         self._holds: list[Callable[[], str]] = [hold] if hold is not None else []
 
     # ---- holds: no new entry while something else runs --------------------------------------
@@ -1278,6 +1282,33 @@ class PlanDesk:
         if ticker in blocked:
             return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
         return ""
+
+    def chase_wait(self, ticker: str, side: str, cancelled_order_id: Any, why: str) -> None:
+        """A chase Step 7's flip handed over could not go on its reading for a passing reason: it
+        waits, and the plan offers the pick to the chase again on each later reading until the watch
+        ends (companion/plan_auto/chase.py offers; architect's live test notes, N1 and N4)."""
+        ticker = str(ticker or "").upper().strip()
+        with self._lock:
+            self._chase_waits[self._key() + ticker] = {"side": str(side or "").lower(),
+                                                      "cancelled_order_id": cancelled_order_id, "why": str(why)}
+
+    def chase_waits(self) -> dict:
+        """Today's waiting chases, by ticker (a copy)."""
+        key = self._key()
+        with self._lock:
+            return {k[len(key):]: dict(v) for k, v in self._chase_waits.items() if k.startswith(key)}
+
+    def drop_chase_wait(self, ticker: str) -> None:
+        ticker = str(ticker or "").upper().strip()
+        with self._lock:
+            self._chase_waits.pop(self._key() + ticker, None)
+
+    def note_rejected(self, order_id: Any, through: bool) -> tuple[int, int]:
+        """Count a plan entry Schwab rejected (once per order id): today's (all, already through)."""
+        with self._lock:
+            day = self._rejects.setdefault(self._key(), {})
+            day[str(order_id)] = bool(through)
+            return len(day), sum(1 for t in day.values() if t)
 
     def chase_retry_left(self, ticker: str, seconds: float) -> float:
         """Seconds before this row may read Schwab's quote for a chase again: after a try refused

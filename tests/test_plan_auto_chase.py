@@ -447,12 +447,20 @@ def test_not_when_the_range_changed_since_the_decision(rig):
     assert rig.host.said[-1][1] == "chase_range_changed"
 
 
-def test_not_on_an_old_order_list(rig):
+def test_not_on_an_old_order_list_and_it_waits(rig):
+    """An old order list is a wait (architect's live test notes N1, 2026-11-13): nothing is sent or
+    spent, the pick is not left, and the handler says it did not act, so the worker waits a tick
+    instead of stepping again at once on the same old list. The next fresh reading sends it."""
     rig.fresh[0] = False
-    assert rig.host.handle("would_place", tape(42.51)) is True       # tried: the desk refused
+    assert rig.host.handle("would_place", tape(42.51)) is False      # not an action: no Schwab call
     nothing_sent(rig)
     assert rig.quotes == [] and rig.host.left == {} and (rig.host.orders_pick, rig.host.calls) == (1, 40)
-    assert rec(rig) == {}                                            # the row is as it was
+    assert rec(rig) == {} and rig.desk._chase_tries == {}            # the row is as it was, no try used
+    assert rig.host.said[-1][1:] == ("chase_not_sent", "chase not sent on this reading: "
+                                     + plan_entries.ORDERS_OLD.rstrip("."))
+    rig.fresh[0] = True
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert [no_id(r) for r in rig.sent] == [CHASE_LONG]
 
 
 def test_not_on_a_stale_quote_and_only_the_quote_call_is_spent(rig, monkeypatch):

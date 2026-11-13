@@ -48,7 +48,7 @@ from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
-from .chase import ARM_NOT_TEXT as CHASE_ARM_NOT_TEXT
+from .chase import ARM_NOT_TEXT as CHASE_ARM_NOT_TEXT, offers as chase_offers
 from .flip import armed_with_flips
 from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
 
@@ -536,6 +536,14 @@ class AutoPlan:
         picks = {p["symbol"]: p for p in er["picks"]}
         acts = [d for d in decisions if d.get("kind") in ACTION_KINDS and d.get("symbol") in picks]
         watch_over = now >= self.arming.watch_end(day)
+        # Step 8 (architect's live test notes of 2026-11-13, N1, N2 and N4): the picks the chase takes
+        # between the engine's decisions, an entry Schwab rejected as already through and a chase a
+        # flip handed over that waits; with the chase switch off it only logs each rejected plan entry.
+        with self._lock:
+            left = dict(self.left)
+        offered = [d for d in chase_offers(self, picks, left, watch_over) if d.get("symbol") in picks]
+        self._note_decisions(offered, er, timing)
+        acts += offered
         if watch_over:
             # After the watch end only cancels run, whatever a later step registers: no send, flip,
             # re-level or chase (architect's review, 2026-11-13 16:21 UTC).

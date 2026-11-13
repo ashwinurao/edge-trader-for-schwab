@@ -722,10 +722,22 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   after its confirmed cancel and hands the pick to the chase from that reading. The entry that cancel
   ended does not count as a working order on the name, even while Schwab's order list (up to 5 s
   old) still shows it; any other working order on the name still stops the chase. When that reading
-  is not usable, nothing is sent and the row and the panel say nothing rests. No later reading
-  decides for that pick, so when this chase does not go (an old quote, the price back inside the
-  level, another order action running, Flat all's hold), the pick is left with the reason and
-  nothing rests.
+  is not usable, nothing is sent and the row and the panel say nothing rests. When the chase can't go
+  on that reading for a passing reason (an old order list, another order action running, an old
+  quote, the price back inside the level), the pick waits and the plan offers it to the chase again
+  on each later reading, under the same tries and retry wait as below, until the watch ends. Any
+  other reason (Flat all's hold, another working order, the tries used up) and the watch end leave
+  the pick with the reason and "nothing rests".
+- An armed entry that Schwab accepts (201) and then rejects with "The stop price must be above the
+  current ask for buy stop orders and below the bid for sell stop orders." had its level passed
+  between the plan's quote and Schwab's check (seen live on 2026-11-13, 4 s after the 201). Ash's
+  answer of 2026-11-13 20:01 UTC lets the chase take that pick as already through: the same chase,
+  same cap, once a pick a day, only inside the fast watch, and only while the price is still at or
+  past the level. It is the pick's second order, so it needs room in `armed.orders_per_pick` and
+  `armed.orders_per_day`; without room (Step 6 alone has 1 order a pick) the pick is left, "Schwab
+  rejected the plan's entry and nothing rests", and the plan stays armed. Any other rejection ends
+  the pick as before, and a rejected chase is never sent again. Every rejected plan entry is one
+  `entry_rejected` line in the plan's log with the day's counts, also with the chase switch off.
 - Just before the send the plan reads the tape again: the reading must be usable, still at or past
   the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
   entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
@@ -734,8 +746,10 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   least `armed.chase_retry_seconds` (1.0 s) after the last refused one (both start numbers in
   `companion/opening_plan/playbook.json`). Until then the plan reads no quote for that pick and
   spends nothing; the panel says so once.
-- While a click holds Edge Trader's order lock, the chase writes nothing and uses neither its one
-  chase nor a quote try; the plan tries on its next reading, which must still be past the level.
+- While a click holds Edge Trader's order lock ("Another submission is in progress."), or Schwab's
+  order list is too old, the chase writes nothing, reads no quote and uses neither its one chase nor
+  a quote try; the plan waits a tick and tries on its next reading, which must still be past the
+  level.
   While Flat all runs, its hold refuses every new entry, the chase too, before any quote or record:
   the pick is left with Flat all's reason, also after a flip's hand-over. Flat all turns its hold on
   first and then disarms the plan (`companion/plan_flat.py`). A hold that cannot be read refuses the

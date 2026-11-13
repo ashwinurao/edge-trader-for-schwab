@@ -4,7 +4,10 @@ At 09:31:00 some picks have already traded through their level. Step 3's break e
 (the price is through the level), and Step 6's would_place leaves the pick to Ash. With
 EDGE_TRADER_PLAN_AUTO_CHASE=1 (it needs EDGE_TRADER_PLAN_AUTO=1) this handler takes it instead: it
 is registered for handlers.PAST_TRIGGER, which Step 6's on_place (and Step 7's flip, after a
-confirmed cancel when the other side's level has traded) hands over.
+confirmed cancel when the other side's level has traded) hands over. Between the engine's decisions
+`offers` (called by the executor's step) gives it two more: an armed entry Schwab rejected after its
+201 because the price was already through its level (THROUGH_REJECTED; Ash, 2026-11-13 20:01:19
+UTC, "4 - yes"), and a chase a flip handed over that waits for a later reading.
 
 The rule (the engine's numbers, playbook.json "automatic", start numbers Ash has not approved):
 - cap = 0.15 x the risk per share, at least 2 cents, at most 0.15% of the price (engine.order_for);
@@ -19,13 +22,16 @@ The rule (the engine's numbers, playbook.json "automatic", start numbers Ash has
 
 It acts only when: armed; this switch on; no chase yet today for the pick; nothing resting or filled
 on the row; a tape reading taken just before is usable and still past the level; the range is the
-same; Schwab's order list is fresh; the bounds allow one more order. PlanDesk.chase_auto and
-Trader.submit check again at the send. A chase refused after Schwab's quote for a passing reason
-(an old quote, the price back inside the level) may try on a later reading, at most
+same; Schwab's order list is fresh; the bounds allow one more order (for a rejected entry's pick,
+checked first: without room the pick is left and the plan stays armed). PlanDesk.chase_auto and
+Trader.submit check again at the send. A passing reason waits for a later reading: an old order
+list or a busy order lock (no Schwab call, nothing counted; architect's live test notes N1 and N4,
+2026-11-13), an old quote or the price back inside the level at Schwab's quote (one call, at most
 armed.chase_quote_tries times a pick a day and not before armed.chase_retry_seconds after the last
-refused try (playbook.json, start numbers). After Step 7's flip no later reading decides for the
-pick, so a chase it handed over (decision["cancelled_order_id"]) and refused for such a reason, or
-by a busy order lock, leaves the pick: nothing rests (architect, 2026-11-13 17:23 UTC).
+refused try; playbook.json, start numbers). A chase Step 7's flip handed over
+(decision["cancelled_order_id"]) waits the same way: PlanDesk.chase_wait keeps it and `offers` gives
+it again on each reading. Any other refusal, or the watch end, leaves the pick with a true sentence:
+nothing rests (architect, 2026-11-13 17:23 UTC; the waits replace that ruling's "leave").
 
 Schwab says no (brief 18 item 5): a 4xx ends the pick for the day with Schwab's text on the row and
 is never retried or answered with another order; a 429 disarms the plan for the day; no answer
@@ -35,14 +41,20 @@ Calls (architect's ruling 2026-11-13 15:47 UTC, brief 14): the calls bound count
 code's worst case, armed_rules.calls_per_send. A chase send is the quote, at most one order read
 (Trader._unresolved_close, only when an earlier close on the name is still open), the POST and the
 two status reads after a 201 (fork PR #15): 5 at worst, 4 usually (tests/test_plan_auto_chase.py).
-A chase refused after the quote gives back all but that one quote call.
+A chase refused after the quote gives back all but that one quote call. A chase step makes no
+Schwab call before the send: the tape is Edge Scanner's, the order list is the poller's and Step 2's
+view is the feed's last answer. So a step costs 0 calls when it waits on an old list or a busy lock,
+1 when Schwab's quote refuses it, 4 (5 at worst) when it sends; its pullback cancel is Step 6's
+on_cancel, 12 at worst. Those calls count in the poller's own 70 a minute (companion/poller.py
+_throttle; architect's live test notes N1).
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
+from .. import plan_entries
 from . import CHASE_FLAG, switch_on
 from .handlers import PAST_TRIGGER, Lane, _dec, outcome, past_trigger
 
@@ -56,6 +68,14 @@ FREE = ("none", "ended")
 
 # The end of the pick's line when a chase handed over by Step 7's flip does not go: nothing rests.
 HANDED_LEFT = "the plan's entry was cancelled and nothing rests"
+# The same when the pick came from an entry Schwab rejected (offers, N2): nothing rests.
+REJECTED_LEFT = "Schwab rejected the plan's entry and nothing rests"
+
+# Schwab's words when it rejects a stop entry after its 201 because the price passed the level between
+# our quote and its own check. Seen live on 2026-11-13: SPY short 18:49:43 UTC, and CBRS long
+# 19:39:08 UTC, 4.0 s after the 201 (architect's live test notes, N2).
+THROUGH_REJECTED = ("The stop price must be above the current ask for buy stop orders and below the bid "
+                    "for sell stop orders.")
 
 # One line of the Arm dialog's "It will" (Registry.arm_texts), shown only when this switch is on.
 ARM_TEXT = ("When a pick has already traded at or past its trigger (EDGE_TRADER_PLAN_AUTO_CHASE=1): send one "
@@ -85,7 +105,8 @@ def _same_range(a: dict, b: dict) -> bool:
 
 
 def on_chase(lane: Lane) -> bool:
-    """PAST_TRIGGER: chase this pick once with a LIMIT at the cap. True when it tried at Schwab."""
+    """PAST_TRIGGER: chase this pick once with a LIMIT at the cap. True when it tried at Schwab, or
+    when it took Step 7's hand-over (which then says nothing more)."""
     d, ticker = lane.decision, lane.ticker
     side = str(d.get("side") or "").lower()
     if side not in ("long", "short"):
@@ -102,16 +123,43 @@ def on_chase(lane: Lane) -> bool:
         return False
     if not lane.armed():
         return False
+    # Where the pick comes from: Step 6's on_place (no key), Step 7's flip after its confirmed cancel
+    # (cancelled_order_id; "offer" when it waits and comes again from offers()), or an armed entry
+    # Schwab rejected because the price was already through (rejected_order_id, from offers(): N2).
+    handed = d.get("cancelled_order_id") is not None
+    first = handed and not d.get("offer")          # Step 7's own call, right after its cancel
+    rejected = d.get("rejected_order_id") is not None
+
+    def wait(code: str, text: str, why: str) -> bool:
+        """No chase on this reading for a passing reason. A pick Step 7 handed over waits and comes
+        again on the next reading (offers()) until the watch ends (architect's live test notes N1 and
+        N4, 2026-11-13: an old order list and a busy order lock are waits; any other passing reason
+        waits the same way, since a later reading now decides for the pick)."""
+        lane.say(code, text)
+        if handed:
+            lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
+        return first                               # taken: Step 7 adds no "the chase did not go" line
+
+    if rejected:
+        # The rejected entry used one of the pick's orders, so the chase is the pick's second: it needs
+        # room in both order bounds. Without it the pick is left and the plan stays armed; a bound
+        # reached by a send still disarms (spend, brief 16 item 6).
+        b, r = lane.bounds, lane.armed_rules
+        full = ("" if b["orders_pick"] >= 1 and b["orders_day"] >= 1 else
+                f"the pick's orders are used (armed.orders_per_pick {r.orders_per_pick})" if b["orders_pick"] < 1 else
+                f"the day's orders are used (armed.orders_per_day {r.orders_per_day})")
+        if full:
+            lane.leave(f"no chase: {full}; {REJECTED_LEFT}")
+            return False
     # Spaced tries (architect's review 1 of PR #25, 2026-11-13 17:08 UTC): after a try refused after
     # Schwab's quote, the worker steps again at once, so without a wait the armed.chase_quote_tries
     # tries were gone in about 1.2 s at 0.3 to 0.4 s a call. No quote, no spend, said once.
-    # Only a chase from Step 6's on_place: a hand-over from Step 7's flip has no later try to space.
-    handed = d.get("cancelled_order_id") is not None
+    # Not for Step 7's own call right after its cancel: that is the pick's first try.
     retry_s = float(lane.armed_rules.chase_retry_seconds)
-    if not handed and lane.desk.chase_retry_left(ticker, retry_s) > 0:
-        lane.say("chase_retry_wait", f"the last chase try was refused after Schwab's quote; the next one waits "
-                                     f"{retry_s:g} s (armed.chase_retry_seconds)")
-        return False
+    if not first and lane.desk.chase_retry_left(ticker, retry_s) > 0:
+        return wait("chase_retry_wait", f"the last chase try was refused after Schwab's quote; the next one waits "
+                                        f"{retry_s:g} s (armed.chase_retry_seconds)",
+                    "the last chase try was refused after Schwab's quote")
     o = lane.order_for(side)
     if o is None:
         lane.say("no_numbers", "no range, risk or calm flag to build the chase from")
@@ -123,15 +171,15 @@ def on_chase(lane: Lane) -> bool:
     # confirmed cancel.
     pick, usable, why = lane.reread()
     if not usable or pick is None:
-        lane.say("chase_unusable", f"no chase on this reading: the tape reading is not usable ({why})")
-        return False
+        return wait("chase_unusable", f"no chase on this reading: the tape reading is not usable ({why})",
+                    f"the tape reading is not usable ({why})")
     if not _same_range(pick, lane.pick):
-        lane.say("chase_range_changed", "no chase: the first-minute range changed since the decision")
-        return False
+        return wait("chase_range_changed", "no chase: the first-minute range changed since the decision",
+                    "the first-minute range changed since the decision")
     last = _dec(pick.get("last"))
     if not past_trigger(side, last, o["trigger"]):
-        lane.say("chase_back_inside", f"no chase: the last trade {last} is back inside the level {o['trigger']}")
-        return False
+        return wait("chase_back_inside", f"no chase: the last trade {last} is back inside the level {o['trigger']}",
+                    f"the last trade {last} is back inside the level {o['trigger']}")
     sign = 1 if side == "long" else -1
     inside = sign * (o["limit"] - last) >= 0
     calls = int(lane.armed_rules.calls_per_send)
@@ -148,7 +196,8 @@ def on_chase(lane: Lane) -> bool:
              last_age_s=_age(now, pick.get("last_at")),
              reading_at=_iso(pick.get("fresh_at")) if isinstance(pick.get("fresh_at"), datetime)
              else pick.get("fresh_at"),
-             decided_at=_iso(now), inside_cap=inside, pullback_wait_s=wait_s)
+             decided_at=_iso(now), inside_cap=inside, pullback_wait_s=wait_s,
+             after="flip" if handed else "rejected" if rejected else None)
     # view=lane.view: Step 2's view, read by the executor before the tape, so no Edge Scanner GET falls
     # between the reading and the send (architect's review, 2026-11-13 16:21 UTC).
     # cancelled_order_id: set only by Step 7's flip hand-over, for the entry its confirmed cancel
@@ -159,25 +208,35 @@ def on_chase(lane: Lane) -> bool:
     if r.get("not_sent"):
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))
-        if handed:
-            # After Step 7's flip no later reading decides for this pick: the row is NONE, auto_entry
-            # says "ended" and the engine's pick is DONE. Any refusal, a passing one (an old quote,
-            # the price back inside, an old order list), a busy lock or Flat all's hold, has no next
-            # try, so the pick is left with a true sentence (architect, 2026-11-13 17:23 and 17:42 UTC;
-            # tests in test_plan_auto_chase_executor).
-            lane.leave(f"chase not sent: {str(r.get('error') or 'refused').rstrip('.')}; {HANDED_LEFT}")
-            return True
+        why = str(r.get("error") or "refused").rstrip(".")
         if r.get("busy"):
-            # Trader's lock is held (a click): not an action. The step ends, no other pick tries on
-            # this reading, the worker waits a tick and the next reading decides again (architect's
-            # review 1 of Step 6, 2026-11-13 16:45 UTC). Said once per pick by the executor.
+            # Trader's lock is held (a click, or "Another submission is in progress."): not an action.
+            # The step ends, no other pick tries on this reading, the worker waits a tick and the next
+            # reading decides again (architect's review 1 of Step 6, 2026-11-13 16:45 UTC; live test
+            # notes N4). Said once per pick by the executor. A pick Step 7 handed over waits too.
+            if handed:
+                lane.desk.chase_wait(ticker, side, d.get("cancelled_order_id"), why)
             lane.busy("send")
             return True
-        if not r.get("again"):
-            lane.leave(f"chase not sent: {r.get('error')}")
+        if r.get("again"):
+            # A passing reason: an old order list (no Schwab call; N1: a wait, never a send), an old
+            # quote or the price back inside at Schwab's quote (one call, a try counted).
+            took = wait("chase_not_sent", f"chase not sent on this reading: {why}", why)
+            # After a quote it was an action, so the worker steps again at once (the retry wait spaces
+            # the next try); without one, nothing happened and the worker waits a tick, so an old
+            # list is not read again in a tight loop.
+            return True if r.get("quoted") else took
+        lane.desk.drop_chase_wait(ticker)
+        if handed:
+            # Not a passing reason: nothing rests, since the flip's cancel was confirmed
+            # (architect, 2026-11-13 17:23 and 17:42 UTC).
+            lane.leave(f"chase not sent: {why}; {HANDED_LEFT}")
+        elif rejected:
+            lane.leave(f"chase not sent: {why}; {REJECTED_LEFT}")
         else:
-            lane.say("chase_not_sent", f"chase not sent on this reading: {r.get('error')}")
+            lane.leave(f"chase not sent: {r.get('error')}")
         return True
+    lane.desk.drop_chase_wait(ticker)
     outcome(lane, r, "chase")
     if r.get("ok") and r.get("order_id"):
         lane.say("chased", f"chased: limit {o['limit']}, cap {o['cap']}" +
@@ -185,4 +244,91 @@ def on_chase(lane: Lane) -> bool:
     return True
 
 
-__all__ = ["on_chase", "ARM_TEXT", "ARM_NOT_TEXT", "CHASE_SEND_CALLS_WORST", "HANDED_LEFT", "PAST_TRIGGER"]
+def rejected_through(o: Mapping) -> bool:
+    """Schwab rejected this entry with nothing filled, saying the price was already through its level
+    (THROUGH_REJECTED). Any other text, or a fill count it does not give, is not this case."""
+    if not isinstance(o, Mapping) or o.get("status") != "REJECTED":
+        return False
+    filled = _dec(o.get("filledQuantity"))
+    return filled == 0 and _words(THROUGH_REJECTED) in _words(o.get("statusDescription"))
+
+
+def _words(text: Any) -> str:
+    return " ".join(str(text or "").lower().replace(".", " ").split())
+
+
+def _offer(host: Any, pick: Optional[Mapping], sym: str, side: str, **extra) -> Optional[dict]:
+    """A PAST_TRIGGER decision for the executor's step, with the trigger and risk per share its
+    nearest-first order needs."""
+    if pick is None or side not in ("long", "short"):
+        return None
+    o = host.order_for(sym, pick, side)
+    if o is None:
+        return None
+    return {"kind": PAST_TRIGGER, "symbol": sym, "side": side, "trigger": str(o["trigger"]),
+            "risk_per_share": str(o["rps"]), "offer": True, **extra}
+
+
+def offers(host: Any, picks: Mapping, left: Mapping, watch_over: bool) -> list:
+    """The picks this step gives the chase between the engine's decisions (the executor's step calls
+    it on every reading; architect's live test notes of 2026-11-13, N1, N2 and N4):
+
+    - an armed entry Schwab rejected after its 201 because the price was already through its level
+      (THROUGH_REJECTED) is handed to the chase as "already through", once per pick a day, under the
+      chase's own rules (Ash, project thread, 2026-11-13 20:01:19 UTC: "4 - yes"). Any other
+      rejection, and a rejection of a chase, ends the pick as before: the engine marks it done;
+    - a chase Step 7's flip handed over that waits (PlanDesk.chase_wait) comes again.
+
+    Every plan entry Schwab rejects is logged once ("entry_rejected", with the day's counts), also with
+    the chase switch off, so a real open can be counted before the chase is on. At or after the watch
+    end nothing is offered, and a pick still waiting is left with a true sentence."""
+    desk = host.desk
+    on = host.registry.get(PAST_TRIGGER, host.env) is not None
+    try:
+        recs, orders = desk.records(), desk._orders()
+    except Exception:
+        return []                                  # the next reading tries again; nothing is sent here
+    out = []
+    for sym, rec in recs.items():
+        if rec.get("origin") != "auto" or rec.get("state") != plan_entries.SENT or not rec.get("order_id"):
+            continue
+        o = desk._order(rec, orders)
+        if o is None or o.get("status") != "REJECTED":
+            continue
+        through = rejected_through(o)
+        if host.once(f"rejected:{rec['order_id']}"):
+            n, n_through = desk.note_rejected(rec["order_id"], through)
+            host.log("entry_rejected", sym, order_id=rec["order_id"], kind=rec.get("kind") or "break",
+                     side=str(rec.get("side") or "").lower(), through=through,
+                     reason=str(o.get("statusDescription") or "")[:300], rejected_today=n,
+                     through_today=n_through, chase_on=on)
+        if (not on or not through or rec.get("kind") == "chase" or sym in left
+                or int(rec.get("chases") or 0) >= plan_entries.CHASES_PER_ROW):
+            continue
+        if watch_over:
+            host.leave(sym, f"no chase before the fast watch ended; {REJECTED_LEFT}")
+            continue
+        d = _offer(host, picks.get(sym), sym, str(rec.get("side") or "").lower(),
+                   rejected_order_id=rec["order_id"],
+                   why="Schwab rejected the plan's entry: the price was already through its level")
+        if d is not None:
+            out.append(d)
+    if not on:
+        return out
+    for sym, w in desk.chase_waits().items():
+        if sym in left:
+            desk.drop_chase_wait(sym)
+            continue
+        if watch_over:
+            desk.drop_chase_wait(sym)
+            host.leave(sym, f"chase not sent: {str(w.get('why') or 'no chase').rstrip('.')}; {HANDED_LEFT}")
+            continue
+        d = _offer(host, picks.get(sym), sym, w.get("side") or "", cancelled_order_id=w.get("cancelled_order_id"),
+                   why="the chase after the flip waits for this reading")
+        if d is not None:
+            out.append(d)
+    return out
+
+
+__all__ = ["on_chase", "offers", "rejected_through", "ARM_TEXT", "ARM_NOT_TEXT", "CHASE_SEND_CALLS_WORST",
+           "HANDED_LEFT", "REJECTED_LEFT", "THROUGH_REJECTED", "PAST_TRIGGER"]
