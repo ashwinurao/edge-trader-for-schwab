@@ -2,8 +2,9 @@
 
 The four rows reuse the made-up tickers and levels of Edge Scanner's contract sample
 `ov_picks/samples/score_parts` (2026-11-05), moved to today, and show each row state at once:
-AAAA the final 09:30 bar, BBBB a one-cent minute (under the 2% ATR stop minimum), CCCC the
-minute so far, DDDD no trade yet. The demo clock is held at 09:31:05 ET today and runs on from
+AAAA the final 09:30 bar, BBBB a one-cent minute (under the 2% ATR stop minimum) that is still
+Edge Scanner's early bar from Alpaca's snapshot, not confirmed (its PR #45), CCCC the minute so
+far, DDDD not in the snapshot yet. The demo clock is held at 09:31:05 ET today and runs on from
 there, so the ages move. SPY RV20 9.80 makes it a calm day.
 """
 from __future__ import annotations
@@ -41,13 +42,15 @@ def picks_answer(now: datetime) -> dict:
          "first_minute": {"open": 42.15, "high": 42.48, "low": 41.92, "close": 42.37}},
         {"rank": 2, "ticker": "BBBB", "top": True, "metrics": _metric(None),
          "levels": {"atr": 0.95, "pm_high": 18.58, "pm_low": 18.06, "last": 18.45},
-         "first_minute": {"open": 18.46, "high": 18.46, "low": 18.46, "close": 18.46}},
+         "first_minute": {"open": 18.46, "high": 18.46, "low": 18.46, "close": 18.46},
+         "first_minute_as_of": "09:31:00"},
         {"rank": 3, "ticker": "CCCC", "top": True, "metrics": _metric(None),
          "levels": {"atr": 3.1, "pm_high": 72.19, "pm_low": 71.11, "last": 71.92},
          "first_minute": {"open": 71.80, "high": 71.84, "low": 71.20, "close": 71.31},
          "first_minute_as_of": "09:30:47"},
         {"rank": 4, "ticker": "DDDD", "top": True,
-         "metrics": _metric("No trade since 09:30 ET yet. Edge Scanner looks again every few seconds."),
+         "metrics": _metric("Alpaca's snapshot does not show this name's 09:30 minute yet. Edge "
+                            "Scanner asks again every few seconds."),
          "levels": {"atr": 5.8, "pm_high": 129.34, "pm_low": 117.16, "last": 126.3},
          "first_minute": None},
         {"rank": 5, "ticker": "EEEE", "top": False, "metrics": _metric(None),

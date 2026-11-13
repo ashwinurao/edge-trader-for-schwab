@@ -265,7 +265,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         atr = None
     out = {"rank": row.get("rank"), "ticker": row.get("ticker"), "atr": _f(atr),
            "bar": {"state": None, "high": None, "low": None, "close": None, "as_of_et": None,
-                   "age_s": None, "text": ""},
+                   "age_s": None, "unconfirmed": False, "text": ""},
            "long": None, "short": None, "rps": None, "nearer": None,
            "under_min_stop": None, "min_stop": None,
            "shares": {"state": None, "used": None, "full": None, "half": None, "text": ""}}
@@ -297,6 +297,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                 # Scanner sends before its bar request confirms it (Edge Scanner PR #45). Still
                 # SO_FAR, so the order buttons wait for the confirmed bar (plan_entries.py).
                 if at == end:
+                    bar["unconfirmed"] = True       # the screen says "not confirmed", not "so far"
                     text = (f"The {pb.bar_start_et:%H:%M} ET bar from Edge Scanner's snapshot, not confirmed "
                             "yet. Edge Scanner's bar request confirms it within seconds.")
                 else:
