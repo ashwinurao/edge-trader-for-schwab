@@ -1695,6 +1695,101 @@ def test_arm_is_refused_unless_the_size_stage_is_1_share(rig):
     assert "Act after a Flat all click: the click disarms it first, and Flat all does the cancels." in t["will_not"]
 
 
+def test_a_desk_without_a_readable_stage_refuses_arm(rig):
+    """Review 3 of PR #27 (architect, 18:01 UTC): the stage is read strictly; a missing one is not 1 share."""
+    rig.clock.t = et(9, 30, 0)
+    del rig.desk.stage
+    r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
+    assert not r["ok"] and not rig.plan.arming.is_armed(rig.clock.now())
+    assert r["refusals"] == ["The size stage is not readable (AttributeError). The armed plan sends 1 share only, so "
+                             "it arms only at the 1-share stage (size.stage \"1_share\" in playbook.json)."]
+
+
+class AppPoller:
+    """What plan_entries.register, plan_flat.register and executor.register read from the poller."""
+
+    def __init__(self, rig):
+        self.rig, self.account, self.terminal = rig, {"securitiesAccount": {"positions": []}}, set()
+
+    def _merged_orders(self):
+        return list(self.rig.broker.orders.values())
+
+    def _fresh(self, name):
+        return self.rig.knobs["fresh"]
+
+    def cooldown_left(self):
+        return self.rig.knobs["cooldown"]
+
+    def snapshot(self):
+        return {"brackets": []}
+
+
+def app_registers(rig, env, between=None):
+    """companion/app.py's order: plan_entries.register (its desk, then Step 9's Flat all), then the
+    armed plan's executor.register. `between` runs in between. The rig then uses that app's desk and plan."""
+    app = FastAPI()
+    app.state.opening_plan_view, app.state.opening_plan_now = rig.view, rig.clock.now
+    poller = AppPoller(rig)
+    assert plan_entries.register(app, rig.trader, poller, lambda r: None, env=env)
+    if between is not None:
+        between(app)
+    plan = X.register(app, rig.trader, poller, lambda r: None, env=env, tape=rig.tape,
+                      usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
+    plan._mono = rig.clock.mono
+    rig.plan, rig.desk = plan, app.state.opening_plan_desk
+    rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
+    return app
+
+
+def test_through_app_pys_registers_a_flat_all_click_disarms_the_plan(rig):
+    """Review 3 (architect, 18:01 UTC): the real plan_entries.register, then executor.register, all
+    switches on, the real PlanFlat, the click through its route. This pins app.state.opening_plan_flat
+    and the order of the two calls in companion/app.py."""
+    from pathlib import Path
+    src = (Path(X.__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+    assert src.index("_plan_entries.register(app") < src.index("_plan_auto.register(app")
+    app = app_registers(rig, {**ENV, plan_flat.FLAT_FLAG: "1"})
+    flat = app.state.opening_plan_flat
+    assert isinstance(flat, plan_flat.PlanFlat) and rig.plan.flat_unwired == ""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    r = TestClient(app).post("/api/opening-plan/flat-all", json={"expected": flat_list(flat)}).json()
+    assert r["ok"] and len(rig.broker.cancelled) == 4
+    p = rig.plan.panel()
+    assert not p["armed"] and p["disarmed"]["why"] == X.FLAT_ALL_CLICK
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert lines(rig, "cancel_start") == [] and len(rig.broker.cancelled) == 4
+
+
+def test_flat_all_on_with_nothing_to_wire_refuses_arm(rig, caplog):
+    """Review 3: with Flat all switched on and no Flat all on app.state when the plan registers (the
+    calls in another order, a renamed attribute), a Flat all click would not disarm the plan. Arm is
+    refused in words, and the log says so once at start."""
+    def renamed(app):
+        app.state.opening_plan_flat_all = app.state.opening_plan_flat
+        del app.state.opening_plan_flat
+    with caplog.at_level("ERROR", logger="companion.plan_auto"):
+        app_registers(rig, {**ENV, plan_flat.FLAT_FLAG: "1"}, between=renamed)
+    assert [x.getMessage() for x in caplog.records if x.name == "companion.plan_auto"] == [
+        f"armed plan: {X.FLAT_UNWIRED}"]
+    rig.clock.t = et(9, 30, 0)
+    r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
+    assert not r["ok"] and r["refusals"] == [X.FLAT_UNWIRED] and not rig.plan.arming.is_armed(rig.clock.now())
+    assert X.FLAT_UNWIRED == ("Flat all is on (EDGE_TRADER_PLAN_FLAT=1), but the armed plan found no Flat all to wire "
+                              "its Disarm to, so a Flat all click would not disarm it. The plan does not arm. See "
+                              "Edge Trader's log at start.")
+    assert rig.plan.panel(check=True)["refusals"] == [X.FLAT_UNWIRED]
+
+
+def test_flat_all_off_needs_no_wiring(rig, caplog):
+    with caplog.at_level("ERROR", logger="companion.plan_auto"):
+        app = app_registers(rig, ENV)
+    assert getattr(app.state, "opening_plan_flat", None) is None and rig.plan.flat_unwired == ""
+    assert not [x for x in caplog.records if x.name == "companion.plan_auto"]
+    assert arm(rig)["armed"]
+
+
 # ---------------------------------------------------------------- the netlog records the clicks
 
 def test_arm_and_disarm_refusals_are_recorded(rec):  # noqa: F811
