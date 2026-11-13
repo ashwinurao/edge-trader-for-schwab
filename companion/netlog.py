@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 log = logging.getLogger("companion.netlog")
 
 DIR = Path(__file__).resolve().parent.parent / "data" / "netlog"
+APP = "edge-trader"                  # record format v1 (brief 08): every app names itself
 MAX_QUEUE = 20_000
 
 _q: queue.Queue = queue.Queue(maxsize=MAX_QUEUE)
@@ -83,8 +84,30 @@ def _on_response(r, *args, **kwargs):
     return None
 
 
+def _write(batch: list) -> None:
+    """Append one batch. Each line is encoded on its own (a Decimal becomes text), so one line
+    that still cannot be encoded is skipped and counted in `dropped`, never the whole batch:
+    `emit` takes free fields (architect's review of PR #21)."""
+    global _warned, dropped
+    lines = []
+    for x in batch:
+        try:
+            lines.append(json.dumps(x, separators=(",", ":"), default=str) + "\n")
+        except Exception:
+            dropped += 1
+    if not lines:
+        return
+    try:
+        DIR.mkdir(parents=True, exist_ok=True)
+        with open(DIR / f"{str(batch[0].get('ts', ''))[:10] or 'undated'}.jsonl", "a", encoding="utf-8") as f:
+            f.write("".join(lines))
+    except Exception as e:
+        if not _warned:  # say it once; a full disk must not flood the log
+            _warned = True
+            log.warning("netlog: could not write to %s: %r", DIR, e)
+
+
 def _run() -> None:
-    global _warned
     while True:
         batch = [_q.get()]
         try:
@@ -93,29 +116,47 @@ def _run() -> None:
         except queue.Empty:
             pass
         try:
-            DIR.mkdir(parents=True, exist_ok=True)
-            with open(DIR / f"{batch[0]['ts'][:10]}.jsonl", "a", encoding="utf-8") as f:
-                f.write("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in batch))
-        except Exception as e:
-            if not _warned:  # say it once; a full disk must not flood the log
-                _warned = True
-                log.warning("netlog: could not write to %s: %r", DIR, e)
+            _write(batch)
+        except Exception:
+            pass
         finally:
             for _ in batch:
                 _q.task_done()
 
 
+def _ensure_writer() -> None:
+    """Start the writer thread once (and again if it ever died)."""
+    global _writer
+    with _start_lock:
+        if _writer is None or not _writer.is_alive():
+            _writer = threading.Thread(target=_run, name="netlog-writer", daemon=True)
+            _writer.start()
+
+
+def emit(kind: str, **fields) -> None:
+    """Queue one line of any kind (record format v1, brief 08). Never raises."""
+    global dropped
+    try:
+        if not enabled():
+            return
+        _ensure_writer()
+        rec = {"ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), "kind": kind,
+               "app": APP, **fields}
+        try:
+            _q.put_nowait(rec)
+        except queue.Full:
+            dropped += 1
+    except Exception:
+        pass
+
+
 def attach(session) -> bool:
     """Record every answer this requests session gets. True when attached."""
-    global _writer
     try:
         if not enabled():
             return False
         hooks = session.hooks.setdefault("response", [])
-        with _start_lock:
-            if _writer is None or not _writer.is_alive():
-                _writer = threading.Thread(target=_run, name="netlog-writer", daemon=True)
-                _writer.start()
+        _ensure_writer()
         if _on_response not in hooks:
             hooks.append(_on_response)
         return True

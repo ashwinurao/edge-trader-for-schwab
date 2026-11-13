@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, break_entry, fills_feed
+from . import __version__, break_entry, fills_feed, open_probe
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -77,6 +77,7 @@ if DEMO:      # the ticket plans on invented quotes and an invented option chain
 async def lifespan(_app: FastAPI):
     trader.arm(False, reason="startup")   # arming never survives a restart
     poller.start()
+    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO)  # brief 09, off by default
     if not DEMO:
         import threading
         from . import update_check
