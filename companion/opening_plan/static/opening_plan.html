@@ -102,7 +102,8 @@ const px = v => v == null ? "–" : Number(v).toFixed(2);
 const sh = v => v == null ? "–" : Number(v).toLocaleString("en-US");
 const ago = s => s == null ? "" : (s < 10 ? `${Number(s).toFixed(1)} s ago` : `${Math.round(s)} s ago`);
 let lastOk = 0, lastView = null, refresh = 2000, busy = false, typing = false;
-// Row buttons (companion/plan_entries.py): only when the server has them (EDGE_TRADER_BREAK_ENTRY=1).
+// Row buttons (companion/plan_entries.py): only when the server has them (EDGE_TRADER_PLAN_BUTTONS=1
+// and EDGE_TRADER_BREAK_ENTRY=1); a 404 means no buttons.
 let entries = null, entriesOff = false;
 const clicking = {}, said = {};
 const STALE_MS = 6000;   // the page's own check: no answer from Edge Trader for 6 s marks the view old
@@ -232,8 +233,8 @@ function render(v, browserStale) {
   const mode = $("mode");
   if (entries) {
     mode.className = "pill warn";
-    mode.textContent = `Break entries ON · ${entries.break_max_shares} share test stage${entries.armed ? "" : " · ARM is off"}`;
-    mode.title = "Each button sends one order to Schwab when you click it (EDGE_TRADER_BREAK_ENTRY=1). Nothing is sent without a click.";
+    mode.textContent = `Plan buttons ON · ${entries.break_max_shares} share test stage${entries.armed ? "" : " · ARM is off"}`;
+    mode.title = "Each button sends one order to Schwab when you click it (EDGE_TRADER_PLAN_BUTTONS=1). Nothing is sent without a click.";
   }
   $("clock").textContent = `${v.now_et} ET`;
   const old = v.stale || browserStale;
@@ -271,7 +272,7 @@ function render(v, browserStale) {
   $("foot").innerHTML = `Rule (research, opening_drive/engine.py): enter ${px(v.playbook.offset)} past the 09:30 ET minute's high or low; the stop is the other side.
     Shares = risk per pick ÷ risk per share, rounded down, inside the ticket's caps (10,000 shares, $250,000).
     Calm SPY day (RV20 ≤ ${v.playbook.calm_rv20_max}): ${v.playbook.calm_multiplier}× the risk. Nearer side: which break the minute's close sits closer to.
-    ${entries ? `With break entries on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
+    ${entries ? `With the plan buttons on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
     the server's own row (never this page's prices). Flip cancels first and places the other side only after Schwab confirms the cancel with nothing
     filled; otherwise the row turns red and nothing more is sent from it today. At most ${entries.max_flips} flips per row a day.`
     : "This screen places, changes and cancels nothing."}`;

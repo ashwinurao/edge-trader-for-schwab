@@ -3,7 +3,8 @@
 Unset EDGE_SCANNER_URL means the feature is off: no route, no menu entry, no request to Edge
 Scanner. No route here places, changes or cancels an order, and nothing here imports the order
 code (tests/test_opening_plan.py checks the imports). The row buttons of Step 4 live in
-companion/plan_entries.py, off unless EDGE_TRADER_BREAK_ENTRY=1; they read current_view().
+companion/plan_entries.py, off unless EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1;
+they read current_view().
 """
 from __future__ import annotations
 

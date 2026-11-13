@@ -3,8 +3,11 @@
 Ash's go: "since things are moving quickly, can we build 3, 4 and 5 before 9:15ET.. let's try
 that" (project thread "Review OV picks desk architecture", 2026-11-13 13:33 UTC).
 
-Off unless EDGE_TRADER_BREAK_ENTRY=1 (Step 3's switch, companion/break_entry.py) and the Opening
-plan is on (EDGE_SCANNER_URL, companion/opening_plan). The display package stays free of order
+Off unless both EDGE_TRADER_PLAN_BUTTONS=1 (this file's own switch) and EDGE_TRADER_BREAK_ENTRY=1
+(Step 3's switch, companion/break_entry.py) are set and the Opening plan is on (EDGE_SCANNER_URL,
+companion/opening_plan). The break switch alone puts the Break entry on the ticket only: it is on
+on the live server since 2026-11-13 14:02 UTC, so the buttons need their own switch (architect,
+2026-11-13 14:46 UTC). The display package stays free of order
 code (tests/test_opening_plan.py checks its imports); this file is where its rows meet the orders.
 
 Every send is the user's click (CONTRIBUTING rule 1):
@@ -45,6 +48,7 @@ from .pnl import ET
 log = logging.getLogger("companion.plan_entries")
 
 FLAG = break_entry.FLAG
+BUTTONS_FLAG = "EDGE_TRADER_PLAN_BUTTONS"
 PLAYBOOK_FILE = Path(__file__).resolve().parent / "opening_plan" / "playbook.json"
 RECORDS_KEY = "opening_plan_entries:{day}"     # Edge Trader's settings table: one JSON per ET day
 
@@ -62,7 +66,8 @@ OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
 
 
 def enabled(env: Mapping[str, str] = os.environ) -> bool:
-    return env.get(FLAG) == "1"
+    """Both switches: the buttons' own and the break entry's. Either one alone: no buttons."""
+    return env.get(BUTTONS_FLAG) == "1" and env.get(FLAG) == "1"
 
 
 def max_flips(path: Path = PLAYBOOK_FILE) -> int:
@@ -493,7 +498,8 @@ class PlanDesk:
 
 def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
              now: Optional[Callable[[], datetime]] = None) -> bool:
-    """Add the row buttons' endpoints when EDGE_TRADER_BREAK_ENTRY=1 and the Opening plan is on.
+    """Add the row buttons' endpoints when EDGE_TRADER_PLAN_BUTTONS=1, EDGE_TRADER_BREAK_ENTRY=1 and
+    the Opening plan is on. Otherwise nothing is added: the routes answer 404 and the page shows no buttons.
     Returns True when they were added. In demo (with the flag on too) the rows show invented
     entries and every click is refused, like every other order action in demo."""
     view = getattr(app.state, "opening_plan_view", None)

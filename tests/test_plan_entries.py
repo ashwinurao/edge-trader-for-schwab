@@ -409,6 +409,9 @@ def test_flip_when_arming_lapses_after_the_cancel_places_nothing(rig, monkeypatc
 
 # ---------------------------------------------------------------- the switch and the routes
 
+BOTH = {break_entry.FLAG: "1", plan_entries.BUTTONS_FLAG: "1"}
+
+
 def make_app(rig, env, demo=False):
     app = FastAPI()
     app.state.opening_plan_view = rig.view
@@ -421,13 +424,28 @@ def make_app(rig, env, demo=False):
     return app, added
 
 
-def test_flag_off_means_no_buttons_and_no_routes(rig):
-    app, added = make_app(rig, env={})
+@pytest.mark.parametrize("env", [
+    {},                                              # neither switch
+    {break_entry.FLAG: "1"},                         # the break entry alone (the live server since 14:02 UTC)
+    {plan_entries.BUTTONS_FLAG: "1"},                # the buttons alone
+    {break_entry.FLAG: "1", plan_entries.BUTTONS_FLAG: "0"},
+    {break_entry.FLAG: "true", plan_entries.BUTTONS_FLAG: "1"},
+], ids=["none", "break-only", "buttons-only", "buttons-0", "break-true"])
+def test_without_both_switches_no_buttons_and_no_routes(rig, env):
+    app, added = make_app(rig, env=env)
     assert not added
     c = TestClient(app)
-    assert c.get("/api/opening-plan/entries").status_code == 404
-    assert c.post("/api/opening-plan/place", json={"ticker": "AAAA", "side": "LONG", "expected": LONG}).status_code == 404
-    assert rig.broker.placed == []
+    assert c.get("/api/opening-plan/entries").status_code == 404      # the page shows no buttons on 404
+    for path, body in (("place", {"ticker": "AAAA", "side": "LONG", "expected": LONG}),
+                       ("flip", {"ticker": "AAAA", "expected": SHORT}), ("cancel", {"ticker": "AAAA"})):
+        assert c.post(f"/api/opening-plan/{path}", json=body).status_code == 404
+    assert rig.broker.placed == [] and rig.broker.cancelled == []
+
+
+def test_the_page_hides_the_buttons_on_404():
+    page = (plan_entries.Path(plan_entries.__file__).parent / "opening_plan" / "static" / "opening_plan.html").read_text()
+    assert 'r.status === 404) { entriesOff = true; entries = null; return; }' in page
+    assert "${entries ? ordersCell(r) : \"\"}" in page
 
 
 def test_flag_off_also_refuses_in_the_trader(rig, monkeypatch):
@@ -437,8 +455,8 @@ def test_flag_off_also_refuses_in_the_trader(rig, monkeypatch):
     assert not r["ok"] and "Break entries are off" in r["error"] and rig.broker.placed == []
 
 
-def test_routes_with_the_flag_on(rig):
-    app, added = make_app(rig, env={break_entry.FLAG: "1"})
+def test_routes_with_both_switches_on(rig):
+    app, added = make_app(rig, env=BOTH)
     assert added
     c = TestClient(app)
     st = c.get("/api/opening-plan/entries").json()
@@ -450,8 +468,9 @@ def test_routes_with_the_flag_on(rig):
 
 
 def test_demo_shows_entries_and_refuses_every_click(rig):
-    assert not make_app(rig, env={}, demo=True)[1]          # demo follows the switch too
-    app, added = make_app(rig, env={break_entry.FLAG: "1"}, demo=True)
+    assert not make_app(rig, env={}, demo=True)[1]          # demo follows the switches too
+    assert not make_app(rig, env={break_entry.FLAG: "1"}, demo=True)[1]
+    app, added = make_app(rig, env=BOTH, demo=True)
     c = TestClient(app)
     st = c.get("/api/opening-plan/entries").json()
     assert st["demo"] and {r["ticker"]: r["entry"]["state"] for r in st["rows"]}["AAAA"] == plan_entries.SENT
