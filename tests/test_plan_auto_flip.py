@@ -938,6 +938,104 @@ def test_after_the_cancel_a_side_not_clear_waits_then_sends_once(r, monkeypatch,
     assert r.host.left["orders_pick"] == 4 and r.host.left["calls_minute"] == 36   # one send's worth, net
 
 
+# When the side rule itself fails (CONTRIBUTING rule 4, "when unsure, refuse"): PlanDesk._swap_side
+# answers NOT_CLEAR with "Could not read your AAAA position and orders (...)", never OK (architect's
+# review 4 of Step 7, 2026-11-13 23:30 UTC: no test failed with its except answering OK).
+SIDE_RULE_FAILED = "Could not read your AAAA position and orders (the side rule broke). Nothing was sent."
+
+
+def side_rule_fails_while(monkeypatch, failing):
+    """plan_side.plan_shares raises while `failing` is not empty, as a bug or an odd order would."""
+    real = plan_side.plan_shares
+
+    def plan_shares(rec, orders):
+        if failing:
+            raise RuntimeError("the side rule broke")
+        return real(rec, orders)
+    monkeypatch.setattr(plan_side, "plan_shares", plan_shares)
+
+
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_before_the_cancel_a_side_rule_that_fails_waits_for_this_pick_only(r, monkeypatch, kind):
+    # As a side that is not clear: nothing reaches Schwab, nothing is written or logged, the entry
+    # keeps its one automatic cancel, and only this pick waits (lane.busy with end_step=False and
+    # the not_clear log fields). When the rule reads again, the flip or re-level goes once.
+    oid = place_long(r)
+    by_hand(r, {})
+    failing = [1]
+    side_rule_fails_while(monkeypatch, failing)
+    args = swap_args(r, kind)
+    wrote = []
+    real_save = r.desk._save
+    r.desk._save = lambda recs: wrote.append(1) or real_save(recs)
+    for _ in range(3):
+        assert run(r, kind, **args) is False             # not an action, and the step goes on
+    nothing_at_schwab(r)
+    assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.said == []
+    k, new = kind[len("would_"):], ("short" if kind == "would_flip" else "long")
+    assert r.host.busied == [k] * 3 and r.host.busy_why == [SIDE_RULE_FAILED] * 3     # the panel
+    assert r.host.busy_ends == [False] * 3
+    assert r.host.busy_logged == [{"why": "the side rule said not_clear", "side_rule": "not_clear", "side": new}] * 3
+    got = rec(r)
+    assert (got["state"], got["side"], got["order_id"]) == (plan_entries.SENT, "LONG", oid)
+    r.desk._save = real_save
+    failing.clear()                                      # the rule reads again
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and r.host.keys == {f"cancel:{oid}"} and len(r.broker.placed) == 2
+    assert r.broker.placed[-1]["orderLegCollection"][0]["instruction"] == ("SELL_SHORT" if new == "short" else "BUY")
+
+
+@pytest.mark.parametrize("when", ["cancel", "recheck"])
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_after_the_cancel_a_side_rule_that_fails_sends_nothing_until_it_reads_again(r, monkeypatch, kind, when):
+    # The rule fails from the confirmed cancel on (seen at the top of the send half), or from the
+    # recheck on (seen first under the lock just before the send). No send while it fails: the
+    # not-clear wait, a tick at a time. Three ticks later it reads again and the new side goes once.
+    oid = place_long(r)
+    by_hand(r, {})
+    args = swap_args(r, kind)
+    k, new = kind[len("would_"):], ("short" if kind == "would_flip" else "long")
+    failing, seen = [], []
+    side_rule_fails_while(monkeypatch, failing)
+    if when == "cancel":
+        real_cancel = r.trader.cancel_entry
+
+        def cancel(o):
+            got = real_cancel(o)
+            failing.append(1)
+            return got
+        monkeypatch.setattr(r.trader, "cancel_entry", cancel)
+    else:
+        real_reread, n = r.host.reread, []
+
+        def reread(t):
+            n.append(1)
+            if len(n) == 2:                              # the first reading after the cancel
+                failing.append(1)
+            return real_reread(t)
+        r.host.reread = reread
+
+    def tick(s):
+        if not failing and not seen:
+            return                                       # Trader.cancel_entry's own read-back waits
+        assert s == 0.25 and len(r.broker.placed) == 1 and len(r.sent) == 1   # nothing sent while it fails
+        seen.append(rec(r)["text"])
+        if len(seen) == 3:
+            failing.clear()
+    monkeypatch.setattr(trading.time, "sleep", tick)
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 2 and len(r.sent) == 2
+    assert r.broker.placed[-1]["orderLegCollection"][0]["instruction"] == ("SELL_SHORT" if new == "short" else "BUY")
+    waiting = (f"The armed plan cancelled the long entry. It places the {new} once it can tell which side you "
+               f"trade AAAA on: {SIDE_RULE_FAILED}")
+    assert seen == [waiting] * 3
+    assert r.host.said == [(f"{k}_not_clear", f"cancelled the long entry; the {new} goes once Schwab's positions "
+                                              "and orders show which side you trade AAAA on")]
+    line = [f for e, t, f in r.host.logs if e == f"{k}_auto"][0]
+    assert line["ok"] and {"not_clear_from", "not_clear_until"} <= set(line["times"])
+    assert r.host.gone == [] and r.host.disarms == []
+
+
 def test_not_when_no_order_is_left_for_the_pick(r):
     place_long(r)
     r.host.left["orders_pick"] = 0
