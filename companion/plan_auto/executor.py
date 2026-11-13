@@ -37,13 +37,15 @@ The worker never holds a lock of its own across a call to Schwab or Edge Scanner
 exception (an unexpected one disarms for the day and shows why) and never blocks the ticket, the
 poller or the page. Every decision and action is one JSON line in
 data/opening_plan/auto/YYYY-MM-DD.jsonl (git-ignored) with its times; no account numbers, tokens,
-request bodies or share counts of the user's own positions (the side rule logs its code).
+request bodies or share counts of the user's own positions (the side rule logs its code), and no
+dollar amount: log() masks each one in its strings (_no_dollars; Step 8 review 5).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import threading
 import time as _time
 from collections import Counter, deque
@@ -141,6 +143,28 @@ def _when(v: Any) -> Optional[datetime]:
             return None
         return dt if dt.utcoffset() is not None else None
     return None
+
+
+# A dollar amount in a string: a $, optional spaces, an optional ( or -, digits with commas and an
+# optional decimal part, an optional ). Schwab's reject words reach the plan's day log through Step 7's
+# flip and Step 8's chase answers, and it is not confirmed that they never name a balance (architect,
+# 2026-11-13 23:53 UTC, Step 8 review 5: the armed plan's day log keeps no dollar amount). The ) is
+# taken only after a (, so "below zero ($1,234.56)" keeps its own closing bracket.
+_AMOUNT = r"\d+(?:,\d+)*(?:\.\d+)?"
+_DOLLARS = re.compile(rf"\$\s*(?:\(\s*-?{_AMOUNT}(?:\s*\))?|-?{_AMOUNT})")
+DOLLARS_MASK = "$[masked]"
+
+
+def _no_dollars(v: Any) -> Any:
+    """v with every dollar amount in its strings, also inside a dict or a list, replaced by
+    DOLLARS_MASK. For the day log's row only: the page keeps Schwab's words."""
+    if isinstance(v, str):
+        return _DOLLARS.sub(DOLLARS_MASK, v)
+    if isinstance(v, Mapping):
+        return {k: _no_dollars(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_no_dollars(x) for x in v]
+    return v
 
 
 def _jsonable(v: Any) -> Any:
@@ -307,7 +331,7 @@ class AutoPlan:
 
     def log(self, event: str, ticker: Optional[str] = None, **fields) -> None:
         now = self._now()
-        row = {"t": _iso(now), "event": event, "ticker": ticker, **_jsonable(fields)}
+        row = _no_dollars({"t": _iso(now), "event": event, "ticker": ticker, **_jsonable(fields)})
         try:
             with self._log_lock:
                 self.out_dir.mkdir(parents=True, exist_ok=True)

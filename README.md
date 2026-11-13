@@ -745,7 +745,7 @@ with how long it waited (`waited_s`). A side rule line keeps the rule's code and
 (`side_rule`, `side`), never the words on the page, which can name your own shares. The poller hold
 adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
 row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
-request body or share count of your own positions. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
+request body or share count of your own positions, and no dollar amount: each `$` amount in its text, such as one in Schwab's words when it rejects a flip, is written as `$[masked]` (`companion/plan_auto/executor.py`). A number without a dollar sign is not masked, and what Schwab writes in a reject is not confirmed. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
 
 **Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
