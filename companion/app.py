@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, break_entry, fills_feed
+from . import __version__, break_entry, fills_feed, netlog
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -76,12 +76,16 @@ if DEMO:      # the ticket plans on invented quotes and an invented option chain
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     trader.arm(False, reason="startup")   # arming never survives a restart
+    # The network record (netlog.py): its threads, a start note and the event-loop lag task.
+    lag_task = netlog.start(f"Edge Trader {__version__} started{' in DEMO mode' if DEMO else ''}")
     poller.start()
     if not DEMO:
         import threading
         from . import update_check
         threading.Thread(target=lambda: UPDATE.update({"info": update_check.check()}), daemon=True).start()
     yield
+    if lag_task is not None:
+        lag_task.cancel()
     signin.cancel()
     poller.stop()
 
@@ -103,6 +107,11 @@ async def only_local_host(request: Request, call_next):
                                               or request.url.path.startswith("/api/signin/")):
         return JSONResponse({"ok": False, "error": "Demo mode: no orders and no Schwab calls."})
     return await call_next(request)
+
+
+# Outermost: a route line per request to our named routes and a refusal line per order action
+# that sent nothing (netlog.py). It watches the messages pass and changes none of them.
+app.add_middleware(netlog.RouteTimer)
 
 
 def _guard(request: Request) -> None:
@@ -147,6 +156,12 @@ def state():
     return JSONResponse({**snap, "ui": UI, "update": UPDATE["info"], "demo": DEMO, "server": SERVER,
                          "signin": signin.status(), "version": __version__, "features": FEATURES,
                          "break_entry": {"on": break_entry.enabled(), "max_shares": break_entry.BREAK_MAX_SHARES}}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/netlog/summary")
+def netlog_summary():
+    """Timing and errors of every network call, from memory (companion/netlog.py). Never calls out."""
+    return JSONResponse(netlog.summary(), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/fills")
@@ -448,6 +463,9 @@ def main() -> None:
         handlers = [logging.FileHandler(LOG, encoding="utf-8"), logging.StreamHandler(sys.stderr)]
     logging.basicConfig(level=logging.INFO, handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # WARNING and above also to data/logs/edge-trader-YYYY-MM-DD.log (netlog.py): one file per UTC
+    # day, kept by a rebuild, which deletes the container's own log.
+    netlog.keep_warnings()
     logging.getLogger("companion").info("Edge Trader %s starting (pid %s)%s", __version__, os.getpid(),
                                         " in DEMO mode" if DEMO else "")
     # One process, no reload: exactly one poller.

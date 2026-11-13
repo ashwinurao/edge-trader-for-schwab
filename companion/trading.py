@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from . import break_entry, schwab
+from . import break_entry, netlog, schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -410,7 +410,13 @@ class Trader:
         log.warning("trading %s (%s)", "ARMED" if on else "disarmed", reason)
 
     def _logged(self, endpoint: str, fn):
-        """Run one Schwab request and record it in the same requests log as the poller."""
+        """Run one Schwab request and record it in the same requests log as the poller. The call's
+        waits, wire time and outcome also go to data/netlog/ (netlog.py): a record only, it never
+        changes what this returns or raises."""
+        with netlog.call("schwab", endpoint, clients=(self._client, self._status_client)) as call:
+            return self._logged_call(endpoint, fn, call)
+
+    def _logged_call(self, endpoint: str, fn, call):
         started = now_iso()
         if endpoint not in ("place_order", "cancel_order", "replace_order") and self.cooldown_left:
             # During a 429 pause: status polling and quotes are not sent at all (the action then
@@ -419,18 +425,24 @@ class Trader:
             left = self.cooldown_left()
             if left > 0:
                 if endpoint in ("order_details", "ticket_quote", "option_expirations", "option_chain"):
+                    call.skip("pause_429")
                     return _Throttled()
                 end = time.monotonic() + left
                 if abs(end - self._waited_for) > 2.0:      # wait once per pause, at most 5 s
                     self._waited_for = end
+                    t_pause = time.monotonic()
                     time.sleep(min(left, 5.0))
+                    call.waited("pause", (time.monotonic() - t_pause) * 1000)
         if self.on_request:
             self.on_request(None)
+        call.sending()
         try:
             r = fn()
         except Exception as e:
+            call.failed(e)
             self.store.log_request(endpoint, started, False, None, repr(e)[:300])
             raise
+        call.returned(r)
         if r.status_code == 429 and self.on_request:
             self.on_request(r.headers.get("Retry-After") or "30")
         ok = r.status_code in (200, 201)

@@ -12,7 +12,7 @@ import re
 import time
 from pathlib import Path
 
-from . import __version__
+from . import __version__, netlog
 
 REPO = "simonro/edge-trader-for-schwab"
 URL = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -31,11 +31,15 @@ def newer(latest: str, current: str = __version__) -> bool:
 
 def _fetch(timeout: float = 3.0) -> dict | None:
     import requests
-    r = requests.get(URL, timeout=timeout, headers={"Accept": "application/vnd.github+json"})
-    if r.status_code != 200:
-        return None
-    d = r.json()
-    return {"tag": d.get("tag_name"), "url": d.get("html_url"), "name": d.get("name")}
+    # Recorded in data/netlog/ as vendor github (netlog.py): a record only.
+    with netlog.call("github", "releases_latest", "update_check") as call:
+        r = requests.get(URL, timeout=timeout, headers={"Accept": "application/vnd.github+json"})
+        netlog.record_answer(r, "github")
+        call.returned(r)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        return {"tag": d.get("tag_name"), "url": d.get("html_url"), "name": d.get("name")}
 
 
 def check(now: float | None = None, cache: Path = CACHE, fetch=_fetch, current: str = __version__) -> dict | None:
