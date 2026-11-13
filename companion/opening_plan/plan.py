@@ -25,7 +25,8 @@ From 09:00 ET until the 09:25 freeze (brief 21, Ash's ask of 2026-11-13 15:17 UT
 populating from 9:00 ET just like the edge scanner does"), a day without frozen picks shows Edge
 Scanner's preview: state PREVIEW, never OK, and its rows in view["preview"]["rows"], never in
 view["rows"]. So no gate, button, shadow or probe that reads view["rows"] or tests for "OK" can
-take a preview row for a pick. The frozen picks replace it, as before.
+take a preview row for a pick. The frozen picks replace it, as before. Only the opening probe reads
+the preview's names, to preview them (no order) for their margin rates (brief 23).
 
 view["buying_power"] shows Schwab's day-trading buying power, buying power and equity from the
 account read Edge Trader already makes, with the time read. On screen only.
