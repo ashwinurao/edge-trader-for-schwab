@@ -267,6 +267,32 @@ def test_one_missing_bar_waits_until_the_latest_time_then_the_others_fix_and_fil
     assert d["shares"]["text"] == "Not in the buying power cap: at most 1 share today."
 
 
+def test_the_estimate_of_a_pick_outside_the_cap_shows_at_most_one_share():
+    # Review 2 of brief 23: DDDD has no 09:30 minute at 09:31:15, so it stays out of the cap; its
+    # estimate ("about 63" before) shows at most 1 share, in words.
+    three = [frow(1, "AAAA", fm=FM), frow(2, "BBBB", fm=FM), frow(3, "CCCC", fm=FM)]
+    v = view(et(9, 31, 15), three + [frow(4, "DDDD", fm=None, atr=5.80, last=126.30)], latch=CapLatch())
+    d = next(r for r in v["rows"] if r["ticker"] == "DDDD")
+    e = d["estimate"]["used"]
+    assert (e["about"], e["headline"], e["fewer"], e["more"], e["limited_by"]) == (1, 1, None, None, "not_in_cap")
+    assert d["estimate"]["text"].endswith(" Not in the buying power cap: at most 1 share today.")
+    # A pick in the cap keeps its estimate as before (none here: the three have their minute).
+    assert all(r["estimate"] is None for r in v["rows"] if r["ticker"] != "DDDD")
+
+
+@pytest.mark.parametrize("bad", [-1, 301])
+def test_the_playbook_refuses_a_latest_fixing_time_out_of_bounds(tmp_path, bad):
+    raw = json.loads(P.PLAYBOOK_FILE.read_text())
+    raw["size"]["buying_power"]["fix_latest_seconds"]["value"] = bad
+    f = tmp_path / "pb.json"
+    f.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="fix_latest_seconds from 0 to 300"):
+        P.load_playbook(f)
+    raw["size"]["buying_power"]["fix_latest_seconds"]["value"] = 300            # the bounds count
+    f.write_text(json.dumps(raw))
+    assert P.load_playbook(f).bp_fix_latest_seconds == 300
+
+
 def test_a_restart_after_the_latest_time_fixes_at_once_on_the_final_picks():
     v = view(et(9, 40), [frow(1, "AAAA", fm=FM), frow(2, "DDDD", fm=None, atr=5.80, last=126.30)], latch=CapLatch())
     assert v["cap"]["state"] == "FIXED" and v["cap"]["at_et"] == "09:40:00"
@@ -520,6 +546,26 @@ def test_a_pick_not_in_the_fixed_cap_is_refused_above_one_share_and_sends_one_sh
     res = rig.desk.place("AAAA", "LONG", LONG)
     assert res["ok"], res
     assert without_id(rig.sent[0]) == LONG_REQ
+
+
+def test_at_one_share_a_pick_outside_the_cap_says_so_in_its_stage_line(rig):
+    # Review 2 of brief 23: not "the buying power cap would give 1" (the cap gives it nothing).
+    bal = {"availableFunds": 10_000_000.0, "buyingPower": 4e7, "dayTradingBuyingPower": 4e7}
+    rig.view.cap_fixed()
+    cccc = Pick("CCCC", {"long": (D("71.94"), D("0.65")), "short": (D("71.19"), D("0.65"))}, False)
+    rig.view.latch.offer(NOW.astimezone(ET).date(), bp_cap.pool_sums([cccc], bal, None, {}, D("1.0")),
+                         "09:31:15", False, names=["CCCC"])
+    assert row(rig)["stage"]["long"] == "1 share (plan size 175); not in the buying power cap: at most 1 share today"
+
+
+def test_above_one_share_a_cap_of_zero_shares_says_buying_power_not_the_risk(rig):
+    # Review 2 of brief 23: fixed at a made-up $10, the row's size is 0 because of the cap.
+    rig.view.cap_fixed(available=10.0)
+    rig.desk.stage = plan_size.parse_stage(0.25)
+    res = rig.desk.place("AAAA", "LONG", {**LONG, "shares": 0})
+    assert not res["ok"] and res["error"] == "0 shares for the long side: capped by buying power."
+    assert row(rig)["place"]["long"] == "0 shares for the long side: capped by buying power."
+    assert rig.broker.placed == []
 
 
 def test_above_one_share_a_send_is_refused_until_the_cap_is_fixed(rig):

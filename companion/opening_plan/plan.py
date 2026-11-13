@@ -873,6 +873,15 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
                         r[k]["shares"] = min(1, r[k]["shares"])
                 sh["used"] = {k: min(1, n) if isinstance(n, int) else n for k, n in sh["used"].items()}
                 sh["text"] = "Not in the buying power cap: at most 1 share today."
+            est = r.get("estimate")
+            if isinstance(est, Mapping):
+                # Review 2: its estimate (no 09:30 minute yet) shows at most 1 share too.
+                for k in ("used", "full", "half"):
+                    x = est.get(k)
+                    if isinstance(x, Mapping) and isinstance(x.get("about"), int):
+                        x.update(about=min(1, x["about"]), headline=min(1, x["about"]), fewer=None, more=None,
+                                 limited_by="not_in_cap")
+                est["text"] = (est.get("text") or "") + " Not in the buying power cap: at most 1 share today."
     view["rows"] = built
     # Brief 23 item 5, display only: with no buttons nothing is sent, so every row counts as not sent
     # (plan_entries.PlanDesk.state says it with the rows really not sent yet).

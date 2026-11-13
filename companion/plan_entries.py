@@ -284,7 +284,9 @@ class PlanDesk:
             before = s.get("shares_before_cap")
             basis = before if isinstance(before, int) and not isinstance(before, bool) and before >= 0 else shares
             n, why = plan_size.shares(basis, self.stage, price=trig)
-            if basis != shares:
+            if cap.get("state") == bp_cap.NOT_IN_CAP:
+                why += "; not in the buying power cap: at most 1 share today"
+            elif basis != shares:
                 why += f"; the buying power cap would give {shares:,}"
         else:
             if cap.get("state") != "FIXED":
@@ -331,6 +333,9 @@ class PlanDesk:
         if n is None:
             return self._sized(row, side)[1] or (row.get("shares") or {}).get("text") or "The row has no shares for that side."
         if n["shares"] < 1:
+            # Review 2 of brief 23: a size the buying power cap brought to 0 says so, not the risk.
+            if (row.get("shares") or {}).get("by_buying_power"):
+                return f"0 shares for the {side.lower()} side: capped by buying power."
             return f"0 shares for the {side.lower()} side at this risk."
         return ""
 

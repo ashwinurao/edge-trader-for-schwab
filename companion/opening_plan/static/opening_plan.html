@@ -431,6 +431,9 @@ function estSet(x, label) {
   const pre = label ? `<span class="mut">${label}</span> ` : "";
   const range = x.fewer != null && x.more != null ? `usually ${sh(x.fewer)} to ${sh(x.more)}` : "";
   const capped = x.capped ? esc(x.capped) : "";
+  // Review 2 of brief 23: a pick not in the fixed cap sends at most 1 share today.
+  if (x.limited_by === "not_in_cap")
+    return `${pre}at most <b>${sh(x.about)}</b> <span class="tag sofar">not in the buying power cap</span>`;
   if (x.limited_by === "buying_power")
     return `${pre}about <b>${sh(x.about)}</b> <span class="tag sofar">capped by buying power</span>
       <span class="sub">${[range, capped].filter(Boolean).join(" · ")}</span>`;
