@@ -6,15 +6,19 @@ Step 5 of the OV entries build. Off unless EDGE_TRADER_SHADOW=1 and the Opening 
 
 Each step, inside the window (playbook automatic.shadow_from_et to shadow_until_et, weekdays), it
 reads the open tape (tape.EsTape: Edge Scanner's GET /api/v2/ov-picks/open-tape, at most every
-tape.every_seconds, brief 15) and turns it into an engine reading with tape.py's rules. When the
-tape has a problem (no answer, a failed or late GET, no picks for today) it falls back to Step 2's
-feed as before (feed.Feed: GET /api/v2/ov-picks and /api/v2/clock, at most every
-feed.picks_every_seconds, shared with the Opening plan screen). The calm flag always comes from
-Step 2's clock reading. When the tape answers but tape.usable says no (old answer, late feed), every
-pick carries `hold`, so the engine acts on no price, as the armed plan would not.
+tape.every_seconds, brief 15) and turns it into an engine reading with tape.py's rules. Until the
+tape has given picks today, a tape problem (no answer, a failed or late GET, no picks for today)
+falls back to Step 2's feed as before (feed.Feed: GET /api/v2/ov-picks and /api/v2/clock, at most
+every feed.picks_every_seconds, shared with the Opening plan screen). Once it has, a tape problem
+is a hold, as the armed plan would do: the last tape picks, each with `hold`, at the time the tape
+was read, so time-based cancels still run and nothing moves on a price (review 1 of brief 15). The
+calm flag always comes from Step 2's clock reading. When the tape answers but tape.usable says no
+(old answer, late feed), judged when read() handed the reading out (`read_at`), every pick carries
+`hold` too.
 
 It appends each decision to data/opening_plan/shadow/YYYY-MM-DD.jsonl (git-ignored) with `source`
-("tape" or "picks feed"; with the feed, `tape_problem` says why the tape was not used) and the
+("tape" or "picks feed"; `tape_problem` says why the tape was not used, or why the picks are on
+hold) and the
 times: `t` (this reading), `es_ok_at` and `es_age_s` (when Edge Scanner's answer came and how old it
 was), the engine's `price_age_s` (and `fresh_age_s` from the tape), and from the tape `tape_seq`,
 `tape_age_s`, `feed_age`, `tape_usable`, `tape_why`.
@@ -38,7 +42,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -129,6 +133,10 @@ class Shadow:
         self._risk_value: Optional[Decimal] = None
         self._risk_at: Optional[datetime] = None
         self.state: Optional[dict] = None
+        # The last tape reading with picks, and its ET day: once the tape has given picks today, a
+        # tape problem is a hold, never a fallback to the picks feed (review 1 of brief 15).
+        self._tape_last: Optional[dict] = None
+        self._tape_day: Optional[date] = None
         self._last_problem = ""
         self._stop = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -162,18 +170,42 @@ class Shadow:
         if self.tape is None:
             return None, {}, {}
         tr = self.tape.read()
+        # Judged when read() handed the reading out (`read_at`), not at the step's start: the feed's
+        # read before it can block (review 1 of brief 15).
+        read_at = tr.get("read_at") or now
+        today = now.astimezone(engine.ET).date()
         if tr.get("problem") or not tr.get("picks"):
-            return None, {}, {"tape_problem": tr.get("problem") or tr.get("no_picks_why") or "no picks"}
-        ok, why = tape_mod.usable(tr, self.tape_rules, now)
+            problem = tr.get("problem") or tr.get("no_picks_why") or "no picks"
+            if self._tape_last is None or self._tape_day != today:
+                return None, {}, {"tape_problem": problem}
+            return self._hold(tr, read_at, calm, problem)
+        self._tape_last, self._tape_day = tr, today
+        ok, why = tape_mod.usable(tr, self.tape_rules)
         reading = dict(tr, risk=self._risk_value, calm=calm)
         if not ok:
             # As the armed plan: an unusable reading moves nothing price-based; time-based cancels run.
             reading["picks"] = [dict(p, hold=f"the open tape is not usable: {why}") for p in tr["picks"]]
         received = tr["received"]
-        head = {"source": "tape", "es_ok_at": _iso(received), "es_age_s": round((now - received).total_seconds(), 3),
-                "es_error": None, "tape_seq": tr.get("seq"), "tape_age_s": tr.get("tape_age_s"),
-                "feed_age": tr.get("feed_age"), "tape_usable": ok, "tape_why": why or None}
+        head = {"source": "tape", "es_ok_at": _iso(received),
+                "es_age_s": round((read_at - received).total_seconds(), 3), "es_error": None,
+                "tape_seq": tr.get("seq"), "tape_age_s": tr.get("tape_age_s"), "feed_age": tr.get("feed_age"),
+                "tape_usable": ok, "tape_why": why or None}
         return reading, {p["symbol"]: tape_mod.range_of(p) for p in tr["picks"]}, head
+
+    def _hold(self, tr: Mapping, read_at: datetime, calm: Optional[bool],
+              problem: str) -> tuple[dict, dict, dict]:
+        """The tape gave picks today and now has a problem: the last picks, each on hold, at read_at,
+        so time-based cancels still run and nothing moves on a price, as the armed plan would do."""
+        _, why = tape_mod.usable(tr, self.tape_rules)
+        last = self._tape_last
+        picks = [dict(p, hold=f"the open tape is not usable: {why}") for p in last["picks"]]
+        reading = {"received": read_at, "risk": self._risk_value, "calm": calm, "picks": picks, "no_picks_why": ""}
+        received = last["received"]
+        head = {"source": "tape", "tape_problem": problem, "es_ok_at": _iso(received),
+                "es_age_s": round((read_at - received).total_seconds(), 3), "es_error": None,
+                "tape_seq": last.get("seq"), "tape_age_s": None, "feed_age": None, "tape_usable": False,
+                "tape_why": why}
+        return reading, {p["symbol"]: tape_mod.range_of(p) for p in last["picks"]}, head
 
     def _write(self, now: datetime, rows: list[dict]) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)

@@ -27,6 +27,11 @@ The rules (one place, used by the live reader EsTape AND by replay.py):
   never from a bar of another minute or day. The first such bar seen is the range in use.
 - when a bars-request bar's high or low differs from the range in use by more than one cent, the
   reading takes the bars values and carries `range_changed` with both (brief 17 uses it).
+- when the snapshot's versions of the 09:30 bar differ in high or low by more than one cent and no
+  bars-request bar is in yet, the range is disputed: not final, no high or low, and the pick
+  carries `range_disputed` with the versions. A bars-request bar settles it: final, from the bars
+  request, with `range_changed` against the first version when it differs (architect's review 1
+  of brief 15, 2026-11-13). Versions that differ only in volume, count or vwap change nothing.
 - `feed_age`: received minus the newest trade or quote time of the reference symbol, in seconds.
 - `received`: when the answer was in hand (live: Edge Trader's clock; replay: the line's `t1`).
 
@@ -44,7 +49,8 @@ The reading (a plain dict, the engine's input plus the tape's own fields):
     reference, feed_at         SPY, and its newest trade or quote time
     feed_age                   received minus feed_at, in seconds
     picks                      [{symbol, rank, last, last_at, fresh_at, bid, ask, quote_at,
-                                 high, low, final, from, range_seen, range_changed}]
+                                 high, low, final, from, range_seen, range_changed,
+                                 range_disputed}]
     no_picks_why               why picks is empty
 
 `usable(reading, rules, now=None) -> (ok, why)` says whether a price-based action may use it.
@@ -151,8 +157,9 @@ def empty(received: datetime, problem: str = "", no_picks_why: str = "") -> dict
 
 # ---------------------------------------------------------------- the rules
 
-def _bar_range(versions: Any, day: date, bar_start_et: time) -> tuple[Optional[dict], Optional[dict]]:
-    """(the range to use, range_changed or None) from one ticker's 09:30 bar versions."""
+def _bar_range(versions: Any, day: date,
+               bar_start_et: time) -> tuple[Optional[dict], Optional[dict], Optional[list]]:
+    """(the range to use, range_changed, range_disputed) from one ticker's 09:30 bar versions."""
     bar_at = datetime.combine(day, bar_start_et, tzinfo=ET)
     valid = []
     for v in versions if isinstance(versions, list) else []:
@@ -166,13 +173,28 @@ def _bar_range(versions: Any, day: date, bar_start_et: time) -> tuple[Optional[d
             continue
         valid.append({"high": high, "low": low, "from": _SOURCE_NAMES[v["from"]], "seen": v.get("seen")})
     if not valid:
-        return None, None
+        return None, None, None
     base = valid[0]
+    snaps = [v for v in valid if v["from"] == FROM_SNAPSHOT]
     bars = [v for v in valid if v["from"] == FROM_BARS]
     latest = bars[-1] if bars else None
+    if _spread(snaps):
+        # One day's file said the minute bar does not change; if it does, neither version is
+        # trusted until the bars request answers (architect's review 1, 2026-11-13).
+        if latest is None:
+            return None, None, snaps
+        return latest, ({"old": base, "new": latest} if _differs(base, latest) else None), None
     if latest is not None and latest is not base and _differs(base, latest):
-        return latest, {"old": base, "new": latest}
-    return base, None
+        return latest, {"old": base, "new": latest}, None
+    return base, None, None
+
+
+def _spread(versions: list) -> bool:
+    """True when the versions' highs or lows are more than RANGE_CHANGE apart."""
+    if len(versions) < 2:
+        return False
+    return any(max(Decimal(str(v[k])) for v in versions) - min(Decimal(str(v[k])) for v in versions)
+               > RANGE_CHANGE for k in ("high", "low"))
 
 
 def _differs(a: Mapping, b: Mapping) -> bool:
@@ -239,8 +261,10 @@ def _pick(ticker: str, rank: int, snap: Any, versions: Any, day: date, bar_start
     p = {"symbol": ticker, "rank": rank, "last": last, "last_at": trade_at if last is not None else None,
          "fresh_at": _newest(trade_at if last is not None else None, quote_at),
          "bid": _num(quote.get("bp")), "ask": _num(quote.get("ap")), "quote_at": quote_at,
-         "high": None, "low": None, "final": False, "from": None, "range_seen": None, "range_changed": None}
-    use, changed = _bar_range(versions, day, bar_start_et)
+         "high": None, "low": None, "final": False, "from": None, "range_seen": None, "range_changed": None,
+         "range_disputed": None}
+    use, changed, disputed = _bar_range(versions, day, bar_start_et)
+    p["range_disputed"] = disputed
     if use is not None:
         p.update(high=use["high"], low=use["low"], final=True, **{"from": use["from"]},
                  range_seen=_stamp(use["seen"]), range_changed=changed)
@@ -252,6 +276,8 @@ def range_of(pick: Mapping) -> dict:
     out = {"high": pick.get("high"), "low": pick.get("low"), "final": pick.get("final"), "from": pick.get("from")}
     if pick.get("range_changed"):
         out["changed"] = pick["range_changed"]
+    if pick.get("range_disputed"):
+        out["disputed"] = pick["range_disputed"]
     return out
 
 
