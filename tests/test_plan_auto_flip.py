@@ -89,7 +89,7 @@ class Host:
         self.tape = []                  # what reread() answers, in order; the last one repeats
         self.left = {"orders_pick": 5, "orders_day": 20, "calls_minute": 40}
         self.said, self.gone, self.disarms, self.logs, self.keys = [], [], [], [], set()
-        self.busied, self.busy_why = [], []
+        self.busied, self.busy_why, self.busy_ends = [], [], []
         self.orders = lambda: []        # the order list reread() gives auto_entry (the fixture sets it)
 
     def armed(self):
@@ -154,9 +154,11 @@ class Host:
     def forget(self, key):
         self.keys.discard(key)
 
-    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY):
+    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY, end_step=True):
+        # end_step: Step 6's keyword since 2ca2073 (brief 25); False lets the other picks go on.
         self.busied.append(what)
         self.busy_why.append(why)
+        self.busy_ends.append(end_step)
 
 
 def tape_pick(last, high=42.48, low=41.92, final=True, age=0.1, entry=None):
