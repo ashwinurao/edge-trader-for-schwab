@@ -392,7 +392,7 @@ async function openArm() {
   $("ovl").innerHTML = `<div class="ovl"><div class="dlg" role="dialog" aria-label="Arm the plan">
     <h3>Arm “${esc(t.playbook)}” for today?</h3>
     <div class="mutline">Picks: <b>${esc((t.picks || []).join(", ") || "none")}</b> · <b>${esc(t.shares)} share each</b> ·
-      risk per pick $${t.risk == null ? "not set" : Number(t.risk).toFixed(2)} · calm flag ${t.calm == null ? "not known" : t.calm ? "calm (half size)" : "not calm (full size)"}</div>
+      risk per pick ${t.risk == null ? "not set" : "$" + Number(t.risk).toFixed(2)} · calm flag ${t.calm == null ? "not known" : t.calm ? "calm (half size)" : "not calm (full size)"}</div>
     <div class="k">It will</div><ul>${li(t.will)}</ul>
     <div class="k">It will not</div><ul>${li(t.will_not)}</ul>
     <div class="k">Bounds (start numbers, not approved by Ash; playbook.json "armed")</div>

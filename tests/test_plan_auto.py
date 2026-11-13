@@ -649,6 +649,27 @@ def test_watch_end_cancels_each_unfilled_entry_and_confirms(rig):
     assert not p["armed"] and "fast watch ended" in p["disarmed"]["why"] and p["resting"] == []
 
 
+def test_no_pullback_in_the_wait_cancels_that_entry_before_the_watch_end(rig):
+    """The engine's pullback wait (automatic.pullback_wait_seconds, 120): the trigger 42.49 traded
+    and the price ran past the limit 42.55 with nothing filled. 120 s after the trigger was seen
+    the plan cancels that entry, once; the others rest until 09:35."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    oid = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}["AAAA"]
+    rig.tape.prices["AAAA"] = 42.56
+    run(rig, et(9, 33, 2))                              # seen at 09:31:03.0; the wait ends 09:33:03.0
+    assert rig.broker.cancelled == []
+    run(rig, et(9, 33, 10))
+    assert rig.broker.cancelled == [oid]
+    start = lines(rig, "cancel_start")
+    assert [x["ticker"] for x in start] == ["AAAA"] and "pullback" in json.dumps(start[0])
+    e = {r["ticker"]: r["entry"] for r in rig.desk.state()["rows"]}["AAAA"]
+    assert e["state"] == plan_entries.NONE and "Cancelled by the armed plan" in e["text"]
+    assert rig.plan.panel()["armed"]
+    run(rig, et(9, 34, 59))
+    assert rig.broker.cancelled == [oid] and len(rig.broker.placed) == 4    # no resend
+
+
 def test_a_filled_entry_is_left_alone(rig):
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))

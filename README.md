@@ -424,8 +424,10 @@ Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge S
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
 `Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
 attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
-again before each send. At the end of the fast watch (09:35 ET) it cancels each plan entry that has not
-filled, one attempt per order, waiting for Schwab to confirm, and then disarms. It never flips, chases,
+again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
+but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
+log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
+waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never flips, chases,
 exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it.
@@ -482,7 +484,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
-| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones at 09:35 ET. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, or at 09:35 ET). Off by default. |
 
 ## Good to know
 
