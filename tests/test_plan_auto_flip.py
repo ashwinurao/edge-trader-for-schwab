@@ -522,7 +522,7 @@ def test_not_an_entry_placed_by_a_click(r):
     assert entry(r)["state"] == "hand"            # the engine leaves a click's entry alone
     o = engine.order_for("short", Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
     got = r.desk.flip_auto("AAAA", "SHORT", o, limit=3)
-    assert got["stage"] == "refused" and "placed by a click" in got["error"]
+    assert got["stage"] == "refused" and got["error"] == plan_entries.CLICK_TAKES_ROW
     nothing_at_schwab(r)
 
 
@@ -715,10 +715,10 @@ def test_no_automatic_flip_or_relevel_after_a_click_flip(r):
     assert flip.on_flip(handlers.Lane(r.host, {**flip_decision(r, side="long")}, pick, {})) is False
     o = engine.order_for("long", Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
     got = r.desk.flip_auto("AAAA", "LONG", o, kind="flip", limit=3)
-    assert got["stage"] == "refused" and "placed by a click" in got["error"]
+    assert got["stage"] == "refused" and got["error"] == plan_entries.CLICK_TAKES_ROW
     got = r.desk.flip_auto("AAAA", "SHORT", engine.order_for("short", Decimal("42.60"), Decimal("41.92"),
                                                               Decimal(100), RULES), kind="relevel", limit=1)
-    assert got["stage"] == "refused" and "placed by a click" in got["error"]
+    assert got["stage"] == "refused" and got["error"] == plan_entries.CLICK_TAKES_ROW
     assert len(r.broker.calls) == calls and rec(r)["origin"] == "click"
 
 
@@ -732,9 +732,10 @@ def test_no_automatic_flip_or_relevel_after_a_click_cancel(r):
     pick = tape_pick(42.10, entry=entry(r))
     assert flip.on_flip(handlers.Lane(r.host, flip_decision(r), pick, {})) is False
     o = engine.order_for("short", Decimal("42.48"), Decimal("41.92"), Decimal(100), RULES)
+    assert rec(r)["origin"] == "click" and entry(r)["state"] == "hand"
     for kind in ("flip", "relevel"):
         got = r.desk.flip_auto("AAAA", "SHORT" if kind == "flip" else "LONG", o, kind=kind, limit=3)
-        assert got["stage"] == "refused"
+        assert got["stage"] == "refused" and got["error"] == plan_entries.CLICK_TAKES_ROW
     assert len(r.broker.calls) == calls and len(r.broker.placed) == 1
 
 
@@ -1232,7 +1233,7 @@ def test_executor_no_flip_or_relevel_after_a_click_flip(frig):
     frig.view.bars["AAAA"] = (42.60, 41.92, 42.30)
     run_plan(frig, et(9, 31, 8))
     assert len(frig.broker.placed) == placed and frig.broker.cancelled == [ids["AAAA"]]
-    assert "placed by a click" in frig.plan.left["AAAA"]
+    assert frig.plan.left["AAAA"] == plan_entries.CLICK_TAKES_ROW
     assert frig.desk.records()["AAAA"]["origin"] == "click"
 
 
@@ -1243,3 +1244,15 @@ def test_executor_no_flip_after_a_click_cancel(frig):
     frig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
     run_plan(frig, et(9, 31, 8))
     assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 4
+    assert frig.plan.left["AAAA"] == plan_entries.CLICK_TAKES_ROW
+
+
+def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):
+    place_long(r)
+    assert run(r) is True                                                   # the plan flips to short
+    assert rec(r)["auto_note"] == "Flipped by the armed plan (1 of 3)."
+    r.desk._put("AAAA", relevels=1)
+    assert r.desk.cancel("AAAA")["ok"]                                      # Ash cancels it
+    got = rec(r)
+    assert got["origin"] == "click" and got["flips"] == 1                   # the click's counter stays
+    assert not {"relevels", "auto_note", "auto_note_for"} & set(got)

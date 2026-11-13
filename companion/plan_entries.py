@@ -80,7 +80,8 @@ OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
 # Architect's ruling of 2026-11-13 16:17 UTC (brief 14), "a click takes the row for the day": a
 # Place, Flip or Cancel click on a row makes it the click's (origin "click") and clears every key
 # an automatic step wrote. A step that adds a key adds it here. The click's own counters (flips) stay.
-AUTO_KEYS = ("kind", "sent", "sent_at", "wait_from", "wait_until", "range")
+AUTO_KEYS = ("kind", "sent", "sent_at", "wait_from", "wait_until", "range",
+             "relevels", "auto_note", "auto_note_for")    # Step 7: the re-level count and the row's flip line
 CLICK_TAKES_ROW = "Yours since your click. The armed plan leaves this row for today."
 
 
@@ -844,6 +845,10 @@ class PlanDesk:
         what = "flip" if kind == "flip" else "re-level"
         if entry["state"] in BUSY:
             return f"{ticker}: the last action is still running."
+        if rec.get("origin") != "auto":
+            # A click takes the row for the day (architect's ruling, 2026-11-13 16:17 UTC); a row
+            # with no origin is not the plan's either (when unsure, refuse).
+            return CLICK_TAKES_ROW
         if entry["state"] == RED:
             return rec.get("red_why") or f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
         if entry["state"] == UNKNOWN:
@@ -852,9 +857,6 @@ class PlanDesk:
             return ORDERS_OLD
         if entry["state"] != SENT or not entry["resting"]:
             return f"{ticker} has no resting, unfilled entry to {what}."
-        if rec.get("origin") != "auto":
-            # When unsure, refuse (CONTRIBUTING rule 4): an entry sent by a click stays the user's.
-            return f"{ticker}'s entry was placed by a click: the armed plan does not {what} it."
         if rec.get("kind") == "chase":
             return f"{ticker}'s entry was chased: a chased entry is never flipped or re-levelled (brief 18)."
         old = rec.get("side")

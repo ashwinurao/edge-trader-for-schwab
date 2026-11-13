@@ -77,8 +77,8 @@ def arm_relevel(rules: Any) -> str:
     return ("Re-level (the same switch): when Edge Scanner's 09:30 bars request moves the range by more than one "
             "cent from the one a resting plan entry was built on, and that entry has not filled or triggered, "
             "cancel it, confirm, and place the same side from the new range; at most "
-            f"{'once' if n == 1 else f'{n} times'} a pick a day. After a fill nothing moves: the row says the "
-            "range changed.")
+            f"{'once' if n == 1 else f'{n} times'} a pick a day. After a fill nothing moves (the plan never "
+            "moves a stop); the panel says the range changed.")
 
 
 def register(reg: Registry) -> None:
