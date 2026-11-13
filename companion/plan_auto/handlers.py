@@ -31,10 +31,12 @@ What a Lane gives a handler (names fixed with Step 7's thread, 2026-11-13):
 - disarm(reason, for_day=False): the whole plan disarms; for_day stops a new Arm today (a 429).
 - delegate(kind) -> None when no handler for `kind` is on, else that handler's answer.
 - once(key) -> True the first time this key is seen today (one automatic cancel per order id).
-- busy(what): Trader's order lock was busy (a desk answer with `busy`: a click, a ticket send or
-  Flat all holds it), so nothing reached Schwab. Not an action: return True after it; the executor
-  ends the step, tries no other pick on that reading and waits one tick (architect's review 1,
-  2026-11-13 16:45 UTC). Said once per pick while it lasts.
+- busy(what, why=TRADER_BUSY): nothing reached Schwab and the pick tries again on a later reading.
+  Trader's order lock was busy (a desk answer with `busy`: a click, a ticket send or Flat all holds
+  it; architect's review 1, 2026-11-13 16:45 UTC), or Schwab's order list was old (a desk answer
+  with `again` and no `busy`: an old list is a wait, architect's live-test notes N1, 2026-11-13).
+  Not an action: return True after it; the executor ends the step, tries no other pick on that
+  reading and waits one tick. Said once per pick while the same reason lasts.
 
 The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces brief 16's counts):
 - A send counts its worst case, armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC). The
@@ -50,10 +52,12 @@ The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces
 - Cancels and sends go one at a time, nearest to the trigger first, each after a Disarm check.
 - A flip (Step 7) is a cancel (never refused) then a send (checked). When the send half is
   refused, the pick ends with no order and says why.
-- The worst minute, not measured live: 7 sends (35) and 3 flip cancels (36) is 71 calls by the
-  plan; with the poller's 32-50 a minute that is 103-121 against Schwab's 120. The top passes 120,
-  and needs every cancel to use all ten read-backs and every send to find an unresolved close. A
-  429 disarms for the day. The real numbers come from the netlog on the first 1-share day.
+- The limit that binds is the poller's own MAX_PER_MIN 70 (companion/poller.py _throttle), not
+  Schwab's 120: every Schwab call of Edge Trader counts there and order calls never wait, so the
+  poller's reads wait and the order list can go old (live test 2026-11-13: 76 and 78 calls in a
+  minute; architect's live-test notes N1). An old list is a wait for every action here. Step 6
+  alone with four picks: at most 4 sends (16 usual, 20 worst) and 4 cancels (12 to 48), at most 68
+  calls in one minute. A 429 disarms for the day. Brief 24 changes the poller.
 tests/test_plan_auto.py pins both worst cases against break_entry.prepare and Trader.cancel_entry.
 
 Step 6 registers would_place and would_cancel (default_registry). A decision kind with no handler
@@ -65,6 +69,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
+from .. import plan_entries
 from . import switch_on
 
 Handler = Callable[["Lane"], bool]
@@ -141,7 +146,7 @@ class LaneHost(Protocol):
     def disarm(self, reason: str, for_day: bool = False) -> None: ...
     def once(self, key: str) -> bool: ...
     def forget(self, key: str) -> None: ...
-    def busy(self, ticker: str, what: str) -> None: ...
+    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY) -> None: ...
 
 
 class Lane:
@@ -198,8 +203,8 @@ class Lane:
     def once(self, key: str) -> bool:
         return self.host.once(key)
 
-    def busy(self, what: str) -> None:
-        self.host.busy(self.ticker, what)
+    def busy(self, what: str, why: str = plan_entries.TRADER_BUSY) -> None:
+        self.host.busy(self.ticker, what, why)
 
     def delegate(self, kind: str) -> Optional[bool]:
         h = self.host.registry.get(kind, self.host.env)
@@ -265,8 +270,11 @@ def on_place(lane: Lane) -> bool:
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
         # Schwab, so the order and calls go back.
         lane.refund(orders=1, calls=calls)
-        if r.get("busy") or r.get("again"):
+        if r.get("busy"):
             lane.busy("send")                   # the step ends; the pick tries one tick later
+        elif r.get("again"):
+            # An old order list (N1): the same wait, with the desk's reason on the pick's line.
+            lane.busy("send", str(r.get("error") or ""))
         else:
             lane.leave(f"not sent: {r.get('error')}")
         return True
@@ -288,10 +296,10 @@ def on_cancel(lane: Lane) -> bool:
     if not lane.once(key):
         return False                           # tried once already: never repeated
     r = lane.desk.cancel_auto(lane.ticker, str(lane.decision.get("why") or ""), log=lane.log)
-    if r.get("not_sent") and r.get("busy"):
-        lane.host.forget(key)                  # Trader's lock was busy: nothing reached Schwab
-        lane.busy("cancel")                    # the step ends; the cancel tries one tick later
-        return True
+    if r.get("not_sent") and (r.get("busy") or r.get("again")):
+        lane.host.forget(key)                  # Trader's lock was busy, or the list old: nothing reached Schwab
+        lane.busy("cancel", plan_entries.TRADER_BUSY if r.get("busy") else str(r.get("error") or ""))
+        return True                            # the step ends; the cancel tries one tick later
     if r.get("not_sent"):
         # The desk found no resting plan entry on the row (a click took it, or the record moved):
         # nothing reached Schwab. The attempt for this order id is used; the plan leaves the pick.

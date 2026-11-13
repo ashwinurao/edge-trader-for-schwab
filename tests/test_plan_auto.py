@@ -472,11 +472,58 @@ def test_must_not_send_when_the_dashboard_arm_goes_off(rig):
     assert rig.broker.placed == [] and "ARM went off" in rig.plan.panel()["disarmed"]["why"]
 
 
-def test_must_not_send_on_an_old_order_list(rig):
+def test_an_old_order_list_is_a_wait_and_the_pick_goes_once_it_is_fresh(rig):
+    """Architect's live-test notes N1 (2026-11-13 20:12 UTC): an old order list is a wait. It used to
+    disarm the plan (and place_auto's refusal left the pick for the day); on 2026-11-13 the poller
+    read orders_today every 12 to 19 s while order calls ran. Old at one reading, fresh at the next:
+    nothing on the old one, nothing spent, then each pick is sent once."""
     arm(rig)
     rig.knobs["fresh"] = False
+    rig.clock.t = et(9, 31, 0.1)
+    assert not rig.plan.safe_step()                         # a wait, not an action
+    p = rig.plan.panel()
+    assert p["armed"] and rig.broker.placed == [] and rig.sent == [] and rig.desk.records() == {}
+    assert rig.plan.orders_day == 0 and rig.plan.bounds_left("DDDD")["calls_minute"] == 40
+    assert {x["ticker"]: x["note"] for x in p["picks"]}["DDDD"] == plan_entries.ORDERS_OLD
+    rig.knobs["fresh"] = True
+    rig.clock.advance(rig.plan.armed_rules.every_seconds)
+    run(rig, et(9, 31, 3))
+    assert placed(rig) == NEAREST_FIRST                     # each exactly once
+    assert [(x["ticker"], x["what"], x["why"]) for x in lines(rig, "wait")] == [("DDDD", "send", plan_entries.ORDERS_OLD)]
+    p = rig.plan.panel()
+    assert {x["ticker"]: x["note"] for x in p["picks"]}["DDDD"] == "" and all(x["left"] == "" for x in p["picks"])
+
+
+def test_an_old_order_list_until_the_watch_ends_sends_nothing_and_says_why(rig):
+    """N1: old from 09:31 to past the watch end. Nothing is ever sent, the plan stays armed until its
+    watch ends (not disarmed by the list), and the pick's line says why, once in the log."""
+    arm(rig)
+    rig.knobs["fresh"] = False
+    run(rig, et(9, 35, 50), start=et(9, 31, 0.1))
+    assert rig.broker.placed == [] and rig.sent == [] and rig.plan.orders_day == 0
+    assert lines(rig, "send_start") == [] and [x["ticker"] for x in lines(rig, "wait")] == ["DDDD"]
+    p = rig.plan.panel()
+    assert not p["armed"] and "fast watch" in p["disarmed"]["why"]
+    assert [x["why"] for x in lines(rig, "disarm")] == [p["disarmed"]["why"]]
+    assert {x["ticker"]: x["note"] for x in p["picks"]}["DDDD"] == plan_entries.ORDERS_OLD
+
+
+def test_an_old_order_list_at_the_watch_end_holds_the_cancels_until_it_is_fresh(rig):
+    """N1 for the cancel twin: the plan acts on no old list. At 09:35 the cancels wait (the attempt
+    for each order id is not used up), then go once the list is fresh, each once."""
+    arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
-    assert rig.broker.placed == [] and "order list went old" in rig.plan.panel()["disarmed"]["why"]
+    ids = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}
+    rig.knobs["fresh"] = False
+    run(rig, et(9, 35, 2), start=et(9, 35, 0))
+    assert rig.broker.cancelled == [] and lines(rig, "cancel_start") == []
+    assert [(x["ticker"], x["what"], x["why"]) for x in lines(rig, "wait")] == [
+        ("DDDD", "cancel", plan_entries.ORDERS_OLD_AUTO_CANCEL)]
+    assert rig.plan.panel()["armed"]
+    rig.knobs["fresh"] = True
+    run(rig, et(9, 35, 15))
+    assert sorted(rig.broker.cancelled) == sorted(ids.values())
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "AAAA", "BBBB", "CCCC"]
 
 
 def test_must_not_send_on_a_blocked_name(rig):
@@ -689,6 +736,30 @@ def test_a_4xx_is_not_retried_and_the_other_picks_go_on(rig):
     assert placed(rig) == NEAREST_FIRST                   # DDDD tried once, never again
     assert [s for s in placed(rig) if s == "DDDD"] == ["DDDD"]
     assert "rejected" in rig.plan.left["DDDD"] and rig.plan.arming.is_armed(rig.clock.now())
+
+
+STOP_THROUGH = ("The stop price must be above the current ask for buy stop orders and below the bid for sell "
+                "stop orders.")
+
+
+def test_a_reject_4_s_after_the_201_ends_the_pick_and_the_others_go_on(rig):
+    """Architect's live-test notes N2 (2026-11-13 20:12 UTC): Schwab accepted an entry (201, order id),
+    then rejected it 4.0 s later (CBRS 19:39:08 UTC; SPY 18:49:43 UTC) because the level was reached
+    between our quote and its check. The pick ends: nothing is sent for it again, the plan stays
+    armed, the other picks go on (and get their 09:35 cancels), and the row shows Schwab's reason."""
+    arm(rig)
+    rig.broker.delay = 0.4                                    # today's p50: DDDD's 201 at 09:31:00.9
+    run(rig, et(9, 31, 4.9), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    oid = rig.desk.records()["DDDD"]["order_id"]
+    rig.broker.orders[oid].update(status="REJECTED", statusDescription=STOP_THROUGH)   # 4.0 s after its 201
+    run(rig, et(9, 31, 30))
+    assert placed(rig) == NEAREST_FIRST and rig.plan.arming.is_armed(rig.clock.now())
+    row = {r["ticker"]: r["entry"] for r in rig.desk.state()["rows"]}["DDDD"]
+    assert row["order_status"] == "REJECTED" and row["text"] == f"Ended REJECTED with nothing filled. Schwab: {STOP_THROUGH}"
+    run(rig, et(9, 35, 15), start=et(9, 35, 0))
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["AAAA", "BBBB", "CCCC"]
+    assert placed(rig) == NEAREST_FIRST and oid not in rig.broker.cancelled
 
 
 def test_a_429_disarms_for_the_day(rig):

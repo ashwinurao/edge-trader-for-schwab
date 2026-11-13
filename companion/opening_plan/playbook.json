@@ -174,7 +174,7 @@
     },
     "calls_per_minute": {
       "value": 40,
-      "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC); with the poller's 32-50 a minute it stays under Schwab's 120"
+      "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC). The limit that binds is the poller's own MAX_PER_MIN 70 (companion/poller.py _throttle), not Schwab's 120: Edge Trader's order calls count there and never wait, so the poller's reads wait (live test 2026-11-13: 76 and 78 calls in a minute, poller reads up to 14.8 s late). Brief 24 changes the poller (architect's live-test notes N1)"
     },
     "calls_per_send": {
       "value": 5,
