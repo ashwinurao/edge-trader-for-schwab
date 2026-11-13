@@ -200,7 +200,20 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   power and equity from the account read Edge Trader already makes every 5 seconds, with the time read.
   Missing, or older than 30 seconds, it says "not known", never a zero; with `--private` it is hidden. It
   is on the screen only, never in a log. `--demo` shows invented numbers; set `EDGE_TRADER_PLAN_DEMO_ET`
-  (e.g. `09:10:00`) to start the demo clock at that time of day and see the preview.
+  (e.g. `09:10:00`) to start the demo clock at that time of day and see the preview, and
+  `EDGE_TRADER_PLAN_DEMO_RV20` (e.g. `12.3`) for a day that is not calm.
+  Before the 09:30 minute there is no range, so each preview row, and each frozen row still waiting for
+  the minute, shows **estimated shares**, marked "estimate": the risk per pick you set (half on a calm
+  day) over a typical first minute of 0.27 x ATR, with the usual range at 0.37 and 0.19 x ATR, for
+  example "about 154, usually 112 to 219". Under it, "buying power allows N": a quarter of day-trading
+  buying power over the row's last price, at Schwab's full margin for every name. The headline is the
+  smaller of the two, and says "limited by buying power" when buying power decides. The header says
+  once what the estimate assumes. The numbers are in `playbook.json` under `size.estimate` (from a 2026
+  study of OV's top 4; Ash picked "About N, usually L to H" on 2026-11-13): `show` is `range`,
+  `cautious` (one number at 0.37 x ATR) or `none`. An estimate is never a size: rows with levels size
+  from the real minute exactly as before, and only get a note when their shares are above what buying
+  power allows. Buying power not known: no maximum; with `--private` it is hidden. The maximum is on
+  the screen only, never in a log.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
 - **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
@@ -615,6 +628,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 | `EDGE_TRADER_PLAN_DEMO_ET` | `--demo` only: the time of day (ET, e.g. `09:10:00`) the demo clock starts at, so the Opening plan shows the 09:00 to 09:25 preview. Default: 09:31:05. |
+| `EDGE_TRADER_PLAN_DEMO_RV20` | `--demo` only: the SPY RV20 the demo's Opening plan reads (e.g. `12.3` for a day that is not calm). Default: 9.80, a calm day. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 | `EDGE_TRADER_NETLOG` | `0` turns off the network record in `data/netlog/` (answers, calls, waits, routes, refusals, lag) and its threads. On by default. |
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
