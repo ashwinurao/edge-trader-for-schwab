@@ -18,10 +18,19 @@
   "size": {
     "calm_rv20_max": 10.5,
     "calm_multiplier": 0.5,
-    "rv20_through_max_days": 4
+    "rv20_through_max_days": 4,
+    "stage": "1_share",
+    "_stage_about": "Step 9 size stage (companion/plan_size.py, brief 19): what a plan entry sends. \"1_share\" (the default, the test stage) sends 1 share; 0.10, 0.25, 0.50 or 1.0 send floor(plan shares x stage), at least 1, inside the ticket's limits. Nothing else is allowed. Raising it is its own one-line PR that quotes Ash's go for that stage (who, when, where). A stage above 1 share needs EDGE_TRADER_PLAN_FLAT=1 (the cover watch) and every point of README section \"Before any stage above 1 share\", including the rule for a stop under entry.min_stop_atr, which Ash decides."
   },
   "exit": {
     "flat_et": "10:00"
+  },
+  "cover": {
+    "_about": "Step 9 partial-fill cover watch (companion/plan_flat.py, brief 19 Part C), only with EDGE_TRADER_PLAN_FLAT=1. A plan row whose shares have no working stop for longer than this turns red with an Add stop button (the user's click). Display only: nothing is sent by the clock.",
+    "grace_seconds": {
+      "value": 3,
+      "note": "start number, not approved by Ash"
+    }
   },
   "buttons": {
     "_about": "Step 4 row buttons (companion/plan_entries.py), only with EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1. Start value from the fast-open design (max 3 flips), not yet approved by Ash.",
