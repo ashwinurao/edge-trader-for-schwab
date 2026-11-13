@@ -932,6 +932,36 @@ def test_the_row_check_skip_is_said_once_per_reason(rig):
         ["row_check_skipped", "row_check_back", "row_check_skipped", "row_check_skipped"]
 
 
+def test_the_panel_shows_a_skipped_row_check_while_armed_and_drops_it_when_it_is_back(rig):
+    """Architect's review 2 of PR #27 (2026-11-13 16:53 UTC): while armed, a protection that is off
+    is on the screen, not only in the log."""
+    arm(rig)
+    app, asks = feed_app(rig)
+    rig.clock.t = et(9, 31, 0.1)
+    assert rig.plan.panel()["row_check_text"] == ""           # not checked yet: nothing to say
+    rig.plan.safe_step()
+    text = rig.plan.panel()["row_check_text"]
+    assert text == ("Row check off: no answer from Edge Scanner's picks route yet. Sends use the open tape "
+                    "alone. Keep this page open, or turn the shadow log on.")
+    rig.clock.t = et(9, 31, 0.2)
+    app.state.opening_plan_view()                             # the page asks (3 s on the fake clock)
+    rig.plan.safe_step()
+    assert rig.plan.panel()["row_check_text"] == ""
+    rig.clock.advance(7)                                      # that answer is now older than 6 s
+    rig.plan.safe_step()
+    assert rig.plan.panel()["row_check_text"].startswith("Row check off: Edge Scanner's last picks answer is ")
+    rig.plan.click_disarm()
+    assert rig.plan.panel()["row_check_text"] == ""           # only while armed
+    page = (X.PLAYBOOK_FILE.parent / "static" / "opening_plan.html").read_text()
+    assert '${a.row_check_text ? `<div class="warnline" id="auto-row-check"' in page
+
+
+def test_the_arm_dialog_says_how_the_row_check_works(rig):
+    assert ("Before each send: check the pick's row against the last OV picks answer this page or the shadow log "
+            "fetched. With none from the last 6 s, send on the open tape alone and say so on this panel."
+            in rig.plan.terms()["will"])
+
+
 def test_decision_lines_carry_the_read_times_and_a_slow_step_says_so(rig):
     """Review 1 item 3: where each step's time went, on the first armed morning."""
     arm(rig)

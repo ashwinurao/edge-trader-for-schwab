@@ -143,6 +143,8 @@ class AutoPlan:
         self.rules = engine.rules_from(playbook)
         self.armed_rules = armed_rules_from(playbook)
         self.playbook_name = str(playbook.get("name") or "")
+        # Step 2's own limit for an old answer (plan.build_view marks the view stale past it).
+        self.rules_feed_stale = float((playbook.get("feed") or {}).get("stale_after_seconds", 6))
         self.registry = registry or default_registry()
         if any(self.registry.get(k, env) is not None for k in ("would_flip", "would_relevel")):
             # Brief 17 item 5: a flip or a re-level is an order too (companion/plan_auto/flip.py).
@@ -165,7 +167,8 @@ class AutoPlan:
         self.last_reading: dict = {}
         self.busy_picks: dict[str, str] = {}   # ticker -> "send" or "cancel" while Trader's lock is busy
         self._busy_step = False
-        self.row_check = ""                     # why the row check is skipped now ("" when it runs)
+        self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
+        self.row_check_why = ""                 # the same in words, for the panel
         self.problem = ""
         self._mono = _time.monotonic
         self._stop = threading.Event()
@@ -342,7 +345,7 @@ class AutoPlan:
             if self.day != day:
                 self.day, self.state, self.left, self.notes, self.known = day, None, {}, {}, {}
                 self.orders_pick, self.orders_day, self.onces = Counter(), 0, set()
-                self.busy_picks, self.row_check = {}, ""
+                self.busy_picks, self.row_check, self.row_check_why = {}, "", ""
                 self.sends.clear()
 
     def _read(self, now: datetime) -> tuple[Any, bool, str]:
@@ -464,7 +467,7 @@ class AutoPlan:
             elif view.get("state") != "OK":
                 why, code = view.get("message") or f"the plan view says {view.get('state')}", str(view.get("state"))
         with self._lock:
-            was, self.row_check = self.row_check, code
+            was, self.row_check, self.row_check_why = self.row_check, code, why
         if code and code != was:
             self.log("row_check_skipped", None, why=f"{why}. The sends go on the open tape alone until it is back.",
                      source=view.get("source"))
@@ -634,6 +637,9 @@ class AutoPlan:
                 "tape: send Step 3's break entry on the side nearer the last trade, "
                 f"{break_entry.BREAK_MAX_SHARES} share, its stop attached.",
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
+                "Before each send: check the pick's row against the last OV picks answer this page or the shadow log "
+                f"fetched. With none from the last {self.rules_feed_stale:g} s, send on the open tape alone and say so "
+                "on this panel.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
                 "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env, self.rules)
         # Name each step that is not on (Step 8 engineer, 2026-11-13: with only the chase on, the
@@ -666,6 +672,7 @@ class AutoPlan:
             notes = {k: dict(v) for k, v in self.notes.items()}
             left = dict(self.left)
             last = dict(self.last_reading)
+            row_check_why = self.row_check_why if self.row_check else ""
         resting = []
         try:
             recs, orders = self.desk.records(), self._orders()
@@ -683,6 +690,10 @@ class AutoPlan:
                "picks": [{"ticker": t, "decision": (n.get("decision") or {}), "action": n.get("action"),
                           "note": n.get("note") or "", "left": left.get(t, "")} for t, n in sorted(notes.items()) if t != "*"],
                "tape_note": (notes.get("*") or {}).get("note") or "",
+               # A protection that is off shows on the screen while armed (architect's review 2 of
+               # fork PR #27, 2026-11-13 16:53 UTC); gone once the row check runs again.
+               "row_check_text": (f"Row check off: {row_check_why}. Sends use the open tape alone. Keep this page open, "
+                                  "or turn the shadow log on." if armed and row_check_why else ""),
                "resting": sorted(resting),
                # Architect's review, 2026-11-13 16:21 UTC: after any disarm the plan cancels nothing,
                # also not at 09:35, so the page says it in red and names the remedy.
