@@ -1,0 +1,6 @@
+{
+  "_about": "The opening probe's settings (companion/open_probe.py, brief 09). Times are ET, weekdays only. It reads Schwab quotes and previews a 1-share Break order; it never sends an order. quote_every_s and the preview times are start numbers, not approved by Ash.",
+  "windows": ["09:28:00-09:40:00"],
+  "quote_every_s": 5,
+  "previews": ["09:29:30", "09:30:02", "09:30:30", "09:31:02", "09:32:00", "09:35:00"]
+}

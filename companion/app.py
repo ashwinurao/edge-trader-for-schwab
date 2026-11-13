@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, break_entry, fills_feed, netlog
+from . import __version__, break_entry, fills_feed, netlog, open_probe
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -79,6 +79,7 @@ async def lifespan(_app: FastAPI):
     # The network record (netlog.py): its threads, a start note and the event-loop lag task.
     lag_task = netlog.start(f"Edge Trader {__version__} started{' in DEMO mode' if DEMO else ''}")
     poller.start()
+    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO)  # brief 09, off by default
     if not DEMO:
         import threading
         from . import update_check

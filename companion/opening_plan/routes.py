@@ -17,7 +17,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from .feed import ENV_VAR, Feed, Get, http_get
-from .plan import NOT_SET_UP, build_view, load_playbook, parse_risk
+from .plan import NOT_SET_UP, build_view, calm_reading, load_playbook, parse_risk
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,12 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
             log.error("opening plan: %s", bad_url)
     elif demo:
         feed = DemoFeed(now)
+    if url and feed is not None:
+        # Step 5, shadow: off unless EDGE_TRADER_SHADOW=1. It shares this feed and logs what the
+        # automatic plan would do; it sends nothing (companion/opening_plan/shadow.py).
+        from . import shadow
+        shadow.maybe_start(env, feed, None, lambda: stored_risk(store),
+                           lambda c, at: calm_reading(c.body, c.ok_at, c.error, at, pb)["calm"])
 
     @app.get(f"/features/{FEATURE}.js", include_in_schema=False)
     def opening_plan_js():
