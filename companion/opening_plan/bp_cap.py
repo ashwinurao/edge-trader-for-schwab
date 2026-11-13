@@ -30,8 +30,11 @@ The rule (every number is a start number, Ash's to approve; playbook size.buying
 - Before a row's 09:30 bar is final its risk per share is not known: the term uses the narrow
   first minute (playbook size.estimate.narrow_atr x ATR, the most shares) at the row's last price,
   and X is an estimate. A row with no ATR and no final bar is left out and named.
-- The balances and the sums of the terms are fixed for the day (CapLatch) at the first view with
-  at least one final bar and balances at most 30 s old. Why fixed: the plan's own orders and Ash's
+- The balances and the sums of the terms are fixed for the day (CapLatch) at the first view where
+  every counted pick has its final bar and the balances are at most 30 s old. Why every pick: the
+  bar's range, not the price, drives the need (shares = risk / range), so a pick fixed at the
+  narrow estimate could need more than its share when its real bar is narrower (Ash asked about
+  this on 2026-11-13 22:33 UTC). Until then nothing above 1 share is sent. Why fixed: the plan's own orders and Ash's
   trades lower the balances afterwards, and a size that moves between the page and the click is
   refused (plan_entries.PlanDesk._same). X is worked from them on every view, so a change of the
   share or the Risk per pick moves the sizes at once. In memory only: after a restart they are

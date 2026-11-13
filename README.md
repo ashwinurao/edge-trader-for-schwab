@@ -238,9 +238,10 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   counted at `size.buying_power.default_rate` (1.0, no margin) and says so, and Schwab's own words on a
   hard-to-borrow or rejected short show on the row. The screen says it both ways round, for example "At
   50% the most risk per pick is $N" and "Risk per pick $100 needs about P% of buying power" ("more
-  than 100%" when it can't fit). Before the first final 09:30 bar it is an estimate (each pick's range
-  taken as the narrow 0.19 x ATR); at the first view with a final bar and balances read within 30
-  seconds the balances and the sum are fixed for the day, so the plan's own orders never shrink it, while
+  than 100%" when it can't fit). Until every pick's 09:30 bar is final it is an estimate (a pick without
+  its final bar counts at the narrow range, 0.19 x ATR, the most shares); at the first view where every
+  pick has its final bar and the balances were read within 30 seconds, the balances and the sum are
+  fixed for the day, so the plan's own orders never shrink it, while
   a change to the share or to Risk per pick moves the sizes at once. A restart reads the balances again.
   The fixed cap also guards the send on the server (`companion/plan_entries.py`): a size stage above 1
   share is refused until it is fixed. In the test stage (`size.stage` "1_share") the screen says "Test

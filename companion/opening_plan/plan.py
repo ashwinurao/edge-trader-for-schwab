@@ -36,7 +36,7 @@ Buying power cap (brief 23, companion/opening_plan/bp_cap.py; Ash's asks of 2026
 balance allows at each name's margin rate from today's Schwab previews, all picks at once at their
 worse side. Every row is sized at min(risk used, X), so the picks keep equal risk, and a capped
 row says "capped by buying power". Before a final 09:30 bar X is an estimate; the balances and
-sums are fixed for the day at the first final bar (bp_cap.CapLatch), and X follows Ash's share
+sums are fixed for the day once every pick's bar is final (bp_cap.CapLatch), and X follows Ash's share
 and Risk per pick at once. With --private every dollar of it is hidden on the screen, but the
 rows are still sized by it. Each row also says Schwab's rate for it, long and short apart when
 they differ.
@@ -662,7 +662,9 @@ def cap_view(rows: list, account: Optional[Mapping], rates: Optional[Mapping], r
     if fixed is None and most is not None:
         out["state"] = bp_cap.ESTIMATE
         out["estimate"] = preview or any(p.estimate for p in picks)
-        if latch is not None and not preview and any(not p.estimate for p in picks):
+        # Fixed only when no counted pick is an estimate: a real bar narrower than the narrow
+        # estimate would need more than its share (bp_cap docstring).
+        if latch is not None and not preview and picks and not any(p.estimate for p in picks):
             at_et = now.astimezone(ET).strftime("%H:%M:%S")
             if latch.offer(day, pools, at_et, out["estimate"]):
                 out["state"], out["at_et"] = bp_cap.FIXED, at_et
@@ -704,7 +706,7 @@ def cap_view(rows: list, account: Optional[Mapping], rates: Optional[Mapping], r
                 "A restart reads the balances again, after the plan's own orders, so sizes after a restart can "
                 "come out smaller.")
     else:
-        when = ("Estimate until the first final 09:30 bar: then the balances are fixed for today. "
+        when = ("Estimate until every pick's 09:30 bar is final: then the balances are fixed for today. "
                 "Until then nothing above 1 share is sent.")
     names = f"{out['rated']} of {out['names']} names have a margin rate from today's Schwab previews."
     if out["no_margin"]:

@@ -63,7 +63,10 @@ class Plan:
 
     def cap_fixed(self, available=10_000_000.0):
         """Made-up balances, fresh at NOW, and a latch: the cap is fixed at the first view. At the
-        default it is far above every size, so a stage test sends the stage's size (brief 23)."""
+        default it is far above every size, so a stage test sends the stage's size (brief 23).
+        The cap fixes only when every pick's bar is final, so CCCC's bar is made final here."""
+        for r in self.rows:
+            r.pop("first_minute_as_of", None)
         bal = {"availableFunds": available, "buyingPower": 4 * available, "dayTradingBuyingPower": 4 * available}
         self.account = {"balances": bal, "ok_at": NOW - timedelta(seconds=2), "private": False}
         self.latch = CapLatch()

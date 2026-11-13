@@ -190,7 +190,7 @@ def test_the_cap_is_an_estimate_before_the_bar_and_fixed_at_the_first_final_bar(
     v = view(et(9, 26), [frow(1, "AAAA")], latch=latch)
     assert v["cap"]["state"] == "ESTIMATE" and v["cap"]["estimate"] is True and v["cap"]["most"] == 125.86
     assert latch.get(et(9, 26).astimezone(ET).date()) is None
-    assert "Estimate until the first final 09:30 bar" in v["cap"]["text"]
+    assert "Estimate until every pick's 09:30 bar is final" in v["cap"]["text"]
     # 09:31:10: the final bar. Term max(42.55, 41.91) / 0.57 = 74.6491; X = 11,620.62 / 74.6491 = 155.66.
     v = view(at_now(), [frow(1, "AAAA", fm=FM)], latch=latch)
     assert v["cap"]["state"] == "FIXED" and v["cap"]["at_et"] == "09:31:10" and v["cap"]["most"] == 155.66
@@ -202,6 +202,30 @@ def test_the_cap_is_an_estimate_before_the_bar_and_fixed_at_the_first_final_bar(
     assert v["cap"]["test_stage"] is True and v["cap"]["risk_text"] == ""
     assert "Balances fixed at 09:31:10 ET for today" in v["cap"]["text"]
     assert "A restart reads the balances again, after the plan's own orders" in v["cap"]["text"]
+
+
+def test_the_cap_is_fixed_only_when_every_picks_bar_is_final():
+    # Ash, 2026-11-13 22:33 UTC: the first bar's size moves the need a lot. The need follows the
+    # range (shares = risk / range), so a pick still at the narrow estimate when the cap fixes could
+    # need more than its share. The cap fixes only when no counted pick is an estimate.
+    latch = CapLatch()
+    so_far = frow(2, "BBBB", fm={"open": 18.40, "high": 18.60, "low": 18.30, "close": 18.50}, atr=0.95, last=18.45)
+    so_far["first_minute_as_of"] = "09:30:40"
+    no_bar = frow(3, "CCCC", fm=None, atr=3.10, last=71.90)
+    for other in (so_far, no_bar):
+        v = view(at_now(), [frow(1, "AAAA", fm=FM), other], latch=latch)
+        assert v["cap"]["state"] == "ESTIMATE" and v["cap"]["estimate"] is True, other["ticker"]
+        assert latch.get(at_now().astimezone(ET).date()) is None
+        assert "Estimate until every pick's 09:30 bar is final" in v["cap"]["text"]
+        assert all(r["cap"]["state"] == "ESTIMATE" for r in v["rows"] if r.get("cap"))
+    # Both bars final: fixed now, and no longer an estimate.
+    final = frow(2, "BBBB", fm={"open": 18.40, "high": 18.60, "low": 18.30, "close": 18.50}, atr=0.95, last=18.45)
+    v = view(at_now(), [frow(1, "AAAA", fm=FM), final], latch=latch)
+    assert v["cap"]["state"] == "FIXED" and v["cap"]["estimate"] is False
+    # A pick left out (no ATR and no bar) does not hold the fixing back; it is named instead.
+    latch2 = CapLatch()
+    v = view(at_now(), [frow(1, "AAAA", fm=FM), frow(2, "EEEE", fm=None, atr=None)], latch=latch2)
+    assert v["cap"]["state"] == "FIXED" and [x["ticker"] for x in v["cap"]["left_out"]] == ["EEEE"]
 
 
 def test_x_does_not_move_when_balances_drop_but_follows_the_share_and_the_risk():
@@ -411,14 +435,14 @@ def test_above_one_share_a_send_is_refused_until_the_cap_is_fixed(rig):
 
 
 def test_the_stage_applies_to_the_capped_plan_size(rig, caplog):
-    # Available funds 23,241.24: AAAA final (term 74.6491) and CCCC so far, counted at the narrow
-    # minute (71.94 / 0.456 = 157.7632): sum 232.4123; X = 11,620.62 / 232.4123 = 50.00.
+    # Available funds 18,532.61, no previews (rate 1.0): AAAA term 42.55 / 0.57 = 74.6491 and CCCC
+    # (its bar final) 71.94 / 0.65 = 110.6769: sum 185.3260; X = 9,266.305 / 185.3260 = 50.00.
     # AAAA at $100 is sized at $50: 50 / 0.57 = 87 shares; 25% of 87 = 21.
     caplog.set_level(logging.WARNING)
-    rig.view.cap_fixed(available=23241.24)
+    rig.view.cap_fixed(available=18532.61)
     rig.desk.stage = plan_size.parse_stage(0.25)
     v = rig.view()
-    assert v["cap"]["state"] == "FIXED" and v["cap"]["most"] == 50.0 and v["cap"]["estimate"] is True
+    assert v["cap"]["state"] == "FIXED" and v["cap"]["most"] == 50.0 and v["cap"]["estimate"] is False
     r = row(rig)
     assert r["send"]["long"] == {**LONG, "shares": 21, "plan_shares": 87}
     res = rig.desk.place("AAAA", "LONG", {**LONG, "shares": 21})
@@ -432,7 +456,7 @@ def test_the_stage_applies_to_the_capped_plan_size(rig, caplog):
 def test_the_servers_guard_caps_the_send_even_if_the_rows_size_were_larger(rig):
     # plan_entries._sized passes the row's cap through plan_size.shares(caps=): a row whose shares
     # were somehow above it still sends at most the cap.
-    rig.view.cap_fixed(available=23241.24)
+    rig.view.cap_fixed(available=18532.61)
     rig.desk.stage = plan_size.parse_stage(1.0)
     v = rig.view()
     aaaa = next(r for r in v["rows"] if r["ticker"] == "AAAA")
