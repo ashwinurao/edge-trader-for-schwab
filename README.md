@@ -677,19 +677,34 @@ the sends, 12 to 48 for the cancels, at most 68 in one minute (sends held back b
 before 09:35, then the four 09:35 cancels, each at its worst). The limit that binds is not Schwab's 120
 but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
 Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
-wait. That is why the order list can go old while the plan works; brief 24 changes the poller.
+wait. That is why the order list could go old while the plan works, and why the plan holds the
+poller's later reads while it works (next paragraph).
 Since brief 26 (`companion/read_retry.py`) a quote or order read whose connection Schwab dropped before
 any answer is sent once more, so each such drop adds one call to a send or a cancel (on 2026-11-13,
 1 in 31 ticket quotes dropped). `calls_per_send` stays 5 and does not count them.
+
+From 09:30:00 ET, while armed and a send or cancel is left, the plan holds the poller's later reads
+(brief 24: `Poller.hold_later` in `companion/poller.py`, the rules in `companion/poll_budget.py`). The
+account and the order list keep their 5 second pace. Fills still come about every 15 seconds
+(`HELD_FILLS_EVERY_S`). Position marks (quotes), corrections and market hours pause, and the
+dashboard shows the marks, open P&L and live R as old. A stop the app moves itself keeps its reads:
+an Auto B/E that has not fired and a spread stop with Send still get their quotes. The plan asks for
+30 second holds and renews them every 10 seconds, never past its own end (`POLL_HOLD_SECONDS` and
+`POLL_HOLD_RENEW_SECONDS` in `companion/plan_auto/executor.py`). When nothing is left to send or
+cancel, on a disarm, or at the plan's end it stops renewing, and the last hold lapses within 30
+seconds. The hold is the poller's own memory, not a Schwab call. Before 09:30:00 ET, or without an
+Arm click, nothing is held.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
 start and its answer with their times. A step that took over 100 ms before its action adds a
 `slow_step` line. A busy order lock adds one `busy` line per pick; an old order list or account read,
 or a side that is not clear, one `wait` line; and the pick's action after either a `wait_over` line
-with how long it waited (`waited_s`). A skipped
-row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
-or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
+with how long it waited (`waited_s`). A side rule line keeps the rule's code and the pick's side
+(`side_rule`, `side`), never the words on the page, which can name your own shares. The poller hold
+adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
+row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
+request body or share count of your own positions. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
 
 ## Updating to a new release

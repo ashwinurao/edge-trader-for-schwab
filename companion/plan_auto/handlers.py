@@ -40,6 +40,8 @@ What a Lane gives a handler (names fixed with Step 7's thread, 2026-11-13):
   busy(what, why, end_step=False): only this pick waits, and the handler returns False so the
   other picks go on that reading. For a desk answer with `again` and `this_name`: the user's side
   on this name is not clear (brief 25, companion/plan_side.py; architect, 2026-11-13 21:31 UTC).
+- leave and busy take `logged`: the fields the plan's log keeps in place of the page's words. The
+  side rule's words can name the user's own shares, so its log line keeps its code and the side.
 
 The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces brief 16's counts):
 - A send counts its worst case, armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC). The
@@ -134,13 +136,13 @@ class LaneHost(Protocol):
     def order_for(self, ticker: str, pick: Mapping, side: str) -> Optional[dict]: ...
     def log(self, event: str, ticker: Optional[str], **fields) -> None: ...
     def say(self, ticker: str, code: str, text: str) -> None: ...
-    def leave(self, ticker: str, reason: str) -> None: ...
+    def leave(self, ticker: str, reason: str, logged: Optional[Mapping] = None) -> None: ...
     def red(self, ticker: str, reason: str) -> None: ...
     def disarm(self, reason: str, for_day: bool = False) -> None: ...
     def once(self, key: str) -> bool: ...
     def forget(self, key: str) -> None: ...
     def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY,
-             end_step: bool = True) -> None: ...
+             end_step: bool = True, logged: Optional[Mapping] = None) -> None: ...
 
 
 class Lane:
@@ -185,8 +187,8 @@ class Lane:
     def say(self, code: str, text: str) -> None:
         self.host.say(self.ticker, code, text)
 
-    def leave(self, reason: str) -> None:
-        self.host.leave(self.ticker, reason)
+    def leave(self, reason: str, logged: Optional[Mapping] = None) -> None:
+        self.host.leave(self.ticker, reason, logged=logged)
 
     def red(self, reason: str) -> None:
         self.host.red(self.ticker, reason)
@@ -197,8 +199,9 @@ class Lane:
     def once(self, key: str) -> bool:
         return self.host.once(key)
 
-    def busy(self, what: str, why: str = plan_entries.TRADER_BUSY, end_step: bool = True) -> None:
-        self.host.busy(self.ticker, what, why, end_step=end_step)
+    def busy(self, what: str, why: str = plan_entries.TRADER_BUSY, end_step: bool = True,
+             logged: Optional[Mapping] = None) -> None:
+        self.host.busy(self.ticker, what, why, end_step=end_step, logged=logged)
 
     def delegate(self, kind: str) -> Optional[bool]:
         h = self.host.registry.get(kind, self.host.env)
@@ -264,19 +267,23 @@ def on_place(lane: Lane) -> bool:
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
         # Schwab, so the order and calls go back.
         lane.refund(orders=1, calls=calls)
+        # The page shows the desk's words; the log keeps `log_fields` when the desk gives them (the
+        # side rule's code and the side, never a count of the user's own shares: architect,
+        # 2026-11-13 21:53 UTC).
+        why, logged = str(r.get("error") or ""), r.get("log_fields")
         if r.get("busy"):
             lane.busy("send")                   # the step ends; the pick tries one tick later
         elif r.get("again") and r.get("this_name"):
             # Brief 25: the user's side on this name is not clear. Only this pick waits; the other
             # picks go on this reading (architect, 2026-11-13 21:31 UTC).
-            lane.busy("send", str(r.get("error") or ""), end_step=False)
+            lane.busy("send", why, end_step=False, logged=logged)
             return False
         elif r.get("again"):
             # An old order list or account read (N1): the same wait, with the desk's reason on the
             # pick's line.
-            lane.busy("send", str(r.get("error") or ""))
+            lane.busy("send", why, logged=logged)
         else:
-            lane.leave(f"not sent: {r.get('error')}")
+            lane.leave(f"not sent: {why}", logged=None if logged is None else {**logged, "why": f"not sent: {logged['why']}"})
         return True
     outcome(lane, r, "send")
     return True
