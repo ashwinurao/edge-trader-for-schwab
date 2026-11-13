@@ -70,7 +70,10 @@ def test_one_answer_becomes_one_line_without_ids_or_body(tmp_path, monkeypatch):
     assert first["date"] == "Fri, 13 Nov 2026 14:30:01 GMT"
     assert first["wire_ms"] >= 0 and first["thread"] and first["ts"].endswith("+00:00")
     assert second["method"] == "GET" and second["path"] == "/trader/v1/accounts/{hash}/orders/{n}"
-    assert set(first) == {"ts", "method", "path", "http", "wire_ms", "bytes", "date", "retry_after", "thread"}
+    # Record format v1 (brief 08, telemetry records PR): answer lines gained kind, app and vendor.
+    assert set(first) == {"ts", "kind", "app", "vendor", "method", "path", "http", "wire_ms", "bytes", "date",
+                          "retry_after", "thread"}
+    assert (first["kind"], first["app"], first["vendor"]) == ("answer", "edge-trader", "schwab")
 
 
 def test_a_429_keeps_its_retry_after(tmp_path, monkeypatch):
