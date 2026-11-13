@@ -75,6 +75,9 @@ What to add:
 - `companion/poller.py`: the one polling thread and its request budget.
 - `companion/view.py`, `companion/orders.py`, `companion/pnl.py`: dashboard state, order trees, the FIFO ledger.
 - `companion/bracket.py`: sizing and the bracket order. `companion/trading.py`: every order action.
+- `companion/break_entry.py`: the Break entry (a stop-limit entry with its stop attached, OV entries
+  Step 3): its start numbers, the 1-share cap, the 5-second quote rule and `build_request()`, the
+  request shape the Opening plan buttons use. Off unless `EDGE_TRADER_BREAK_ENTRY=1`.
 - `companion/app.py`: the local FastAPI server. `companion/static/index.html`: the whole UI.
 - `companion/floating.py`: the always-on-top windows (pywebview).
 

@@ -2392,7 +2392,8 @@ class Trader:
         if o.get("orderStrategyType") not in ("TRIGGER", "SINGLE") or len(legs) != 1:
             return None
         entry = (legs[0].get("instruction"), (legs[0].get("instrument") or {}).get("symbol"),
-                 num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")))
+                 num(legs[0].get("quantity") or o.get("quantity")), num(o.get("price")),
+                 num(o.get("stopPrice")))           # a break entry's level (None for the others)
         if o.get("orderStrategyType") == "SINGLE":
             # An entry sent without stop or target: only an opening order can be a ticket's entry.
             return ((entry, ()) if not o.get("childOrderStrategies") and entry[0] in OPENING_INSTRUCTIONS | {"BUY"}

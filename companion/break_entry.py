@@ -130,10 +130,10 @@ def make_plan(req: dict, q: dict) -> Plan:
     # fill anywhere up to the limit. No chase by click in this step: refuse.
     if long and ask is not None and Decimal(str(ask)) >= trig:
         return _bad(req, f"Price is already through the break level: ask {fmt(Decimal(str(ask)))} is at or above "
-                         f"{fmt(trig)}. Nothing was sent.")
+                         f"{fmt(trig)}.")
     if not long and bid is not None and Decimal(str(bid)) <= trig:
         return _bad(req, f"Price is already through the break level: bid {fmt(Decimal(str(bid)))} is at or below "
-                         f"{fmt(trig)}. Nothing was sent.")
+                         f"{fmt(trig)}.")
     # The rest is the limit bracket's own sizing and checks, entered at the limit (worst fill), so
     # one share's risk is limit to stop.
     p = plan(req.get("symbol") or "", side, st, 0, req.get("r") or 0, bid, ask, entry="limit",
@@ -180,7 +180,7 @@ def prepare(trader, req: dict, now_ms: float | None = None) -> tuple[Plan | None
                   "Nothing was sent. Click again.")
     p = make_plan(req, q)
     if not p.ok:
-        return no("; ".join(p.errors), plan=p.as_dict())
+        return no("; ".join(p.errors).rstrip(".") + ". Nothing was sent.", plan=p.as_dict())
     exp_target = _price(req.get("expected_target")) or Decimal(0)
     if p.has_target and p.target != exp_target:
         return no(f"Target is now {p.f(p.target)} (ticket showed {p.f(exp_target) if exp_target else 'none'}). "
