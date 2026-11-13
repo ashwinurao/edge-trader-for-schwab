@@ -75,6 +75,7 @@ class Tape:
         self.prices = {s: v[3] for s, v in PICKS.items()}
         self.ranges = {s: (v[1], v[2]) for s, v in PICKS.items()}
         self.problem, self.snap_lag, self.feed_age, self.data_lag = "", 0.05, 0.1, 0.05
+        self.disputed = {}                 # symbol -> brief 15's range_disputed list (high and low None)
 
     def read(self):
         now = self.clock.now()
@@ -84,12 +85,13 @@ class Tape:
         at = now - timedelta(seconds=self.data_lag)
         picks = []
         for sym, (rank, *_rest) in PICKS.items():
-            hl = self.ranges[sym]
+            hl = None if sym in self.disputed else self.ranges[sym]
             p = self.prices[sym]
             picks.append({"symbol": sym, "rank": rank, "last": p, "last_at": at, "fresh_at": at,
                           "bid": round(p - 0.01, 2), "ask": round(p + 0.01, 2), "quote_at": at,
                           "high": hl and hl[0], "low": hl and hl[1], "final": hl is not None,
-                          "from": "snapshot minute bar" if hl else None, "range_seen": None, "range_changed": None})
+                          "from": "snapshot minute bar" if hl else None, "range_seen": None, "range_changed": None,
+                          "range_disputed": self.disputed.get(sym)})
         return {"received": now, "read_at": now, "problem": "", "seq": self.reads, "day": "2026-11-13",
                 "state": {"code": "recording", "why": ""}, "tape_now": now,
                 "snapshot_at": now - timedelta(seconds=self.snap_lag), "tape_age_s": self.snap_lag,
@@ -778,6 +780,38 @@ def test_no_send_after_the_watch_end(rig, monkeypatch):
     monkeypatch.setattr(X.engine, "decide", late)
     run(rig, et(9, 35, 30), start=et(9, 35, 0))
     assert rig.broker.placed == []
+
+
+DISPUTE = [{"high": 42.48, "low": 41.92, "from": "snapshot minute bar", "seen": "2026-11-13T14:31:00.100Z"},
+           {"high": 42.61, "low": 41.92, "from": "snapshot minute bar", "seen": "2026-11-13T14:31:00.600Z"}]
+
+
+def test_a_disputed_range_sends_nothing_for_that_pick(rig):
+    """Brief 15 (open tape b518b05): the snapshot's 09:30 bar versions disagree by more than a cent
+    and no bars bar has come: high and low None, not final. The armed plan sends nothing for it."""
+    arm(rig)
+    rig.tape.disputed["AAAA"] = DISPUTE
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC"]
+    assert rig.plan.known["AAAA"]["range_disputed"] == DISPUTE      # the executor keeps the tape's key
+    d = [x for x in lines(rig, "decision") if x["ticker"] == "AAAA"]
+    assert d and d[-1]["kind"] == "no_action" and d[-1]["code"] == engine.RANGE_DISPUTED
+    rig.tape.disputed.clear()                                          # the bars bar settles it
+    run(rig, et(9, 31, 5))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC", "AAAA"]
+
+
+def test_a_working_entry_waits_while_its_range_is_disputed_and_the_watch_end_still_cancels(rig):
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.tape.disputed["AAAA"] = DISPUTE
+    rig.tape.prices["AAAA"] = 42.10                    # past AAAA's flip line 42.144: no flip while disputed
+    run(rig, et(9, 32))
+    assert not [x for x in lines(rig, "note") if x["ticker"] == "AAAA" and x["code"] == "off:would_flip"]
+    assert not [x for x in lines(rig, "decision") if x["ticker"] == "AAAA" and x["kind"] == "would_flip"]
+    oid = ids(rig)["AAAA"]
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert oid in rig.broker.cancelled                 # the time-based cancel still runs
 
 
 def test_a_filled_entry_is_left_alone(rig):

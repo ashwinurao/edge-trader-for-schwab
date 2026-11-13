@@ -49,6 +49,9 @@ log = logging.getLogger("companion.plan_auto")
 
 OUT_DIR = Path("data/opening_plan/auto")
 PLAYBOOK_FILE = Path(__file__).resolve().parent.parent / "opening_plan" / "playbook.json"
+# Only for a tape pick that is not a dict (the tape's own picks are dicts: tape.py reading_from).
+KNOWN_KEYS = ("rank", "last", "last_at", "fresh_at", "bid", "ask", "quote_at", "high", "low", "final", "from",
+              "range_changed", "range_disputed")
 IDLE_SECONDS = 1.0                 # the longest sleep while not armed (an Arm click wakes it)
 ACTION_KINDS = ("would_place", "would_cancel", "would_flip", "would_relevel")
 NOT_ON = {"would_flip": "flip is not on: the entry stays",
@@ -324,10 +327,12 @@ class AutoPlan:
                 sym = str(_get(p, "symbol") or _get(p, "ticker") or "").upper()
                 if not sym:
                     continue
+                # The whole pick, not a fixed list of keys: a list dropped brief 15's range_disputed
+                # (architect, 2026-11-13 16:25 UTC), and the engine then saw "no range yet".
+                kp = dict(p) if isinstance(p, Mapping) else {k: _get(p, k) for k in KNOWN_KEYS}
+                kp.pop("entry", None)
                 with self._lock:
-                    self.known[sym] = {k: _get(p, k) for k in ("rank", "last", "last_at", "fresh_at", "bid", "ask",
-                                                               "quote_at", "high", "low", "final", "from",
-                                                               "range_changed")}
+                    self.known[sym] = kp
         recs = self.desk.records()
         orders = self._orders()
         picks = []
