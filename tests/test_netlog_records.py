@@ -509,6 +509,37 @@ def test_a_refused_plan_button_is_a_refusal_named_by_its_ticker(rec):
     assert [(x["ok"], x["sent"]) for x in rec.lines("route")] == [(False, 0)] * 3
 
 
+def test_a_refused_flat_all_or_add_stop_is_a_refusal(rec):
+    """Step 9 (companion/plan_flat.py): Flat all answers ok and error, Add stop ok, error and ticker."""
+    app = FastAPI()
+
+    @app.post("/api/opening-plan/flat-all")
+    async def flat_all(request: Request):
+        await request.json()
+        return {"ok": False, "error": "ARM is off. Arm on the dashboard first. Nothing was sent."}
+
+    @app.post("/api/opening-plan/add-stop")
+    async def add_stop(request: Request):
+        b = await request.json()
+        return {"ok": False, "ticker": b["ticker"].upper(), "error": "Part of the position has a working stop."}
+
+    @app.get("/api/opening-plan/flat")
+    def flat_state():
+        return {"enabled": True, "error": ""}
+
+    app.add_middleware(netlog.RouteTimer)
+    c = TestClient(app)
+    c.post("/api/opening-plan/flat-all", json={"expected": []})
+    c.post("/api/opening-plan/add-stop", json={"ticker": "bbbb", "expected": {"shares": 1, "stop": "18.47"}})
+    c.get("/api/opening-plan/flat")                       # the page's poll: not an action
+    got = [(x["action"], x["symbol"], x["code"]) for x in rec.lines("refusal")]
+    assert got == [("opening_plan_flat_all", None, "arm_is_off"),
+                   ("opening_plan_add_stop", "BBBB", "part_of_the_position_has_a")]
+    assert [(x["route"], x["ok"], x["sent"]) for x in rec.lines("route") if x["method"] == "POST"] == [
+        ("/api/opening-plan/flat-all", False, 0), ("/api/opening-plan/add-stop", False, 0)]
+    assert "/api/opening-plan/flat" not in netlog.ACTIONS
+
+
 def test_a_guard_refusal_is_a_refusal_with_its_status(rec):
     from companion.app import app
     c = TestClient(app, base_url="http://127.0.0.1:8770")

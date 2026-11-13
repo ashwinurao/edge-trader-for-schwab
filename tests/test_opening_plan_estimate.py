@@ -82,14 +82,19 @@ def view(answer, now, risk="100", rv=12.3, account="ok"):
 
 # ---- the playbook's numbers -----------------------------------------------------------------------
 
-def test_the_playbook_holds_the_studys_start_numbers_and_shows_the_range():
+def test_the_playbook_holds_ashs_pick_the_range_at_the_studys_numbers():
     assert PB.estimate_show == "range"
     assert (PB.estimate_first_minute_atr, PB.estimate_wide_atr, PB.estimate_narrow_atr) == (
         Decimal("0.27"), Decimal("0.37"), Decimal("0.19"))
     raw = json.loads(P.PLAYBOOK_FILE.read_text())["size"]["estimate"]
     assert "pm_bar_break_trades.parquet" in raw["_about"] and "or1_risk_atr" in raw["_about"]
+    # Ash picked the card's first option, which names these numbers (review 1 of PR #31).
     for k in ("show", "first_minute_atr", "wide_atr", "narrow_atr"):
-        assert "not approved by Ash" in raw[k]["note"], k
+        note = raw[k]["note"]
+        assert note.startswith("Ash's pick, 2026-11-13 17:38:49 UTC"), k
+        assert '"Choose how the plan estimates shares before the first minute exists"' in note, k
+        assert '"Review OV picks desk architecture"' in note and '"About N, usually L to H"' in note, k
+        assert "0.27 x ATR" in note and "0.19 to 0.37 x ATR" in note, k
 
 
 @pytest.mark.parametrize("change, match", [
