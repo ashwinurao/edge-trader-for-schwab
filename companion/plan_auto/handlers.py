@@ -132,10 +132,15 @@ class LaneHost(Protocol):
 class Lane:
     """One pick's view for one decision. Methods forward to the executor (the host)."""
 
-    def __init__(self, host: LaneHost, decision: Mapping, pick: Mapping, reading: Mapping) -> None:
+    def __init__(self, host: LaneHost, decision: Mapping, pick: Mapping, reading: Mapping,
+                 view: Optional[Mapping] = None) -> None:
         self.host, self.decision, self.pick, self.reading = host, dict(decision), dict(pick), reading
         self.ticker = str(decision.get("symbol") or pick.get("symbol") or "").upper()
         self.rules, self.armed_rules, self.desk = host.rules, host.armed_rules, host.desk
+        # Step 2's view, read by the executor at the start of the step, BEFORE the tape reading, so
+        # no Edge Scanner GET falls between the reading and the send (architect's review, 16:21 UTC).
+        # Pass it to the desk's twins; None only when a Lane is built outside the executor.
+        self.view = view
 
     @property
     def entry(self) -> dict:
@@ -237,7 +242,7 @@ def on_place(lane: Lane) -> bool:
     if not lane.armed():
         lane.refund(orders=1, calls=calls)
         return False
-    r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, log=lane.log)
+    r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log)
     if r.get("not_sent"):
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
         # Schwab, so the order and calls go back. The desk said whether the pick may try again.

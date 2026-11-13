@@ -92,7 +92,7 @@ name are refused). It needs no account and sends no telemetry.
   record can name it. The armed plan (`EDGE_TRADER_PLAN_AUTO=1`, below) reads the same open tape through
   the same reader, so with the shadow log on as well it is still at most one read every 0.25 seconds:
   once when its Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
-  the end of the watch (about 09:35:20 ET). Before each send it also checks the pick's row against the
+  the end of the watch (at the latest 09:35:45 ET). Before each send it also checks the pick's row against the
   OV picks read above (at most every 2 seconds), even with the screen closed.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
@@ -442,8 +442,11 @@ today, or when the tape is stamped ahead of Edge Trader's clock. It stops and di
 is left and the row follows its ticket, as after a click); a cancel Schwab does not confirm (the row
 turns red); a reached bound; ARM turned off on the dashboard; an old order list; or an unexpected error.
 A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
-pick and is never retried. After a disarm, entries already at Schwab stay: a red banner lists them,
-and each row's Cancel works. A restart never restores "armed".
+pick and is never retried. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
+up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
+at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
+Cancel. A restart never restores "armed".
 
 Its bounds are in `companion/opening_plan/playbook.json` under `armed`, each a start number Ash has not
 approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pick, 4 orders a day, and
