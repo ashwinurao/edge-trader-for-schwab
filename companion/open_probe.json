@@ -1,6 +1,9 @@
 {
-  "_about": "The opening probe's settings (companion/open_probe.py, brief 09). Times are ET, weekdays only. It reads Schwab quotes and previews a 1-share Break order; it never sends an order. quote_every_s and the preview times are start numbers, not approved by Ash.",
-  "windows": ["09:28:00-09:40:00"],
+  "_about": "The opening probe's settings (companion/open_probe.py, briefs 09 and 21). Times are ET, weekdays only. It reads Schwab quotes and previews Break orders; it never sends an order. At each preview time it previews a long and a short Break order for one pick, the next in rank order each time (SPY without picks), built at 1 share by the ticket's builders and copied to preview_shares for the preview only. It writes the requirement rate from the poller's last balances, never a balance in dollars. quote_every_s, the window, the preview times, preview_shares and the two caps are start numbers, not approved by Ash.",
+  "windows": ["09:26:30-09:40:00"],
   "quote_every_s": 5,
-  "previews": ["09:29:30", "09:30:02", "09:30:30", "09:31:02", "09:32:00", "09:35:00"]
+  "previews": ["09:27:00", "09:27:30", "09:28:00", "09:28:30", "09:29:30", "09:30:02", "09:31:02", "09:32:00", "09:33:00", "09:35:00"],
+  "preview_shares": 100,
+  "max_previews_per_time": 2,
+  "max_previews_per_window": 24
 }
