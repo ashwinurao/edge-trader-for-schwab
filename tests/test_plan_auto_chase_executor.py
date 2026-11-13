@@ -7,6 +7,7 @@ Hand-worked numbers as tests/test_plan_auto.py. AAAA (09:30 bar high 42.48, low 
 42.49, stop 41.92, 0.57 a share; cap min(0.15 x 0.57 = 0.0855, 0.15% x 42.49 = 0.0637) = 0.06; chase
 limit 42.55. Short: trigger 41.91, stop 42.48; cap 0.06; limit 41.85.
 """
+import copy
 import json
 from datetime import timedelta
 
@@ -16,8 +17,8 @@ from companion import plan_entries
 from companion.plan_auto import CHASE_FLAG
 from companion.plan_auto import chase as C
 from companion.plan_auto import handlers as H
-from test_plan_auto import (ENV, NEAREST_FIRST, PICKS, arm, et, lines, placed, rig, run,  # noqa: F401 (rig: Step 6's fixture)
-                            want_req, without_id)
+from test_plan_auto import (ENV, NEAREST_FIRST, PICKS, _hold_lock, _spy, arm, et, lines, placed,  # noqa: F401
+                            rig, run, want_req, without_id)                                # (rig: Step 6's fixture)
 from test_trading import Resp
 
 CHASE_ENV = {**ENV, CHASE_FLAG: "1"}
@@ -193,6 +194,57 @@ def test_a_chase_refused_after_the_quote_keeps_only_the_quote_call_in_the_bound(
     send = rig.plan.armed_rules.calls_per_send
     assert rig.plan._calls_used() == 3 * send + tries          # 15 for the three sends, 1 per chase try
     assert rig.plan.orders_day == 3
+
+
+# ---- Trader's lock held by a click (architect's review 1 of Step 6, 2026-11-13 16:45 UTC) -------
+
+def _busy_rig(rig):
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51                         # past its trigger: the nearest pick
+    tries = _spy(rig, "chase_auto")
+    saves, real_save = [], rig.desk._save
+
+    def save(recs):
+        if rig.trader._send_lock.locked():
+            saves.append(copy.deepcopy(recs))
+        return real_save(recs)
+    rig.desk._save = save
+    _hold_lock(rig, et(9, 31, 0.1), 2.0)
+    return tries, saves
+
+
+def test_a_lock_held_2_s_the_chase_waits_a_tick_and_goes_after_the_release(crig):
+    """Held 2 s on the fake clock: at most 9 chase tries (one a tick), one "busy" line, no row
+    record written and removed, no chase or quote try used, nothing spent. After the release the
+    fresh reading is still past the trigger, so the chase goes, then the other picks."""
+    rig = crig
+    tries, saves = _busy_rig(rig)
+    busy = [t for t, held in tries if held]
+    assert 1 <= len(busy) <= 9 and set(busy) == {"AAAA"}
+    assert rig.broker.placed == [] and rig.sent == [] and rig.desk.records() == {} and saves == []
+    assert rig.desk._chase_tries == {} and rig.plan.orders_day == 0
+    assert lines(rig, "chase_send_start") == [] and lines(rig, "chase_decision") != []
+    assert [(x["ticker"], x["what"]) for x in lines(rig, "busy")] == [("AAAA", "send")]
+    run(rig, et(9, 31, 5))
+    assert placed(rig)[0] == "AAAA" and order_of(rig, "AAAA")[0]["orderType"] == "LIMIT"
+    assert sorted(placed(rig)) == sorted(PICKS) and len(lines(rig, "busy")) == 1
+    assert row(rig, "AAAA")["entry"]["kind"] == "chase"
+
+
+def test_a_lock_held_2_s_and_the_price_back_inside_gives_the_break_entry_not_a_chase(crig):
+    """The same, but the price comes back inside the range while the lock is held: the fresh
+    reading after the release says would_place inside the level, so AAAA gets Step 3's break
+    entry, never the chase the earlier readings wanted."""
+    rig = crig
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    _hold_lock(rig, et(9, 31, 0.1), 1.0)
+    rig.tape.prices["AAAA"] = 42.37                         # back inside, nearer the high
+    _hold_lock(rig, rig.clock.t, 1.0)
+    run(rig, et(9, 31, 5))
+    (o,) = order_of(rig, "AAAA")
+    assert o["orderType"] == "STOP_LIMIT" and lines(rig, "chase_send_start") == []
+    assert [without_id(r) for r in rig.sent if r["symbol"] == "AAAA"] == [want_req("AAAA")]
 
 
 # ---- Schwab says no ----------------------------------------------------------------------------

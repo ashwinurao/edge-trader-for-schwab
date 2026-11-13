@@ -79,7 +79,7 @@ OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
 # The armed plan's chase (Step 8, brief 18 "one chase per pick per day"): one per row per day. How
 # often a chase refused after the quote may try again is playbook.json armed.chase_quote_tries.
 CHASES_PER_ROW = 1
-TRADER_BUSY = "Another submission is in progress"      # Trader.submit's own lock: nothing was sent
+SUBMIT_BUSY = "Another submission is in progress"      # Trader.submit's refusal on its own lock: nothing was sent
 # Architect's ruling of 2026-11-13 16:17 UTC (brief 14), "a click takes the row for the day": a
 # Place, Flip or Cancel click on a row makes it the click's (origin "click") and clears every key
 # an automatic step wrote. A step that adds a key adds it here. The click's own counters (flips) stay,
@@ -976,7 +976,7 @@ class PlanDesk:
             answer_at=self._now().isoformat(timespec="milliseconds"))
         if self.trader.store.get_ticket(req["ticket_id"]) is None:
             # Trader.submit refused before recording the intent: no request left (CONTRIBUTING rule 4).
-            busy = str(r.get("error") or "").startswith(TRADER_BUSY)     # lost the race for Trader's lock
+            busy = str(r.get("error") or "").startswith(SUBMIT_BUSY)     # lost the race for Trader's lock
             again = bool(r.get("again")) or busy
             if again:
                 with self._lock:

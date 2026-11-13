@@ -511,6 +511,9 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   level and not through the stop. A quote that is old or back inside the level lets the plan try
   again on a later reading, at most `armed.chase_quote_tries` (3, a start number in
   `companion/opening_plan/playbook.json`) times a row a day.
+- While a click (or Flat all) holds Edge Trader's order lock, the chase writes nothing and uses
+  neither its one chase nor a quote try; the plan tries on its next reading, which must still be past
+  the level. The row check uses the plan's cached Step 2 view, never a new request to Edge Scanner.
 - Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
   a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name
   blocked until you press Resolve.

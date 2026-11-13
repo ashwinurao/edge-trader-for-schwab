@@ -158,7 +158,9 @@ class Host:
         h = self.registry.get(kind, self.env)
         if h is None:
             return None
-        return h(Lane(self, d, pick, {"received": pick["fresh_at"], "risk": 100, "calm": False, "picks": [pick]}))
+        # The executor's cached Step 2 view (AutoPlan._row_check_view), here the rig's own view.
+        return h(Lane(self, d, pick, {"received": pick["fresh_at"], "risk": 100, "calm": False, "picks": [pick]},
+                      view=self.desk._view()))
 
     def step(self, at, last, **kw):
         """One reading through the real engine, each decision to its handler (as Step 6's executor)."""
@@ -170,7 +172,7 @@ class Host:
         for d in out:
             h = self.registry.get(d["kind"], self.env)
             if h is not None:
-                h(Lane(self, d, p, reading))
+                h(Lane(self, d, p, reading, view=self.desk._view()))
         return out
 
 
