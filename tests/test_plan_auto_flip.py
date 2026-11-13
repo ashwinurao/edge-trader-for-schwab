@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time as _time
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
@@ -2715,6 +2716,51 @@ def test_executor_the_days_log_never_names_your_own_trades(frig, monkeypatch):
 # send, so it needs no hold of its own (architect, 2026-11-13 22:55 UTC).
 
 from test_plan_auto import held_through, send_times  # noqa: E402
+
+
+# The armed plan's day log keeps no dollar amount (architect, 2026-11-13 23:53 UTC, Step 8 review 5):
+# Schwab's reject words reach it through the flip's answer, and it is not confirmed that they never
+# name a balance. The page keeps Schwab's words.
+WITH_DOLLARS = ("below zero ($1,234.56)", "$-50.00", "$ 75")
+
+
+def no_dollar_amount(r):
+    """No digit after a $ (spaces, a ( or a - between) anywhere in the day's log file."""
+    raw = "".join(f.read_text() for f in (r.tmp / "auto").glob("*.jsonl"))
+    assert raw and not re.search(r"\$\s*[(\-]?\s*\d", raw), raw
+
+
+def test_the_days_log_keeps_no_dollar_amount_in_a_string_a_dict_or_a_list(frig):
+    a, b, c = WITH_DOLLARS
+    frig.plan.log("note", "AAAA", text=f"Schwab: {a}, {b} and {c} more.", answer={"error": a, "why": [b, c, {"in": c}]},
+                  amounts=(a, b), shares=3, price="42.10", ok=True)
+    frig.plan.say("BBBB", "flip_other", f"Schwab says {a}")
+    no_dollar_amount(frig)
+    (line,) = plan_lines(frig, "note")[:1]
+    assert line["text"] == "Schwab: below zero ($[masked]), $[masked] and $[masked] more."   # the words stay
+    assert line["answer"] == {"error": "below zero ($[masked])", "why": ["$[masked]", "$[masked]", {"in": "$[masked]"}]}
+    assert line["amounts"] == ["below zero ($[masked])", "$[masked]"]
+    assert (line["shares"], line["price"], line["ok"]) == (3, "42.10", True)   # a number without a $ is not masked
+    assert plan_lines(frig, "note")[1]["text"] == "Schwab says below zero ($[masked])"
+    assert frig.plan.notes["BBBB"]["note"] == f"Schwab says {a}"                 # the page keeps the words
+
+
+def test_a_flips_4xx_with_a_dollar_amount_leaves_none_in_the_days_log(frig):
+    ids = all_four_rest(frig)
+    body = f"Order rejected: buying power is {WITH_DOLLARS[0]} after a cost of {WITH_DOLLARS[1]} and fees of {WITH_DOLLARS[2]}."
+    frig.broker.fail["AAAA"] = lambda order: Resp(400, text=body)
+    frig.tape.prices["AAAA"] = 42.14                  # past AAAA's flip line 42.144, untriggered
+    frig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    run_plan(frig, et(9, 31, 6))
+    assert frig.broker.cancelled == [ids["AAAA"]] and frig.broker.placed[-1]["orderLegCollection"][0]["instruction"] == "SELL_SHORT"
+    no_dollar_amount(frig)
+    (line,) = plan_lines(frig, "flip_auto")
+    assert (line["stage"], line["ok"]) == ("send", False)
+    assert line["error"] == ("Schwab rejected the order (HTTP 400): Order rejected: buying power is below zero ($[masked]) "
+                             "after a cost of $[masked] and fees of $[masked].")
+    # The page keeps Schwab's words: the row, as the click's own refusal would say them.
+    assert frig.desk.records()["AAAA"]["text"] == ("Cancelled the long entry by the armed plan. The short was not placed: "
+                                                    f"Schwab rejected the order (HTTP 400): {body}")
 
 
 def flip_sends(r):
