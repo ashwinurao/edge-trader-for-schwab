@@ -53,8 +53,9 @@ name are refused). It needs no account and sends no telemetry.
   Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
   quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
-  `skip` line for a read the 429 pause held back, `pause` lines for the pause's start and end, a `token`
-  line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
+  `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
+  `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
+  pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
   web server wake, CPU, memory, the token's time left, and the count, p95 and slowest time of each route
   the screens poll that minute).
   Each click on a ticket, position, spread or Opening plan button gets a `route` line with its duration and
@@ -136,7 +137,14 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Dashboard:** open positions (day trades and carried positions apart) with open P&L, live R, stop
   and target, protection (FULL, PARTIAL, NO STOP SEEN) and P&L at the stop; working orders including
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
-  STALE, DISCONNECTED) that disables every order button when data is not current. Right after a
+  STALE, DISCONNECTED) that disables every order button when data is not current. The account and
+  order list are read every 5 s, marks every 3 s and fills every 10 s. While a ticket window has
+  focus or after a click, marks come every 6 s instead of 3, so the account and order list keep
+  their pace within the app's limit of 70 Schwab calls a minute (`MAX_PER_MIN`,
+  `companion/poller.py`). With up to two clicks a minute marks and fills never show as old; with
+  three clicks close together marks can be up to 15 s old for a moment and show as old (after 9 s).
+  In heavier order traffic (30 or more order calls a minute) marks, fills and realized P&L can show
+  as old until it eases (`companion/poll_budget.py`). Right after a
   start, until the first read of Schwab is in, the dashboard says "Edge Trader just started. Reading
   Schwab." and `/api/state` already carries the `trading` block (ARM off) with `first_read_done: false`.
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
@@ -449,11 +457,13 @@ under the row (`companion/plan_price.py`), for example "Long: Ask 754.50, 3 s ag
 level 754.44. A click would be refused." or "Short: Ask 42.52, 3 s ago: at or above this side's stop
 42.48. A click would be refused." It uses the click's own rule (through the level, or the bid or ask
 past the side's stop, see Break entry above) on the newest price Edge Trader already holds: the poller's
-Schwab quotes (only names with a position or a working order, every 3 s), the last ticket or click
+Schwab quotes (only names with a position or a working order, every 3 s, or 6 s while a ticket has
+focus or after a click), the last ticket or click
 quote on the name, or the open tape's last reading (09:29 to 09:36 ET, only while the shadow reads it).
 No call is added for it. Inside the band there is no line. A price older than 15 s
-(`OLD_AFTER_S`, a start number) says "Price is N s old: no check before the click.", and a name with no
-held price says "No recent price: no check before the click." The line is display only: it turns no
+(`OLD_AFTER_S`, a start number) says "Price is N s old: no check before the click.". A name with no
+held price, or one older than 120 s (`GONE_AFTER_S`, a start number; the open tape's last answer stays
+in memory after 09:36 ET), says "No recent price: no check before the click." The line is display only: it turns no
 button off and lets no click through. The click reads Schwab's quote again, so the line and the click
 can differ.
 
