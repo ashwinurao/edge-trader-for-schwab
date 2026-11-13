@@ -529,10 +529,11 @@ def test_the_reads_run_on_their_own_thread_after_the_answer(tmp_path, monkeypatc
                                                    len(t._status_client.asked) == 2 and done.set())[1]
     assert t.submit(req())["ok"]
     assert done.wait(5)
-    for _ in range(50):
-        if t.store.get_ticket("ticket-0001")["status"] == "REJECTED":
-            break
-        done.wait(0.02)
+    # Wait for the reader thread itself. `done` is set inside its second read, before it records
+    # REJECTED, so a poll with done.wait() never waited and failed whenever that write was slow (a
+    # busy GitHub runner, fork PR #27's docker.yml run, 2026-11-13 22:45 UTC).
+    for th in [th for th in threading.enumerate() if th.name == "status-after-send"]:
+        th.join(5)
     assert t.store.get_ticket("ticket-0001")["status"] == "REJECTED"
 
 
