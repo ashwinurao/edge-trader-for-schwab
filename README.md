@@ -53,8 +53,9 @@ name are refused). It needs no account and sends no telemetry.
   Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
   quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
-  `skip` line for a read the 429 pause held back, `pause` lines for the pause's start and end, a `token`
-  line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
+  `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
+  `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
+  pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
   web server wake, CPU, memory, the token's time left, and the count, p95 and slowest time of each route
   the screens poll that minute).
   Each click on a ticket, position, spread or Opening plan button gets a `route` line with its duration and
@@ -98,11 +99,13 @@ name are refused). It needs no account and sends no telemetry.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews Break orders, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
-  weekdays, from `companion/open_probe.json` (default 09:26:30 to 09:40:00). Every 5 seconds it asks one
-  quote for the day's Opening plan symbols (ranks 1 to 4, at most 6) plus SPY. At 09:27:00, 09:27:30,
+  weekdays, from `companion/open_probe.json` (default 09:05:00 to 09:07:30, 09:15:00 to 09:17:30 and
+  09:26:30 to 09:40:00). Every 5 seconds it asks one quote for the day's Opening plan symbols (ranks 1 to 4,
+  at most 6; before the 09:25 freeze, the plan's preview picks) plus SPY. At 09:05:30, 09:06:00, 09:06:30
+  and 09:07:00, again at 09:15:30, 09:16:00, 09:16:30 and 09:17:00, and at 09:27:00, 09:27:30,
   09:28:00, 09:28:30, 09:29:30, 09:30:02, 09:31:02, 09:32:00, 09:33:00 and 09:35:00 it previews a long and a
   short Break order for one pick, the next in rank order each time, so ranks 1 to 4 are covered both sides
-  before the open and again after it (SPY when there are no picks). Long: trigger = ask + the larger of
+  twice before the freeze, once before the open and again after it (SPY when there are no picks). Long: trigger = ask + the larger of
   5 cents and 0.2%, stop = trigger - 1% of the price. Short (`SELL_SHORT`): trigger = bid - the same step,
   stop = trigger + 1%. Each order is built at 1 share by the ticket's own builders (the Break entry stays
   capped at 1 share), then a copy with 100 shares in every leg (`preview_shares`) is previewed, so Schwab's
@@ -113,18 +116,24 @@ name are refused). It needs no account and sends no telemetry.
   hard-to-borrow or not-shortable answer is there word for word; on a refused preview the texts of its
   message and errors; `keys`, the dotted key names of Schwab's answer (names only, never a value; a key
   that looks like an account number or hash shows as `{id}`); the order value and the projected commission
-  and fees with the path each was read from; and the requirement rates `bp_rate` and `af_rate` =
-  (the account's buying power or available funds before, minus Schwab's projected value) / the order
-  value, with the two fields each came from. The "before" value is the account read the app already makes
+  and fees with the path each was read from; and the requirement rates `bp_rate`, `af_rate` and
+  `dt_rate` = (the account's buying power, available funds or day-trading buying power before, minus
+  Schwab's projected buying power, available funds or intraday buying power) / the order value, with the
+  two fields each came from. The "before" value is the account read the app already makes
   every 5 seconds; older than 30 seconds gives no rate and says why. A pairing is taken only when its rate is
   from -0.05 to 5 (an opening order never adds buying power); otherwise the next balance is tried, and when
   none fits the line says "negative" or "above 5" for each, never the number. In every text it writes from
   Schwab, a number after a `$` and any number of 4 or more digits becomes `{n}`, so a "not enough buying
   power" text never carries a balance; "100%" or "12.5" stay. **No balance, equity or buying power in
   dollars is ever written**, and nothing else from the answer (it holds the account number). No retries:
-  any 429, or the app's own 429 pause, stops it for the rest of the window. About 182 Schwab requests per
-  default window (162 quote calls and 20 previews in 13.5 minutes), on the same Schwab app limit as
-  everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
+  any 429, or the app's own 429 pause, stops it for the rest of the window. About 182 Schwab requests in
+  the 09:26:30 window (162 quote calls and 20 previews in 13.5 minutes) and about 38 in each window before
+  the freeze (30 quote calls and 8 previews in 2.5 minutes), on the same Schwab app limit as everything
+  else. Each preview's rates also go to the Opening plan's rate store (`companion/preview_rates.py`, in
+  memory, for today only): per name and side, the highest rate whose `af_rate` on the same preview is from
+  0.24 to 1.10 (a trade of yours between the balance read and the preview bends a rate; a bent one is
+  dropped, and the highest of the rest sizes smaller, never larger), with its ET time, Schwab's status word
+  and texts. A restart empties it; it is not read back from `data/netlog/`. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner a minute before each
   window (09:25:30 ET by default). When that gives no picks it reads again every 15 seconds (one request to
   Edge Scanner on your LAN, never to Schwab) until the picks come or 09:29:00 ET, then starts the rotation at
   rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`). Picks that come
@@ -141,7 +150,16 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Dashboard:** open positions (day trades and carried positions apart) with open P&L, live R, stop
   and target, protection (FULL, PARTIAL, NO STOP SEEN) and P&L at the stop; working orders including
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
-  STALE, DISCONNECTED) that disables every order button when data is not current.
+  STALE, DISCONNECTED) that disables every order button when data is not current. The account and
+  order list are read every 5 s, marks every 3 s and fills every 10 s. While a ticket window has
+  focus or after a click, marks come every 6 s instead of 3, so the account and order list keep
+  their pace within the app's limit of 70 Schwab calls a minute (`MAX_PER_MIN`,
+  `companion/poller.py`). With up to two clicks a minute marks and fills never show as old; with
+  three clicks close together marks can be up to 15 s old for a moment and show as old (after 9 s).
+  In heavier order traffic (30 or more order calls a minute) marks, fills and realized P&L can show
+  as old until it eases (`companion/poll_budget.py`). Right after a
+  start, until the first read of Schwab is in, the dashboard says "Edge Trader just started. Reading
+  Schwab." and `/api/state` already carries the `trading` block (ARM off) with `first_read_done: false`.
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
   market, ask, bid or your own limit price (Lmt), one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
@@ -152,7 +170,12 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   Schwab as one order. You type the level, the stop and optionally a cap (how far past the level the
   limit sits; blank = 0.15 x risk per share, at least 2 cents, at most 0.15% of the price). One share
   only for now (`BREAK_MAX_SHARES` in `companion/break_entry.py`). The click is refused when the price
-  is already through the level or Schwab's quote is not real-time or is over 5 seconds old.
+  is already through the level or Schwab's quote is not real-time or is over 5 seconds old. It is also
+  refused when the stop would rest on the wrong side of the market: a long whose bid is at or below its
+  stop, a short whose ask is at or above its stop. So a break entry is sent only while the price is
+  between its stop and its level, and the refusal says so, for example "The bid 752.14 is at or below
+  this entry's stop 753.44. A long break entry is sent only while the price is between its stop 753.44
+  and its level 754.44. Nothing was sent."
 - **Size by risk or by quantity:** size from your risk and stop (the default), or type the number of
   shares or contracts yourself. Sizing by quantity also allows **no stop** (a red warning and a
   confirmation on every click) and either way you can send **no target**. The order then carries only
@@ -194,8 +217,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   day's ranks 1 to 4 instead: ticker, ATR and the pre-market high, low and last price as Edge Scanner
   gives them, re-ranked each minute as the preview changes, and marked in the header and on every row
   "Preview, not locked. Picks freeze at 09:25 ET." A preview row has no 09:30 minute, no levels, no
-  shares and no buttons, and nothing that places an order, the shadow log or the opening probe reads it
-  as a pick. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
+  shares and no buttons, and nothing that places an order or the shadow log reads it as a pick. The
+  opening probe previews its names (no order) only to learn each name's margin rate before the freeze. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
   or for another day. The header's **Buying power** line shows Schwab's day-trading buying power, buying
   power and equity from the account read Edge Trader already makes every 5 seconds, with the time read.
   Missing, or older than 30 seconds, it says "not known", never a zero; with `--private` it is hidden. It
@@ -443,6 +466,21 @@ sends one request to Schwab when you click it; nothing is sent without a click.
   more that day. At most `max_flips_per_row` flips per row a day (3, in
   `companion/opening_plan/playbook.json`).
 
+**The price line (brief 29).** Once the 09:30 minute is final, each row side can get one short line
+under the row (`companion/plan_price.py`), for example "Long: Ask 754.50, 3 s ago: through the long
+level 754.44. A click would be refused." or "Short: Ask 42.52, 3 s ago: at or above this side's stop
+42.48. A click would be refused." It uses the click's own rule (through the level, or the bid or ask
+past the side's stop, see Break entry above) on the newest price Edge Trader already holds: the poller's
+Schwab quotes (only names with a position or a working order, every 3 s, or 6 s while a ticket has
+focus or after a click), the last ticket or click
+quote on the name, or the open tape's last reading (09:29 to 09:36 ET, only while the shadow reads it).
+No call is added for it. Inside the band there is no line. A price older than 15 s
+(`OLD_AFTER_S`, a start number) says "Price is N s old: no check before the click.". A name with no
+held price, or one older than 120 s (`GONE_AFTER_S`, a start number; the open tape's last answer stays
+in memory after 09:36 ET), says "No recent price: no check before the click." The line is display only: it turns no
+button off and lets no click through. The click reads Schwab's quote again, so the line and the click
+can differ.
+
 Place and Flip refuse, with the reason on the button, when entries are not armed, the market is closed,
 the 09:30 minute is not final, Edge Scanner's data is old, the calm flag is not known, an earlier order
 on the name is unclear, or the row already has an entry that is working, unclear or filled.
@@ -671,19 +709,44 @@ the sends, 12 to 48 for the cancels, at most 68 in one minute (sends held back b
 before 09:35, then the four 09:35 cancels, each at its worst). The limit that binds is not Schwab's 120
 but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
 Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
-wait. That is why the order list can go old while the plan works; brief 24 changes the poller.
+wait. That is why the order list could go old while the plan works, and why the plan holds the
+poller's later reads during its opening burst (next paragraph).
 Since brief 26 (`companion/read_retry.py`) a quote or order read whose connection Schwab dropped before
 any answer is sent once more, so each such drop adds one call to a send or a cancel (on 2026-11-13,
 1 in 31 ticket quotes dropped). `calls_per_send` stays 5 and does not count them.
+
+For its opening burst only, the plan holds the poller's later reads (brief 24: `Poller.hold_later` in
+`companion/poller.py`, the rules in `companion/poll_budget.py`; reviews 6 and 7 of fork PR #27). The
+hold starts 30 seconds before the plan may act (09:30:30 ET) and ends 60 seconds after the plan's
+last send. With no send yet it ends at once when no pick is left to send. It never runs past 150
+seconds after the plan may act (09:33:30 ET), with or without a send, so at most 3 minutes: sends
+less than 60 seconds apart do not keep it going. On a normal morning that is 09:30:30 to about
+09:32:05 ET. The
+account and the order list keep their 5 second pace. Fills still come about every 15 seconds
+(`HELD_FILLS_EVERY_S`). Position marks (quotes), corrections and market hours pause, and the
+dashboard shows the marks, open P&L and live R as old. A stop the app moves itself keeps its reads:
+an Auto B/E that has not fired and a spread stop with Send still get their quotes. The plan asks for
+30 second holds and renews them every 10 seconds, each cut so it ends at that second and never past
+the plan's own end (`POLL_HOLD_LEAD_SECONDS`, `POLL_HOLD_AFTER_SEND_SECONDS`,
+`POLL_HOLD_LATEST_SECONDS`, `POLL_HOLD_SECONDS` and `POLL_HOLD_RENEW_SECONDS` in
+`companion/plan_auto/executor.py`; start numbers, not approved by Ash). One hold per arm: entries that
+only rest keep no hold. A later send inside the hold, a Step 7 flip's or re-level's too, moves its end to
+60 seconds after that send, still never past 09:33:30 ET. Sends after the hold ended and the 09:35
+cancels start none (one action is 5 to 10 calls,
+and below 30 order calls a minute the poller keeps marks at 6 seconds by itself). On a disarm or at
+the plan's end it stops renewing, and the last hold lapses within 30 seconds. The hold is the poller's
+own memory, not a Schwab call. Before 09:30:30 ET, or without an Arm click, nothing is held.
 
 Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
 time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
 start and its answer with their times. A step that took over 100 ms before its action adds a
 `slow_step` line. A busy order lock adds one `busy` line per pick; an old order list or account read,
 or a side that is not clear, one `wait` line; and the pick's action after either a `wait_over` line
-with how long it waited (`waited_s`). A skipped
-row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token
-or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
+with how long it waited (`waited_s`). A side rule line keeps the rule's code and the pick's side
+(`side_rule`, `side`), never the words on the page, which can name your own shares. The poller hold
+adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
+row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
+request body or share count of your own positions. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
 `refusal` line, and the plan's Schwab calls their usual `call` lines.
 
 **Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
@@ -747,10 +810,12 @@ stays" (or "re-level is not on") and the entry stays.
   side twice: before the cancel and again just before the send. Same side, or not in the name: it goes,
   beside your shares and orders, and never touches them. Other side, before the cancel: nothing is
   cancelled or written, the entry stays, the plan keeps its one try to cancel that order, and the panel
-  says once "You are long 100 T by hand. The plan does not take the other side of a name you trade.
-  Nothing was sent." Other side after the cancel (you traded during it): nothing is placed and the row
-  says "Cancelled the long entry by the armed plan. Did not place the short: You are long 100 T by
-  hand. ..." Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
+  says once "the side rule said other_side: you are on the long side of T, and the plan does not take
+  the other side of a name you trade, so the long entry stays". Other side after the cancel (you traded
+  during it): nothing is placed and the row and the panel say "Cancelled the long entry by the armed
+  plan. Did not place the short: You are long 100 T by hand. ..." The plan's log
+  (`data/opening_plan/auto/`) keeps the side rule's code (`side_rule`), the name and the side, never
+  your share count or "by hand", as Step 6's armed send does; the page keeps the words. Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
   Schwab's positions old), before the cancel: the entry stays and the next reading decides again. For
   old positions no pick acts on that reading, as for an old order list; for a name that is not clear
   only that pick waits, so the other picks go on. Not clear after the cancel: the same wait as for an old
@@ -796,7 +861,11 @@ stays" (or "re-level is not on") and the entry stays.
   pick and its panel line says nothing rests. No answer to the new
   entry blocks the name, as for any unclear order, and disarms the plan. A 4xx is never retried.
 - The armed plan's log has one line per flip or re-level with its times: the reading, the decision,
-  the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer.
+  the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer. The send
+  writes the same `send_start` and `send_answer` lines as Step 6's sends, so a flip or re-level sent
+  inside the poller hold moves the hold's end to 60 seconds after it, never past 09:33:30 ET (Step 6's
+  hold above). A flip after the hold ended starts no hold of its own. Its `wait`, `wait_over`, `leave`
+  and `flip_auto` lines keep the side rule's code (`side_rule`) and the side, never your share count.
 - Not confirmed at Schwab: how fast a cancel of a resting stop-limit entry shows CANCELED. The cancel
   reads the order back up to ten times, 0.25 s apart. At 0.4 s a Schwab call, a flip takes about
   2.25 s from the start of the cancel to Schwab's answer to the new entry; a cancel that never confirms

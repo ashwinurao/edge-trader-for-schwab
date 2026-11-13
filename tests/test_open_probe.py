@@ -137,11 +137,15 @@ def run(probe, clock, until, step=0.5):
 
 def test_the_shipped_file_has_the_brief_defaults():
     # Brief 21 item 6 (changed from brief 09's 09:28:00-09:40:00 and six times): ranks 1 to 4 both
-    # sides before the open, then again after it.
+    # sides before the open, then again after it. Brief 23 PR A item 2 added two short windows
+    # before the 09:25 freeze, four preview times each, so each name's rate is known early.
     cfg = op.load_config(env={})
-    assert cfg.windows == ((dtime(9, 26, 30), dtime(9, 40)),)
+    assert cfg.windows == ((dtime(9, 5), dtime(9, 7, 30)), (dtime(9, 15), dtime(9, 17, 30)),
+                           (dtime(9, 26, 30), dtime(9, 40)))
     assert cfg.quote_every_s == 5
-    assert cfg.previews == (dtime(9, 27), dtime(9, 27, 30), dtime(9, 28), dtime(9, 28, 30), dtime(9, 29, 30),
+    assert cfg.previews == (dtime(9, 5, 30), dtime(9, 6), dtime(9, 6, 30), dtime(9, 7),
+                            dtime(9, 15, 30), dtime(9, 16), dtime(9, 16, 30), dtime(9, 17),
+                            dtime(9, 27), dtime(9, 27, 30), dtime(9, 28), dtime(9, 28, 30), dtime(9, 29, 30),
                             dtime(9, 30, 2), dtime(9, 31, 2), dtime(9, 32), dtime(9, 33), dtime(9, 35))
     assert cfg.preview_shares == 100
     assert cfg.max_previews_per_time == 2 and cfg.max_previews_per_window == 24
@@ -1084,3 +1088,95 @@ def test_picks_that_come_inside_the_window_are_not_quoted_in_the_429_pause():
     run(probe, clock, et(9, 40, 1), step=0.5)
     assert client.quote_calls == [(et(9, 26, 30), ["SPY"])] and client.previews == []
     assert sink.notes()[-1]["halted"] == "the app is in its 429 pause"
+
+
+# ---- brief 23 PR A: rates before the freeze, kept for the plan ----------------------------------
+
+class DtClient(RichClient):
+    """RichClient whose answer also has projectedIntradayBuyingPower, dropping by the order value
+    times a made-up day-trading rate per side."""
+
+    DT = {"BUY": 1.2, "SELL_SHORT": 1.6}
+
+    def preview_order(self, account, order):
+        ans = super().preview_order(account, order)
+        leg = order["orderLegCollection"][0]
+        value = ans._body["orderStrategy"]["orderBalance"]["orderValue"]
+        ans._body["orderStrategy"]["orderBalance"]["projectedIntradayBuyingPower"] = \
+            round(self.before["dayTradingBuyingPower"] - value * self.DT[leg["instruction"]], 2)
+        return ans
+
+
+def test_the_day_trading_pair_gives_its_own_rate_and_never_a_balance():
+    clock = Clock(et(9, 29, 29))
+    probe, sink = make_rich(clock, DtClient(clock))
+    run(probe, clock, et(9, 29, 31))
+    long_line, short_line = sink.probes("preview")
+    # Long: value 10,035.00; projectedIntradayBuyingPower = 306,172.84 - 12,042.00 -> rate 1.2.
+    assert long_line["dt_rate"] == 1.2 and long_line["dt_rate_why"] is None
+    assert long_line["dt_rate_from"] == ["dayTradingBuyingPower",
+                                         "orderStrategy.orderBalance.projectedIntradayBuyingPower"]
+    assert short_line["dt_rate"] == 1.6
+    # bp keeps its two balances: buyingPower first.
+    assert long_line["bp_rate"] == 1.0 and long_line["bp_rate_from"][0] == "buyingPower"
+    text = json.dumps(sink.lines)
+    for bad in DOLLARS + ("294130", "294131", ACCOUNT_NUMBER, HASH):
+        assert bad not in text, bad
+    # Without the field in the answer: no dt rate, and why.
+    clock = Clock(et(9, 29, 29))
+    probe, sink = make_rich(clock, RichClient(clock))
+    run(probe, clock, et(9, 29, 31))
+    line = sink.probes("preview")[0]
+    assert line["dt_rate"] is None and line["dt_rate_why"] == "no projectedIntradayBuyingPower in the answer"
+
+
+def test_each_preview_goes_to_the_rate_store_and_the_store_holds_no_dollar():
+    from companion.preview_rates import PreviewRates
+    store = PreviewRates()
+    clock = Clock(et(9, 29, 29))
+    client = DtClient(clock)
+    sink = Sink()
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=CFG, make_client=lambda: client,
+                         symbols=lambda: (["NVDA"], ""), emit=sink, wall=clock.wall, mono=clock.mono,
+                         balances=lambda: (BAL, clock.wall() - timedelta(seconds=4)), rates=store.add)
+    run(probe, clock, et(9, 29, 31))
+    day = et(9, 29, 31).astimezone(ET).date()
+    assert store.best("NVDA", "LONG", "af", day) == {"rate": 0.25, "at_et": "09:29:30", "balance": "availableFunds"}
+    assert store.best("NVDA", "SHORT", "af", day)["rate"] == 0.375
+    assert store.best("NVDA", "LONG", "dt", day)["balance"] == "dayTradingBuyingPower"
+    assert store.best("NVDA", "LONG", "bp", day)["rate"] == 1.0
+    text = json.dumps(store.today(clock.wall()))
+    for bad in DOLLARS + ("10035", "9964", ACCOUNT_NUMBER, HASH):
+        assert bad not in text, bad
+
+
+def test_a_store_that_raises_never_stops_the_probe():
+    def boom(line, when):
+        raise RuntimeError("store broke")
+
+    clock = Clock(et(9, 29, 29))
+    client = RichClient(clock)
+    sink = Sink()
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=CFG, make_client=lambda: client,
+                         symbols=lambda: (["NVDA"], ""), emit=sink, wall=clock.wall, mono=clock.mono, rates=boom)
+    run(probe, clock, et(9, 30, 3))
+    assert len(client.previews) == 4                                      # 09:29:30 and 09:30:02, both sides
+    assert sum(1 for n in sink.notes() if "rates failed" in n["text"]) == 1
+
+
+def test_the_windows_before_the_freeze_preview_ranks_1_to_4_both_sides():
+    cfg = op.load_config(env={})
+    clock = Clock(et(9, 3, 0))
+    client = RichClient(clock)
+    probe, sink = make_rich(clock, client, picks=("AAA", "BBB", "CCC", "DDD"), cfg=cfg)
+    run(probe, clock, et(9, 18, 0), step=0.5)
+    got = [(p[0], p[2]["orderLegCollection"][0]["instrument"]["symbol"], p[2]["orderLegCollection"][0]["instruction"])
+           for p in client.previews]
+    times = [et(9, 5, 30), et(9, 6), et(9, 6, 30), et(9, 7), et(9, 15, 30), et(9, 16), et(9, 16, 30), et(9, 17)]
+    ranks = ["AAA", "BBB", "CCC", "DDD"] * 2
+    assert got == [(t, s, i) for t, s in zip(times, ranks) for i in ("BUY", "SELL_SHORT")]
+    # Each window builds its client a minute early and drops it at its end; quotes only inside it.
+    starts = [n for n in sink.notes() if n["text"] == "open probe: window start"]
+    assert [n["window"] for n in starts] == ["2026-11-13 09:05:00-09:07:30 ET", "2026-11-13 09:15:00-09:17:30 ET"]
+    assert all(et(9, 5) <= t < et(9, 7, 30) or et(9, 15) <= t < et(9, 17, 30) for t, _ in client.quote_calls)
+    assert probe.client is None

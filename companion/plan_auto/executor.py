@@ -18,17 +18,26 @@ Each step, from armed.act_from_et (09:31:00 ET) while armed:
    reading and decides again, so a later pick never goes out on an earlier pick's reading. A wait
    (Trader's lock busy: a click, a ticket send or Flat all; or Schwab's order list old) is not an
    action: the step ends, no other pick tries on that reading, and the next step comes one tick
-   later. When a pick that waited acts, one `wait_over` line says how long it waited.
+   later. When a pick that waited acts, one `wait_over` line says how long it waited. A side that
+   is not clear on one name (brief 25) is that pick's own wait: the other picks go on.
 5. At the watch end the engine says would_cancel for each unfilled plan entry; once none is left
    the plan disarms ("the fast watch ended"). The arm ends at the latest end_grace_seconds later;
    if the cancels were still waiting on an old order list, the disarm says how many entries were
    not cancelled for that reason (review 4 of fork PR #27).
 
+For the opening burst only, each step also renews a short hold of the poller's later polls
+(Poller.hold_later, brief 24; `_poll_hold`; reviews 6 and 7 of fork PR #27): from 30 s before
+act_from (09:30:30 ET) while armed, until 60 s after the plan's last send, or with no send yet
+while a pick may still send. Never past 150 s after act_from (09:33:30 ET), so at most 3 minutes.
+The order list and account reads keep their pace, fills still come about every 15 s, position
+marks pause. One hold per arm: later sends and the 09:35 cancels are not announced. A disarm or
+the plan's end stops the renewals, and the last hold lapses by itself.
+
 The worker never holds a lock of its own across a call to Schwab or Edge Scanner, contains every
 exception (an unexpected one disarms for the day and shows why) and never blocks the ticket, the
 poller or the page. Every decision and action is one JSON line in
-data/opening_plan/auto/YYYY-MM-DD.jsonl (git-ignored) with its times; no account numbers, tokens
-or request bodies.
+data/opening_plan/auto/YYYY-MM-DD.jsonl (git-ignored) with its times; no account numbers, tokens,
+request bodies or share counts of the user's own positions (the side rule logs its code).
 """
 from __future__ import annotations
 
@@ -71,6 +80,23 @@ FAR = Decimal(10 ** 9)
 # A step that took longer than this from its first read to its handler logs one "slow_step" line
 # (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC).
 SLOW_STEP_MS = 100.0
+# Brief 24 (architect, 2026-11-13 21:53 UTC) and reviews 6 and 7 of fork PR #27 (22:13 and
+# 22:38 UTC): for its opening burst only, the plan holds the poller's LATER polls
+# (Poller.hold_later in companion/poller.py; the rules in companion/poll_budget.py) so the order
+# list and account reads keep their 5 s pace while it sends. From POLL_HOLD_LEAD_SECONDS before
+# act_from_et, until POLL_HOLD_AFTER_SEND_SECONDS after its last send, and never past
+# POLL_HOLD_LATEST_SECONDS after act_from_et, with or without a send: sends less than 60 s apart
+# (a pick that waits on the side rule, Steps 7 and 8's flips and chases) would keep it going, and
+# Ash trades by hand in these minutes, so the pause of his marks has a fixed upper bound (review 7).
+# One hold per arm (one later action is 5 to 10 calls, and below 30 order calls a minute the poller
+# keeps marks at 6 s by itself). Short holds, renewed: a worker that stops lets the hold lapse by
+# itself. Start numbers, not approved by Ash.
+POLL_HOLD_LEAD_SECONDS = 30.0
+POLL_HOLD_AFTER_SEND_SECONDS = 60.0
+POLL_HOLD_LATEST_SECONDS = 150.0
+POLL_HOLD_SECONDS = 30.0
+POLL_HOLD_RENEW_SECONDS = 10.0
+POLL_HOLD_WHY = "the armed plan's opening sends"
 FLAT_ALL_CLICK = "the Flat all click"
 # Flat all is switched on but register found nothing to wire (architect's review 3 of fork PR #27,
 # 2026-11-13 18:01 UTC): a Flat all click would not disarm the plan, so the plan does not arm.
@@ -146,8 +172,11 @@ class AutoPlan:
                  view: Callable[[], dict], orders: Callable[[], list], orders_fresh: Callable[[], bool],
                  cooldown_left: Callable[[], float], env: Mapping[str, str] = os.environ,
                  registry: Optional[Registry] = None, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 out_dir: Path = OUT_DIR, demo: bool = False, row_view: Optional[Callable[[], dict]] = None) -> None:
+                 out_dir: Path = OUT_DIR, demo: bool = False, row_view: Optional[Callable[[], dict]] = None,
+                 hold_later: Optional[Callable[[float, str], None]] = None) -> None:
+        """`hold_later` is the poller's (Poller.hold_later, brief 24); None holds nothing."""
         self.desk, self.trader, self.tape, self._usable = desk, trader, tape, usable
+        self._hold_later = hold_later
         self._view, self._orders, self._orders_fresh, self._cooldown = view, orders, orders_fresh, cooldown_left
         self._row_view = row_view or view
         self.env, self._now, self.out_dir, self.demo = env, now, Path(out_dir), demo
@@ -181,7 +210,16 @@ class AutoPlan:
         self.sends: deque = deque()             # (monotonic seconds, calls) of the plan's sends
         self.onces: set = set()
         self.last_reading: dict = {}
-        self.busy_picks: dict[str, tuple] = {}  # ticker -> (what, why, since mono) while it waits (Trader's lock, an old list)
+        self.busy_picks: dict[str, tuple] = {}  # ticker -> (what, why, since mono, logged) while it waits
+        # The poller's hold (review 6): the arm (armed_at) the next three belong to, whether that arm's one
+        # hold has ended, when the plan's last send started (its send_start line) and whether a pick may
+        # still send (from the last reading; True before the first).
+        self._hold_arm: Optional[datetime] = None
+        self._hold_done = False
+        self._last_send: Optional[datetime] = None
+        self._may_send = True
+        self._hold_at: Optional[float] = None   # monotonic time of the last hold_later, None when not holding
+        self._hold_from: Optional[float] = None
         self._busy_step = False
         self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
         self.row_check_why = ""                 # the same in words, for the panel
@@ -283,6 +321,11 @@ class AutoPlan:
                     fh.write(json.dumps(row, default=str) + "\n")
         except OSError:
             log.exception("armed plan: could not write its log")
+        if event == "send_start":
+            # Every send of the plan (the break entry, and the later steps' flips and chases) logs this
+            # line just before its Schwab call: the poller's hold runs to 60 s after the last one.
+            with self._lock:
+                self._last_send = now
         if ticker:
             with self._lock:
                 n = self.notes.setdefault(ticker, {})
@@ -299,13 +342,15 @@ class AutoPlan:
             n["said"], n["note"] = code, text
         self.log("note", ticker, code=code, text=text)
 
-    def leave(self, ticker: str, reason: str) -> None:
+    def leave(self, ticker: str, reason: str, logged: Optional[Mapping] = None) -> None:
+        """The plan leaves this pick for today. `logged`: the log's fields (with `why`) when the
+        page's words must not go there (the side rule's words can name the user's own shares)."""
         with self._lock:
             if ticker in self.left:
                 return
             self.left[ticker] = reason
             self.notes.setdefault(ticker, {})["note"] = reason
-        self.log("leave", ticker, why=reason)
+        self.log("leave", ticker, **(dict(logged) if logged else {"why": reason}))
 
     def red(self, ticker: str, reason: str) -> None:
         try:
@@ -333,14 +378,16 @@ class AutoPlan:
         with self._lock:
             self.onces.discard(key)
 
-    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY, end_step: bool = True) -> None:
+    def busy(self, ticker: str, what: str, why: str = plan_entries.TRADER_BUSY, end_step: bool = True,
+             logged: Optional[Mapping] = None) -> None:
         """Nothing reached Schwab and the pick tries again on a later reading: Trader's order lock was
         busy (architect's review 1 of fork PR #27, 2026-11-13 16:45 UTC), or Schwab's order list was
         old (an old list is a wait: live-test notes N1, 2026-11-13 20:12 UTC). Not an action: the
         step ends, no other pick tries on that reading and the worker waits one tick. With
         `end_step` False only this pick waits and the other picks go on (brief 25: the user's side
         on this name is not clear). Said once per pick while the same reason lasts, not once per
-        try: a "busy" line for the lock, "wait" else."""
+        try: a "busy" line for the lock, "wait" else. `logged`: the log's fields (with `why`) in
+        place of `why` (the side rule's code and side, not its words)."""
         now = self._mono()
         with self._lock:
             if end_step:
@@ -348,11 +395,12 @@ class AutoPlan:
             prev = self.busy_picks.get(ticker)
             first = prev is None or prev[:2] != (what, why)
             # The wait counts from its first try, whatever the reason became (wait_over's waited_s).
-            self.busy_picks[ticker] = (what, why, now if prev is None else prev[2])
+            logged = dict(logged) if logged else {"why": why}
+            self.busy_picks[ticker] = (what, why, now if prev is None else prev[2], logged)
             if first:
                 self.notes.setdefault(ticker, {})["note"] = why
         if first:
-            self.log("busy" if why == plan_entries.TRADER_BUSY else "wait", ticker, what=what, why=why)
+            self.log("busy" if why == plan_entries.TRADER_BUSY else "wait", ticker, what=what, **logged)
 
     def _busy_over(self, ticker: str) -> None:
         """A pick that waited acted: one wait_over line with how long it waited (review 4 of fork PR
@@ -364,7 +412,7 @@ class AutoPlan:
             n = self.notes.setdefault(ticker, {})
             if n.get("note") == got[1]:
                 n["note"] = ""
-        self.log("wait_over", ticker, what=got[0], why=got[1], waited_s=round(self._mono() - got[2], 2))
+        self.log("wait_over", ticker, what=got[0], waited_s=round(self._mono() - got[2], 2), **got[3])
 
     def _resting(self) -> list[str]:
         """The plan's own entries still working at Schwab, by the poller's order list."""
@@ -386,6 +434,83 @@ class AutoPlan:
             return f"{why}; entries were not cancelled because Schwab's order list was old"
         return (f"{why}; {n} entr{'y was' if n == 1 else 'ies were'} not cancelled because Schwab's order "
                 "list was old")
+
+    # ---- the poller's hold (brief 24) ---------------------------------------------------------
+
+    @staticmethod
+    def _picks_may_send(er: Mapping, watch_over: bool) -> bool:
+        """A pick may still send: before the watch end, a pick without an entry (or no pick known yet:
+        its sends are still to come). Entries that only rest do not count (review 6 item 4)."""
+        if watch_over:
+            return False
+        states = [(p.get("entry") or {}).get("state") for p in er.get("picks") or []]
+        return not states or "none" in states
+
+    def _poll_hold(self, now: datetime, snap: Mapping) -> None:
+        """The opening burst's hold of the poller's LATER polls (transactions, quotes, corrections,
+        hours; the account and order reads are never held, and fills still come every
+        poll_budget.HELD_FILLS_EVERY_S) with Poller.hold_later (review 6 of fork PR #27, architect,
+        2026-11-13 22:13 UTC). It starts POLL_HOLD_LEAD_SECONDS before act_from_et and ends
+        POLL_HOLD_AFTER_SEND_SECONDS after the plan's last send; with no send yet, while a pick may
+        still send, at once when none may. It never runs past POLL_HOLD_LATEST_SECONDS after
+        act_from_et, with or without a send (review 7, 22:38 UTC). Holds of at most
+        POLL_HOLD_SECONDS, renewed every POLL_HOLD_RENEW_SECONDS, each cut to that end and to the
+        plan's own: a worker that stops lets the hold lapse by itself. One hold per arm. No Schwab
+        call: the hold is the poller's own memory."""
+        if self._hold_later is None:
+            return
+        armed_at, until = snap.get("armed_at"), snap.get("until")
+        if armed_at is None or until is None:
+            return
+        with self._lock:
+            if self._hold_arm != armed_at:
+                self._hold_arm, self._hold_done, self._last_send, self._may_send = armed_at, False, None, True
+            done, last_send, may_send = self._hold_done, self._last_send, self._may_send
+        if done:
+            return
+        act_from = datetime.combine(now.astimezone(ET).date(), self.armed_rules.act_from_et, tzinfo=ET)
+        if now < act_from - timedelta(seconds=POLL_HOLD_LEAD_SECONDS):
+            return
+        latest = act_from + timedelta(seconds=POLL_HOLD_LATEST_SECONDS)
+        if last_send is not None:
+            end = last_send + timedelta(seconds=POLL_HOLD_AFTER_SEND_SECONDS)
+            if end <= latest:
+                why = f"{POLL_HOLD_AFTER_SEND_SECONDS:g} s after the plan's last send"
+            else:
+                end, why = latest, f"the hold's latest end, {_et(latest)} ET"
+        elif may_send:
+            end, why = latest, f"no send by {_et(latest)} ET"
+        else:
+            end, why = None, "no pick left to send"
+        if end is None or now >= end:
+            with self._lock:
+                self._hold_done = True
+            self._poll_hold_end(why)
+            return
+        mono = self._mono()
+        if self._hold_at is not None and mono - self._hold_at < POLL_HOLD_RENEW_SECONDS:
+            return
+        seconds = min(POLL_HOLD_SECONDS, (min(end, until) - now).total_seconds())
+        if seconds <= 0:
+            return
+        try:
+            self._hold_later(seconds, POLL_HOLD_WHY)
+        except Exception:
+            log.exception("armed plan: could not hold the poller's later polls")
+            return
+        if self._hold_at is None:
+            self._hold_from = mono
+            self.log("poll_hold", None, seconds=round(seconds, 2), renew_every_s=POLL_HOLD_RENEW_SECONDS)
+        self._hold_at = mono
+
+    def _poll_hold_end(self, why: str) -> None:
+        """No more renewals; the last hold lapses by itself, at most POLL_HOLD_SECONDS later (and never
+        past the end it was cut to)."""
+        if self._hold_at is None:
+            return
+        held = self._mono() - (self._hold_from if self._hold_from is not None else self._hold_at)
+        self._hold_at = self._hold_from = None
+        self.log("poll_hold_end", None, why=why, held_s=round(held, 2))
 
     # ---- one step -----------------------------------------------------------------------------
 
@@ -545,6 +670,7 @@ class AutoPlan:
         self._roll_day(now)
         snap = self.arming.snapshot()
         if not self.arming.is_armed(now):
+            self._poll_hold_end("the plan is not armed")
             if snap["armed_at"] is not None:
                 self.disarm(self._arm_end_reason())
             return False
@@ -552,6 +678,7 @@ class AutoPlan:
         if why:
             self.disarm(why, for_day=for_day)
             return False
+        self._poll_hold(now, snap)
         day = now.astimezone(ET).date()
         if now < datetime.combine(day, self.armed_rules.act_from_et, tzinfo=ET):
             return False
@@ -587,6 +714,9 @@ class AutoPlan:
         offered = [d for d in chase_offers(self, picks, left, watch_over) if d.get("symbol") in picks]
         self._note_decisions(offered, er, timing)
         acts += offered
+        may_send = self._picks_may_send(er, watch_over)
+        with self._lock:
+            self._may_send = may_send
         if watch_over:
             # After the watch end only cancels run, whatever a later step registers: no send, flip,
             # re-level or chase (architect's review, 2026-11-13 16:21 UTC).
@@ -887,7 +1017,9 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         plan = AutoPlan(desk, trader, playbook, tape, usable or (lambda r, now: (False, "no tape")),
                         app.state.opening_plan_view, poller._merged_orders,
                         (lambda: True) if demo else (lambda: poller._fresh("orders_today")),
-                        poller.cooldown_left, env=env, now=now, out_dir=out_dir, demo=demo, row_view=row_view)
+                        poller.cooldown_left, env=env, now=now, out_dir=out_dir, demo=demo, row_view=row_view,
+                        # Brief 24: the poller's hold of its later polls while the plan works (no Schwab call).
+                        hold_later=None if demo else getattr(poller, "hold_later", None))
     except Exception as e:
         # A bad playbook never stops Edge Trader: no armed plan, and the log says why.
         log.error("armed plan is off: %s", e)

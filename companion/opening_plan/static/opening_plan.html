@@ -220,6 +220,11 @@ function notes(r) {
     if (st.auto_text) out.push(`<div class="mutline">${esc(st.auto_text)}</div>`);
     // Brief 25 rule F: the user's own shares or working orders on the name, beside the plan's.
     if (e.manual) out.push(`<div class="mutline">${esc(e.manual)}</div>`);
+    // Brief 29 part B: what the newest price Edge Trader holds says before the click. Display only.
+    const pl = e.price || {}, pk = s => s && (s.state === "THROUGH" || s.state === "STOP") ? "warnline" : "mutline";
+    if (pl.long && pl.short && pl.long.text && pl.long.text === pl.short.text) out.push(`<div class="${pk(pl.long)}">${esc(pl.long.text)}</div>`);
+    else for (const [k, s] of [["Long", pl.long], ["Short", pl.short]])
+      if (s && s.text) out.push(`<div class="${pk(s)}">${k}: ${esc(s.text)}</div>`);
   }
   const cv = coverOf(r.ticker);
   if (cv && cv.red) out.push(`<div class="badline">${esc(cv.text)}<button class="ob stop" data-act="add-stop" data-t="${esc(r.ticker)}"
@@ -522,7 +527,9 @@ function render(v, browserStale) {
     ${entries ? `With the plan buttons on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
     the server's own row (never this page's prices). Flip cancels first and places the other side only after Schwab confirms the cancel with nothing
     filled; otherwise the row turns red and nothing more is sent from it today. At most ${entries.max_flips} flips per row a day.
-    Each send is the size stage in the Orders column (size.stage in playbook.json; 1 share until Ash raises it).`
+    Each send is the size stage in the Orders column (size.stage in playbook.json; 1 share until Ash raises it).
+    The price line under a row uses the newest price Edge Trader already holds and turns no button off: the click checks
+    Schwab's own quote again, so the line and the click can differ.`
     : "This screen places, changes and cancels nothing."}${flat ? ` Flat all lists what it will do per row and sends it only on Confirm:
     cancels first, then closes of what the plan's own entries filled, never retried; it stands out from 2 minutes before ${esc(flat.flat_et)} ET
     and sends nothing by the clock. A row whose shares have no working stop for more than ${esc(flat.grace_seconds)} s turns red with
