@@ -92,7 +92,8 @@ class Host:
         self.tape = []                  # what reread() answers, in order; the last one repeats
         self.left = {"orders_pick": 5, "orders_day": 20, "calls_minute": 40}
         self.said, self.gone, self.disarms, self.logs, self.keys = [], [], [], [], set()
-        self.busied, self.busy_why, self.busy_ends = [], [], []
+        self.busied, self.busy_why, self.busy_ends, self.busy_logged = [], [], [], []
+        self.gone_logged = []
         self.orders = lambda: []        # the order list reread() gives auto_entry (the fixture sets it)
 
     def armed(self):
@@ -137,12 +138,15 @@ class Host:
     def say(self, ticker, code, text):
         self.said.append((code, text))
 
-    def leave(self, ticker, reason):
+    def leave(self, ticker, reason, logged=None):
+        # logged: Step 6's keyword since 8f6b68c, the log's fields in place of the page's words.
         self.gone.append(reason)
+        self.gone_logged.append(logged)
 
     def red(self, ticker, reason):
         self.desk.red_auto(ticker, reason)
         self.gone.append(reason)
+        self.gone_logged.append(None)
 
     def disarm(self, reason, for_day=False):
         self.disarms.append((reason, for_day))
@@ -157,11 +161,13 @@ class Host:
     def forget(self, key):
         self.keys.discard(key)
 
-    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY, end_step=True):
+    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY, end_step=True, logged=None):
         # end_step: Step 6's keyword since 2ca2073 (brief 25); False lets the other picks go on.
+        # logged: since 8f6b68c, the log's fields in place of the page's words.
         self.busied.append(what)
         self.busy_why.append(why)
         self.busy_ends.append(end_step)
+        self.busy_logged.append(logged)
 
 
 def tape_pick(last, high=42.48, low=41.92, final=True, age=0.1, entry=None):
