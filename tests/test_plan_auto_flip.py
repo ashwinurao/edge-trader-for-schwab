@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from companion import break_entry, plan_entries, plan_flat, trading
+from companion import break_entry, plan_entries, plan_flat, plan_side, trading
 from companion.opening_plan import engine
 from companion.plan_auto import AUTO_FLAG, FLIP_FLAG, SCANNER_URL, flip, handlers
 from companion.store import Store
@@ -52,8 +52,10 @@ RELEVEL_REQ = {**LONG_REQ, "trigger": "42.61", "limit": "42.67", "expected_limit
 class StrictBroker(PlanBroker):
     """PlanBroker that checks the armed plan's structural rules on every Schwab call: never two
     entries working for one name (brief 17 item 2), and no lock of the desk held across a call
-    (brief 14 safety rule 7)."""
+    (brief 14 safety rule 7). `manual` holds the ids of the user's own orders (brief 25): they are
+    not the plan's entries, so they stay out of that check."""
     desk = None
+    manual: frozenset = frozenset()
 
     def _no_lock(self):
         assert self.desk is None or not self.desk._lock.locked(), "the desk's lock is held across a Schwab call"
@@ -61,7 +63,8 @@ class StrictBroker(PlanBroker):
     def place_order(self, h, order):
         self._no_lock()
         sym = order["orderLegCollection"][0]["instrument"]["symbol"]
-        working = [o["orderId"] for o in self.orders.values() if o.get("status") in trading.LIVE and any(
+        working = [o["orderId"] for o in self.orders.values() if o.get("status") in trading.LIVE
+                   and o["orderId"] not in self.manual and any(
             (leg.get("instrument") or {}).get("symbol") == sym for leg in o.get("orderLegCollection") or [])]
         assert not working, f"two entries for {sym}: order {working} still works"
         return super().place_order(h, order)
@@ -659,13 +662,246 @@ def test_an_old_order_list_before_the_cancel_waits_for_the_next_reading(r, kind)
     assert rec(r)["state"] == plan_entries.SENT and rec(r)["side"] == ("SHORT" if kind == "would_flip" else "LONG")
 
 
-def test_not_with_another_working_order_on_the_name(r):
-    place_long(r)
-    r.broker.orders[77] = {"orderId": 77, "status": "WORKING", "filledQuantity": 0,
-                           "orderLegCollection": [{"instruction": "SELL", "instrument": {"symbol": "AAAA"}}]}
-    assert run(r) is False
+# ---------------------------------------------------------------- your own trades on the name (brief 25)
+# Ash picked "Plan trades beside you" (project thread, 2026-11-13 20:04:42 UTC). The architect's rule
+# for this step (2026-11-13 21:31 UTC): plan_side.manual_refusal for the NEW side, before the cancel
+# and again before the send.
+
+OTHER_SIDE_TAIL = " The plan does not take the other side of a name you trade. Nothing was sent."
+BOTH_SIDES = ("You are on both sides of AAAA (shares or working orders), so the plan cannot tell which side "
+              "you trade. Nothing was sent.")
+
+
+def by_hand(x, positions=None, fresh=True, orders=()):
+    """Ash's own trades: the poller's net shares per name, whether that read is fresh, and working
+    orders of his own on the broker (left out of the strict brokers' one-entry check)."""
+    hand = getattr(x, "hand", None)
+    if hand is None:
+        hand = x.hand = {}
+        x.desk._positions_fn = lambda: dict(hand["positions"])
+        x.desk._positions_fresh_fn = lambda: hand["fresh"]
+    hand.update(positions=dict(positions or {}), fresh=fresh)
+    for o in orders:
+        x.broker.orders[o["orderId"]] = o
+        x.broker.manual = frozenset(set(getattr(x.broker, "manual", ())) | {o["orderId"]})
+
+
+def own_order(oid, instruction, symbol="AAAA", status="WORKING", qty=100):
+    return {"orderId": oid, "status": status, "filledQuantity": 0, "orderType": "LIMIT", "quantity": qty,
+            "price": 10.0, "orderLegCollection": [{"instruction": instruction, "quantity": qty,
+                                                    "instrument": {"symbol": symbol, "assetType": "EQUITY"}}]}
+
+
+def swap_args(r, kind):
+    """The run() arguments for a flip (long to short) or a re-level (long again, the bar moved)."""
+    if kind == "would_flip":
+        return {}
+    new_bar(r)
+    return {"last": 42.40, "high": 42.60}
+
+
+# Ash on the other side of the NEW side: long for the flip's short, short for the re-level's long.
+OTHER_SIDE_CASES = {
+    "flip-shares": ("would_flip", {"AAAA": 100}, None, "You are long 100 AAAA by hand."),
+    "flip-order": ("would_flip", {}, "BUY", "You have a working long order on AAAA."),
+    "relevel-shares": ("would_relevel", {"AAAA": -100}, None, "You are short 100 AAAA by hand."),
+    "relevel-order": ("would_relevel", {}, "SELL_SHORT", "You have a working short order on AAAA."),
+}
+
+
+@pytest.mark.parametrize("case", list(OTHER_SIDE_CASES))
+def test_before_the_cancel_your_other_side_keeps_the_entry_and_its_one_cancel(r, case):
+    # Nothing reaches Schwab, nothing is written, no line is logged, and the order's one automatic
+    # cancel is not used: when Ash is out of the name later, the same order is still cancelled.
+    kind, positions, instruction, what = OTHER_SIDE_CASES[case]
+    oid = place_long(r)
+    by_hand(r, positions, orders=[own_order(77, instruction)] if instruction else ())
+    args = swap_args(r, kind)
+    wrote = []
+    real_save = r.desk._save
+    r.desk._save = lambda recs: wrote.append(1) or real_save(recs)
+    for _ in range(3):
+        assert run(r, kind, **args) is False             # nothing done: other picks go on
     nothing_at_schwab(r)
-    assert "already at Schwab (order 77)" in r.host.said[-1][1]
+    assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.busied == []
+    k = kind[len("would_"):]
+    assert r.host.said == [(f"{k}_other_side", what + OTHER_SIDE_TAIL)] * 3   # the executor says it once
+    got = rec(r)
+    assert (got["state"], got["side"], got["order_id"]) == (plan_entries.SENT, "LONG", oid)
+    assert got.get("flips", 0) == 0 and got.get("relevels", 0) == 0
+    assert r.broker.orders[77]["status"] == "WORKING" if instruction else 77 not in r.broker.orders
+    # Ash is out of the name: the same order is cancelled once and the new side goes.
+    if instruction:
+        r.broker.orders[77]["status"] = "CANCELED"
+    by_hand(r, {})
+    r.desk._save = real_save
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and r.host.keys == {f"cancel:{oid}"}
+    assert r.broker.placed[-1]["orderLegCollection"][0]["instruction"] == (
+        "SELL_SHORT" if kind == "would_flip" else "BUY")
+
+
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_before_the_cancel_old_positions_are_a_wait_for_the_next_reading(r, kind):
+    # As an old order list (N1): no pick can read the side, so the step ends with lane.busy and the
+    # next reading decides again. Nothing sent, written or logged, and the one cancel is not used.
+    place_long(r)
+    by_hand(r, {}, fresh=False)
+    args = swap_args(r, kind)
+    wrote = []
+    real_save = r.desk._save
+    r.desk._save = lambda recs: wrote.append(1) or real_save(recs)
+    for _ in range(3):
+        assert run(r, kind, **args) is True              # not an action: the step ends, a tick later again
+    nothing_at_schwab(r)
+    assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.said == []
+    assert r.host.busied == [kind[len("would_"):]] * 3 and r.host.busy_why == [plan_side.POSITIONS_OLD] * 3
+    assert r.host.busy_ends == [True] * 3
+    r.desk._save = real_save
+    by_hand(r, {}, fresh=True)
+    assert run(r, kind, **args) is True
+    assert len(r.broker.cancelled) == 1 and len(r.broker.placed) == 2
+
+
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_before_the_cancel_a_side_not_clear_waits_for_this_pick_only(r, kind):
+    # Ash holds AAAA long and works a short order on it: the plan cannot tell his side. A wait of
+    # this pick only, as Step 6's armed send (lane.busy with end_step=False): the next reading
+    # decides again and the other picks go on. Nothing sent, written or logged; the one cancel is
+    # not used.
+    place_long(r)
+    by_hand(r, {"AAAA": 100}, orders=[own_order(77, "SELL_SHORT")])
+    args = swap_args(r, kind)
+    wrote = []
+    real_save = r.desk._save
+    r.desk._save = lambda recs: wrote.append(1) or real_save(recs)
+    for _ in range(3):
+        assert run(r, kind, **args) is False             # not an action, and the step goes on
+    nothing_at_schwab(r)
+    assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.said == []
+    assert r.host.busied == [kind[len("would_"):]] * 3 and r.host.busy_why == [BOTH_SIDES] * 3
+    assert r.host.busy_ends == [False] * 3
+    r.desk._save = real_save
+    r.broker.orders[77]["status"] = "CANCELED"
+    by_hand(r, {})
+    assert run(r, kind, **args) is True
+    assert len(r.broker.cancelled) == 1 and len(r.broker.placed) == 2
+
+
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_your_own_trades_on_the_new_side_do_not_stop_it(r, kind):
+    # Ash holds the NEW side by hand with his own stop working: the plan goes beside him (brief 25,
+    # rule B), and his order is never touched.
+    oid = place_long(r)
+    if kind == "would_flip":
+        by_hand(r, {"AAAA": -100}, orders=[own_order(77, "BUY_TO_COVER")])
+    else:
+        by_hand(r, {"AAAA": 100}, orders=[own_order(77, "SELL")])
+    args = swap_args(r, kind)
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 2
+    assert r.broker.placed[-1]["orderLegCollection"][0]["instruction"] == (
+        "SELL_SHORT" if kind == "would_flip" else "BUY")
+    assert r.broker.orders[77]["status"] == "WORKING"
+    assert rec(r)["state"] == plan_entries.SENT and r.host.said == [] and r.host.gone == []
+
+
+def _other_side_at(r, monkeypatch, when, positions):
+    """Ash takes the other side of the name after the plan's look before the cancel: during the
+    cancel (the look at the top of the send half sees it) or during the recheck after it (only the
+    look under the lock just before the send sees it)."""
+    if when == "cancel":
+        real_cancel = r.trader.cancel_entry
+
+        def cancel(oid):
+            got = real_cancel(oid)
+            by_hand(r, positions)
+            return got
+        monkeypatch.setattr(r.trader, "cancel_entry", cancel)
+    else:
+        real_reread, n = r.host.reread, []
+
+        def reread(t):
+            n.append(1)
+            if len(n) == 2:                          # the first reading after the cancel
+                by_hand(r, positions)
+            return real_reread(t)
+        r.host.reread = reread
+
+
+@pytest.mark.parametrize("when", ["cancel", "recheck"])
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_after_the_cancel_your_other_side_places_nothing_and_leaves_the_pick(r, monkeypatch, kind, when):
+    oid = place_long(r)
+    by_hand(r, {})
+    args = swap_args(r, kind)
+    left = dict(r.host.left)
+    if kind == "would_flip":
+        _other_side_at(r, monkeypatch, when, {"AAAA": 100})
+        new, what = "short", "You are long 100 AAAA by hand."
+    else:
+        _other_side_at(r, monkeypatch, when, {"AAAA": -100})
+        new, what = "long", "You are short 100 AAAA by hand."
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 1 and len(r.sent) == 1   # nothing sent
+    want = f"Cancelled the long entry by the armed plan. Did not place the {new}: {what}{OTHER_SIDE_TAIL}"
+    got = rec(r)
+    assert (got["state"], got["order_id"], got["text"]) == (plan_entries.NONE, None, want)
+    assert r.host.gone == [want] and r.host.disarms == []
+    assert r.host.left == left                       # the send's reservation, if made, went back
+    (line,) = [f for e, t, f in r.host.logs if e == f"{kind[len('would_'):]}_auto"]
+    assert (line["stage"], line["code"], line["cancelled_order_id"]) == ("recheck", "other_side", oid)
+
+
+@pytest.mark.parametrize("when", ["cancel", "recheck"])
+@pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
+def test_after_the_cancel_a_side_not_clear_waits_then_sends_once(r, monkeypatch, kind, when):
+    # The same wait as for an old order list after the cancel: a tick at a time, one row line and
+    # one panel line, never a send while it is not clear, then everything checked again and one send.
+    oid = place_long(r)
+    by_hand(r, {})
+    args = swap_args(r, kind)
+    k, new = kind[len("would_"):], ("short" if kind == "would_flip" else "long")
+    seen, started = [], []
+    if when == "cancel":
+        real_cancel = r.trader.cancel_entry
+
+        def cancel(o):
+            got = real_cancel(o)
+            by_hand(r, {}, fresh=False)
+            started.append(1)
+            return got
+        monkeypatch.setattr(r.trader, "cancel_entry", cancel)
+    else:
+        real_reread, n = r.host.reread, []
+
+        def reread(t):
+            n.append(1)
+            if len(n) == 2:
+                by_hand(r, {}, fresh=False)
+                started.append(1)
+            return real_reread(t)
+        r.host.reread = reread
+
+    def tick(s):
+        if not started:
+            return                                   # Trader.cancel_entry's own read-back waits
+        assert s == 0.25 and len(r.broker.placed) == 1
+        seen.append(rec(r)["text"])
+        if len(seen) == 4:
+            by_hand(r, {}, fresh=True)
+    monkeypatch.setattr(trading.time, "sleep", tick)
+    assert run(r, kind, **args) is True
+    assert r.broker.cancelled == [oid] and len(r.broker.placed) == 2
+    assert r.broker.placed[-1]["orderLegCollection"][0]["instruction"] == ("SELL_SHORT" if new == "short" else "BUY")
+    waiting = (f"The armed plan cancelled the long entry. It places the {new} once it can tell which side you "
+               f"trade AAAA on: {plan_side.POSITIONS_OLD}")
+    assert seen == [waiting] * 4
+    assert r.host.said == [(f"{k}_not_clear", f"cancelled the long entry; the {new} goes once Schwab's positions "
+                                              "and orders show which side you trade AAAA on")]
+    line = [f for e, t, f in r.host.logs if e == f"{k}_auto"][0]
+    assert line["ok"] and {"not_clear_from", "not_clear_until"} <= set(line["times"])
+    assert r.host.left["orders_pick"] == 4 and r.host.left["calls_minute"] == 36   # one send's worth, net
 
 
 def test_not_when_no_order_is_left_for_the_pick(r):
@@ -1587,7 +1823,7 @@ def frig(rig):  # noqa: F811
         # Never two entries working for one name (brief 17 item 2), checked after every place.
         by_name = {}
         for o in rig.broker.orders.values():
-            if o.get("status") in trading.LIVE:
+            if o.get("status") in trading.LIVE and o["orderId"] not in getattr(rig.broker, "manual", ()):
                 sym = o["orderLegCollection"][0]["instrument"]["symbol"]
                 by_name[sym] = by_name.get(sym, 0) + 1
         working.append(max(by_name.values()))
@@ -2231,6 +2467,70 @@ def test_the_new_entry_schwab_rejects_after_its_201_is_not_sent_again(frig, read
     run_plan(frig, et(9, 35, 10))
     assert sorted(frig.broker.cancelled) == sorted(ids.values()) and new_id not in frig.broker.cancelled
     assert len(frig.broker.placed) == 5
+
+
+def test_executor_your_other_side_before_the_flip_is_said_once_and_the_entry_stays(frig):
+    # Brief 25 through Step 6's executor: each reading still decides would_flip, the pick's line says
+    # why once, nothing is cancelled or logged, and the plan stays armed. When Ash is out of the
+    # name, the next reading flips once.
+    ids = aaaa_past_its_flip_line(frig)
+    by_hand(frig, {"AAAA": 100})
+    run_plan(frig, et(9, 31, 9))
+    assert frig.broker.cancelled == [] and len(frig.broker.placed) == 4
+    want = "You are long 100 AAAA by hand." + OTHER_SIDE_TAIL
+    said = [x["text"] for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == "flip_other_side"]
+    assert said == [want] and note(frig) == want
+    assert not [x for x in plan_lines(frig) if x["event"] == "flip_auto"]
+    assert frig.desk.records()["AAAA"]["state"] == plan_entries.SENT
+    assert frig.plan.arming.is_armed(frig.clock.now())
+    by_hand(frig, {})
+    run_plan(frig, et(9, 31, 12))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5 and max(frig.working) == 1
+    assert frig.broker.placed[-1]["orderLegCollection"][0]["instruction"] == "SELL_SHORT"
+
+
+def test_executor_a_side_not_clear_on_one_name_lets_the_other_picks_go_on(frig):
+    # AAAA's side is not clear (Ash long and working a short order); its flip waits for a later
+    # reading, but the step does not end there: BBBB, past its own flip line, flips.
+    ids = aaaa_past_its_flip_line(frig)
+    frig.tape.prices["BBBB"] = 20.30                  # BBBB's flip line 20.300; AAAA is nearer its trigger
+    frig.view.bars["BBBB"] = (20.50, 20.00, 20.30)
+    by_hand(frig, {"AAAA": 100}, orders=[own_order(77, "SELL_SHORT")])
+    run_plan(frig, et(9, 31, 9))
+    assert frig.broker.cancelled == [ids["BBBB"]] and len(frig.broker.placed) == 5 and max(frig.working) == 1
+    assert frig.broker.placed[-1]["orderLegCollection"][0]["instrument"]["symbol"] == "BBBB"
+    waits = [(x["what"], x["why"]) for x in plan_lines(frig, "wait") if x["ticker"] == "AAAA"]
+    assert waits == [("flip", BOTH_SIDES)] and note(frig) == BOTH_SIDES        # said once
+    assert not [x for x in plan_lines(frig, "busy") if x["ticker"] == "AAAA"]
+    assert frig.broker.orders[77]["status"] == "WORKING"
+
+
+@pytest.mark.parametrize("ready", [aaaa_past_its_flip_line, relevel_ready], ids=["flip", "relevel"])
+def test_executor_a_side_not_clear_after_the_cancel_until_the_watch_end_sends_nothing(frig, monkeypatch, ready):
+    # The positions read goes old just as the cancel is confirmed and stays old: the send waits a
+    # tick at a time, as for an old order list, and at 09:35:00 nothing is placed and the row says why.
+    ids = ready(frig)
+    by_hand(frig, {})
+    real_cancel = frig.trader.cancel_entry
+
+    def cancel(oid):
+        got = real_cancel(oid)
+        by_hand(frig, {}, fresh=False)
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel)
+    run_plan(frig, et(9, 35, 0.1), start=et(9, 34, 58))
+    # AAAA's cancel first; after 09:35:00 the watch end's own cancels end the other picks' entries.
+    assert frig.broker.cancelled[0] == ids["AAAA"] and frig.broker.cancelled.count(ids["AAAA"]) == 1
+    assert len(frig.broker.placed) == 4
+    want = ("Cancelled the long entry by the armed plan; the fast watch ended while your side of AAAA was not "
+            "clear, so nothing rests.")
+    got = frig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and got["text"] == want
+    assert [x["why"] for x in plan_lines(frig, "leave") if x["ticker"] == "AAAA"] == [want]
+    (line,) = [x for x in plan_lines(frig) if x["event"].endswith("_auto") and x["ticker"] == "AAAA"
+               and x.get("stage") == "recheck"]
+    assert line["code"] == "not_clear" and line["cancelled_order_id"] == ids["AAAA"]
+    assert {"not_clear_from"} <= set(line["times"])
 
 
 def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):

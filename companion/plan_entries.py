@@ -425,8 +425,8 @@ class PlanDesk:
 
     def _foreign(self, ticker: str, rec: Mapping, orders: list[dict]) -> Optional[dict]:
         """A working order on this name that this row did not send (the ticket, thinkorswim).
-        Not used by Place, Flip or Step 6's armed send since brief 25 (the side rule: _beside and
-        _auto_refusal); kept for the branches of Steps 7 and 8 (ET PRs #28 and #25) until they move."""
+        Not used by Place, Flip, Step 6's armed send or Step 7's flip and re-level since brief 25 (the
+        side rule: _beside, _auto_refusal, _swap_side); kept for Step 8's branch (ET PR #25) until it moves."""
         own = rec.get("order_id")
         for o in orders:
             if o.get("orderId") == own or o.get("status") not in LIVE:
@@ -1000,23 +1000,35 @@ class PlanDesk:
             return (f"{ticker}: {used} of {limit} flips used today (automatic.max_flips in playbook.json)."
                     if kind == "flip" else
                     f"{ticker}: {used} of {limit} re-levels used today (armed.relevels_per_pick in playbook.json).")
-        return self._swap_send_refusal(ticker, rec.get("order_id"), orders, blocked)
+        return self._swap_send_refusal(ticker, blocked)
 
-    def _swap_send_refusal(self, ticker: str, own_id: Any, orders: list[dict], blocked: Optional[set]) -> str:
+    def _swap_send_refusal(self, ticker: str, blocked: Optional[set]) -> str:
         """The click's send rules that are not about Step 2's row (the tape's own tests replace
-        those, brief 16 item 5): ARM, regular hours, an unclear order, another working order."""
+        those, brief 16 item 5) or about the user's own trades on the name (_swap_side, brief 25):
+        ARM, regular hours, an unclear order."""
         if not self._armed():
             return "ARM is off on the dashboard."
         if not self._market_open():
             return "The market is closed."
-        f = self._foreign(ticker, {"order_id": own_id}, orders)
-        if f is not None:
-            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
         if blocked is None:
             return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
         if ticker in blocked:
             return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
         return ""
+
+    def _swap_side(self, ticker: str, side: str, rec: Mapping, orders: list[dict], fresh: bool) -> tuple[str, str]:
+        """Brief 25's side rule for the NEW side of the armed plan's flip or re-level: (code, text)
+        from plan_side.manual_refusal, code OK, OTHER_SIDE or NOT_CLEAR. The row's own entry, its
+        stop and the order a confirmed cancel ended are the plan's (plan_side.plan_shares), never
+        the user's. Asked twice, before the cancel and again under the lock just before the send
+        (architect, 2026-11-13 21:31 UTC). Same side as the user, or not in the name: OK."""
+        positions, pfresh = self._positions_read()
+        try:
+            ps = plan_side.plan_shares(rec, orders)
+            return plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ps.ids, ps.held)
+        except Exception as e:                    # when unsure, refuse (CONTRIBUTING rule 4)
+            _log.exception("armed plan: the side rule failed for %s", ticker)
+            return plan_side.NOT_CLEAR, f"Could not read your {ticker} position and orders ({e}). Nothing was sent."[:300]
 
     def _paused(self) -> bool:
         """The app's 429 pause (the poller sets Trader.cooldown_left)."""
@@ -1034,7 +1046,8 @@ class PlanDesk:
                   view: Optional[Mapping] = None,
                   wait: Callable[..., str] = lambda reason="busy": (
                       "another order action holds Trader's lock" if reason == "busy" else
-                      "Schwab's order list is old")) -> dict:
+                      "Schwab's order list is old" if reason == "orders_old" else
+                      "your side of the name is not clear")) -> dict:
         """Flip's twin for the armed plan (Step 7, brief 17 item 2), and the re-level (item 4).
 
         kind "flip" cancels the row's resting entry and places the other side; "relevel" places
@@ -1068,14 +1081,27 @@ class PlanDesk:
         the flip waits as for the lock, `wait("orders_old")` once per tick, with one row line; when
         the list is fresh, recheck() and the checks run again before the send.
 
+        The user's own trades on the name (brief 25, companion/plan_side.py; architect, 2026-11-13
+        21:31 UTC): _swap_side asks plan_side.manual_refusal about the NEW side twice, before the
+        cancel and again under the lock just before the send. Same side as the user, or not in the
+        name: it goes. Before the cancel nothing is written, no line is logged and `may_cancel` is
+        not asked, so the order keeps its one automatic cancel: the other side answers code
+        "other_side" (the entry stays); a side that is not clear answers `again` with code
+        "not_clear" and `this_name` (only this pick waits, as Step 6's WAIT_NAME), or code
+        "positions_old" when Schwab's positions are old (every pick waits), and the next reading
+        decides again. After the confirmed cancel the other side places nothing and the row says
+        why (code "other_side"); a side that is not clear is a wait as for an old list,
+        `wait("not_clear")` once per tick, until it is clear, the plan is disarmed or the fast
+        watch ends.
+
         Flat all's hold (`held()`, Step 9): first of all, before the cancel, the answer is `held` with
         no record written and no line logged. After the confirmed cancel it is checked on each pass,
         before the busy wait, and again under the lock just before the send: nothing is placed and
         the row says "Cancelled by the armed plan, nothing rests." with the hold's reason.
 
         Returns {"ok", "ticker", "side", "kind", "stage", "code", "error", "red", "unclear",
-        "throttled", "filled", "again", "busy", "cancel_not_sent", "not_sent", "cancel", "send",
-        "cancelled_order_id", "times"}.
+        "throttled", "filled", "again", "busy", "this_name", "cancel_not_sent", "not_sent", "cancel",
+        "send", "cancelled_order_id", "times"}.
         stage: "refused" (nothing reached Schwab), "cancel" (the cancel did not confirm: the row is
         red), "recheck" (cancelled, nothing placed), "send" (Trader.submit answered, in "send";
         `not_sent` when it refused before any request left). `cancelled_order_id` is the order the
@@ -1084,8 +1110,8 @@ class PlanDesk:
         times = dict(times or {})
         out = {"ok": False, "ticker": ticker, "side": side, "kind": kind, "stage": "refused", "code": "",
                "error": "", "red": False, "unclear": False, "throttled": False, "filled": False,
-               "again": False, "busy": False, "cancel_not_sent": False, "not_sent": False, "cancel": None, "send": None,
-               "cancelled_order_id": None, "times": times}
+               "again": False, "busy": False, "this_name": False, "cancel_not_sent": False, "not_sent": False,
+               "cancel": None, "send": None, "cancelled_order_id": None, "times": times}
 
         def done(**kw) -> dict:
             out.update(kw)
@@ -1143,6 +1169,18 @@ class PlanDesk:
                 return out
             if why:
                 return done(error=why, again=entry["state"] in BUSY)
+            # Brief 25: the user's own trades on the name, for the NEW side (architect, 2026-11-13
+            # 21:31 UTC). Before may_cancel, so a refusal keeps the order's one automatic cancel; no
+            # record written and no line logged (it can last minutes), the lane says it once.
+            s_code, s_text = self._swap_side(ticker, side, rec, orders, fresh)
+            if s_code != plan_side.OK:
+                # Step 6's wait words (2ca2073): an old read is a wait of every pick (WAIT_ALL), a side
+                # that is not clear on this name a wait of this pick only (`this_name`, WAIT_NAME).
+                word = {ORDERS_OLD: "orders_old", plan_side.POSITIONS_OLD: "positions_old"}.get(s_text, "not_clear")
+                out.update(code="other_side" if s_code == plan_side.OTHER_SIDE else word, error=s_text,
+                           again=s_code == plan_side.NOT_CLEAR,
+                           this_name=s_code == plan_side.NOT_CLEAR and word == "not_clear")
+                return out
             try:
                 shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
                 if shares < 1:
@@ -1198,10 +1236,20 @@ class PlanDesk:
         # (architect's review 1 of Step 6, 2026-11-13 16:45 UTC, must 1). There is no state to resume
         # on a later step: the executor treats a FLIPPING row as ended.
         waiting = ""
+        mine = {"order_id": oid, "side": old}     # the plan's ids on the name: the ended entry and its stop
+        side_wait = ""                            # the lock's side check said "not clear": wait first
         while True:
             held = self.held()
-            # What the send waits for, if anything: Trader's lock, then a fresh order list (N1).
+            # What the send waits for, if anything: Trader's lock, then a fresh order list (N1), then
+            # which side the user is on (brief 25).
             pause = "" if held else "busy" if self.trader_busy() else "" if self._orders_fresh() else "orders_old"
+            s_code, s_text = plan_side.OK, ""
+            if not held and not pause:
+                s_code, s_text = ((plan_side.NOT_CLEAR, side_wait) if side_wait else
+                                  self._swap_side(ticker, side, mine, self._orders(), True))
+                side_wait = ""
+                if s_code == plan_side.NOT_CLEAR:
+                    pause = "not_clear"
             if held:
                 # Flat all started during the cancel: nothing new goes while it runs, and the batch
                 # disarms the plan first (Step 6's before_batch). Checked before the busy wait, since
@@ -1213,7 +1261,8 @@ class PlanDesk:
                     stamp(f"{pause}_from")
                     text = (f"The armed plan cancelled the {old.lower()} entry. It places the {side.lower()} "
                             + ("when the order action in progress ends." if pause == "busy" else
-                               "when Schwab's order list is fresh again."))
+                               "when Schwab's order list is fresh again." if pause == "orders_old" else
+                               f"once it can tell which side you trade {ticker} on: {s_text}"))
                     with self._lock:
                         now_rec = self._load().get(ticker) or {}
                         if now_rec.get("origin") == "auto" and now_rec.get("state") == FLIPPING:
@@ -1223,10 +1272,14 @@ class PlanDesk:
                 except Exception as e:                # a bug in the caller: stop waiting, place nothing
                     _log.exception("armed plan wait failed")
                     why = (f"the wait for the order action failed ({e})" if pause == "busy" else
-                           f"the wait for a fresh order list failed ({e})")
+                           f"the wait for a fresh order list failed ({e})" if pause == "orders_old" else
+                           f"the wait for your side of {ticker} failed ({e})")
                 if not why:
                     continue
                 code = pause
+            elif s_code == plan_side.OTHER_SIDE:
+                # The user took the other side of the name during the cancel: no send (brief 25).
+                why, code = s_text, "other_side"
             else:
                 if waiting:
                     stamp(f"{waiting}_until")
@@ -1261,11 +1314,20 @@ class PlanDesk:
                     # the top, which waits for a fresh one a tick at a time (the lock is let go here).
                     continue
                 if not why:
+                    # Brief 25 again, on this list, just before the send: the user may have traded the
+                    # name during the recheck. Not clear: back to the top, which waits a tick first.
+                    s_code, s_text = self._swap_side(ticker, side, mine, orders, fresh)
+                    if s_code == plan_side.NOT_CLEAR:
+                        side_wait = s_text
+                        continue
+                    if s_code == plan_side.OTHER_SIDE:
+                        why, code = s_text, "other_side"
+                if not why:
                     try:
                         blocked = self._blocked_names()
                     except Exception:
                         blocked = None                    # refuses: "not confirmed"
-                    why = self._swap_send_refusal(ticker, oid, orders, blocked)
+                    why = self._swap_send_refusal(ticker, blocked)
                     code = "refused" if why else ""
                 if not why:
                     red = self._row_disagrees(view, ticker, side, o)
@@ -1279,7 +1341,7 @@ class PlanDesk:
                     text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
                             f"Cancelled by the armed plan, nothing rests. {why}" if code == "held" else
                             f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
-                            if code in ("traded", "busy", "watch", "orders_old") else
+                            if code in ("traded", "busy", "watch", "orders_old", "not_clear") else
                             f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
                     self._put(ticker, state=NONE, order_id=None, text=text)
                     return done(stage="recheck", code=code, error=text)

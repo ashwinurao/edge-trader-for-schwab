@@ -694,10 +694,11 @@ stays" (or "re-level is not on") and the entry stays.
   new reading of Edge Scanner's open tape; if it still shows that, it cancels the entry through the
   dashboard's Cancel entry path, which reads the order back until Schwab confirms CANCELED with nothing
   filled. Only then it checks again: the plan is still armed, another new tape reading is usable and
-  the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh and
-  shows no other working order on the name, and the plan row agrees with the tape (Step 2's row from
-  the feed's last answer; the plan never asks Edge Scanner for it, and without one the row check is
-  skipped as for the armed send). Then it places the other side's break entry from the tape's range:
+  the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh,
+  your own trades on the name are not on the other side (below), and the plan row agrees with the
+  tape (Step 2's row from the feed's last answer; the plan never asks Edge Scanner for it, and
+  without one the row check is skipped as for the armed send). Then it places the other side's break
+  entry from the tape's range:
   the same risk, shares from that side's own risk per share, 1 share at this stage. The row says
   "Flipped by the armed plan (1 of 3)." while that entry rests.
 - **After the cancel, one entry to place.** When the new tape reading is unusable or its price stale,
@@ -713,8 +714,8 @@ stays" (or "re-level is not on") and the entry stays.
   nothing rests."
 - While a flip or re-level runs, the plan does nothing for the other picks: another pick's entry, or
   its 09:35 cancel, waits until the flip ends (about 2.25 s at 0.4 s a Schwab call, up to 7.3 s for an
-  unconfirmed cancel, and longer while it waits for the order lock or a fresh order list, at most until
-  the fast watch ends).
+  unconfirmed cancel, and longer while it waits for the order lock, a fresh order list or your side of
+  the name, at most until the fast watch ends).
 - **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
   from the range the entry was built on, while the entry rests unfilled and its trigger has not
   traded. The plan cancels the entry the same way and places the same side from the new range, at most
@@ -740,6 +741,21 @@ stays" (or "re-level is not on") and the entry stays.
   again." When the list is fresh it checks everything again and places. At a disarm or the end of the
   fast watch it stops with nothing resting: "Cancelled the long entry by the armed plan; the fast watch
   ended while Schwab's order list was old, so nothing rests."
+- **Your own trades on the name** (brief 25, the same rule as Place and Flip above; the architect's
+  rule for this step, 2026-11-13 21:31 UTC). The plan asks which side you are on for the NEW entry's
+  side twice: before the cancel and again just before the send. Same side, or not in the name: it goes,
+  beside your shares and orders, and never touches them. Other side, before the cancel: nothing is
+  cancelled or written, the entry stays, the plan keeps its one try to cancel that order, and the panel
+  says once "You are long 100 T by hand. The plan does not take the other side of a name you trade.
+  Nothing was sent." Other side after the cancel (you traded during it): nothing is placed and the row
+  says "Cancelled the long entry by the armed plan. Did not place the short: You are long 100 T by
+  hand. ..." Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
+  Schwab's positions old), before the cancel: the entry stays and the next reading decides again. For
+  old positions no pick acts on that reading, as for an old order list; for a name that is not clear
+  only that pick waits, so the other picks go on. Not clear after the cancel: the same wait as for an old
+  order list, a tick at a time, until it is clear (then everything is checked again), the plan is
+  disarmed or the fast watch ends ("... the fast watch ended while your side of T was not clear, so
+  nothing rests.").
 - **Schwab calls.** A flip or a re-level is one cancel (3 calls usually: a read, the cancel, a
   read-back; 12 at worst) and one send (4 usually: the quote, the order, two status reads; 5 at worst),
   so 7 usually and 17 at worst. Waiting costs no call. With four picks the bounds allow at most 8 sends
