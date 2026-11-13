@@ -42,7 +42,7 @@ PLAYBOOK_FILE = Path(__file__).resolve().parent / "playbook.json"
 # Row states of the first minute.
 WAITING = "WAITING"      # before the bar starts
 NO_DATA = "NO_DATA"      # after it started, nothing from Edge Scanner yet
-SO_FAR = "SO_FAR"        # the minute so far, while it forms
+SO_FAR = "SO_FAR"        # not final: the minute so far, or the bar from the snapshot not confirmed yet
 FINAL = "FINAL"          # the minute's bar
 NO_LIVE = "NO_LIVE"      # Edge Scanner sends no first minute for this row
 BAD = "BAD"              # Edge Scanner sent numbers that can't be a bar
@@ -265,7 +265,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         atr = None
     out = {"rank": row.get("rank"), "ticker": row.get("ticker"), "atr": _f(atr),
            "bar": {"state": None, "high": None, "low": None, "close": None, "as_of_et": None,
-                   "age_s": None, "text": ""},
+                   "age_s": None, "unconfirmed": False, "text": ""},
            "long": None, "short": None, "rps": None, "nearer": None,
            "under_min_stop": None, "min_stop": None,
            "shares": {"state": None, "used": None, "full": None, "half": None, "text": ""}}
@@ -293,8 +293,16 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                 at = _as_of(trading_date, as_of)
                 bar["as_of_et"] = str(as_of)
                 bar["age_s"] = round((now - at).total_seconds(), 1) if at else None
-                bar.update(state=SO_FAR, text=f"So far, to {as_of} ET. The bar replaces it just after "
-                                              f"{end:%H:%M} ET.")
+                # At the bar's end the values are the whole bar from Alpaca's snapshot, which Edge
+                # Scanner sends before its bar request confirms it (Edge Scanner PR #45). Still
+                # SO_FAR, so the order buttons wait for the confirmed bar (plan_entries.py).
+                if at == end:
+                    bar["unconfirmed"] = True       # the screen says "not confirmed", not "so far"
+                    text = (f"The {pb.bar_start_et:%H:%M} ET bar from Edge Scanner's snapshot, not confirmed "
+                            "yet. Edge Scanner's bar request confirms it within seconds.")
+                else:
+                    text = f"So far, to {as_of} ET. The bar replaces it just after {end:%H:%M} ET."
+                bar.update(state=SO_FAR, text=text)
             else:
                 bar.update(state=FINAL, text=f"The {pb.bar_start_et:%H:%M} ET bar, final.")
     if bar["high"] is None:
