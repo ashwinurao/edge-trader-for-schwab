@@ -21,7 +21,9 @@ into the engine's reading with the same rules the live reader uses:
   is that bar, or the bars line's bar. Either one makes it final. Never the day bar: on
   2026-11-13 it was the PRIOR day's until 09:31:00.65 ET, and this replay used to size every
   would-be order from yesterday's high and low. A bars bar more than a cent away from the range
-  in use replaces it, and the line's range says `changed`.
+  in use replaces it, and the line's range says `changed`. Snapshot versions of the 09:30 bar more
+  than a cent apart, with no bars bar yet, make the range disputed (not final; the line's range
+  says `disputed`) until a bars bar settles it.
 - ranks = the order of `start`'s tickers (the recorder keeps the rank order, not the numbers).
 - risk per pick and the calm flag are not in the file: --risk and --calm give them.
 Failed request lines are skipped. Decisions go to --out (default stdout) as JSON lines, each with

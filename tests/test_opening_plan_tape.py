@@ -161,11 +161,51 @@ def test_a_bars_bar_within_a_cent_keeps_the_range_in_use(hl):
     assert "changed" not in tape.range_of(a)
 
 
-def test_a_later_snapshot_version_does_not_move_the_range():
-    versions = [bar_version("snapshot", "09:31:00.100"), bar_version("snapshot", "09:31:00.600", hl=(50.20, 49.00))]
+@pytest.mark.parametrize("hl", [(50.20, 49.00), (50.00, 48.98), (50.02, 49.00)])
+def test_snapshot_versions_more_than_a_cent_apart_dispute_the_range(hl):
+    # Review 1 of brief 15: one day's file said the minute bar does not change; if it does, neither
+    # version is trusted until the bars request answers.
+    versions = [bar_version("snapshot", "09:31:00.100"), bar_version("snapshot", "09:31:00.600", hl=hl)]
     r = tape.reading_from(body(bars={"AAA": versions}, symbols={"AAA": sym(49.80, "09:31:00.550")}),
                           at("09:31:00.700"))
-    assert (pick_of(r)["high"], pick_of(r)["range_changed"]) == (50.00, None)
+    a = pick_of(r)
+    assert (a["high"], a["low"], a["final"], a["from"], a["range_changed"]) == (None, None, False, None, None)
+    assert a["range_disputed"] == [
+        {"high": 50.00, "low": 49.00, "from": tape.FROM_SNAPSHOT, "seen": z("09:31:00.100")},
+        {"high": hl[0], "low": hl[1], "from": tape.FROM_SNAPSHOT, "seen": z("09:31:00.600")}]
+    assert tape.range_of(a) == {"high": None, "low": None, "final": False, "from": None,
+                                "disputed": a["range_disputed"]}
+
+
+@pytest.mark.parametrize("bars_hl, changed", [((50.20, 49.00), True), ((50.00, 49.00), False)])
+def test_a_bars_bar_settles_a_disputed_range(bars_hl, changed):
+    versions = [bar_version("snapshot", "09:31:00.100"), bar_version("snapshot", "09:31:00.600", hl=(50.20, 49.00)),
+                bar_version("bars", "09:31:01.400", hl=bars_hl)]
+    r = tape.reading_from(body(bars={"AAA": versions}, symbols={"AAA": sym(49.80, "09:31:01.300")}),
+                          at("09:31:01.500"))
+    a = pick_of(r)
+    assert (a["high"], a["low"], a["final"], a["from"]) == (bars_hl[0], 49.00, True, tape.FROM_BARS)
+    assert a["range_disputed"] is None and "disputed" not in tape.range_of(a)
+    if changed:          # against the first version seen, the range a working entry was placed on
+        assert a["range_changed"] == {
+            "old": {"high": 50.00, "low": 49.00, "from": tape.FROM_SNAPSHOT, "seen": z("09:31:00.100")},
+            "new": {"high": 50.20, "low": 49.00, "from": tape.FROM_BARS, "seen": z("09:31:01.400")}}
+    else:
+        assert a["range_changed"] is None
+
+
+@pytest.mark.parametrize("second", [
+    bar_version("snapshot", "09:31:00.600", hl=(50.01, 49.00)),                  # within a cent
+    bar_version("snapshot", "09:31:00.600", hl=(50.00, 48.99)),
+    {**bar_version("snapshot", "09:31:00.600"), "v": 1900, "n": 19, "vw": 49.6},  # volume, count, vwap only
+])
+def test_snapshot_versions_within_a_cent_or_only_in_volume_are_not_disputed(second):
+    versions = [bar_version("snapshot", "09:31:00.100"), second]
+    r = tape.reading_from(body(bars={"AAA": versions}, symbols={"AAA": sym(49.80, "09:31:00.550")}),
+                          at("09:31:00.700"))
+    a = pick_of(r)
+    assert (a["high"], a["low"], a["final"], a["from"]) == (50.00, 49.00, True, tape.FROM_SNAPSHOT)
+    assert a["range_disputed"] is None and a["range_changed"] is None
 
 
 def test_feed_age_is_received_minus_the_references_newest_trade_or_quote():
@@ -284,6 +324,43 @@ def test_hold_blocks_price_actions_but_not_the_watch_end_cancel():
     assert [(d["kind"], d["code"]) for d in out] == [("no_action", "stale_price")]
 
 
+def disputed_pick(last, last_at):
+    """A pick whose snapshot 09:30 bar versions disagree: tape.py gives no high, low or final."""
+    p = engine_pick(last, last_at, final=False)
+    p.update(high=None, low=None, range_disputed=[{"high": 50.00, "low": 49.00}, {"high": 50.20, "low": 49.00}])
+    return p
+
+
+def test_a_disputed_range_places_no_order_and_keeps_the_range_deadline():
+    state, out = engine.decide(None, engine_reading("09:31:00.700", disputed_pick(49.80, "09:31:00.650")), RULES)
+    assert [(d["kind"], d["code"]) for d in out] == [("no_action", "range_disputed")]
+    assert "no order until the bars request" in out[0]["why"]
+    # Settled inside range_final_wait_seconds (3 s past 09:31:00): the order is placed then.
+    _, out = engine.decide(state, engine_reading("09:31:01.500", engine_pick(49.80, "09:31:01.450")), RULES)
+    assert [d["kind"] for d in out] == ["would_place"]
+    # Still disputed at 09:31:03: not final, so no order today, even if the bars bar comes later.
+    state, _ = engine.decide(None, engine_reading("09:31:00.700", disputed_pick(49.80, "09:31:00.650")), RULES)
+    state, out = engine.decide(state, engine_reading("09:31:03.000", disputed_pick(49.80, "09:31:02.950")), RULES)
+    assert [(d["kind"], d["code"]) for d in out] == [("no_action", "range_not_final")]
+    assert "versions disagree" in out[0]["why"] and "no order today" in out[0]["why"]
+    _, out = engine.decide(state, engine_reading("09:31:03.500", engine_pick(49.80, "09:31:03.450")), RULES)
+    assert out == []
+
+
+def test_a_working_entry_neither_fills_nor_flips_while_disputed_but_the_watch_end_cancel_runs():
+    state, out = engine.decide(None, engine_reading("09:31:00.200", engine_pick(49.80, "09:31:00.100")), RULES)
+    assert [d["kind"] for d in out] == ["would_place"] and out[0]["trigger"] == 50.01
+    # 50.04 is inside the band (50.01 to 50.08): a fill if the range were settled.
+    state, out = engine.decide(state, engine_reading("09:31:00.700", disputed_pick(50.04, "09:31:00.650")), RULES)
+    assert [(d["kind"], d["code"]) for d in out] == [("no_action", "range_disputed")]
+    assert "working entry waits" in out[0]["why"]
+    # 49.30 is past the flip line (49.40): a flip if the range were settled.
+    state, out = engine.decide(state, engine_reading("09:31:01.200", disputed_pick(49.30, "09:31:01.150")), RULES)
+    assert out == []                                                    # said once, nothing else
+    state, out = engine.decide(state, engine_reading("09:35:00.000", disputed_pick(49.30, "09:34:59.950")), RULES)
+    assert [d["kind"] for d in out] == ["would_cancel"]
+
+
 # ---------------------------------------------------------------- the live reader
 
 class FakeGet:
@@ -366,11 +443,12 @@ def _line(**kw):
     return json.dumps({"v": 1, **kw})
 
 
-def open_like_2026_11_13(tmp_path: Path, late_bar_high=50.00) -> Path:
+def open_like_2026_11_13(tmp_path: Path, late_bar_high=50.00, minute_high_from=None) -> Path:
     """A recorder file shaped like 2026-11-13's: a snapshot every 0.5 s; the day bar is YESTERDAY's
     (55.00 / 45.00) until 09:31:00.65; the minute bar is 09:29's until 09:31:00.1, then the
     finished 09:30 bar (50.00 / 49.00); the bars request has it at 09:31:01.4; a settled one at
-    09:35:30 with `late_bar_high`."""
+    09:35:30 with `late_bar_high`. `minute_high_from` = (time, high): from that snapshot on, the
+    snapshot's 09:30 bar has that high (it did not change on 2026-11-13)."""
     lines = [_line(kind="start", t=z("09:29:00"), day=DAY, tickers=["AAA", "SPY"], reference="SPY", feed="sip",
                    poll_seconds=0.5)]
     t = at("09:30:00.100")
@@ -379,7 +457,10 @@ def open_like_2026_11_13(tmp_path: Path, late_bar_high=50.00) -> Path:
         minute = "09:30:00" if t >= at("09:31:00.100") else "09:29:00"
         today = t >= at("09:31:00.650")
         price = 49.60 if t < at("09:31:01.600") else 50.04
-        s = sym(price, hms, minute_hms=minute, day_bar_day=DAY if today else "2026-11-12",
+        minute_high = 50.00
+        if minute_high_from and t >= at(minute_high_from[0]):
+            minute_high = minute_high_from[1]
+        s = sym(price, hms, minute_hms=minute, minute_hl=(minute_high, 49.00), day_bar_day=DAY if today else "2026-11-12",
                 day_bar_hl=(50.30, 49.00) if today else (55.00, 45.00))
         lines.append(_line(kind="snapshot", t0=z(hms), t1=z(hms), ms=40.0, ok=True, missing=[],
                            symbols={"AAA": s, "SPY": spy(hms)}))
@@ -421,6 +502,20 @@ def test_replay_shows_a_settled_bar_that_moved_the_range(tmp_path):
     reading, ranges = readings[-1]
     assert ranges["AAA"]["high"] == 50.05 and ranges["AAA"]["changed"]["old"]["high"] == 50.0
     assert pick_of(reading)["range_changed"]["new"]["from"] == tape.FROM_BARS
+
+
+def test_replay_follows_a_disputed_snapshot_bar_until_the_bars_request_settles_it(tmp_path):
+    rows = replay.replay(open_like_2026_11_13(tmp_path, minute_high_from=("09:31:00.600", 50.20)), PLAYBOOK,
+                         risk=Decimal("101"), calm=False)
+    after = [(r["t"], r["kind"], r.get("code"), r["range"].get("from"), r["range"].get("final"))
+             for r in rows if r["t"] >= z("09:31:00.100")]
+    assert after == [
+        (z("09:31:00.100"), "would_place", None, tape.FROM_SNAPSHOT, True),     # the first version
+        (z("09:31:00.600"), "no_action", "range_disputed", None, False),      # 50.20: the entry waits
+        (z("09:31:01.600"), "would_fill", None, tape.FROM_BARS, True),        # the bars bar (50.00) settled it
+    ]
+    disputed = next(r for r in rows if r.get("code") == "range_disputed")
+    assert [v["high"] for v in disputed["range"]["disputed"]] == [50.0, 50.2]
 
 
 def test_replay_and_the_live_reader_read_the_same_answer_the_same_way(tmp_path):
@@ -511,12 +606,124 @@ def test_a_tape_without_todays_picks_falls_back_too(tmp_path):
 
 def test_an_unusable_tape_moves_nothing_price_based(tmp_path):
     r = fresh_reading(snap_hms="09:31:00.100", received="09:31:00.150")
-    sh = make(tmp_path, FakeFeed(), FakeTape([r]), at("09:31:01.500"))      # 1.4 s after the snapshot
+    r["read_at"] = at("09:31:01.500")                                        # 1.4 s after the snapshot
+    sh = make(tmp_path, FakeFeed(), FakeTape([r]), at("09:31:01.500"))
     sh.step()
     rows = [x for x in shadow_rows(tmp_path) if x["symbol"] == "AAA"]
     assert [(x["kind"], x["code"], x["source"], x["tape_usable"]) for x in rows] == [
         ("no_action", "stale_price", "tape", False)]
     assert rows[0]["why"].startswith("the open tape is not usable: the open tape's newest snapshot is 1.40 s old")
+
+
+class Clock:
+    def __init__(self, hms):
+        self.t = at(hms)
+
+    def __call__(self):
+        return self.t
+
+
+class BlockingFeed(FakeFeed):
+    """Step 2's feed, whose read blocks for `seconds` (a slow /api/v2/ov-picks answer)."""
+
+    def __init__(self, clock, seconds, **kw):
+        super().__init__(**kw)
+        self.clock, self.seconds = clock, seconds
+
+    def read(self):
+        self.clock.t += timedelta(seconds=self.seconds)
+        return super().read()
+
+
+class ClockTape(FakeTape):
+    """A tape whose read() stamps read_at with the clock, as EsTape.read() does."""
+
+    def __init__(self, readings, clock):
+        super().__init__(readings)
+        self.clock = clock
+
+    def read(self):
+        return dict(super().read(), read_at=self.clock())
+
+
+def test_the_tape_is_judged_when_it_was_read_not_when_the_step_began(tmp_path):
+    # Review 1 of brief 15: the step starts at 09:31:00.200, the feed blocks 1.3 s, and the tape's
+    # answer (snapshot 09:31:00.100) is handed out at 09:31:01.500, 1.4 s old: no price action.
+    clock = Clock("09:31:00.200")
+    r = fresh_reading(snap_hms="09:31:00.100", received="09:31:00.150")
+    sh = make(tmp_path, BlockingFeed(clock, 1.3), ClockTape([r], clock), None)
+    sh._now = clock
+    sh.step()
+    rows = [x for x in shadow_rows(tmp_path) if x["symbol"] == "AAA"]
+    assert [(x["kind"], x["code"], x["tape_usable"]) for x in rows] == [("no_action", "stale_price", False)]
+    assert "newest snapshot is 1.40 s old" in rows[0]["tape_why"]
+    assert rows[0]["t"] == z("09:31:00.200") and rows[0]["es_age_s"] == 1.35
+
+
+def placed_then(tmp_path, problem, feed_body, steps):
+    """The tape places AAA at 09:31:00.200, then answers `problem` at each of `steps` while the
+    picks feed answers `feed_body`. Returns the AAA lines."""
+    clock = Clock("09:31:00.200")
+    r = fresh_reading(snap_hms="09:31:00.100", received="09:31:00.150")
+    tp = FakeTape([r])
+    sh = make(tmp_path, FakeFeed(feed_body, at("09:31:00.250")), tp, None)
+    sh._now = clock
+    sh.step()
+    for hms, reading in steps:
+        clock.t = at(hms)
+        tp.readings = [reading if reading is not None else problem(hms)]
+        sh.step()
+    return [x for x in shadow_rows(tmp_path) if x["symbol"] == "AAA"]
+
+
+def feed_with_a_fill_price():
+    """A picks-feed answer that WOULD fill the working long (50.04 is inside 50.01 to 50.08)."""
+    a = es_feed_answer()
+    a["day"]["picks"][0].update(first_minute={"open": 49.5, "high": 50.0, "low": 49.0, "close": 50.04},
+                                first_minute_as_of="09:31:00")
+    return a
+
+
+PROBLEMS = {
+    "timeout": lambda hms: tape.empty(at(hms), "TimeoutError: timed out"),
+    "no picks": lambda hms: tape.reading_from(body(day=None, state={"code": "error", "why": "x", "error": "x"}),
+                                              at(hms)),
+}
+
+
+@pytest.mark.parametrize("problem", sorted(PROBLEMS))
+def test_after_the_tape_gave_picks_a_tape_problem_holds_and_never_falls_back(tmp_path, problem):
+    later = fresh_reading(snap_hms="09:31:00.600", received="09:31:00.650", spy_hms="09:31:00.550")
+    later["picks"][0].update(last=50.04, last_at=at("09:31:00.550"), fresh_at=at("09:31:00.550"))
+    rows = placed_then(tmp_path, PROBLEMS[problem], feed_with_a_fill_price(),
+                       [("09:31:00.300", None), ("09:31:00.400", None), ("09:31:00.700", later)])
+    assert [(x["kind"], x.get("code"), x["source"]) for x in rows] == [
+        ("would_place", None, "tape"),
+        ("no_action", "stale_price", "tape"),        # held: the feed's 50.04 fills nothing
+        ("would_fill", None, "tape")]                # the tape is back: its 50.04 fills
+    held = rows[1]
+    assert held["why"].startswith("the open tape is not usable: ") and held["tape_usable"] is False
+    assert held["tape_problem"] and held["tape_why"] and held["tape_seq"] == 7
+    assert held["es_ok_at"] == z("09:31:00.150") and held["es_age_s"] == 0.15
+    assert held["range"] == {"high": 50.0, "low": 49.0, "final": True, "from": tape.FROM_SNAPSHOT}
+
+
+def test_a_held_working_entry_still_cancels_at_the_watch_end(tmp_path):
+    rows = placed_then(tmp_path, PROBLEMS["timeout"], feed_with_a_fill_price(),
+                       [("09:31:00.300", None), ("09:35:00.000", None)])
+    assert [(x["kind"], x["source"]) for x in rows] == [
+        ("would_place", "tape"), ("no_action", "tape"), ("would_cancel", "tape")]
+    assert rows[-1]["tape_problem"] == "TimeoutError: timed out" and rows[-1]["t"] == z("09:35:00.000")
+
+
+def test_picks_from_another_day_do_not_stop_todays_fallback(tmp_path):
+    clock = Clock("09:31:00.200")
+    sh = make(tmp_path, FakeFeed(es_feed_answer(), at("09:30:59.000")),
+              FakeTape([tape.empty(at("09:31:00.200"), "TimeoutError: timed out")]), None)
+    sh._now = clock
+    sh._tape_last, sh._tape_day = fresh_reading(), datetime(2026, 11, 12).date()     # yesterday's picks
+    sh.step()
+    assert [x["source"] for x in shadow_rows(tmp_path)] == ["picks feed"]
 
 
 def test_the_shadow_without_a_tape_is_as_before(tmp_path):
