@@ -26,7 +26,7 @@ from companion.opening_plan import routes as R
 from companion.opening_plan.bp_cap import CapLatch, Pick
 from companion.preview_rates import PreviewRates
 from companion.store import Store
-from test_plan_entries import LONG, NOW, rig, row  # noqa: F401  (rig is a fixture)
+from test_plan_entries import LONG, LONG_REQ, NOW, rig, row, without_id  # noqa: F401  (rig is a fixture)
 
 PB = P.load_playbook()
 ET = P.ET
@@ -228,6 +228,51 @@ def test_the_cap_is_fixed_only_when_every_picks_bar_is_final():
     assert v["cap"]["state"] == "FIXED" and [x["ticker"] for x in v["cap"]["left_out"]] == ["EEEE"]
 
 
+def test_all_bars_final_before_the_latest_time_fixes_then():
+    # Review 1 of brief 23: every counted pick final at 09:31:03 fixes at once.
+    latch = CapLatch()
+    v = view(et(9, 31, 3), [frow(1, "AAAA", fm=FM), frow(2, "BBBB", fm=FM)], latch=latch)
+    assert v["cap"]["state"] == "FIXED" and v["cap"]["at_et"] == "09:31:03"
+    assert v["cap"]["in_cap"] == ["AAAA", "BBBB"] and v["cap"]["not_in_cap"] == []
+    assert v["cap"]["fix_latest_et"] == "09:31:15"
+
+
+def test_one_missing_bar_waits_until_the_latest_time_then_the_others_fix_and_fill_the_pool():
+    latch = CapLatch()
+    three = [frow(1, "AAAA", fm=FM), frow(2, "BBBB", fm=FM), frow(3, "CCCC", fm=FM)]
+    missing = frow(4, "DDDD", fm=None, atr=5.80, last=126.30)
+    v = view(et(9, 31, 14), three + [missing], latch=latch)
+    assert v["cap"]["state"] == "ESTIMATE" and latch.get(et(9, 31).astimezone(ET).date()) is None
+    assert "Estimate until every pick's 09:30 bar is final, at the latest 09:31:15 ET" in v["cap"]["text"]
+    v = view(et(9, 31, 15), three + [missing], latch=latch)
+    assert v["cap"]["state"] == "FIXED" and v["cap"]["at_et"] == "09:31:15"
+    assert v["cap"]["in_cap"] == ["AAAA", "BBBB", "CCCC"] and v["cap"]["not_in_cap"] == ["DDDD"]
+    assert ("Not in the cap fixed at 09:31:15 ET (no final 09:30 bar then): DDDD. "
+            "Nothing above 1 share for it today.") in v["cap"]["text"]
+    # The three fill the pool: X is the one the three alone give, not lowered by DDDD's estimate.
+    alone = view(et(9, 31, 15), three, latch=CapLatch())
+    assert v["cap"]["most"] == alone["cap"]["most"] and v["cap"]["most"] > view(et(9, 31, 14), three + [missing])["cap"]["most"]
+    # Each of the three sized at X: 3 x X x term = share x balance (the whole share is used).
+    assert v["cap"]["most"] == 51.88                   # 23,241.24 x 0.5 / (3 x 74.6491), floored to the cent
+    d = next(r for r in v["rows"] if r["ticker"] == "DDDD")
+    assert d["cap"]["state"] == "NOT_IN_CAP" and d["cap"]["long"] is None
+    # The late bar at 09:31:40: still not in the cap, said in words.
+    v = view(et(9, 31, 40), three + [frow(4, "DDDD", fm=FM, atr=5.80)], latch=latch)
+    d = next(r for r in v["rows"] if r["ticker"] == "DDDD")
+    assert d["cap"]["state"] == "NOT_IN_CAP" and d["cap"]["why"] == (
+        "Not in the buying power cap fixed at 09:31:15 ET (no final 09:30 bar then): nothing above 1 share for it today.")
+    assert d["cap"]["text"][0] == d["cap"]["why"]
+
+
+def test_a_restart_after_the_latest_time_fixes_at_once_on_the_final_picks():
+    v = view(et(9, 40), [frow(1, "AAAA", fm=FM), frow(2, "DDDD", fm=None, atr=5.80, last=126.30)], latch=CapLatch())
+    assert v["cap"]["state"] == "FIXED" and v["cap"]["at_et"] == "09:40:00"
+    assert v["cap"]["in_cap"] == ["AAAA"] and v["cap"]["not_in_cap"] == ["DDDD"]
+    # No final bar at all: not fixed, even after the latest time.
+    v = view(et(9, 40), [frow(1, "DDDD", fm=None, atr=5.80, last=126.30)], latch=CapLatch())
+    assert v["cap"]["state"] == "ESTIMATE"
+
+
 def test_x_does_not_move_when_balances_drop_but_follows_the_share_and_the_risk():
     latch = CapLatch()
     view(at_now(), [frow(1, "AAAA", fm=FM)], latch=latch)
@@ -325,7 +370,9 @@ def test_cap_zero_shares_and_the_uncovered_line():
     r = v["rows"][0]
     assert v["cap"]["most"] == 0.06 and r["shares"]["used"] == {"long": 0, "short": 0}
     assert r["cap"]["long"] == 0
-    assert r["shares"]["text"] == "$0.06 is less than one share's risk ($0.57): 0 shares. Capped by buying power."
+    assert r["shares"]["text"] == ("$0.06 is less than one share's risk ($0.57): 0 shares. Capped by buying power. "
+                                   "Test stage: the plan order is still 1 share; the buying power cap would give 0.")
+    assert r["long"]["shares_before_cap"] == 175                    # $100 / 0.57, kept for the 1-share send
     # Fixed at 23,241.24; later Schwab shows 3,000: the row's need 7,446.25 (175 x 42.55 x 1.0 at $100) is not covered.
     latch = CapLatch()
     view(at_now(), [frow(1, "AAAA", fm=FM)], latch=latch)
@@ -423,6 +470,53 @@ def test_at_one_share_a_send_goes_as_today_with_the_cap_not_known(rig):
     res = rig.desk.place("AAAA", "LONG", LONG)
     assert res["ok"], res
     assert rig.broker.placed[0]["orderLegCollection"][0]["quantity"] == 1
+
+
+def test_in_the_test_stage_a_fixed_cap_of_zero_shares_changes_no_order(rig):
+    # Review 1 of brief 23: at 1_share the cap changes no order. Fixed at a made-up $10 of available
+    # funds, X is $0.02 and the row shows 0 shares; the click still sends today's 1-share request.
+    rig.view.cap_fixed(available=10.0)
+    v = rig.view()
+    aaaa = next(r for r in v["rows"] if r["ticker"] == "AAAA")
+    assert v["cap"]["state"] == "FIXED" and aaaa["long"]["shares"] == 0 and aaaa["long"]["shares_before_cap"] == 175
+    assert "the buying power cap would give 0" in aaaa["shares"]["text"]
+    assert row(rig)["send"]["long"] == {**LONG, "plan_shares": 0}
+    assert "the buying power cap would give 0" in row(rig)["stage"]["long"]
+    res = rig.desk.place("AAAA", "LONG", LONG)
+    assert res["ok"], res
+    assert without_id(rig.sent[0]) == LONG_REQ
+    assert rig.broker.placed[0]["orderLegCollection"][0]["quantity"] == 1
+
+
+def test_in_the_test_stage_an_estimate_of_zero_shares_changes_no_order(rig):
+    # Fresh made-up balances, no latch: the cap stays an estimate at X $0.02 and the row shows 0.
+    rig.view.account = {"balances": {"availableFunds": 10.0}, "ok_at": NOW - timedelta(seconds=2), "private": False}
+    v = rig.view()
+    assert v["cap"]["state"] == "ESTIMATE"
+    assert next(r for r in v["rows"] if r["ticker"] == "AAAA")["long"]["shares"] == 0
+    res = rig.desk.place("AAAA", "LONG", LONG)
+    assert res["ok"], res
+    assert without_id(rig.sent[0]) == LONG_REQ
+
+
+def test_a_pick_not_in_the_fixed_cap_is_refused_above_one_share_and_sends_one_share_at_one_share(rig):
+    # The cap was fixed at 09:31:15 ET on CCCC alone; AAAA's bar came final later.
+    bal = {"availableFunds": 10_000_000.0, "buyingPower": 4e7, "dayTradingBuyingPower": 4e7}
+    rig.view.cap_fixed()
+    cccc = Pick("CCCC", {"long": (D("71.94"), D("0.65")), "short": (D("71.19"), D("0.65"))}, False)
+    rig.view.latch.offer(NOW.astimezone(ET).date(), bp_cap.pool_sums([cccc], bal, None, {}, D("1.0")),
+                         "09:31:15", False, names=["CCCC"])
+    why = "Not in the buying power cap fixed at 09:31:15 ET (no final 09:30 bar then): nothing above 1 share for it today."
+    assert row(rig)["send"]["long"] == {**LONG, "plan_shares": 175}      # 1_share: sends as today
+    rig.desk.stage = plan_size.parse_stage(0.25)
+    assert row(rig)["send"]["long"] is None and row(rig)["place"]["long"] == why
+    res = rig.desk.place("AAAA", "LONG", {**LONG, "shares": 43})
+    assert not res["ok"] and res["error"] == why and rig.broker.placed == []
+    assert row(rig, "CCCC")["send"]["short"]["shares"] > 1               # CCCC, in the cap, still sizes up
+    rig.desk.stage = plan_size.ONE_SHARE
+    res = rig.desk.place("AAAA", "LONG", LONG)
+    assert res["ok"], res
+    assert without_id(rig.sent[0]) == LONG_REQ
 
 
 def test_above_one_share_a_send_is_refused_until_the_cap_is_fixed(rig):

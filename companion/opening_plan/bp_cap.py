@@ -34,7 +34,12 @@ The rule (every number is a start number, Ash's to approve; playbook size.buying
   every counted pick has its final bar and the balances are at most 30 s old. Why every pick: the
   bar's range, not the price, drives the need (shares = risk / range), so a pick fixed at the
   narrow estimate could need more than its share when its real bar is narrower (Ash asked about
-  this on 2026-11-13 22:33 UTC). Until then nothing above 1 share is sent. Why fixed: the plan's own orders and Ash's
+  this on 2026-11-13 22:33 UTC). At the latest fix_latest_seconds after the bar's end (playbook,
+  15 s: 09:31:15 ET) the sums are fixed on the picks whose bars are final by then, so one missing
+  bar cannot hold the others back (architect's review 1). A pick not in the fixed sums (late, or
+  left out) gets nothing above 1 share that day. Until fixed nothing above 1 share is sent. At
+  size.stage 1_share the cap changes no order: a send is 1 share whenever the size before the cap
+  is at least 1 (plan_entries.PlanDesk._sized). Why fixed: the plan's own orders and Ash's
   trades lower the balances afterwards, and a size that moves between the page and the click is
   refused (plan_entries.PlanDesk._same). X is worked from them on every view, so a change of the
   share or the Risk per pick moves the sizes at once. In memory only: after a restart they are
@@ -50,7 +55,7 @@ import threading
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from ..break_entry import default_cap, limit_for
 
@@ -67,6 +72,7 @@ MAX_WORDS = 2                         # Schwab texts shown per side
 NOT_KNOWN = "NOT_KNOWN"     # no balance, or none fresh: nothing is capped, nothing above 1 share is sent
 ESTIMATE = "ESTIMATE"       # from fresh balances, not fixed yet: shown, never a send above 1 share
 FIXED = "FIXED"             # fixed for today: the rows and the sends use it
+NOT_IN_CAP = "NOT_IN_CAP"     # a row of a pick not in the fixed sums (review 1): nothing above 1 share today
 
 
 def _dec(value: Any) -> Optional[Decimal]:
@@ -331,10 +337,13 @@ class CapLatch:
         with self._lock:
             return dict(self._fixed) if self._fixed and self._fixed["day"] == day else None
 
-    def offer(self, day: date, pools: list[dict], at_et: str, estimate: bool) -> bool:
-        """Fix the pools for `day` unless they are fixed already. True when this call fixed them."""
+    def offer(self, day: date, pools: list[dict], at_et: str, estimate: bool, names: Iterable[str] = ()) -> bool:
+        """Fix the pools for `day` unless they are fixed already. `names` are the picks in the fixed
+        sums: any other pick gets nothing above 1 share that day (review 1 of brief 23). True when
+        this call fixed them."""
         with self._lock:
             if self._fixed and self._fixed["day"] == day:
                 return False
-            self._fixed = {"day": day, "pools": [dict(p) for p in pools], "at_et": at_et, "estimate": estimate}
+            self._fixed = {"day": day, "pools": [dict(p) for p in pools], "at_et": at_et, "estimate": estimate,
+                           "names": frozenset(str(n).upper() for n in names)}
             return True

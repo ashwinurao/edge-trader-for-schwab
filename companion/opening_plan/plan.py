@@ -126,6 +126,7 @@ class Playbook:
     estimate_narrow_atr: Decimal
     bp_default_share_pct: int = 50          # brief 23: size.buying_power, start numbers
     bp_default_rate: Decimal = Decimal("1.0")
+    bp_fix_latest_seconds: int = 15         # review 1 of brief 23: the latest fixing, after the bar's end
     size_stage: str = "1_share"             # size.stage as written (plan_size.py checks it)
 
 
@@ -156,6 +157,7 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
             estimate_narrow_atr=Decimal(str(est["narrow_atr"]["value"])),
             bp_default_share_pct=int(size["buying_power"]["default_share_pct"]["value"]),
             bp_default_rate=Decimal(str(size["buying_power"]["default_rate"]["value"])),
+            bp_fix_latest_seconds=int(size["buying_power"]["fix_latest_seconds"]["value"]),
             size_stage=str(size.get("stage", "1_share")))
     except (KeyError, TypeError, ValueError, InvalidOperation) as e:
         raise ValueError(f"playbook {path}: {type(e).__name__}: {e}") from e
@@ -179,9 +181,10 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
         raise ValueError(f"playbook: size.estimate.show must be one of {', '.join(ESTIMATE_SHOWS)}")
     if not 0 < pb.estimate_narrow_atr < pb.estimate_first_minute_atr < pb.estimate_wide_atr:
         raise ValueError("playbook: size.estimate needs 0 < narrow_atr < first_minute_atr < wide_atr")
-    if not SHARE_MIN <= pb.bp_default_share_pct <= SHARE_MAX or not pb.bp_default_rate > 0:
-        raise ValueError(f"playbook: size.buying_power needs default_share_pct from {SHARE_MIN} to {SHARE_MAX} "
-                         "and default_rate above 0")
+    if not SHARE_MIN <= pb.bp_default_share_pct <= SHARE_MAX or not pb.bp_default_rate > 0 \
+            or not 0 <= pb.bp_fix_latest_seconds <= 300:
+        raise ValueError(f"playbook: size.buying_power needs default_share_pct from {SHARE_MIN} to {SHARE_MAX}, "
+                         "default_rate above 0 and fix_latest_seconds from 0 to 300")
     return pb
 
 
@@ -409,7 +412,8 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         s = lv[side]
         out[side] = {"entry": _f(s["entry"]), "stop": _f(s["stop"]), "rps": _f(s["rps"]),
                      "stop_atr_pct": round(float(s["stop_atr_pct"]), 1) if "stop_atr_pct" in s else None,
-                     "research_stop": _f(s.get("research_stop")), "shares": None, "capped": None}
+                     "research_stop": _f(s.get("research_stop")), "shares": None, "capped": None,
+                     "shares_before_cap": None}
     out["rps"] = _f(lv["long"]["rps"])
     out["min_stop"] = _f(lv["min_stop"])
     out["under_min_stop"] = lv["under_min_stop"]
@@ -434,8 +438,12 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
     asked = risk * pb.calm_multiplier if calm else risk
     used, by_bp = _capped(asked, most)
     got = {k: size(used, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
+    before = {k: size(asked, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")} if by_bp else got
     for k in ("long", "short"):
         out[k]["shares"], out[k]["capped"] = got[k]["shares"], got[k]["capped"]
+        # Review 1 of brief 23: in the test stage the cap changes no order, so the send at 1 share
+        # goes on the size before the cap (plan_entries.PlanDesk._sized).
+        out[k]["shares_before_cap"] = before[k]["shares"]
     if by_bp:
         text = (f"{_risk_words(used, private)} at risk, capped by buying power "
                 f"({'calm day: ' if calm else ''}${asked:,.2f} asked).")
@@ -446,6 +454,8 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
     if all(got[k]["shares"] == 0 for k in ("long", "short")):
         sh["text"] = (f"{_risk_words(used, private)} is less than one share's risk (${lv['long']['rps']}): 0 shares."
                       + (" Capped by buying power." if by_bp else ""))
+    if pb.size_stage == "1_share" and any(got[k]["shares"] < 1 <= before[k]["shares"] for k in ("long", "short")):
+        sh["text"] += " Test stage: the plan order is still 1 share; the buying power cap would give 0."
     return out
 
 
@@ -630,7 +640,9 @@ def cap_view(rows: list, account: Optional[Mapping], rates: Optional[Mapping], r
              pb: Playbook, latch: Optional[bp_cap.CapLatch] = None, preview: bool = False) -> tuple[dict, Optional[Decimal]]:
     """(view["cap"], X as a Decimal or None). `rows` are the built rows (or the preview rows) the
     cap counts; `share_pct` is Ash's saved share (None: the playbook's default). A latch fixes the
-    balances and sums at the first view with a final bar and fresh balances (not a preview)."""
+    balances and sums (not on a preview) at the first view with fresh balances where every counted
+    pick's bar is final, or, from fix_latest_seconds after the bar's end, on the picks final by then
+    (review 1 of brief 23). The picks in the fixed sums are view["cap"]["in_cap"]."""
     private = bool(isinstance(account, Mapping) and account.get("private"))
     pct = share_pct if share_pct is not None else pb.bp_default_share_pct
     share = Decimal(pct) / 100
@@ -649,25 +661,35 @@ def cap_view(rows: list, account: Optional[Mapping], rates: Optional[Mapping], r
            "no_margin": bp_cap.no_margin(picks, rates), "left_out": left_out,
            "needs_pct": None, "over": False, "balances": None,
            "test_stage": pb.size_stage == "1_share", "text": "", "risk_text": "", "share_text": "",
-           "needs_text": ""}
+           "needs_text": "", "in_cap": None, "not_in_cap": [], "fix_latest_et": None}
+    latest = (datetime.combine(day, pb.bar_start_et, tzinfo=ET)
+              + timedelta(minutes=pb.bar_minutes, seconds=pb.bp_fix_latest_seconds))
+    out["fix_latest_et"] = latest.strftime("%H:%M:%S")
     fixed = latch.get(day) if latch is not None and not preview else None
     bal, why = _fresh_balances(account, now)
+    if fixed is None and bal is not None and latch is not None and not preview:
+        # Fixed when no counted pick is an estimate (a real bar narrower than the narrow estimate
+        # would need more than its share), at the latest at `latest` on the picks final by then,
+        # so one missing bar cannot hold the others back (review 1 of brief 23).
+        finals = [p for p in picks if not p.estimate]
+        if finals and (len(finals) == len(picks) or now >= latest):
+            latch.offer(day, bp_cap.pool_sums(finals, bal, rates, ratios, pb.bp_default_rate),
+                        now.astimezone(ET).strftime("%H:%M:%S"), False, names=[p.ticker for p in finals])
+            fixed = latch.get(day)
     if fixed is not None:
         pools, out["state"], out["at_et"], out["estimate"] = fixed["pools"], bp_cap.FIXED, fixed["at_et"], fixed["estimate"]
     elif bal is None:
         pools = []
     else:
         pools = bp_cap.pool_sums(picks, bal, rates, ratios, pb.bp_default_rate)
+    if fixed is not None:
+        names = fixed.get("names") or frozenset()
+        out["in_cap"] = sorted(names)
+        out["not_in_cap"] = [t for t in (str(r.get("ticker") or "").upper() for r in rows) if t and t not in names]
     most, decided_by, per = bp_cap.most_of(pools, share)
     if fixed is None and most is not None:
         out["state"] = bp_cap.ESTIMATE
         out["estimate"] = preview or any(p.estimate for p in picks)
-        # Fixed only when no counted pick is an estimate: a real bar narrower than the narrow
-        # estimate would need more than its share (bp_cap docstring).
-        if latch is not None and not preview and picks and not any(p.estimate for p in picks):
-            at_et = now.astimezone(ET).strftime("%H:%M:%S")
-            if latch.offer(day, pools, at_et, out["estimate"]):
-                out["state"], out["at_et"] = bp_cap.FIXED, at_et
     if most is None:
         out["state"] = bp_cap.NOT_KNOWN if fixed is None else bp_cap.FIXED
         reason = why if bal is None and fixed is None else (
@@ -705,9 +727,13 @@ def cap_view(rows: list, account: Optional[Mapping], rates: Optional[Mapping], r
         when = (f"Balances fixed at {out['at_et']} ET for today; it follows your share and Risk per pick. "
                 "A restart reads the balances again, after the plan's own orders, so sizes after a restart can "
                 "come out smaller.")
+        if out["not_in_cap"]:
+            when += (f" Not in the cap fixed at {out['at_et']} ET (no final 09:30 bar then): "
+                     f"{', '.join(out['not_in_cap'])}. Nothing above 1 share for "
+                     f"{'it' if len(out['not_in_cap']) == 1 else 'them'} today.")
     else:
-        when = ("Estimate until every pick's 09:30 bar is final: then the balances are fixed for today. "
-                "Until then nothing above 1 share is sent.")
+        when = (f"Estimate until every pick's 09:30 bar is final, at the latest {out['fix_latest_et']} ET: then the "
+                "balances are fixed for today on the picks final by then. Until then nothing above 1 share is sent.")
     names = f"{out['rated']} of {out['names']} names have a margin rate from today's Schwab previews."
     if out["no_margin"]:
         names += f" Counted without margin on a side: {', '.join(out['no_margin'])}."
@@ -825,12 +851,20 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
     view["cap"], most = cap_view(built, account, rates, ratios, share_pct, risk, calm, now, pb, latch)
     if most is not None:
         built = [build_row(r, trading_date, now, risk, calm, pb, most, private) for r in rows]
+    out_of_cap = set(view["cap"]["not_in_cap"])
     for r in built:
+        tk = str(r["ticker"] or "").upper()
         guard = bp_cap.row_cap(r, most, size)
         r["cap"] = {"state": view["cap"]["state"], "long": guard["long"], "short": guard["short"],
-                    "text": bp_cap.rate_text(rates, str(r["ticker"] or "").upper()),
+                    "text": bp_cap.rate_text(rates, tk),
                     "need": None if private or most is None else
                     bp_cap.row_need(r, rates, ratios or {}, pb.bp_default_rate)}
+        if tk in out_of_cap:
+            # Review 1 of brief 23: a pick not in the fixed sums gets nothing above 1 share today.
+            why = (f"Not in the buying power cap fixed at {view['cap']['at_et']} ET (no final 09:30 bar then): "
+                   "nothing above 1 share for it today.")
+            r["cap"].update(state=bp_cap.NOT_IN_CAP, long=None, short=None, need=None, why=why,
+                            text=[why] + r["cap"]["text"])
     view["rows"] = built
     # Brief 23 item 5, display only: with no buttons nothing is sent, so every row counts as not sent
     # (plan_entries.PlanDesk.state says it with the rows really not sent yet).

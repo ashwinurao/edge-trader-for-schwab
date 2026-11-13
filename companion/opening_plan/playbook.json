@@ -44,7 +44,7 @@
       }
     },
     "buying_power": {
-      "_about": "Brief 23: the most risk per pick that buying power allows (companion/opening_plan/bp_cap.py). Each entry needs shares x the higher of its trigger and limit x that name's rate for that side from today's Schwab previews (companion/preview_rates.py). The plan may use Ash's share of each balance (his setting on the Opening plan page, a whole percent from 5 to 100; default_share_pct until he sets it); the rest stays for his own trades. X = balance x share / the sum over the picks of max(price x rate / risk per share) over long and short; the smallest X over available funds, buying power and day-trading buying power decides, and every pick is sized at min(risk used, X). The balances and sums are fixed for the day at the first view with a final 09:30 bar and balances at most 30 s old. Ash's asks: project chat 2026-11-13 15:17:44 and 15:18:31 UTC, thread \"Review OV picks desk architecture\" 22:05:32 UTC.",
+      "_about": "Brief 23: the most risk per pick that buying power allows (companion/opening_plan/bp_cap.py). Each entry needs shares x the higher of its trigger and limit x that name's rate for that side from today's Schwab previews (companion/preview_rates.py). The plan may use Ash's share of each balance (his setting on the Opening plan page, a whole percent from 5 to 100; default_share_pct until he sets it); the rest stays for his own trades. X = balance x share / the sum over the picks of max(price x rate / risk per share) over long and short; the smallest X over available funds, buying power and day-trading buying power decides, and every pick is sized at min(risk used, X). The balances and sums are fixed for the day at the first view where every counted pick has its final 09:30 bar (at the latest fix_latest_seconds after the bar's end, then on the picks final by then) and balances at most 30 s old; a pick not in the fixed sums gets nothing above 1 share that day. At size.stage 1_share the cap changes no order. Ash's asks: project chat 2026-11-13 15:17:44 and 15:18:31 UTC, thread \"Review OV picks desk architecture\" 22:05:32 UTC.",
       "default_share_pct": {
         "value": 50,
         "note": "start number, Ash's to approve: the share of each balance the plan may use until Ash saves his own on the page"
@@ -52,6 +52,10 @@
       "default_rate": {
         "value": 1.0,
         "note": "start number, Ash's to approve: a name or side without a preview today counts without margin (available funds rate 1.0); buying power and day-trading buying power use this times that pair's median ratio to available funds over today's previews"
+      },
+      "fix_latest_seconds": {
+        "value": 15,
+        "note": "start number, Ash's to approve (architect review 1 of brief 23): the cap waits for every pick's final 09:30 bar at most this long after the bar's end (09:31:15 ET), then fixes on the picks final by then; not confirmed how long all four bars take on a normal morning"
       }
     }
   },

@@ -268,7 +268,9 @@ class PlanDesk:
 
         Brief 23: the row's buying power cap (row["cap"], companion/opening_plan/bp_cap.py) goes
         through plan_size.shares(caps=) as the server's own guard. Above 1 share a send needs it
-        fixed for the day; until then (None, why) refuses it. At 1 share a send goes as before."""
+        fixed for the day with this pick in it; until then (None, why) refuses it. At 1 share the
+        cap changes no order (review 1): the send is 1 share whenever the size before the cap is
+        at least 1."""
         s = row.get(side.lower())
         if not isinstance(s, Mapping):
             return None, ""
@@ -276,12 +278,20 @@ class PlanDesk:
         if trig is None or stop is None or not isinstance(shares, int) or isinstance(shares, bool) or shares < 0:
             return None, ""
         cap = row.get("cap") if isinstance(row.get("cap"), Mapping) else {}
-        fixed = cap.get("state") == "FIXED"
-        if self.stage != plan_size.ONE_SHARE and not fixed:
-            return None, BP_NOT_KNOWN
-        most = cap.get(side.lower()) if fixed else None
-        caps = [("buying power", most)] if isinstance(most, int) and not isinstance(most, bool) else []
-        n, why = plan_size.shares(shares, self.stage, caps=caps, price=trig)
+        if self.stage == plan_size.ONE_SHARE:
+            # Review 1 of brief 23: in the test stage the cap changes no order. The send is 1 share
+            # whenever the size before the cap is at least 1, whatever the cap's state.
+            before = s.get("shares_before_cap")
+            basis = before if isinstance(before, int) and not isinstance(before, bool) and before >= 0 else shares
+            n, why = plan_size.shares(basis, self.stage, price=trig)
+            if basis != shares:
+                why += f"; the buying power cap would give {shares:,}"
+        else:
+            if cap.get("state") != "FIXED":
+                return None, (cap.get("why") or BP_NOT_KNOWN)
+            most = cap.get(side.lower())
+            caps = [("buying power", most)] if isinstance(most, int) and not isinstance(most, bool) else []
+            n, why = plan_size.shares(shares, self.stage, caps=caps, price=trig)
         return ({"trigger": str(trig.quantize(Decimal("0.01"))), "stop": str(stop.quantize(Decimal("0.01"))),
                  "plan_shares": shares, "shares": n}, why)
 

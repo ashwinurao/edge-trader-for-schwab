@@ -241,11 +241,14 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   than 100%" when it can't fit). Until every pick's 09:30 bar is final it is an estimate (a pick without
   its final bar counts at the narrow range, 0.19 x ATR, the most shares); at the first view where every
   pick has its final bar and the balances were read within 30 seconds, the balances and the sum are
-  fixed for the day, so the plan's own orders never shrink it, while
-  a change to the share or to Risk per pick moves the sizes at once. A restart reads the balances again.
+  fixed for the day, at the latest 15 seconds after the bar's end (09:31:15 ET,
+  `size.buying_power.fix_latest_seconds`) on the picks final by then. A pick not in the fixed sum (its bar
+  came later, or it was left out) gets nothing above 1 share that day and says so. The plan's own orders
+  never shrink the cap, while a change to the share or to Risk per pick moves the sizes at once. A restart reads the balances again.
   The fixed cap also guards the send on the server (`companion/plan_entries.py`): a size stage above 1
-  share is refused until it is fixed. In the test stage (`size.stage` "1_share") the screen says "Test
-  stage: each plan order is 1 share, whatever these two say." When the fresh balances no longer cover
+  share is refused until it is fixed. In the test stage (`size.stage` "1_share") the cap changes no order: a
+  click sends 1 share whenever the size before the cap is at least 1, and the screen says "Test stage: each
+  plan order is 1 share, whatever these two say." When the fresh balances no longer cover
   the rows not sent yet, one line says so; no send is refused for it. Balances, the amount and the
   sums are on the screen only, hidden with `--private`, and never in a log.
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
