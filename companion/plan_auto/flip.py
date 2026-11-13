@@ -102,7 +102,7 @@ def register(reg: Registry) -> None:
 class FlipRules(ArmedRules):
     """Step 6's armed numbers with this step's own, used only with EDGE_TRADER_PLAN_AUTO_FLIP=1."""
     # How long the send half looks again after a confirmed cancel when the new tape reading is
-    # unusable or its price stale (architect's notes on PR #28, 2026-11-13 17:20 UTC, item 1).
+    # unusable or its price stale (architect's notes on PR #28, 2026-11-13 16:50 UTC, item 1).
     swap_recheck_seconds: float = 0.0
 
 
@@ -272,7 +272,7 @@ def _swap(lane: Lane, kind: str) -> bool:
     def recheck() -> tuple[str, str]:
         """After the confirmed cancel, no lock held: the checks below, again on a new reading a tick
         (armed.every_seconds) later while the reading is unusable or its price stale, for at most
-        armed.swap_recheck_seconds (architect's notes on PR #28, 2026-11-13 17:20 UTC, item 1).
+        armed.swap_recheck_seconds (architect's notes on PR #28, 2026-11-13 16:50 UTC, item 1).
         Before the cancel a bad reading costs nothing, since would_flip comes again; after it there
         is one entry to place. Every other answer ends at once."""
         if spent["send"]:

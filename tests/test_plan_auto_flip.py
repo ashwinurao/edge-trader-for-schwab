@@ -491,7 +491,7 @@ def test_not_when_no_order_is_left_for_the_pick(r):
 
 
 def test_no_cancel_when_the_calls_bound_could_not_take_the_new_entry(r):
-    # Architect's notes on PR #28 (2026-11-13 17:20 UTC, item 2): "never cancel an entry the plan
+    # Architect's notes on PR #28 (2026-11-13 16:50 UTC, item 2): "never cancel an entry the plan
     # could not replace" covers the calls bound too. The entry stays and the panel says so.
     place_long(r)
     r.host.left["calls_minute"] = 3                   # armed.calls_per_send is 4 on this host
@@ -752,7 +752,7 @@ FRESH, STALE = (tape_pick(42.10), True, ""), (tape_pick(42.10, age=0.6), True, "
 
 
 def test_after_the_cancel_a_stale_price_looks_again_and_places_on_a_fresh_one(r, monkeypatch):
-    # Architect's notes on PR #28 (2026-11-13 17:20 UTC, item 1): after the confirmed cancel there is
+    # Architect's notes on PR #28 (2026-11-13 16:50 UTC, item 1): after the confirmed cancel there is
     # one entry to place, so a stale or unusable reading looks again a tick later, up to 1.5 s.
     place_long(r)
     waits = ticking(r, monkeypatch)
