@@ -227,10 +227,14 @@ def test_refused_without_risk_set(rig):
     assert "risk" in refuse(rig).lower()
 
 
-def test_refused_when_another_order_on_the_name_is_working(rig):
+def test_refused_when_another_order_on_the_name_is_working_on_the_other_side(rig):
+    # Brief 25 (changed expectation): until then any other working order on the name refused
+    # ("One entry per name"). Now only an order on the other side does; a same-side one is allowed
+    # (tests/test_plan_side_rules.py).
     rig.broker.orders[77] = {"orderId": 77, "status": "WORKING", "filledQuantity": 0,
-                             "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "AAAA"}}]}
-    assert "already at Schwab (order 77)" in refuse(rig)
+                             "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "AAAA"}}]}
+    assert refuse(rig) == ("You have a working short order on AAAA. The plan does not take the other side "
+                           "of a name you trade. Nothing was sent.")
 
 
 def test_second_place_on_the_row_is_refused(rig):
@@ -428,11 +432,13 @@ def make_app(rig, env, demo=False, fresh=True):
     app.state.opening_plan_now = lambda: NOW
 
     class Poller:
+        account = None                     # no positions (brief 25's side rule reads them)
+
         def _merged_orders(self):
             return list(rig.broker.orders.values())
 
         def _fresh(self, name):
-            assert name == "orders_today"
+            assert name in ("orders_today", "account")
             return fresh
     added = plan_entries.register(app, rig.trader, Poller(), lambda request: None, demo=demo, env=env)
     return app, added
@@ -600,12 +606,14 @@ def test_flip_does_not_place_when_another_order_appears_on_the_name(rig, monkeyp
 
     def cancel_then_other_order(oid):
         out = real(oid)
+        # Brief 25 (changed expectation): the order that appears is now on the other side of the
+        # flip's new short (a BUY); a same-side SELL_SHORT, the test's order until then, is allowed.
         rig.broker.orders[4242] = {"orderId": 4242, "status": "WORKING", "filledQuantity": 0,
-                                   "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "AAAA"}}]}
+                                   "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "AAAA"}}]}
         return out
     monkeypatch.setattr(rig.trader, "cancel_entry", cancel_then_other_order)
     r = rig.desk.flip("AAAA", SHORT)
-    assert not r["ok"] and "order 4242" in r["error"] and len(rig.broker.placed) == 1
+    assert not r["ok"] and "working long order on AAAA" in r["error"] and len(rig.broker.placed) == 1
     assert row(rig)["entry"]["state"] == plan_entries.NONE
 
 

@@ -20,6 +20,9 @@ Every send is the user's click (CONTRIBUTING rule 1):
   (cancel not confirmed, any fill) places nothing and turns the row red. Never two entries
   resting for one name. At most max_flips_per_row flips per row per day (playbook.json).
 
+Brief 25 (companion/plan_side.py): Place and Flip go beside the user's own trades on the same side
+of the name and refuse on the other side, or when the side is not clear or a read is old.
+
 When unsure, refuse (CONTRIBUTING rule 4): ARM off, market closed, the first minute not final,
 old data, the calm flag unknown, the name blocked by an unclear order, an entry already working,
 unclear or filled on the row, or a hold (PlanDesk.add_hold: Flat all's batch, Step 9). Nothing is retried. No lock of this file is held across a
@@ -41,7 +44,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, plan_size, trading
+from . import break_entry, plan_side, plan_size, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -110,13 +113,19 @@ class PlanDesk:
                  armed: Optional[Callable[[], bool]] = None,
                  market_open: Optional[Callable[[], bool]] = None, demo: bool = False,
                  orders_fresh: Optional[Callable[[], bool]] = None, stage: Any = plan_size.DEFAULT,
-                 hold: Optional[Callable[[], str]] = None) -> None:
+                 hold: Optional[Callable[[], str]] = None,
+                 positions: Optional[Callable[[], Mapping]] = None,
+                 positions_fresh: Optional[Callable[[], bool]] = None) -> None:
         """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today")).
         `stage` is the playbook's size stage (companion/plan_size.py, Step 9); the default is 1 share.
-        `hold` returns why no new entry may go now, or "" (see add_hold)."""
+        `hold` returns why no new entry may go now, or "" (see add_hold). `positions` returns the
+        poller's net shares per name and `positions_fresh` whether that read is fresh
+        (Poller._fresh("account")): the side rule of brief 25 (companion/plan_side.py) reads them."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
         self.stage = plan_size.parse_stage(stage)
         self._orders_fresh_fn = orders_fresh or (lambda: True)
+        self._positions_fn = positions or (lambda: {})
+        self._positions_fresh_fn = positions_fresh or (lambda: True)
         self._armed = armed or (lambda: bool(trader.armed))
         self._market_open = market_open or (lambda: trading.market_open())
         self.demo = demo
@@ -347,8 +356,38 @@ class PlanDesk:
                    text=d["text"])
         return out
 
+    def _positions_read(self) -> tuple[Mapping, bool]:
+        """The poller's positions and whether they are fresh. Unreadable: old (when unsure, refuse)."""
+        try:
+            return dict(self._positions_fn() or {}), bool(self._positions_fresh_fn())
+        except Exception:
+            log.exception("opening plan: positions could not be read")
+            return {}, False
+
+    def _beside(self, ticker: str, side: str, rec: Mapping, orders: list[dict], fresh: bool) -> str:
+        """Brief 25 rule B: a new entry goes beside the user's own trades on the same side and is
+        refused on the other side or when the side is not clear (companion/plan_side.py). The row's
+        own entry and its stop are the plan's, never the user's."""
+        positions, pfresh = self._positions_read()
+        ps = plan_side.plan_shares(rec, orders)
+        code, text = plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ps.ids, ps.held)
+        return "" if code == plan_side.OK else text
+
+    def _manual_line(self, ticker: str, rec: Mapping, orders: list[dict]) -> str:
+        """Brief 25 rule F: "You also hold M T by hand" or "You also have a working order on T"."""
+        positions, pfresh = self._positions_read()
+        if not pfresh:
+            return ""
+        ps = plan_side.plan_shares(rec, orders)
+        try:
+            return plan_side.manual(ticker, positions, orders, ps.ids, ps.held).line()
+        except Exception:
+            return ""
+
     def _foreign(self, ticker: str, rec: Mapping, orders: list[dict]) -> Optional[dict]:
-        """A working order on this name that this row did not send (the ticket, thinkorswim)."""
+        """A working order on this name that this row did not send (the ticket, thinkorswim).
+        Not used by Place or Flip since brief 25 (the side rule, _beside); kept for Step 6's branch
+        (ET PR #27), whose armed send moves to plan_side.manual_refusal."""
         own = rec.get("order_id")
         for o in orders:
             if o.get("orderId") == own or o.get("status") not in LIVE:
@@ -370,9 +409,11 @@ class PlanDesk:
             return ORDERS_OLD
         if state == SENT and not entry["done"]:
             return f"{ticker} already has an entry today."
-        f = self._foreign(ticker, rec, orders)
-        if f is not None:
-            return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
+        # Brief 25: the user's own same-side orders and shares no longer refuse ("One entry per name"
+        # until then); the other side, or a side that is not clear, does.
+        why = self._beside(ticker, side, rec, orders, fresh)
+        if why:
+            return why
         return self._send_refusal(view, ticker, side, blocked)
 
     def _flip_refusal(self, view, ticker, rec, entry, orders, blocked, fresh: bool = True) -> str:
@@ -387,6 +428,10 @@ class PlanDesk:
         used = int(rec.get("flips") or 0)
         if used >= self.flips:
             return f"{ticker}: {used} of {self.flips} flips used today (max_flips_per_row in playbook.json)."
+        # Brief 25: refused before the cancel when the user is on the flip's new side's other side.
+        why = self._beside(ticker, OTHER[rec.get("side") or "LONG"], rec, orders, fresh)
+        if why:
+            return why
         return self._send_refusal(view, ticker, OTHER[rec.get("side") or "LONG"], blocked)
 
     @staticmethod
@@ -434,7 +479,8 @@ class PlanDesk:
                            for k in ("LONG", "SHORT")},
                  "cancel": self._cancel_refusal(entry, fresh),
                  "flip_to": OTHER[entry["side"]].lower() if entry["side"] in OTHER else None,
-                 "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh)}
+                 "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh),
+                 "manual": self._manual_line(ticker, rec, orders)}
             out["rows"].append(r)
         return out
 
@@ -613,11 +659,10 @@ class PlanDesk:
             except Exception:
                 blocked = None                       # refuses: "not confirmed"
             # The same list checks as Place (architect's review of PR #19): a fresh order list, and
-            # no other working order on the name (the cancelled entry is not working any more).
-            f = self._foreign(ticker, {"order_id": oid}, orders) if fresh else None
+            # since brief 25 the side rule for the new side (the cancelled entry is the plan's).
             why = (ORDERS_OLD if not fresh else
-                   f"a working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
-                   if f is not None else self._send_refusal(view, ticker, new, blocked))
+                   self._beside(ticker, new, {"order_id": oid, "side": old}, orders, fresh)
+                   or self._send_refusal(view, ticker, new, blocked))
             if why:
                 self._put(ticker, state=NONE, order_id=None,
                           text=f"Cancelled the {old.lower()} entry. Did not place the {new.lower()}: {why}")
@@ -656,11 +701,14 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         # Invented entries so the screen shows each state; every click is still refused.
         recs, orders = demo_entries()
         desk = PlanDesk(trader, view, lambda: orders, flips, now=now,
-                        armed=lambda: True, market_open=lambda: True, demo=True, stage=stage)
+                        armed=lambda: True, market_open=lambda: True, demo=True, stage=stage,
+                        positions=lambda: dict(plan_flat.DEMO_POSITIONS))
         desk._mem = {desk._key(): recs}
     else:
         desk = PlanDesk(trader, view, poller._merged_orders, flips, now=now,
-                        orders_fresh=lambda: poller._fresh("orders_today"), stage=stage)
+                        orders_fresh=lambda: poller._fresh("orders_today"), stage=stage,
+                        positions=lambda: plan_side.account_positions(poller.account),
+                        positions_fresh=lambda: poller._fresh("account"))
         try:
             desk.recover()
         except Exception as e:
@@ -705,13 +753,23 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
 
 def demo_entries() -> tuple[dict, list[dict]]:
     """`--demo` only: AAAA has a resting long entry (Cancel and Flip work), BBBB's flip stopped on a
-    fill (red). Order ids and fills are invented; nothing reaches Schwab."""
+    fill (red), CCCC's long filled 1 share beside 100 bought by hand (brief 25). Order ids and fills are invented; nothing reaches Schwab."""
     recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0},
+            # Brief 25: CCCC's long filled 1 share and its stop works; 100 more were bought by hand.
+            "CCCC": {"state": SENT, "side": "LONG", "ticket_id": "demo-cccc", "order_id": 9003, "flips": 0},
             "BBBB": {"state": RED, "side": "SHORT", "ticket_id": "demo-bbbb", "order_id": 9002, "flips": 1,
                      "text": "Flip stopped: 1 shares filled before the cancel. Its stop is live. Nothing new "
                              "was placed. Check the BBBB order and position in thinkorswim."}}
     orders = [{"orderId": 9001, "status": "WORKING", "filledQuantity": 0, "orderStrategyType": "TRIGGER",
                "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "AAAA"}}]},
               {"orderId": 9002, "status": "FILLED", "filledQuantity": 1, "orderStrategyType": "TRIGGER",
-               "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "BBBB"}}]}]
+               "orderLegCollection": [{"instruction": "SELL_SHORT", "instrument": {"symbol": "BBBB"}}]},
+              {"orderId": 9003, "status": "FILLED", "filledQuantity": 1, "orderStrategyType": "TRIGGER",
+               "orderActivityCollection": [{"executionType": "FILL", "executionLegs": [
+                   {"quantity": 1, "price": 71.85, "time": "2026-11-13T14:31:20+0000"}]}],
+               "orderLegCollection": [{"instruction": "BUY", "instrument": {"symbol": "CCCC"}}],
+               "childOrderStrategies": [{"orderId": 9004, "status": "WORKING", "orderType": "STOP", "quantity": 1,
+                                         "stopPrice": 71.19, "orderStrategyType": "SINGLE",
+                                         "orderLegCollection": [{"instruction": "SELL", "quantity": 1,
+                                                                 "instrument": {"symbol": "CCCC"}}]}]}]
     return recs, orders

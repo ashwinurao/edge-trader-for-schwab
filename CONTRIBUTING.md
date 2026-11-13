@@ -80,6 +80,9 @@ What to add:
 - `companion/break_entry.py`: the Break entry (a stop-limit entry with its stop attached, OV entries
   Step 3): its start numbers, the 1-share cap, the 5-second quote rule and `build_request()`, the
   request shape the Opening plan buttons use. Off unless `EDGE_TRADER_BREAK_ENTRY=1`.
+- `companion/plan_side.py`, `companion/plan_close.py`: the Opening plan beside your own trades on the
+  same name (brief 25): which side you are on, which shares are the plan's (told apart by the plan's
+  own stop), and Flat all's close of only the plan's shares, inside Trader's one-at-a-time lock.
 - `companion/app.py`: the local FastAPI server. `companion/static/index.html`: the whole UI.
 - `companion/floating.py`: the always-on-top windows (pywebview).
 
