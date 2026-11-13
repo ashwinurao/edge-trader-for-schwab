@@ -571,7 +571,10 @@ class AutoPlan:
                "resting_text": (f"{len(resting)} plan entr{'y' if len(resting) == 1 else 'ies'} still rest at Schwab "
                                 f"({', '.join(resting)}). The armed plan does nothing more: each row's Cancel works."
                                 if resting and not armed else "")}
-        if check and not armed:
+        if check and self.demo:
+            out["refusals"] = ["Demo mode: no orders and no Schwab calls."]
+            out["dialog"] = self.terms()
+        elif check and not armed:
             facts, view = self._facts(now, self.playbook_name, self.armed_rules.bounds())
             out["refusals"] = refusals(facts, self.armed_rules)
             out["dialog"] = self.terms(view)
