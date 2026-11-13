@@ -179,10 +179,16 @@ class Poller:
         """Ask the budget (poll_budget.py) whether a due poll gives way now. Each time it does,
         one netlog skip line, at most one per poll interval, so the record counts the reads not sent."""
         now = time.monotonic()
-        ok_at = (self.fresh.get(name) or {}).get("ok_at")
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(ok_at)).total_seconds() if ok_at else None
-        why = poll_budget.give_way(name, now, tuple(self._sent), tuple(self._order_sent), MAX_PER_MIN,
-                                   self._hold_until, self._urgent, age)
+        try:
+            # tuple() copies deques that click threads append to (note_external_request). Under the
+            # GIL that copy is safe: 8.7 million copies against three writer threads on Python
+            # 3.11.18 raised nothing (review 1 of PR #33). If it ever raises, the poll goes as
+            # before brief 24, never the loop's 5 s error wait.
+            why = poll_budget.give_way(name, now, tuple(self._sent), tuple(self._order_sent), MAX_PER_MIN,
+                                       self._hold_until, self._urgent, self._age(name), INTERVALS.get(name))
+        except Exception:
+            log.exception("poll budget failed for %s; the poll goes", name)
+            why = None
         if why is None:
             self._skip_logged.pop(name, None)
             return False
@@ -190,6 +196,20 @@ class Poller:
             self._skip_logged[name] = now + INTERVALS.get(name, 5)
             self._skip(name, why)
         return True
+
+    def _age(self, name: str) -> float | None:
+        ok_at = (self.fresh.get(name) or {}).get("ok_at")
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ok_at)).total_seconds() if ok_at else None
+
+    def _goes_first(self, name: str) -> bool:
+        """True when a LATER poll may wait in the limiter like a FIRST poll (poll_budget.goes_first).
+        On any error it is True: the poll goes and waits as before brief 24."""
+        try:
+            return poll_budget.goes_first(name, time.monotonic(), tuple(self._order_sent), self._hold_until,
+                                          self._age(name), INTERVALS.get(name))
+        except Exception:
+            log.exception("poll budget failed for %s; the poll goes", name)
+            return True
 
     @staticmethod
     def _skip(name: str, why: str) -> None:
@@ -672,7 +692,8 @@ class Poller:
                         if self._give_way(name):      # brief 24: asked again on the next pass
                             continue
                         self._next[name] = time.monotonic() + every
-                        self._later = name not in poll_budget.FIRST and name not in self._urgent
+                        self._later = (name not in poll_budget.FIRST and name not in self._urgent
+                                       and not self._goes_first(name))
                         try:
                             changed |= self._poll(name)
                         except Exception as e:

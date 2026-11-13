@@ -124,30 +124,32 @@ def replay(rig, bins, quiet_before: float = 60.0, after: float = 60.0):
 
 
 # ---- the measured minutes ---------------------------------------------------------------------------
-# Results of this simulation on the start numbers (orders_today / account, longest gap in s), and
-# the same replay with every poll first as before this brief:
-#   19:06 after a quiet minute   21.0 / 20.0     before 35.0 / 37.0
-#   19:37 after a quiet minute   24.0 / 20.8     before 25.0 / 34.5
-#   19:06 played twice, 2nd run  16.5 / 20.0     before 42.3 / 42.4
-#   19:37 played twice, 2nd run   9.5 / 10.0     before 24.7 / 40.0
-#   40 calls in 3 s, cold        30.0 / 30.0     before 30.5 / 30.5
-#   the same, hold_later 90 s     5.0 /  5.0     before 30.5 / 30.5
+# Results of this simulation on the start numbers (orders_today / account, longest gap in s), the
+# head of review 1 (120a518), and the same replay with every poll first as before this brief:
+#                                 now            120a518        before
+#   19:06 after a quiet minute   20.0 / 20.5    21.0 / 20.0    35.0 / 37.0
+#   19:37 after a quiet minute   20.8 / 24.0    24.0 / 20.8    25.0 / 34.5
+#   19:06 played twice, 2nd run  20.0 / 15.9    16.5 / 20.0    42.3 / 42.4
+#   19:37 played twice, 2nd run  11.0 / 11.5     9.5 / 10.0    24.7 / 40.0
+#   40 calls a minute, 2 min     10.0 /  5.5     5.0 /  5.0    29.5 / 29.5
+#   40 calls in 3 s, cold        30.0 / 30.0    30.0 / 30.0    30.5 / 30.5
 # Goal 1's 15 s is not reached in every case: at 44 to 51 order calls a minute the window has 19 to
 # 26 sends left for the poller, and right after a quiet minute it is still full of that minute's
 # ~54 sends, which leave at their own pace. The PR reports it; hold_later covers a known burst.
+# At these rates quotes and fills give way for 70 to 180 s (as at 120a518), and show as old.
 
-@pytest.mark.parametrize("bins, cold, before", [(MINUTE_1906, 21.0, 35.0), (MINUTE_1937, 24.0, 25.0)],
+@pytest.mark.parametrize("bins, orders, account", [(MINUTE_1906, 20.0, 20.5), (MINUTE_1937, 21.0, 24.0)],
                          ids=["19:06", "19:37"])
-def test_the_measured_minutes_after_a_quiet_minute(traffic, monkeypatch, bins, cold, before):
+def test_the_measured_minutes_after_a_quiet_minute(traffic, monkeypatch, bins, orders, account):
     start, end, times = replay(traffic, bins)
     assert 40 < max_in_60s(times) <= 55                         # 44 and 49: goal 1's second band
-    assert max(gaps(traffic, "orders_today", start, end + 15)) <= cold
-    assert max(gaps(traffic, "account", start, end + 15)) <= 21.0
+    assert max(gaps(traffic, "orders_today", start, end + 15)) <= orders
+    assert max(gaps(traffic, "account", start, end + 15)) <= account
     assert poller_never_sent_the_71st(traffic)
     assert traffic.clock.sent == times                         # every order call went at its own time
 
 
-@pytest.mark.parametrize("bins, warm", [(MINUTE_1906, 20.0), (MINUTE_1937, 10.0)], ids=["19:06", "19:37"])
+@pytest.mark.parametrize("bins, warm", [(MINUTE_1906, 20.0), (MINUTE_1937, 11.5)], ids=["19:06", "19:37"])
 def test_the_measured_minutes_played_twice(traffic, bins, warm):
     """The second run of the minute, once the window holds the first run's traffic."""
     run(traffic, 60)
@@ -171,32 +173,39 @@ def test_the_measured_minutes_as_they_were_before(traffic, monkeypatch, bins, wo
     assert max(max(gaps(traffic, n, start, end + 15)) for n in ("orders_today", "account")) >= worst
 
 
-def test_up_to_40_order_calls_a_minute_keep_reads_within_8_s(traffic):
-    """Goal 1's first band: steady order traffic of 40 calls a minute for two minutes, from cold."""
+def test_up_to_40_order_calls_a_minute_keep_reads_within_10_s(traffic):
+    """Goal 1's first band: steady order traffic of 40 calls a minute for two minutes, from cold.
+    Goal 1 asked 8 s; review 1 of PR #33 accepts 10 s here for goal 6 (orders_today 10 s, account
+    5.5 s; 5 / 5 at 120a518)."""
     start, end, times = replay(traffic, [7, 7, 6, 7, 7, 6] * 2)
     assert max_in_60s(times) <= 40
     for name in ("orders_today", "account"):
-        assert max(gaps(traffic, name, start, end + 15)) <= 8, name
+        assert max(gaps(traffic, name, start, end + 15)) <= 10, name
     assert poller_never_sent_the_71st(traffic)
 
 
 # ---- a burst of 40 calls in 3 s ---------------------------------------------------------------------
 
 def burst(rig, hold: float | None):
+    """A quiet minute, then 40 order calls in 3 s. With `hold`, hold_later(hold) starts 90 s before
+    the burst and still holds through it (Step 6 holds from 09:30:00 ET until the plan is done)."""
     run(rig, 60)                                       # a quiet minute: the window holds ~54 sends
     if hold is not None:
         rig.p.hold_later(hold, "test: a burst is coming")
-        run(rig, hold)
+        run(rig, 90)
     start = rig.clock.mono
     rig.clock.schedule([start + 3 * k / 40 for k in range(40)])
     run(rig, 90)
     return start
 
 
-def test_a_burst_with_hold_later_90_s_before_keeps_the_order_list_on_time(traffic):
-    start = burst(traffic, hold=90)
-    assert max(gaps(traffic, "orders_today", start, start + 60)) <= 5
-    assert max(gaps(traffic, "account", start, start + 60)) <= 5
+def test_a_burst_while_hold_later_holds_keeps_the_order_list_on_time(traffic):
+    """orders_today / account 10 / 10 s (5 / 5 at 120a518, whose fills stopped for the whole hold:
+    must 2 of review 1 lets them through every 15 to 20 s)."""
+    start = burst(traffic, hold=150)
+    assert max(gaps(traffic, "orders_today", start, start + 60)) <= 10
+    assert max(gaps(traffic, "account", start, start + 60)) <= 10
+    assert max(gaps(traffic, "tx:today", start - 90, start + 60)) <= 20
     assert poller_never_sent_the_71st(traffic)
     assert any(why == "held" for _, _, why in traffic.skips)
 
@@ -211,12 +220,9 @@ def test_a_burst_without_warning_is_late_but_never_over_70(traffic):
 
 # ---- quiet times -----------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("ticket", [False, True], ids=["no orders", "a focused ticket"])
-def test_a_quiet_hour_runs_every_poll_at_its_interval_with_no_skip(traffic, ticket):
+def test_a_quiet_hour_runs_every_poll_at_its_interval_with_no_skip(traffic):
     run(traffic, 30)
     t0 = traffic.clock.mono
-    if ticket:   # a ticket window with focus reprices every 5 s: 12 order calls a minute, all hour
-        traffic.clock.schedule([t0 + 5 * k + 1.3 for k in range(720)])
     run(traffic, 3600)
     for name, every in INTERVALS.items():
         if every <= 30:
@@ -224,6 +230,81 @@ def test_a_quiet_hour_runs_every_poll_at_its_interval_with_no_skip(traffic, tick
                      t0, t0 + 3600)
             assert max(g) <= every + 0.5, name
     assert traffic.skips == []
+    assert poller_never_sent_the_71st(traffic)
+
+
+# ---- goal 6: ordinary manual trading keeps its marks and fills (review 1 of PR #33) --------------
+# A ticket window with focus reprices every 5 s (12 order calls a minute); a click is 5 calls in 2 s.
+# Longest gap in s, quotes / transactions / orders_today / account, after a quiet minute:
+#                                          now               120a518            before
+#   a focused ticket, all hour             6 / 20 / 5 / 5    3 / 10 / 5 / 5     3 / 10 / 5 / 5
+#   ticket + one click                     6 / 20 / 5 / 5    40 / 39 / 5 / 5    6 / 11.5 / 6.5 / 5.5
+#   ticket + three clicks in 40 s          6 / 20 / 5 / 5    71.5 / 71.5 / 5 / 5  12 / 17 / 12 / 10.5
+#   ticket + a click every 20 s, 2 min     6 / 20 / 5 / 5    151.5 / 151.5 / 5 / 5  12 / 17 / 12 / 10.5
+# The page shows quotes as old after 9 s and fills after 30 s (three intervals).
+
+def ticket(t0: float, seconds: float) -> list[float]:
+    return [t0 + 5 * k + 1.3 for k in range(int(seconds / 5))]
+
+
+def click(t: float) -> list[float]:
+    return [t + 0.5 * k for k in range(5)]
+
+
+GOAL_6 = {"quotes": 9.0, "tx:today": 30.0, "orders_today": 10.0, "account": 10.0}
+
+
+@pytest.mark.parametrize("clicks, seconds", [
+    ([30], 150),
+    ([30, 50, 70], 150),
+    ([30 + 20 * k for k in range(7)], 210),
+], ids=["one click", "three clicks in 40 s", "a click every 20 s for 2 min"])
+def test_ordinary_manual_trading_keeps_marks_fills_and_the_order_list(traffic, clicks, seconds):
+    run(traffic, 60)
+    t0 = traffic.clock.mono
+    times = ticket(t0, seconds) + [x for c in clicks for x in click(t0 + c)]
+    traffic.clock.schedule(times)
+    run(traffic, seconds)
+    assert max_in_60s(times) <= 27
+    for name, most in GOAL_6.items():
+        assert max(gaps(traffic, name, t0, t0 + seconds)) <= most, name
+    assert {why for _, _, why in traffic.skips} <= {"light"}
+    assert poller_never_sent_the_71st(traffic)
+    assert traffic.clock.sent == sorted(times)
+
+
+def test_a_focused_ticket_all_hour_paces_quotes_and_fills_but_never_shows_them_old(traffic):
+    """Quotes every 6 s instead of 3 and fills every 20 s instead of 10: the window keeps room for
+    the clicks (review 1 of PR #33). Every FIRST poll keeps its interval."""
+    run(traffic, 30)
+    t0 = traffic.clock.mono
+    traffic.clock.schedule(ticket(t0, 3600))
+    run(traffic, 3600)
+    for name, every in INTERVALS.items():
+        if every <= 30:
+            g = gaps(traffic, {"orders_sweep": "sweep:WORKING", "transactions": "tx:today"}.get(name, name),
+                     t0, t0 + 3600)
+            late = name not in poll_budget.FIRST
+            assert max(g) <= (poll_budget.LATE_INTERVALS if late else 1) * every + 0.5, name
+    assert {why for _, _, why in traffic.skips} == {"light"}
+    assert poller_never_sent_the_71st(traffic)
+
+
+def test_hold_later_keeps_fills_coming_while_quotes_give_way(traffic):
+    """Must 2 of review 1: a focused ticket, hold_later(90), then 20 order calls in 3 s. The order
+    list and the account at most 8 s apart; transactions never older than 30 s."""
+    run(traffic, 60)
+    t0 = traffic.clock.mono
+    traffic.clock.schedule(ticket(t0, 150))
+    traffic.p.hold_later(90, "test: the armed plan")
+    run(traffic, 60)
+    b = traffic.clock.mono
+    traffic.clock.schedule([b + 3 * k / 20 for k in range(20)])
+    run(traffic, 30)
+    for name in ("orders_today", "account"):
+        assert max(gaps(traffic, name, t0, t0 + 90)) <= 8, name
+    assert max(gaps(traffic, "tx:today", t0, t0 + 90)) <= 30
+    assert {(n, why) for _, n, why in traffic.skips if n == "quotes"} == {("quotes", "held")}
     assert poller_never_sent_the_71st(traffic)
 
 
@@ -304,28 +385,44 @@ def test_first_polls_never_give_way(name):
 
 def test_the_budget_rules_one_by_one():
     gw, B = poll_budget.give_way, poll_budget
+
+    def q(now, sends, orders, **k):
+        return gw("quotes", now, sends, orders, 70, every=3.0, **k)
+
     quiet = [0.0] * B.QUIET_ORDER_CALLS
-    assert gw("quotes", 1.0, quiet, quiet, 70) is None                       # goal 5: as before
-    assert gw("quotes", 1.0, quiet, quiet, 70, hold_until=2.0) == "held"     # hold_later wins
-    # A focused ticket: one call every 5 s, 12 a minute, no burst: as before even when 66 are sent.
-    ticket = [5.0 * k for k in range(10)]
-    assert gw("quotes", 46.0, ticket + [46.0] * 56, ticket, 70) is None
-    # A click: 4 calls inside 10 s make a burst; LATER waits HOLD_AFTER_BURST_S after the last one.
-    click = ticket + [50.0, 50.5, 51.0, 51.5]
-    assert B.last_burst(click, 52.0) == 51.5
-    assert gw("quotes", 52.0, click, click, 70) == "after_burst"
-    after = 51.5 + B.HOLD_AFTER_BURST_S
-    assert gw("quotes", after, click, click, 70) is None                     # room left: goes
-    full = click + [after] * (70 - B.RESERVE + 1)
-    assert gw("quotes", after, full, click, 70) == "reserve"                 # 56 sent: keeps 15 free
-    # Steady traffic above STEADY_ORDER_CALLS without a burst also keeps the reserve.
-    steady = [3.5 * k for k in range(B.STEADY_ORDER_CALLS + 1)]
-    now = steady[-1] + 0.5
-    assert B.last_burst(steady, now) is None
-    assert gw("quotes", now, steady + [now] * 50, steady, 70) == "reserve"
-    assert gw("quotes", now, steady, steady, 70) is None
-    assert gw("quotes", 52.0, click, click, 70, urgent={"quotes"}) is None   # a stop reads it
-    assert gw("quotes", 200.0, full, click, 70) is None                      # all left the window
+    assert q(1.0, quiet, quiet, age_s=3.0) is None                            # goal 5: as before
+    assert q(1.0, quiet, quiet, hold_until=2.0, age_s=60.0) == "held"         # hold_later wins
+    # Light traffic: a focused ticket, 12 calls a minute. A LATER poll waits until it is two
+    # intervals old, then queues with the FIRST polls.
+    ticket = [5.0 * k for k in range(12)]
+    assert B.last_burst(ticket, 56.0) is None
+    assert q(56.0, ticket, ticket, age_s=3.0) == "light"
+    assert q(56.0, ticket, ticket, age_s=6.0) is None
+    assert B.goes_first("quotes", 56.0, ticket, age_s=6.0, every=3.0)
+    assert not B.goes_first("quotes", 56.0, ticket, age_s=5.9, every=3.0)
+    # A click beside the ticket (9 calls in 20 s) is no burst.
+    click = ticket + [56.0, 56.5, 57.0, 57.5, 58.0]
+    assert B.last_burst(click, 58.5) is None
+    assert q(58.5, click, click, age_s=6.0) is None
+    # A burst: BURST_ORDER_CALLS in BURST_WINDOW_S. LATER waits HOLD_AFTER_BURST_S after it.
+    burst = ticket + [56.0 + 0.25 * k for k in range(B.BURST_ORDER_CALLS)]
+    last = burst[-1]
+    assert B.last_burst(burst, last + 0.1) == last
+    assert q(last + 0.1, burst, burst, age_s=60.0) == "after_burst"
+    assert not B.goes_first("quotes", last + 0.1, burst, age_s=60.0, every=3.0)
+    assert q(last + B.HOLD_AFTER_BURST_S, burst, burst, age_s=6.0) is None    # light again, late
+    assert q(last + 0.1, burst, burst, urgent={"quotes"}) is None             # a stop reads it
+    # Heavy traffic: HEAVY_ORDER_CALLS in 60 s, no burst. Goes while 15 of the 70 stay free.
+    heavy = [2.0 * k for k in range(B.HEAVY_ORDER_CALLS)]
+    assert B.last_burst(heavy, 59.0) is None
+    assert q(59.0, heavy, heavy, age_s=60.0) is None
+    assert q(59.0, heavy + [59.0] * (70 - B.RESERVE - len(heavy) + 1), heavy, age_s=60.0) == "reserve"
+    assert q(200.0, heavy * 3, heavy, age_s=3.0) is None                      # all left the window
+    # While hold_later holds: quotes give way at any age, transactions go once 15 s old.
+    tx = dict(hold_until=100.0, every=10.0)
+    assert gw("transactions", 1.0, quiet, quiet, 70, age_s=B.HELD_FILLS_EVERY_S - 0.1, **tx) == "held"
+    assert gw("transactions", 1.0, quiet, quiet, 70, age_s=B.HELD_FILLS_EVERY_S, **tx) is None
+    assert gw("transactions", 1.0, quiet, quiet, 70, age_s=None, **tx) == "held"
 
 
 def test_the_order_sweep_lets_the_5_s_reads_go_first_until_it_is_60_s_old():

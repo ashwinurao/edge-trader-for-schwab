@@ -54,7 +54,7 @@ name are refused). It needs no account and sends no telemetry.
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
   quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
   `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
-  `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
+  `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
   pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
   web server wake, CPU, memory, the token's time left, and the count, p95 and slowest time of each route
   the screens poll that minute).
