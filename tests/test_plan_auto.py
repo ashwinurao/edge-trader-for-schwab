@@ -503,10 +503,16 @@ def test_a_bound_reached_disarms(rig, monkeypatch):
 
 def test_the_calls_bound_refuses_sends(rig):
     arm(rig)
-    rig.plan.armed_rules = A.ArmedRules(**{**rig.plan.armed_rules.__dict__, "calls_per_minute": 8})
+    rig.plan.armed_rules = A.ArmedRules(**{**rig.plan.armed_rules.__dict__, "calls_per_minute": 10})
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
-    assert placed(rig) == ["DDDD", "AAAA"]               # 4 calls each
-    assert "Schwab calls a minute by the plan (8) reached" in rig.plan.panel()["disarmed"]["why"]
+    assert placed(rig) == ["DDDD", "AAAA"]               # 5 calls each, counted at the worst case
+    assert "Schwab calls a minute by the plan (10) reached" in rig.plan.panel()["disarmed"]["why"]
+
+
+def test_the_start_bound_allows_8_sends_a_minute():
+    rules = A.armed_rules_from(PB_RAW)
+    assert (rules.calls_per_minute, rules.calls_per_send) == (40, 5)
+    assert rules.calls_per_minute // rules.calls_per_send == 8
 
 
 def test_step2_row_disagreeing_with_the_tape_turns_the_row_red(rig):
@@ -643,6 +649,27 @@ def test_watch_end_cancels_each_unfilled_entry_and_confirms(rig):
     assert not p["armed"] and "fast watch ended" in p["disarmed"]["why"] and p["resting"] == []
 
 
+def test_no_pullback_in_the_wait_cancels_that_entry_before_the_watch_end(rig):
+    """The engine's pullback wait (automatic.pullback_wait_seconds, 120): the trigger 42.49 traded
+    and the price ran past the limit 42.55 with nothing filled. 120 s after the trigger was seen
+    the plan cancels that entry, once; the others rest until 09:35."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    oid = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}["AAAA"]
+    rig.tape.prices["AAAA"] = 42.56
+    run(rig, et(9, 33, 2))                              # seen at 09:31:03.0; the wait ends 09:33:03.0
+    assert rig.broker.cancelled == []
+    run(rig, et(9, 33, 10))
+    assert rig.broker.cancelled == [oid]
+    start = lines(rig, "cancel_start")
+    assert [x["ticker"] for x in start] == ["AAAA"] and "pullback" in json.dumps(start[0])
+    e = {r["ticker"]: r["entry"] for r in rig.desk.state()["rows"]}["AAAA"]
+    assert e["state"] == plan_entries.NONE and "Cancelled by the armed plan" in e["text"]
+    assert rig.plan.panel()["armed"]
+    run(rig, et(9, 34, 59))
+    assert rig.broker.cancelled == [oid] and len(rig.broker.placed) == 4    # no resend
+
+
 def test_a_filled_entry_is_left_alone(rig):
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
@@ -718,6 +745,39 @@ def test_a_click_entry_on_a_row_is_left_alone(rig):
     assert cc not in rig.broker.cancelled                # the plan never cancels a click's entry
 
 
+def test_a_click_flip_of_the_plans_entry_makes_it_the_clicks(rig):
+    """Found by the Step 8 engineer (2026-11-13): PlanDesk._put merges keys, so a click Flip of the
+    plan's entry kept origin "auto" and the plan cancelled the clicked short entry at 09:35."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    old = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"]}["AAAA"]
+    rig.clock.t = et(9, 32)
+    r = rig.desk.flip("AAAA", {"trigger": "41.91", "stop": "42.48", "shares": 1})
+    assert r["ok"], r
+    rec = rig.desk.records()["AAAA"]
+    assert rec["origin"] == "click" and rec["side"] == "SHORT" and rec["order_id"] != old
+    run(rig, et(9, 32, 2))
+    assert "placed by a click" in rig.plan.left["AAAA"]
+    others = {r["ticker"]: r["entry"]["order_id"] for r in rig.desk.state()["rows"] if r["ticker"] != "AAAA"}
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert rec["order_id"] not in rig.broker.cancelled              # the click's short entry rests
+    assert rig.broker.cancelled == [old] + [others[t] for t in ("DDDD", "BBBB", "CCCC")]
+    assert [x["ticker"] for x in lines(rig, "cancel_start")] == ["DDDD", "BBBB", "CCCC"]
+
+
+def test_the_arm_dialog_names_each_step_that_is_not_on(rig):
+    """Step 8 engineer, 2026-11-13: with only the chase on, the dialog must still say it won't flip."""
+    def first_line(*kinds):
+        rig.plan.registry = H.Registry()
+        for k in ("would_place", "would_cancel") + kinds:
+            rig.plan.registry.register(k, lambda lane, d: None)
+        return rig.plan.terms()["will_not"][0]
+    assert first_line() == "Flip, chase, exit, move a stop or resend."
+    assert first_line(H.PAST_TRIGGER) == "Flip, exit, move a stop or resend."
+    assert first_line("would_flip") == "Chase, exit, move a stop or resend."
+    assert first_line("would_flip", H.PAST_TRIGGER) == "Exit, move a stop or resend."
+
+
 def test_no_flip_handler_says_so_once(rig):
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
@@ -748,8 +808,8 @@ def test_the_log_has_no_bodies_or_account_numbers(rig):
 
 # ---------------------------------------------------------------- the calls the bound counts
 
-def test_a_send_is_4_schwab_calls_in_the_code(rig):
-    """armed.calls_per_send = 4: the quote in break_entry.prepare, the POST, and the two status
+def test_a_usual_send_is_4_schwab_calls_in_the_code(rig):
+    """The usual send is 4 calls: the quote in break_entry.prepare, the POST, and the two status
     reads after a 201 (fork PR #15). Fails if break_entry.prepare or Trader.submit changes its count."""
     rig.broker.calls.clear()
     spawned = []
@@ -759,7 +819,36 @@ def test_a_send_is_4_schwab_calls_in_the_code(rig):
     assert r["ok"], r
     assert [c[0] for c in rig.broker.calls] == ["quote", "place"]
     assert len(spawned) == 1 and len(rig.trader.status_reads_after_send) == 2
-    assert 2 + len(trading._reads_after_send({})) == rig.plan.armed_rules.calls_per_send == 4
+    assert 2 + len(trading._reads_after_send({})) == 4
+
+
+def test_a_send_is_at_most_5_schwab_calls_in_the_code(rig):
+    """armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC): when an earlier close on the name
+    still has an open status, Trader._blocked -> _unresolved_close reads that order once before the
+    POST. Fails if break_entry.prepare, Trader._blocked or Trader.submit changes its count."""
+    rig.broker.orders[777] = {"orderId": 777, "status": "FILLED"}       # Schwab now says the close is final
+    rig.trader.store.log_action("close", "AAAA", 777, "WORKING")        # our record still says open
+    rig.broker.calls.clear()
+    spawned = []
+    rig.trader._spawn = spawned.append
+    rig.clock.t = et(9, 31, 1)
+    r = rig.trader.submit(break_entry.build_request("AAAA", "LONG", "42.49", "41.92", 1))
+    assert r["ok"], r
+    assert [c[0] for c in rig.broker.calls] == ["quote", "read", "place"]
+    assert len(spawned) == 1 and len(rig.trader.status_reads_after_send) == 2
+    assert 3 + len(trading._reads_after_send({})) == rig.plan.armed_rules.calls_per_send == 5
+
+
+def test_an_open_close_still_open_at_schwab_refuses_the_send_after_2_calls(rig):
+    """The same read, when Schwab still shows the close working: the send is refused before the POST
+    (Trader._blocked), so it spends 2 calls, under the 5 counted."""
+    rig.broker.orders[778] = {"orderId": 778, "status": "WORKING"}
+    rig.trader.store.log_action("close", "AAAA", 778, "WORKING")
+    rig.broker.calls.clear()
+    rig.clock.t = et(9, 31, 1)
+    r = rig.trader.submit(break_entry.build_request("AAAA", "LONG", "42.49", "41.92", 1))
+    assert not r["ok"] and "open outcome" in r["error"], r
+    assert [c[0] for c in rig.broker.calls] == ["quote", "read"]
 
 
 def test_a_cancel_is_at_most_12_schwab_calls_in_the_code(rig):

@@ -525,8 +525,11 @@ class AutoPlan:
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
                 "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env)
-        will_not = ["Flip, chase, exit, move a stop or resend." if kinds == ["would_place", "would_cancel"]
-                    else "Exit, move a stop or resend.",
+        # Name each step that is not on (Step 8 engineer, 2026-11-13: with only the chase on, the
+        # old line dropped "flip" too).
+        off = [w for w, kind in (("flip", "would_flip"), ("chase", PAST_TRIGGER)) if kind not in kinds]
+        not_line = ", ".join(off + ["exit", "move a stop or resend."])
+        will_not = [not_line[:1].upper() + not_line[1:],
                     # Step 8: with the chase on, a pick past its trigger is chased, not left to Ash.
                     "Send when the price is already at or past the trigger: that pick is left to you."
                     if PAST_TRIGGER not in kinds else CHASE_ARM_NOT_TEXT,
@@ -574,7 +577,10 @@ class AutoPlan:
                "resting_text": (f"{len(resting)} plan entr{'y' if len(resting) == 1 else 'ies'} still rest at Schwab "
                                 f"({', '.join(resting)}). The armed plan does nothing more: each row's Cancel works."
                                 if resting and not armed else "")}
-        if check and not armed:
+        if check and self.demo:
+            out["refusals"] = ["Demo mode: no orders and no Schwab calls."]
+            out["dialog"] = self.terms()
+        elif check and not armed:
             facts, view = self._facts(now, self.playbook_name, self.armed_rules.bounds())
             out["refusals"] = refusals(facts, self.armed_rules)
             out["dialog"] = self.terms(view)

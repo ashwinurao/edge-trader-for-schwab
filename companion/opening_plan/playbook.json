@@ -120,7 +120,7 @@
     }
   },
   "armed": {
-    "_about": "Step 6, the armed send (companion/plan_auto, brief 16), only with EDGE_TRADER_PLAN_AUTO=1 and after Ash's Arm click. Every number is a start number from briefs 14 and 16 and the architect's ruling of 2026-11-13 15:47 UTC that Ash has not approved. The fast watch ends at automatic.watch_until_et.",
+    "_about": "Step 6, the armed send (companion/plan_auto, brief 16), only with EDGE_TRADER_PLAN_AUTO=1 and after Ash's Arm click. Every number is a start number from briefs 14 and 16 and the architect's rulings of 2026-11-13 15:47 and 16:05 UTC that Ash has not approved. The fast watch ends at automatic.watch_until_et.",
     "arm_from_et": {
       "value": "09:25:00",
       "note": "start number, not approved by Ash; picks freeze at 09:25 ET"
@@ -146,8 +146,8 @@
       "note": "start number, not approved by Ash; counts and refuses sends only (architect, 2026-11-13 15:47 UTC); with the poller's 32-50 a minute it stays under Schwab's 120"
     },
     "calls_per_send": {
-      "value": 4,
-      "note": "the code's worst case: the quote in break_entry.prepare, the POST, two status reads after a 201 (fork PR #15); tests/test_plan_auto.py pins it"
+      "value": 5,
+      "note": "the code's worst case (architect, 2026-11-13 16:02 UTC): 4 usual (the quote in break_entry.prepare, the POST, two status reads after a 201, fork PR #15), 5 when an earlier close or partial on the name still has an open status (Trader._blocked -> _unresolved_close reads that order once); tests/test_plan_auto.py pins both"
     },
     "calls_per_cancel": {
       "value": 12,

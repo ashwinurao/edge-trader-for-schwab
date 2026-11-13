@@ -66,7 +66,8 @@ name are refused). It needs no account and sends no telemetry.
   bodies, order prices or sizes. Nothing in the app reads it back to decide anything. About 40 MB a day
   while the app runs (most of it the poller's account and order reads, all day), plus about 1 MB for each
   hour a position or working order is quoted and about 1.4 MB for each hour the Opening plan page reads
-  Edge Scanner. Nothing deletes it yet.
+  Edge Scanner. The shadow log's open-tape reads add about 0.65 MB a day (two `call` and `answer` lines
+  a second from 09:29 to 09:36 ET, about 790 bytes a read). Nothing deletes it yet.
   `GET /api/netlog/summary` shows, from memory, each vendor and endpoint's count, errors and p50/p95/max
   times for the last 5 minutes and since 09:25 ET, the calls in flight, the pause and the last lag line.
 - Warnings and errors in `data/logs/edge-trader-YYYY-MM-DD.log` (UTC date). `data/companion.log` already
@@ -84,8 +85,15 @@ name are refused). It needs no account and sends no telemetry.
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
   (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
   and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
+  The shadow log also reads Edge Scanner's open tape (`GET /api/v2/ov-picks/open-tape`, at most every
+  0.25 seconds with a 0.5 second time limit, from 09:29 to 09:36 ET only; Edge Scanner answers from
+  memory and asks Alpaca for nothing more).
   Each read carries `X-Edge-App: edge-trader` and the call's id in `X-Edge-Req`, so Edge Scanner's own
-  record can name it.
+  record can name it. The armed plan (`EDGE_TRADER_PLAN_AUTO=1`, below) reads the same open tape through
+  the same reader, so with the shadow log on as well it is still at most one read every 0.25 seconds:
+  once when its Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
+  the end of the watch (about 09:35:20 ET). Before each send it also checks the pick's row against the
+  OV picks read above (at most every 2 seconds), even with the screen closed.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -282,15 +290,20 @@ no request to Edge Scanner.
 
 **Shadow log of the automatic plan (Step 5, sends nothing).** With the Opening plan on, set
 `EDGE_TRADER_SHADOW=1` in `.env` and rebuild. On weekdays from 09:29 to 09:36 ET a background thread
-reads the plan's Edge Scanner feed every half second and writes what an automatic OR1 plan WOULD do,
+reads Edge Scanner's open tape every half second (below) and writes what an automatic OR1 plan WOULD do,
 one JSON line per decision, to `data/opening_plan/shadow/YYYY-MM-DD.jsonl`: the side nearer the last
 trade, a stop-limit entry one cent past the 09:30 minute's level with its limit capped, the stop at the
 other side and the shares; a fill (an estimate), a flip to the other side, a cancel, or no action and
 why (for example "price is 1.2 s old"). It has no button and no route, places, changes and cancels
 nothing, and imports no order code. Its numbers are in `companion/opening_plan/playbook.json` under
-`automatic`, each a start number not approved yet. Edge Scanner's picks route has no price after
-09:31, so the live log mostly shows the first decision and then old prices. For the full picture, replay
-Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
+`automatic`, each a start number not approved yet. Each line says its `source`. With `tape` it carries
+`tape_seq`, `tape_age_s` (Edge Scanner's newest snapshot to the answer), `feed_age` (SPY's newest trade
+or quote to the answer), `tape_usable` and `tape_why`; when the tape is not usable the plan acts on no
+price, as the armed plan would not. When the tape has a problem (no answer, a failed or late read, no
+picks for today) the shadow falls back to the picks route, `source` is `picks feed` and `tape_problem`
+says why; that route has no price after 09:31, so the fallback mostly shows the first decision and then
+old prices. To run the plan over a whole morning again, replay Edge Scanner's opening-recorder file
+(`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
 
     python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
 
@@ -298,6 +311,27 @@ Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in E
 or below 10.5 that day (Edge Scanner's top-bar badge is red), `no` above it, or `unknown`, which
 places nothing. Without `--out` the lines go to the screen. A count by kind goes to the error stream,
 e.g. `would_place 4`.
+
+**The open tape (brief 15).** Edge Scanner's opening recorder asks Alpaca for the top picks' and
+SPY's snapshots twice a second from 09:29 to 09:36 ET, and its open tape serves the newest one from
+memory. `companion/opening_plan/tape.py` holds the rules that turn it into the plan's reading, for the
+shadow, the replay and later the armed plan:
+
+- The first minute's range comes ONLY from a 09:30 bar stamped 09:30:00 ET of the same day: the
+  snapshot's minute bar once it is that bar, or Edge Scanner's 09:30 bars request. Either one makes it
+  final. Never from the day bar: on 2026-11-13 it was the PRIOR day's until 09:31:00.65 ET, and the
+  replay used to size every would-be order from yesterday's high and low. A trade stamped 09:31 no
+  longer makes a range final.
+- When the bars request's bar differs from the range in use by more than one cent, its values replace
+  it, and the range says `changed` with both.
+- A price is fresh by the newer of its trade's and its quote's own times (`fresh_at`): on 2026-11-13 a
+  thin name's last trade was often 0.5 to 4 s old while its quote was current.
+- The reading is not usable when Edge Scanner's newest snapshot is older than 1.0 s, or SPY's newest
+  trade or quote is more than 1.5 s behind the answer. These and the 0.25 s read pace and 0.5 s time
+  limit are in `playbook.json` under `tape`, each a start number not approved yet.
+
+Not confirmed: whether the snapshot's minute bar can change after it first shows the 09:30 bar (one
+day's file, 2026-11-13, says no).
 
 **Reading the replay output.** Each line is one decision about one pick, in time order:
 
@@ -311,60 +345,25 @@ e.g. `would_place 4`.
 | `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
 | `fill` | On `would_fill`: the trade price seen inside the order's band. |
 | `price`, `price_age_s` | The last trade the decision used, and how old it was at `t`. |
-| `range` | The first minute's high and low, whether it was final, and what made it final (`trade at or after 09:31` or `09:30 bar`). |
+| `fresh_age_s` | How old the newer of that trade and its quote was at `t`: the age the plan judges freshness by. |
+| `range` | The first minute's high and low, whether it was final, and where it came from (`snapshot minute bar` or `09:30 bar`, the bars request); `changed` with the old and new range when the bars request moved it. |
 
 A `no_action` is written once per pick until its reason changes, so a long wait is one line. A pick
 with no `would_place` line never got an order, and its last `no_action` says why.
 
 A worked example (made-up ticker and prices, from the test file in `tests/test_opening_plan_shadow.py`):
 
-    {"t": "2026-11-13T14:31:00.200000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 49.8 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 49.8, "price_age_s": 0.1, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "trade at or after 09:31"}}
+    {"t": "2026-11-13T14:31:05.100000Z", "kind": "would_place", "symbol": "AAAA", "why": "long: the last trade 50.04 is nearer the high", "side": "long", "trigger": 50.01, "limit": 50.08, "stop": 49.0, "shares": 100, "cap": 0.07, "risk_per_share": 1.01, "flip_at": 49.4, "calm": false, "risk_used": 101.0, "price": 50.04, "price_age_s": 0.05, "fresh_age_s": 0.05, "range": {"high": 50.0, "low": 49.0, "final": true, "from": "09:30 bar"}}
 
-At 09:31:00.2 ET the first trade stamped 09:31 had arrived, so the first minute (high 50.00, low
-49.00) was final. The last trade, 49.80, was 0.1 s old: fresh enough to act on. It was 0.20 from the
-high and 0.80 from the low, so the plan goes long. The trigger is one cent above the high (50.01) and
-the stop is the low (49.00), so the risk per share is 1.01. The cap is 0.15 x 1.01 = 0.15, but at most
-0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is 50.08. $101 at risk on a day that is not
-calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40 before a fill (60% of the way to the low)
-would flip it to the short side. In the same file, the next line after it says `stale_price`
-("price is 1.0 s old") when the 09:30 bar arrived with no new trade. The line after that is
-`would_fill` at 50.04, a trade inside 50.01 to 50.08.
-
-**Capped chase by the armed plan (Step 8, off by default; not merged until Ash's go).** With
-`EDGE_TRADER_PLAN_AUTO_CHASE=1` on top of the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`,
-`EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1`, `EDGE_TRADER_PLAN_BUTTONS=1`) and only after Ash's Arm
-click, a pick that has already traded at or past its level when the plan would place gets a chase
-instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_entry.py`):
-- The order is the ticket's own limit entry with its stop attached, not a new order shape: BUY (SELL
-  SHORT) LIMIT at the level plus (minus) the cap, the stop at the other side of the 09:30 range,
-  1 share (`BREAK_MAX_SHARES`). The cap is 0.15 x the risk per share, at least 2 cents, at most
-  0.15% of the price, rounded down to the cent (`companion/opening_plan/playbook.json` "automatic";
-  `companion/chase_entry.py` refuses any cap above that rule). A fill at the cap loses at most 1.15 R.
-- Inside the cap it should fill at once. Past the cap it rests at the cap; the plan cancels it
-  `pullback_wait_seconds` (120) after the send if it has not filled, and waits for Schwab's confirmed
-  cancel. The limit never moves. The end of the fast watch (09:35 ET) cancels it like any plan entry.
-- One chase per pick a day. A chased entry is never flipped and never chased again. After a flip,
-  the other side may be chased once when its level has already traded.
-- Just before the send the plan reads the tape again: the reading must be usable, still at or past
-  the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
-  entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
-  level and not through the stop. A quote that is old or back inside the level lets the plan try
-  again on a later reading, at most `armed.chase_quote_tries` (3, a start number in
-  `companion/opening_plan/playbook.json`) times a row a day.
-- Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
-  a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name
-  blocked until you press Resolve.
-- The row says "Chased by the armed plan: limit X, cap Y." and, while it rests, until when it waits.
-  The plan's log (`data/opening_plan/auto/`) has the level, the cap, the last trade and its age, the
-  limit sent and the times (reading, decision, send, answer).
-- The Arm dialog lists the chase under "It will" only while its switch is on, and then no longer says
-  that a pick past its trigger is left to you.
-- A click Flip on a resting chase works as on any row today: it cancels the chase, waits for Schwab's
-  confirmed cancel, then places the other side's break entry. The row keeps the chase's record, so it
-  still shows the chase line and the plan cancels the clicked entry when the chase's pullback wait
-  ends (`tests/test_plan_auto_chase_executor.py` pins this; not changed by Step 8).
-- Not confirmed at Schwab: how a marketable limit entry with an attached stop behaves in the first
-  seconds after 09:31 (the first 1-share live morning answers it).
+That file has no snapshot minute bar, so there is no range (`no_range`) until the 09:30 bar comes from
+the bars request at 09:31:01.1 ET (high 50.00, low 49.00). The last trade then was from 09:31:00.1, 1.0 s
+old, so that line says `stale_price` ("newest trade or quote is 1.0 s old"). At 09:31:05.1 a trade at
+50.04 is 0.05 s old: fresh enough to act on. It is above the high, so the plan goes long. The trigger
+is one cent above the high (50.01) and the stop is the low (49.00), so the risk per share is 1.01. The
+cap is 0.15 x 1.01 = 0.15, but at most 0.15% of 50.01 = 0.075, rounded down to 0.07, so the limit is
+50.08. $101 at risk on a day that is not calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40
+before a fill (60% of the way to the low) would flip it to the short side. 50.04 is already inside
+50.01 to 50.08, so the next line is `would_fill` at 50.04.
 
 **Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
 and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
@@ -406,6 +405,95 @@ If Edge Trader restarts while a click is running, the next start settles the row
 If `companion/opening_plan/playbook.json` cannot be read or has no `buttons.max_flips_per_row`, the
 buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
 
+**The armed plan (OV entries Step 6, off by default).** This is the one place Edge Trader sends and
+cancels orders without a click on each order (CONTRIBUTING rule 1, third exception). It needs
+`EDGE_TRADER_PLAN_AUTO=1` together with `EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1` and
+`EDGE_TRADER_PLAN_BUTTONS=1`. Without all four there is no thread, no route and no panel
+(`companion/plan_auto/`).
+
+The switch alone sends nothing. You arm it for the day with **Arm…** on the Opening plan page, from
+09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, 1 share each, the risk per pick and
+the calm flag, what the plan will and will not do, and its bounds. **Arm with these bounds** is refused,
+with every reason listed, when: it is not a market day or outside that window; ARM is off on the
+dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
+or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
+answer; the bounds or the playbook changed since the dialog showed them; or the plan was disarmed for
+the day.
+
+Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
+plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
+`Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
+attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
+again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
+but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
+log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
+waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never exits, moves a stop or
+resends, and flips or chases only with that step's own switch. Without the capped chase (below), a
+pick whose price is already at or past its trigger is left to you.
+When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
+stop, that row turns red and nothing is sent for it.
+A filled entry is yours to manage, as with a click.
+
+It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
+today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
+**Disarm** click (one click, checked before every send and cancel); an unclear Schwab answer (that pick
+is left and the row follows its ticket, as after a click); a cancel Schwab does not confirm (the row
+turns red); a reached bound; ARM turned off on the dashboard; an old order list; or an unexpected error.
+A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
+pick and is never retried. After a disarm, entries already at Schwab stay: a red banner lists them,
+and each row's Cancel works. A restart never restores "armed".
+
+Its bounds are in `companion/opening_plan/playbook.json` under `armed`, each a start number Ash has not
+approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pick, 4 orders a day, and
+40 Schwab calls a minute by the plan. The calls bound counts and refuses sends only, each at its worst
+case of 5 calls (usually 4: the quote, the POST and two status reads; 5 when an earlier close on the
+name still has an open status), so at most 8 sends in any 60 s. A cancel is never refused by it: it can
+take up to 12 calls (`Trader.cancel_entry` reads, cancels and reads back up to ten times) and is tried
+once per order. Not measured live: the worst minute is 7 sends and 3 flip cancels, 71 calls, which with
+the poller's 32 to 50 a minute is 103 to 121 against Schwab's 120. That top needs every cancel to use
+all ten read-backs and every send to find an open close.
+
+Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
+time, the decision, the send's start and its answer with their times. It holds no account number, token
+or request body. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
+`refusal` line, and the plan's Schwab calls their usual `call` lines.
+
+**Capped chase by the armed plan (Step 8, off by default; not merged until Ash's go).** With
+`EDGE_TRADER_PLAN_AUTO_CHASE=1` on top of the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`,
+`EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1`, `EDGE_TRADER_PLAN_BUTTONS=1`) and only after Ash's Arm
+click, a pick that has already traded at or past its level when the plan would place gets a chase
+instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_entry.py`):
+- The order is the ticket's own limit entry with its stop attached, not a new order shape: BUY (SELL
+  SHORT) LIMIT at the level plus (minus) the cap, the stop at the other side of the 09:30 range,
+  1 share (`BREAK_MAX_SHARES`). The cap is 0.15 x the risk per share, at least 2 cents, at most
+  0.15% of the price, rounded down to the cent (`companion/opening_plan/playbook.json` "automatic";
+  `companion/chase_entry.py` refuses any cap above that rule). A fill at the cap loses at most 1.15 R.
+- Inside the cap it should fill at once. Past the cap it rests at the cap; the plan cancels it
+  `pullback_wait_seconds` (120) after the send if it has not filled, and waits for Schwab's confirmed
+  cancel. The limit never moves. The end of the fast watch (09:35 ET) cancels it like any plan entry.
+- One chase per pick a day. A chased entry is never flipped and never chased again. After a flip,
+  the other side may be chased once when its level has already traded.
+- Just before the send the plan reads the tape again: the reading must be usable, still at or past
+  the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
+  entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
+  level and not through the stop. A quote that is old or back inside the level lets the plan try
+  again on a later reading, at most `armed.chase_quote_tries` (3, a start number in
+  `companion/opening_plan/playbook.json`) times a row a day.
+- Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
+  a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name
+  blocked until you press Resolve.
+- The row says "Chased by the armed plan: limit X, cap Y." and, while it rests, until when it waits.
+  The plan's log (`data/opening_plan/auto/`) has the level, the cap, the last trade and its age, the
+  limit sent and the times (reading, decision, send, answer).
+- The Arm dialog lists the chase under "It will" only while its switch is on, and then no longer says
+  that a pick past its trigger is left to you.
+- A click takes the row for the day. A click Flip on a resting chase cancels the chase, waits for
+  Schwab's confirmed cancel, then places the other side's break entry, which is then the click's: the
+  chase line goes, and the plan cancels it neither at the chase's pullback wait nor at 09:35. After a
+  click Cancel the plan does not chase that row.
+- Not confirmed at Schwab: how a marketable limit entry with an attached stop behaves in the first
+  seconds after 09:31 (the first 1-share live morning answers it).
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -433,6 +521,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, or at 09:35 ET). Off by default. |
 | `EDGE_TRADER_PLAN_AUTO_CHASE` | `1`, together with `EDGE_TRADER_PLAN_AUTO=1` and the switches it needs, lets the armed plan chase a pick that already traded through its level: one limit entry at the capped price with its stop, once per pick a day. Off by default. |
 
 ## Good to know

@@ -11,17 +11,21 @@ GitHub's private vulnerability reporting.
 These decide most review questions:
 
 1. **Every order is the user's click.** Nothing places, replaces or cancels an order on its own: no
-   automation, no retries of an order request, no background jobs that trade. There are two
-   exceptions, each the user's opt-in for one trade. "Auto B/E 1R", chosen per ticket: it moves that
+   automation, no retries of an order request, no background jobs that trade. There are three
+   exceptions, each the user's opt-in. "Auto B/E 1R", chosen per ticket: it moves that
    ticket's own fixed stop to break-even once at +1R, never loosens a stop and is never retried.
    "Send when hit", ticked per spread stop (upstream v1.3.0, `companion/spreads/spread_stop.py`;
    allowed in this fork by Ash on 2026-11-09, fork PR #12): when the app-watched stop fires, the app
-   sends that spread's close once, only while it runs, never retried. Any other change that would act
-   without a click will not be merged.
-   The armed Opening plan (OV entries Steps 6 to 8, `companion/plan_auto/`) would be a third
-   exception, armed by Ash's click each morning; its capped chase (Step 8,
-   `EDGE_TRADER_PLAN_AUTO_CHASE`) sends one limit entry at the capped price with its stop, once per
-   pick a day. None of it merges without Ash's own go for that exception.
+   sends that spread's close once, only while it runs, never retried. The armed plan (OV entries
+   Step 6, `companion/plan_auto/`, `EDGE_TRADER_PLAN_AUTO=1`), armed for one day by the user's Arm
+   click that shows its bounds: from 09:31 ET it sends that day's Opening plan break entries at 1 share,
+   one at a time, and cancels one that has not filled after the pullback wait or at the end of the
+   fast watch, once per order. It never retries, exits or moves a stop, and flips or chases only with
+   that step's own switch; one Disarm click stops it, and an unclear answer, a 429 or a reached bound
+   disarms it. Its capped chase (Step 8, `EDGE_TRADER_PLAN_AUTO_CHASE=1`) sends, for a pick already
+   at or past its trigger, one limit entry at the trigger plus the cap with its stop attached, once
+   per pick a day; the plan cancels it like its other entries. Ash's go for this exception is quoted
+   in the pull request that adds it. Any other change that would act without a click will not be merged.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working
@@ -84,6 +88,10 @@ What to add:
 - `companion/break_entry.py`: the Break entry (a stop-limit entry with its stop attached, OV entries
   Step 3): its start numbers, the 1-share cap, the 5-second quote rule and `build_request()`, the
   request shape the Opening plan buttons use. Off unless `EDGE_TRADER_BREAK_ENTRY=1`.
+- `companion/plan_auto/`: the armed plan (OV entries Step 6, rule 1's third exception): `arming.py`
+  (the Arm window, refusals and bounds), `executor.py` (the worker thread, the panel and its routes),
+  `handlers.py` (one handler per decision kind; Steps 7 and 8 add theirs). It sends and cancels only
+  through `companion/plan_entries.py` and so through `Trader.submit` and `Trader.cancel_entry`.
 - `companion/app.py`: the local FastAPI server. `companion/static/index.html`: the whole UI.
 - `companion/floating.py`: the always-on-top windows (pywebview).
 
