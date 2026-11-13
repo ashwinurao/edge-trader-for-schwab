@@ -448,7 +448,8 @@ stop, that row turns red and nothing is sent for it. That row check uses the las
 Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
 waits on Edge Scanner's picks route, which is at its slowest just after 09:31:00. With the screen closed
 and the shadow log off, or an answer older than 6 seconds (`feed.stale_after_seconds` in the playbook),
-the check is skipped, the sends go on the tape alone, and the log says so once (`row_check_skipped`).
+the check is skipped and the sends go on the tape alone. While armed, the Armed plan panel then says
+"Row check off: …" until the check runs again, and the log says so once (`row_check_skipped`).
 Keep the Opening plan screen open, or the shadow log on, while armed.
 When a click, a ticket send or Flat all is using Edge Trader's one order lock, the plan sends and
 cancels nothing: it waits 0.25 s, reads the tape again and tries then. The pick's line says so once.

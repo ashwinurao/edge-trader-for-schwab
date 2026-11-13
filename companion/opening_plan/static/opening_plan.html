@@ -378,6 +378,7 @@ function renderAuto() {
     </div>${why}
     ${a.problem ? `<div class="badline" style="margin-top:6px">${esc(a.problem)}</div>` : ""}
     ${a.tape_note ? `<div class="mutline" style="margin-top:6px">${esc(a.tape_note)}</div>` : ""}
+    ${a.row_check_text ? `<div class="warnline" id="auto-row-check" style="margin-top:6px">${esc(a.row_check_text)}</div>` : ""}
     ${autoMsg ? `<div class="${autoMsg.ok ? "mutline" : "badline"}" style="margin-top:6px">${esc(autoMsg.text)}</div>` : ""}
     ${lines ? `<div class="lines">${lines}</div>` : `<div class="mutline" style="margin-top:6px">${a.armed ? "Waiting for 09:31:00 ET and a final 09:30 bar on the open tape." : "Nothing armed. Arm works 09:25:00 to 09:30:45 ET; the plan then sends by itself, 1 share a pick."}</div>`}`;
   const arm = $("auto-arm"), dis = $("auto-disarm");
