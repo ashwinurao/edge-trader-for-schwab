@@ -20,8 +20,10 @@ These decide most review questions:
    Step 6, `companion/plan_auto/`, `EDGE_TRADER_PLAN_AUTO=1`), armed for one day by the user's Arm
    click that shows its bounds: from 09:31 ET it sends that day's Opening plan break entries at 1 share,
    one at a time, and cancels one that has not filled after the pullback wait or at the end of the
-   fast watch, once per order. It never retries, flips, chases, exits or moves a stop; one Disarm click stops it, and an
-   unclear answer, a 429 or a reached bound disarms it. Ash's go for this exception is quoted in the
+   fast watch, once per order. It never retries, flips, chases, exits or moves a stop; one Disarm
+   click stops it, and an unclear answer, a 429 or a reached bound disarms it. A Place, Flip or
+   Cancel click on a row makes that row the user's for the day, and the plan never acts on it again
+   (`PlanDesk._put_click`). Ash's go for this exception is quoted in the
    pull request that adds it. Any other change that would act without a click will not be merged.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
