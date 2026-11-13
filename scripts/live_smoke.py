@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from decimal import ROUND_FLOOR, Decimal
 
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
+# Refusals that can pass by themselves in a second or two: asked again, up to 3 times, each recorded.
+TRANSIENT = ("Schwab's quote is", "Another order action is in progress", "order list is old")
 CENT = Decimal("0.01")
 # break_entry.py's own numbers (the default limit offset), so the request equals the ticket's.
 CAP_R, CAP_MIN, CAP_MAX_PCT = Decimal("0.15"), Decimal("0.02"), Decimal("0.0015")
@@ -314,13 +316,18 @@ class Run:
         return (ans if isinstance(ans, dict) else {}), secs
 
     def place(self, ticker: str, side: str, expected, label: str, count: bool = True):
-        if count:
-            self._may_send()
         self.touched.add(ticker)
-        code, ans, secs = self.api("POST", "/api/opening-plan/place",
-                                   {"ticker": ticker, "side": side, "expected": expected})
-        self.note("PLAN_PLACE", label=label, ticker=ticker, side=side, expected=expected, http=code,
-                  secs=round(secs, 3), answer=self.pick(ans))
+        for attempt in (1, 2, 3):
+            if count:
+                self._may_send()
+            code, ans, secs = self.api("POST", "/api/opening-plan/place",
+                                       {"ticker": ticker, "side": side, "expected": expected})
+            self.note("PLAN_PLACE", label=label, ticker=ticker, side=side, expected=expected, http=code,
+                      secs=round(secs, 3), attempt=attempt, answer=self.pick(ans))
+            err = str(ans.get("error") or "") if isinstance(ans, dict) else ""
+            if attempt == 3 or not any(x in err for x in TRANSIENT):
+                break
+            time.sleep(2)
         ans = ans if isinstance(ans, dict) else {}
         if ans.get("ok") and ans.get("order_id"):
             self._own(ticker, ans["order_id"], "plan")
@@ -756,10 +763,12 @@ def sc_ticket_fill(r: Run) -> None:
         stop = trig - Decimal(str(r.a.stop_away)) * sign
         req = r.break_req(r.sym, side, trig, stop)
         ans, secs = r.submit(req, f"{side} fill, try {attempt}")
-        if ans.get("ok") is True or "already through" not in str(ans.get("error") or "") or attempt == 3:
+        err = str(ans.get("error") or "")
+        if ans.get("ok") is True or attempt == 3 or not ("already through" in err or any(x in err for x in TRANSIENT)):
             break
-        # The price reached the level between the quote and the click: the right refusal, try again.
-        r.note("THROUGH_BEFORE_THE_CLICK", attempt=attempt, error=ans.get("error"))
+        # The price reached the level between the quote and the click (the right refusal), or a
+        # refusal that passes by itself: try again.
+        r.note("REFUSED_AT_THE_CLICK", attempt=attempt, error=ans.get("error"))
         time.sleep(2)
     r.must(f"{side}: Schwab accepted the break entry", ans.get("ok") is True and bool(ans.get("order_id")),
            got=r.pick(ans))
@@ -1338,6 +1347,9 @@ def run_one(a, name: str) -> int:
             code = 2
     except Stop as x:
         r.safe_end(str(x))
+        code = 2
+    except KeyboardInterrupt:                    # Ctrl+C: end the same safe way, then stop the list
+        r.safe_end("stopped with Ctrl+C")
         code = 2
     except Exception as x:                       # a bug in this script: end the same safe way
         r.safe_end(f"script error: {type(x).__name__}: {x}"[:300])
