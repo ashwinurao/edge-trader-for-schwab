@@ -492,12 +492,14 @@ def sc_check(r: Run) -> None:
 
 
 def far(q: dict, side: str, away: float = 0.0) -> tuple[Decimal, Decimal]:
-    """A break level far from the price (it rests, it does not trigger) and a stop $1 behind it."""
+    """A break level far from the price (it rests, it does not trigger) and its stop. The stop goes
+    $1 beyond the price on the other side: Edge Trader refuses a break entry whose stop lies between
+    the price and the level ("stop ... must be below the bid", found live on 2026-11-13 18:35 UTC)."""
     if side == "LONG":
         trig = d2(q["ask"] + max(1.0, q["ask"] * 0.003) + away)
-        return trig, trig - Decimal("1.00")
+        return trig, d2(q["bid"]) - Decimal("1.00")
     trig = d2(q["bid"] - max(1.0, q["bid"] * 0.003) - away)
-    return trig, trig + Decimal("1.00")
+    return trig, d2(q["ask"]) + Decimal("1.00")
 
 
 def refused(r: Run, name: str, ans: dict, phrase: str) -> None:
@@ -553,6 +555,9 @@ def sc_refusals(r: Run) -> None:
     refused(r, "ticket refuses a short level the price is through", ans, "already through the break level")
     ans, _ = r.submit(r.break_req(r.sym, "LONG", trig, trig + Decimal("1.00")), "stop above a long level", count=False)
     refused(r, "ticket refuses a stop on the wrong side", ans, "must be below the break level")
+    ans, _ = r.submit(r.break_req(r.sym, "LONG", trig, trig - Decimal("1.00")), "stop between the price and the level",
+                      count=False)
+    refused(r, "ticket refuses a long stop that is above the bid (rule found 2026-11-13)", ans, "must be below the bid")
     req = r.break_req(r.sym, "LONG", trig, stop)
     req["expected_limit"] = f2(Decimal(req["limit"]) + CENT)
     ans, _ = r.submit(req, "shown limit differs", count=False)
