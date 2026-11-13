@@ -83,7 +83,7 @@ class Host:
         self.desk, self.trace, self.env = desk, trace, dict(env)
         self.rules = RULES
         self.armed_rules = SimpleNamespace(calls_per_send=4, calls_per_cancel=12, every_seconds=0.25,
-                                           watch_until_et=dt_time(9, 35))
+                                           watch_until_et=dt_time(9, 35), swap_recheck_seconds=1.5)
         self.registry = handlers.default_registry()
         self.is_armed = True
         self.tape = []                  # what reread() answers, in order; the last one repeats
@@ -490,11 +490,29 @@ def test_not_when_no_order_is_left_for_the_pick(r):
     assert r.host.said[-1][0] == "flip_no_orders" and "the entry stays" in r.host.said[-1][1]
 
 
-def test_the_calls_bound_refuses_the_send_half_only(r):
+def test_no_cancel_when_the_calls_bound_could_not_take_the_new_entry(r):
+    # Architect's notes on PR #28 (2026-11-13 17:20 UTC, item 2): "never cancel an entry the plan
+    # could not replace" covers the calls bound too. The entry stays and the panel says so.
+    place_long(r)
+    r.host.left["calls_minute"] = 3                   # armed.calls_per_send is 4 on this host
+    assert run(r) is False
+    nothing_at_schwab(r)
+    assert r.host.said == [("flip_no_calls", "not enough Schwab calls left this minute for the new entry "
+                                             "(3 of 4, armed.calls_per_minute): the entry stays")]
+    assert rec(r)["state"] == plan_entries.SENT and rec(r)["flips"] == 0 and r.host.disarms == []
+
+
+def test_the_calls_bound_refuses_the_send_half_only(r, monkeypatch):
     # Architect's ruling (2026-11-13 15:47 UTC): the cancel is never refused by the calls bound;
-    # the send is. The pick then ends with no order and says why.
+    # the send is. Calls used up during the cancel: the pick then ends with no order and says why.
     oid = place_long(r)
-    r.host.left["calls_minute"] = 3
+    real_cancel = r.trader.cancel_entry
+
+    def cancel_while_calls_go(i):
+        got = real_cancel(i)
+        r.host.left["calls_minute"] = 3
+        return got
+    monkeypatch.setattr(r.trader, "cancel_entry", cancel_while_calls_go)
     assert run(r) is True
     assert r.broker.cancelled == [oid] and len(r.broker.placed) == 1
     assert r.host.disarms == [("a bound is reached: calls_minute", False)]
@@ -537,7 +555,17 @@ def test_not_when_the_range_changed_since_the_decision(r):
     place_long(r)
     assert run(r, tape=[(tape_pick(42.10, high=42.60), True, "")]) is False
     nothing_at_schwab(r)
-    assert r.host.said == [("flip_wait", "no flip: the range changed, so the re-level decides first")]
+    assert r.host.said == [("flip_wait", "no flip: the 09:30 range changed, so the re-level decides first")]
+
+
+def test_the_range_changed_line_says_the_entry_stays_when_no_relevel_is_left(r):
+    # Architect's notes on PR #28 (item 3): with no re-level left nothing else decides, so say so.
+    place_long(r)
+    r.desk._put("AAAA", relevels=1)                    # armed.relevels_per_pick 1 used today
+    assert run(r, tape=[(tape_pick(42.10, high=42.60), True, "")]) is False
+    nothing_at_schwab(r)
+    assert r.host.said == [("flip_wait", "no flip: the 09:30 range changed since the entry was built and no "
+                                         "re-level is left today, so the entry stays as it is")]
 
 
 @pytest.mark.parametrize("env", [
@@ -706,6 +734,89 @@ def test_the_wait_after_the_cancel_stops_at_the_watch_end(r, monkeypatch):
             r.trader._send_lock.release()
     assert len(seen) == 2 and len(r.broker.placed) == 1 and rec(r)["state"] == plan_entries.NONE
     assert "the fast watch ended while another order action ran" in rec(r)["text"]
+
+
+def ticking(r, monkeypatch):
+    """The desk's clock moves with each wait (armed.every_seconds); returns the waits."""
+    clock, waits = [NOW], []
+    monkeypatch.setattr(r.desk, "_now", lambda: clock[0])
+
+    def sleep(sec):
+        waits.append(sec)
+        clock[0] += timedelta(seconds=sec)
+    monkeypatch.setattr(trading.time, "sleep", sleep)
+    return waits
+
+
+FRESH, STALE = (tape_pick(42.10), True, ""), (tape_pick(42.10, age=0.6), True, "")
+
+
+def test_after_the_cancel_a_stale_price_looks_again_and_places_on_a_fresh_one(r, monkeypatch):
+    # Architect's notes on PR #28 (2026-11-13 17:20 UTC, item 1): after the confirmed cancel there is
+    # one entry to place, so a stale or unusable reading looks again a tick later, up to 1.5 s.
+    place_long(r)
+    waits = ticking(r, monkeypatch)
+    assert run(r, tape=[FRESH, STALE, STALE, FRESH]) is True
+    assert len(r.broker.placed) == 2 and rec(r)["side"] == "SHORT"
+    assert rec(r)["text"] == "Flipped by the armed plan (1 of 3)."
+    assert [w for w in waits if w == 0.25][-2:] == [0.25, 0.25]          # two waits before the third reading
+    assert [c for c, _ in r.host.said] == ["flip_look_again"]
+    assert [c for c in r.broker.calls if c[0] in ("spend", "refund")] == [("spend", 1, 4)]
+
+
+def test_after_the_cancel_an_unusable_reading_looks_again_too(r, monkeypatch):
+    place_long(r)
+    ticking(r, monkeypatch)
+    assert run(r, tape=[FRESH, (None, False, "the open tape did not answer in 0.5 s"), FRESH]) is True
+    assert len(r.broker.placed) == 2 and rec(r)["side"] == "SHORT"
+
+
+def test_after_the_cancel_a_stale_price_past_the_limit_places_nothing_and_says_how_long(r, monkeypatch):
+    place_long(r)
+    waits = ticking(r, monkeypatch)
+    reads = []
+    real_reread = r.host.reread
+    r.host.reread = lambda t: reads.append(1) or real_reread(t)
+    assert run(r, tape=[FRESH, STALE]) is True
+    assert len(r.broker.placed) == 1 and len(reads) == 1 + 7             # 0, 0.25 ... 1.5 s after the cancel
+    got = rec(r)
+    assert got["state"] == plan_entries.NONE
+    assert got["text"] == ("Cancelled the long entry by the armed plan. Did not place the short: the price is "
+                           "0.6 s old (looked again for 1.50 s, armed.swap_recheck_seconds 1.5)")
+    assert r.host.gone == [got["text"]] and ("spend", 1, 4) not in r.broker.calls
+
+
+def test_a_disarm_while_looking_again_places_nothing(r, monkeypatch):
+    place_long(r)
+    ticking(r, monkeypatch)
+    n = []
+    real_reread = r.host.reread
+
+    def reread(t):
+        n.append(1)
+        if len(n) == 3:
+            r.host.is_armed = False                    # Ash's Disarm between the second and third look
+        return real_reread(t)
+    r.host.reread = reread
+    assert run(r, tape=[FRESH, STALE]) is True
+    assert len(r.broker.placed) == 1 and len(n) == 3
+    assert rec(r)["text"] == ("Cancelled by the armed plan, nothing rests: the plan was disarmed before the new "
+                              "side was placed.")
+
+
+@pytest.mark.parametrize("bad, code", [
+    ((tape_pick(42.10, high=42.60), True, ""), "range changed"),
+    ((tape_pick(41.90), True, ""), "has already traded"),
+], ids=["range", "traded"])
+def test_after_the_cancel_any_other_answer_ends_at_once(r, monkeypatch, bad, code):
+    place_long(r)
+    ticking(r, monkeypatch)
+    reads = []
+    real_reread = r.host.reread
+    r.host.reread = lambda t: reads.append(1) or real_reread(t)
+    assert run(r, tape=[FRESH, bad]) is True
+    assert len(r.broker.placed) == 1 and code in rec(r)["text"]
+    assert len(reads) == 2 and "flip_look_again" not in [c for c, _ in r.host.said]
 
 
 def test_a_send_refused_by_traders_lock_after_the_look_waits_and_goes_once(r, monkeypatch):
@@ -1166,8 +1277,21 @@ def test_engine_relevel_with_a_real_entry_counts_the_rows_relevels():
 def test_every_armed_number_is_marked_as_not_approved():
     a = PLAYBOOK["armed"]
     assert a["relevels_per_pick"]["value"] == 1 and a["orders_per_day_with_flips"]["value"] == 8
-    for key in ("relevels_per_pick", "orders_per_day_with_flips"):
+    assert a["swap_recheck_seconds"]["value"] == 1.5
+    for key in ("relevels_per_pick", "orders_per_day_with_flips", "swap_recheck_seconds"):
         assert a[key]["note"].startswith("start number, not approved by Ash")
+
+
+@pytest.mark.parametrize("key", ["orders_per_day_with_flips", "swap_recheck_seconds"])
+def test_the_flip_switch_needs_its_own_numbers(key):
+    pb = copy.deepcopy(PLAYBOOK)
+    del pb["armed"][key]
+    from companion.plan_auto.arming import armed_rules_from
+    with pytest.raises(ValueError, match=key):
+        flip.armed_with_flips(armed_rules_from(PLAYBOOK), RULES, pb)
+    got = flip.armed_with_flips(armed_rules_from(PLAYBOOK), RULES, PLAYBOOK)
+    assert (got.swap_recheck_seconds, got.orders_per_pick, got.orders_per_day) == (1.5, 5, 8)
+    assert got.bounds() == {**armed_rules_from(PLAYBOOK).bounds(), "orders_per_pick": 5, "orders_per_day": 8}
 
 
 # ---------------------------------------------------------------- what Trader.cancel_entry's pace costs a flip

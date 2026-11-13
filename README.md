@@ -500,9 +500,16 @@ stays" (or "re-level is not on") and the entry stays.
   dashboard's Cancel entry path, which reads the order back until Schwab confirms CANCELED with nothing
   filled. Only then it checks again: the plan is still armed, another new tape reading is usable and
   the other side's trigger has not traded, the bounds leave an order, Schwab's order list is fresh and
-  shows no other working order on the name, and the plan row agrees with the tape. Then it places the
-  other side's break entry from the tape's range: the same risk, shares from that side's own risk per
-  share, 1 share at this stage. The row says "Flipped by the armed plan (1 of 3)." while that entry rests.
+  shows no other working order on the name, and the plan row agrees with the tape (Step 2's row from
+  the feed's last answer; the plan never asks Edge Scanner for it, and without one the row check is
+  skipped as for the armed send). Then it places the other side's break entry from the tape's range:
+  the same risk, shares from that side's own risk per share, 1 share at this stage. The row says
+  "Flipped by the armed plan (1 of 3)." while that entry rests.
+- **After the cancel, one entry to place.** When the new tape reading is unusable or its price stale,
+  the plan reads again a tick (`armed.every_seconds`, 0.25 s) later, for at most
+  `armed.swap_recheck_seconds` (1.5 s, a start number Ash has not approved), then gives up with nothing
+  resting and says how long it looked. Any other answer (disarmed, the range changed or disputed, the
+  new trigger traded, a bound, a click) ends at once.
 - **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
   from the range the entry was built on, while the entry rests unfilled and its trigger has not
   traded. The plan cancels the entry the same way and places the same side from the new range, at most
@@ -515,8 +522,19 @@ stays" (or "re-level is not on") and the entry stays.
 - Bounds with this switch on (brief 17 item 5): orders per pick become 1 + `automatic.max_flips` +
   `armed.relevels_per_pick` (5), and orders per day `armed.orders_per_day_with_flips` (8, a start number
   Ash has not approved). The Arm dialog shows them and what flips and re-levels may do. A flip's cancel
-  is never refused by the calls bound; its send counts like any send. When no order is left for a flip,
-  the entry stays as it is.
+  is never refused by the calls bound; its send counts like any send. When no order, or not enough
+  Schwab calls this minute (`armed.calls_per_send`), is left for the new entry, nothing is cancelled and
+  the entry stays as it is. When the 09:30 range moved since the entry was built, only a re-level moves
+  it; with no re-level left the panel says the entry stays.
+- **Another order action running** (a click, a ticket send, Flat all) holds the dashboard's one order
+  lock. Before the cancel the flip tries nothing: no record, one `busy` line, and the next reading
+  decides again. After the confirmed cancel nothing rests, so the flip waits for the lock a tick at a
+  time; the row says "The armed plan cancelled the long entry. It places the short when the order
+  action in progress ends." and the panel says so once. When the lock is free it checks the tape and the
+  row again before the send. It stops waiting, with nothing resting, at a disarm or the end of the fast
+  watch. The other way round: while the plan's own cancel and send run (about 2.25 s at 0.4 s a Schwab
+  call, up to about 7.3 s when Schwab never shows CANCELED), a click on the ticket or a plan row answers
+  "Another submission is in progress." or "Another order action is in progress." and sends nothing.
 - When the cancel is not confirmed, or Schwab answers 429, nothing new is placed, the row turns red and
   the plan disarms (for the day on a 429). A fill during the cancel turns the row red, and the plan
   leaves that pick. When the plan was disarmed between the cancel and the place, or the other side's

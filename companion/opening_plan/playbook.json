@@ -169,6 +169,11 @@
       "value": 8,
       "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_FLIP=1 (Step 7, companion/plan_auto/flip.py): the day's 4 entries and 4 flips or re-levels in all. Orders per pick then becomes orders_per_pick + automatic.max_flips + relevels_per_pick (brief 17 item 5)"
     },
+    "swap_recheck_seconds": {
+      "value": 1.5,
+      "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_FLIP=1 (Step 7, companion/plan_auto/flip.py): after a flip's or re-level's confirmed cancel, how long the send half reads the tape again, a tick (every_seconds) apart, while the new reading is unusable or its price stale; then nothing rests (architect's notes on PR #28, 2026-11-13 17:20 UTC)",
+      "why": "on 2026-11-13 two of five names had quotes 0.4 to 0.5 s old on arrival against the 0.5 s stale limit, and one tape timeout does the same; before the cancel would_flip comes again, after it there is one entry to place"
+    },
     "relevels_per_pick": {
       "value": 1,
       "note": "start number, not approved by Ash; Step 7 (brief 17): how often the armed plan may cancel and place the same side again when the 09:30 bar moves the range by more than one cent. Flips use automatic.max_flips, shared with the row's Flip button"

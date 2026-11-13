@@ -49,13 +49,14 @@ Step 8's chase may take it (handlers.PAST_TRIGGER), else the row says nothing re
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, fields
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Mapping, Optional
 
 from ..opening_plan.engine import ET
 from . import FLIP_FLAG
+from .arming import ArmedRules
 from .handlers import PAST_TRIGGER, Lane, Registry, _dec, outcome, past_trigger
 
 FLIP = "would_flip"
@@ -97,21 +98,39 @@ def register(reg: Registry) -> None:
     reg.register(RELEVEL, on_relevel, switch=FLIP_FLAG, arm_text=arm_relevel)
 
 
-def armed_with_flips(armed: Any, rules: Any, playbook: Mapping) -> Any:
+@dataclass(frozen=True)
+class FlipRules(ArmedRules):
+    """Step 6's armed numbers with this step's own, used only with EDGE_TRADER_PLAN_AUTO_FLIP=1."""
+    # How long the send half looks again after a confirmed cancel when the new tape reading is
+    # unusable or its price stale (architect's notes on PR #28, 2026-11-13 17:20 UTC, item 1).
+    swap_recheck_seconds: float = 0.0
+
+
+def _armed_number(playbook: Mapping, key: str) -> Any:
+    raw = (playbook.get("armed") or {}).get(key)
+    v = raw.get("value") if isinstance(raw, Mapping) else raw
+    if v is None or isinstance(v, bool):
+        raise ValueError(f"playbook armed: {key} is missing (EDGE_TRADER_PLAN_AUTO_FLIP=1)")
+    return v
+
+
+def armed_with_flips(armed: Any, rules: Any, playbook: Mapping) -> FlipRules:
     """The armed bounds with this step on (brief 17 item 5): a pick may send its entry, its flips
     and its re-levels, so orders per pick = armed.orders_per_pick + automatic.max_flips +
     armed.relevels_per_pick (1 + 3 + 1 = 5); the day may send armed.orders_per_day_with_flips
     (start 8: the 4 entries and 4 flips or re-levels in all). With this switch off the executor
-    keeps Step 6's numbers. The Arm dialog shows the result, and the click confirms it."""
-    raw = (playbook.get("armed") or {}).get("orders_per_day_with_flips")
-    per_day = raw.get("value") if isinstance(raw, Mapping) else raw
-    if per_day is None or isinstance(per_day, bool):
-        raise ValueError("playbook armed: orders_per_day_with_flips is missing (EDGE_TRADER_PLAN_AUTO_FLIP=1)")
-    per_day = int(per_day)
+    keeps Step 6's numbers. The Arm dialog shows the result, and the click confirms it. Also
+    armed.swap_recheck_seconds (start 1.5), the send half's second look."""
+    per_day = int(_armed_number(playbook, "orders_per_day_with_flips"))
     if per_day < armed.orders_per_day:
         raise ValueError("playbook armed: orders_per_day_with_flips is below orders_per_day")
-    return replace(armed, orders_per_pick=armed.orders_per_pick + int(rules.max_flips) + int(rules.relevels_per_pick),
-                   orders_per_day=per_day)
+    recheck_s = float(_armed_number(playbook, "swap_recheck_seconds"))
+    if not 0 <= recheck_s <= 10:
+        raise ValueError("playbook armed: swap_recheck_seconds must be 0 to 10")
+    now = {f.name: getattr(armed, f.name) for f in fields(armed) if f.name != "swap_recheck_seconds"}
+    now.update(orders_per_pick=armed.orders_per_pick + int(rules.max_flips) + int(rules.relevels_per_pick),
+               orders_per_day=per_day)
+    return FlipRules(**now, swap_recheck_seconds=recheck_s)
 
 
 def on_flip(lane: Lane) -> bool:
@@ -188,7 +207,12 @@ def _why_not(kind: str, entry: Mapping, pick: Optional[Mapping], usable: bool, w
         return f"no {what}: the {old_side} trigger {old_trigger} has traded (last {last})", None
     if kind == "flip":
         if _moved(rng, built):
-            return "no flip: the range changed, so the re-level decides first", None
+            # A flip takes the other side from the range its entry was built on; with a moved range only
+            # a re-level may move the entry (architect's notes on PR #28, item 3: say what is true).
+            if int(entry.get("relevels") or 0) < int(lane.rules.relevels_per_pick):
+                return "no flip: the 09:30 range changed, so the re-level decides first", None
+            return ("no flip: the 09:30 range changed since the entry was built and no re-level is left today, "
+                    "so the entry stays as it is"), None
         o_old = lane.host.order_for(lane.ticker, pick, old_side)
         if o_old is None:
             return "no flip: no numbers for the entry's side", None
@@ -229,24 +253,54 @@ def _swap(lane: Lane, kind: str) -> bool:
         lane.say(f"{kind}_wait", why)
         return False
     b = lane.bounds
+    calls = int(lane.armed_rules.calls_per_send)
     if int(b.get("orders_pick") or 0) < 1 or int(b.get("orders_day") or 0) < 1:
         # Never cancel an entry that the plan could not replace: it stays as it is.
         lane.say(f"{kind}_no_orders", f"no order left for a {what} (orders per pick or per day): the entry stays")
         return False
+    if int(b.get("calls_minute") or 0) < calls:
+        # The same for the calls bound (architect's notes on PR #28, item 2): the new entry would be
+        # refused after the cancel, so nothing is cancelled. A later reading may find the minute free.
+        lane.say(f"{kind}_no_calls", f"not enough Schwab calls left this minute for the new entry "
+                                     f"({b.get('calls_minute')} of {calls}, armed.calls_per_minute): the entry stays")
+        return False
     high, low = _range(pick)
     rng = {"high": _cents(high), "low": _cents(low)}
     limit = lane.rules.max_flips if kind == "flip" else lane.rules.relevels_per_pick
-    calls = int(lane.armed_rules.calls_per_send)
     spent = {"send": False}
 
     def recheck() -> tuple[str, str]:
-        """After the confirmed cancel, no lock held: still armed, a new usable reading, the same
-        range, the new side's trigger not yet traded, and the send's bounds reserved."""
+        """After the confirmed cancel, no lock held: the checks below, again on a new reading a tick
+        (armed.every_seconds) later while the reading is unusable or its price stale, for at most
+        armed.swap_recheck_seconds (architect's notes on PR #28, 2026-11-13 17:20 UTC, item 1).
+        Before the cancel a bad reading costs nothing, since would_flip comes again; after it there
+        is one entry to place. Every other answer ends at once."""
         if spent["send"]:
             # Trader's lock was taken just before the last send, which never left: give its order and
             # calls back before this look reserves them again.
             lane.refund(orders=1, calls=calls)
             spent["send"] = False
+        tick = float(lane.armed_rules.every_seconds)
+        limit_s = float(getattr(lane.armed_rules, "swap_recheck_seconds", 0) or 0)
+        start = lane.desk._now()
+        for n in range(int(limit_s / tick + 1e-9) + 1):
+            why, code = look()
+            if code not in ("unusable", "stale"):
+                return why, code
+            waited = (lane.desk._now() - start).total_seconds()
+            if waited + tick > limit_s + 1e-9:
+                break
+            if n == 0:
+                lane.say(f"{kind}_look_again", f"cancelled the {old_side} entry; {why}: looking again for up to "
+                                               f"{limit_s:g} s before placing the {side}")
+            time.sleep(tick)
+        if limit_s > 0:
+            why = f"{why} (looked again for {waited:.2f} s, armed.swap_recheck_seconds {limit_s:g})"
+        return why, code
+
+    def look() -> tuple[str, str]:
+        """One look: still armed, a new usable reading, the same range, the new side's trigger not
+        yet traded, and the send's bounds reserved."""
         if not lane.armed():
             return "the plan was disarmed before the new side was placed", "disarmed"
         p2, ok2, why2 = lane.reread()
