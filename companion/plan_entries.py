@@ -1449,7 +1449,7 @@ class PlanDesk:
     def _chase_beside(self, ticker: str, side: str, rec: Mapping, orders: list[dict], fresh: bool,
                       cancelled_order_id: Any = None) -> tuple[str, str]:
         """Brief 25 rule B before each chase order (companion/plan_side.py; Ash, project thread,
-        2026-11-13 20:01:19 UTC, and his card pick "Plan trades beside you", 20:04:42 UTC): the chase
+        2026-11-13 20:01:19 UTC, and Ash's card pick "Plan trades beside you", 20:04:42 UTC): the chase
         goes beside the user's own trades on the same side (OK), never on the other side
         (OTHER_SIDE: the pick is left), and waits while the side is not clear or the account read is
         old (NOT_CLEAR). The row's own entry and its tree are the plan's, never the user's. So is

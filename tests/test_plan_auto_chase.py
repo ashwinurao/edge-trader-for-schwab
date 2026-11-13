@@ -511,7 +511,7 @@ def test_disarm_between_the_checks_and_the_send_sends_nothing_and_refunds(rig):
 
 # ---- beside Ash's own trades on the name (brief 25 rule B; N3 of review 3 of PR #25) -------------
 # Ash, project thread "Review OV picks desk architecture", 2026-11-13 20:01:19 UTC ("did you account
-# for me doing manual trading on the same account in parallel ...") and his card pick "Plan trades
+# for me doing manual trading on the same account in parallel ...") and Ash's card pick "Plan trades
 # beside you" (20:04:42 UTC). Before each chase order: plan_side.manual_refusal for the chase's side.
 
 def ash_order(rig, oid, instruction, symbol="AAAA", status="WORKING"):

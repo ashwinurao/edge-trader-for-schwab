@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from companion import plan_entries, plan_flat, trading
+from companion import plan_entries, plan_flat
 from companion.opening_plan import tape as T
 from companion.plan_auto import CHASE_FLAG
 from companion.plan_auto import executor as X
@@ -554,16 +554,9 @@ def at_the_chase(rig, fn):
 
 
 def plans_own_entries_only(rig, manual):
-    """frig's check that two entries never work for one name, counting the plan's orders only: Ash's
-    own orders on the name are his (brief 25)."""
-    def one_entry_per_name(n):
-        by_name = {}
-        for o in rig.broker.orders.values():
-            if o.get("status") in trading.LIVE and o.get("orderId") not in manual:
-                sym = o["orderLegCollection"][0]["instrument"]["symbol"]
-                by_name[sym] = by_name.get(sym, 0) + 1
-        assert max(by_name.values()) == 1, by_name
-    rig.broker.after_place = one_entry_per_name
+    """frig's one-entry-per-name check skips broker.manual, the ids of Ash's own orders (Step 7
+    f8aa884, brief 25)."""
+    rig.broker.manual = frozenset(set(getattr(rig.broker, "manual", ())) | set(manual))
 
 
 def test_after_a_flip_ashs_working_order_on_the_other_side_refuses_the_chase(fcrig):
