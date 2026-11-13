@@ -22,11 +22,13 @@ These decide most review questions:
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working
    exits may be rejected as oversold with the old exits still working (seen 2026-11-06 on shorts,
-   Ash's approval is in that PR): HTTP 201 does not mean accepted, so read the order's status.
+   Ash's approval is in that PR): HTTP 201 does not mean accepted, so read the order's status. A new
+   entry's status is read about 0.3 s and 1 s after its 201 (`Trader._read_after_send`).
 3. **An incomplete view never looks complete.** P&L carries its coverage (matched, estimated,
    unresolved, stale); unknown is never shown as zero; a stale connection disables order buttons.
 4. **When unsure, refuse.** An order with an unclear outcome blocks further orders for that symbol
-   until Schwab confirms it or the user presses Resolve.
+   until Schwab confirms it or the user presses Resolve. An option counts as its underlying
+   (`trading._name`), so an unclear option also blocks the stock and its other contracts.
 5. **REST only.** Never open Schwab's streamer: Schwab allows one per user and another app may hold it.
 6. **Local first.** The server listens on `127.0.0.1` only. A new network call needs an issue first.
 7. **Small and focused.** One pull request, one change.

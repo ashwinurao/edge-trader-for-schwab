@@ -112,8 +112,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Market clock** with the session countdown (Schwab's calendar, holidays and early closes) and an
   optional spoken alert 10 minutes before the close if day trades are still open.
 - **Safety rails:** no order is ever retried automatically; an order with an unclear outcome blocks
-  further orders for that symbol until Schwab confirms it or you press Resolve; the app never opens
-  Schwab's streamer, so it never disconnects another app that uses it.
+  further orders for that symbol (an option counts as its underlying, so it also blocks the stock and
+  its other contracts) until Schwab confirms it or you press Resolve; other symbols can still be
+  traded; the app never opens Schwab's streamer, so it never disconnects another app that uses it.
 
 ## Screenshots
 
@@ -267,6 +268,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `COMPANION_PORT` | The local port. Default `8770`. |
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
+| `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 | `EDGE_TRADER_BREAK_ENTRY` | `1` turns on the break entry and, with `EDGE_SCANNER_URL`, the Place / Cancel / Flip buttons on the Opening plan rows. Unset: off. |
 
 ## Good to know
@@ -303,6 +305,13 @@ folder across, run `setup.bat` once, then `launch.bat`.
   app once Schwab shows it working (a stop set in thinkorswim does not count).
 - **One stream per Schwab user:** Edge Trader polls (REST) and never opens Schwab's streamer, so it
   works alongside thinkorswim and other tools. It keeps its own requests well under Schwab's limits.
+- **A new entry can be rejected after HTTP 201.** Schwab can answer 201 and then reject the order (for
+  example for buying power). The app reads the new order's status about 0.3 s and 1 s after the 201 and
+  shows REJECTED with Schwab's reason within about a second; the 5 s orders poll still catches it if
+  those reads fail, take over 1.5 s or are skipped during a rate-limit pause. The reads use a read-only
+  Schwab client of their own, so a slow read never holds up your next order. Only Schwab's own status
+  marks it rejected.
+  `EDGE_TRADER_NO_EARLY_STATUS=1` turns the two reads off.
 - **Schwab can reject a new exit while old exits work.** On 2026-11-06 Schwab answered HTTP 201 and then
   rejected new exits on short positions as "oversold/overbought", and the old exits stayed. Long
   positions are not confirmed either way. So Move stop and Replace target change the working order in

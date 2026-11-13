@@ -6,17 +6,22 @@ Safety that is engineering, not coaching:
   once, when the mark touches +1R (auto_breakeven, called by the poller).
 - Separate Schwab client that can only preview and place; it cannot cancel or replace.
 - Intent is written to SQLite BEFORE sending; a ticket id can be sent once (double clicks).
-- One submission at a time. A timeout or 5xx is UNKNOWN, never retried: new submissions wait
-  until the poller finds the order or the user marks it resolved after checking thinkorswim.
+- One submission at a time. A timeout or 5xx is UNKNOWN, never retried: new submissions on the
+  same name (the stock, or an option's underlying) wait until the poller finds the order or the
+  user marks it resolved after checking thinkorswim. Other names are not blocked.
 - Fresh quote at click time. Within LOCK_R of the risk per share (at least LOCK_MIN_TICKS), the
   click sends exactly what the ticket showed (shares, limit, stop, targets); if price moved further
   against the entry, or the stop is now at or through the bid / ask, nothing is sent and the
   ticket shows the new numbers.
 - Regular hours only (stops do not trigger outside them).
+- HTTP 201 is not acceptance: the new order's status is read about 0.3 s and 1 s later, off the
+  click's thread, outside the send lock and on a read-only client of its own (at most 1.5 s per
+  read), and only Schwab's own REJECTED changes the ticket.
 """
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import time
@@ -49,6 +54,18 @@ WORKED = frozenset({"WORKING", "AWAITING_STOP_CONDITION", "PENDING_REPLACE", "PE
                     "FILLED", "CANCELED", "REPLACED", "EXPIRED"})
 INDEX_ROOTS = frozenset({"SPX", "NDX", "RUT", "XSP", "VIX", "DJX", "OEX", "XND", "MRUT"})
 OCC_RE = re.compile(r"^[A-Z0-9.]{1,6} {0,5}\d{6}[CP]\d{8}$")
+
+
+# The status reads after a send wait at most this long for Schwab's answer: a slow read is dropped
+# (the 5 s orders poll still sees the order), never waited for (architect's review of PR #15).
+STATUS_READ_TIMEOUT = 1.5
+
+
+def _reads_after_send(env=os.environ) -> tuple[float, ...]:
+    """Seconds after Schwab's HTTP 201 at which the new order's status is read, so a rejection
+    shows within about a second instead of on the 5 s orders poll (CONTRIBUTING rule 2: HTTP 201
+    does not mean accepted; OV entries Step 0). EDGE_TRADER_NO_EARLY_STATUS=1 turns them off."""
+    return () if env.get("EDGE_TRADER_NO_EARLY_STATUS") == "1" else (0.3, 1.0)
 
 
 def _dec(v) -> Decimal | None:
@@ -207,6 +224,20 @@ def _occ_root(symbol: str) -> str:
     return symbol[:6].strip() if len(symbol) > 15 else symbol
 
 
+def _name(symbol: str) -> str:
+    """The underlying a ticket trades: the stock itself, or an option's root, with index roots
+    SPXW / SPXP read as SPX and an adjusted root (AAPL1) as its underlying. An unclear ticket blocks
+    new tickets on the same name (CONTRIBUTING rule 4; Ash's go 2026-11-13, OV entries Step 0): the
+    wider of the two choices, so an unclear option also blocks its stock and every other contract on it."""
+    s = (symbol or "").upper().strip().lstrip("$")
+    if len(s) <= 15:
+        return s
+    root = _occ_root(s).rstrip("0123456789") or _occ_root(s)
+    if len(root) > 1 and root[:-1] in INDEX_ROOTS and root[-1] in "WP":
+        root = root[:-1]
+    return root
+
+
 def _odd_deliverable(q: dict, symbol: str = "") -> str | None:
     """Why an option is an adjusted contract (after a split, merger or spin-off), or None when it
     is standard. Adjusted contracts deliver something other than 100 shares of one underlying, so
@@ -319,11 +350,15 @@ class Trader:
     on_request = None                  # set by the poller: counts order traffic in its limiter
     cooldown_left = None               # set by the poller: seconds left of a 429 pause
     _waited_for = 0.0                  # the 429 pause this trader already waited on
+    status_reads_after_send = _reads_after_send()
+    _sleep = staticmethod(time.sleep)  # the reads' waits; tests inject their own
     def __init__(self, store: Store):
         self.store = store
         self._client = None
         self._hash: str | None = None
         self._send_lock = threading.Lock()
+        self._status_client = None          # the status reads' own client (_status_reader)
+        self._status_made = threading.Lock()
         self._quote_cache: dict[str, tuple[float, dict]] = {}
         self.spreads = SpreadBook(store) if SpreadBook else None
 
@@ -545,7 +580,9 @@ class Trader:
             return {"ok": False, "error": "Trading is not armed. Use the ARM switch on the ticket."}
         if not market_open():
             return {"ok": False, "error": "Regular hours only (9:30 to 16:00 ET)."}
-        pending = self.store.open_tickets()
+        # Only an unclear ticket on the same name blocks (CONTRIBUTING rule 4); the page lists all.
+        name = _name(str(req.get("symbol") or ""))
+        pending = [t for t in self.store.open_tickets() if _name(t["symbol"]) == name]
         if pending:
             t = pending[0]
             return {"ok": False, "error": f"Previous order ({t['symbol']} {t['qty']}) is not confirmed "
@@ -564,6 +601,52 @@ class Trader:
                     "error": "Error after sending. The order MAY be live: check thinkorswim."}
         finally:
             self._send_lock.release()
+            if state.get("read_after"):
+                try:                                  # its own thread: the answer does not wait
+                    self._spawn(state["read_after"])
+                except Exception:                     # never costs the answer; the 5 s poll still reads it
+                    log.exception("could not start the status reads after sending")
+
+    def _spawn(self, fn) -> None:
+        """Run fn on its own thread: the click's answer never waits for it."""
+        threading.Thread(target=fn, name="status-after-send", daemon=True).start()
+
+    def _status_reader(self):
+        """The status reads' own Schwab client: it may only read an order, waits at most
+        STATUS_READ_TIMEOUT for an answer, and no send ever uses it. schwabdev sends one request at
+        a time per client, so a slow read on the order client would hold up the next click's send."""
+        with self._status_made:
+            if self._status_client is None:
+                self._status_client = schwab.make_client(frozenset({"order_details"}), timeout=STATUS_READ_TIMEOUT)
+            return self._status_client
+
+    def _read_after_send(self, ticket_id: str, oid: int, t0: float) -> None:
+        """Read the order Schwab just answered 201 for, at status_reads_after_send seconds after the
+        answer (t0, monotonic), and record Schwab's own REJECTED at once. One reader per sent ticket,
+        at most one read per delay, never under the send lock, on its own client (_status_reader),
+        each read dropped after STATUS_READ_TIMEOUT. Only the order's own top-level status
+        counts; a fill, a working status, a failed or throttled read (_logged skips reads during a
+        429 pause) changes nothing, and the 5 s orders poll still shows the order either way."""
+        try:
+            client = self._status_reader()
+            for at in self.status_reads_after_send:
+                self._sleep(max(0.0, t0 + at - time.monotonic()))
+                try:
+                    r = self._logged("order_details", lambda: client.order_details(self._hash, oid))
+                    o = r.json() if r.status_code == 200 else None
+                except Exception as e:
+                    log.warning("status read %.1f s after sending order %s failed: %r", at, oid, e)
+                    continue
+                st = o.get("status") if isinstance(o, dict) else None
+                if st == "REJECTED":
+                    why = str(o.get("statusDescription") or "")[:1000] or None
+                    if self.store.update_ticket(ticket_id, "REJECTED", detail=why, only_from="ACCEPTED"):
+                        log.warning("REJECTED after acceptance: order %s, ticket %s: %s", oid, ticket_id, why)
+                    return
+                if st in TERMINAL:       # filled, cancelled, expired: nothing to show early
+                    return
+        except Exception:
+            log.exception("status read after sending order %s failed", oid)
 
     def _safe_update(self, ticket_id: str, status: str, **kw) -> bool:
         try:
@@ -710,8 +793,12 @@ class Trader:
                 return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id, "order_id": oid,
                         "error": "Schwab accepted the order but the companion could not record it. "
                                  "Check thinkorswim."}
-            return {"ok": True, "status": status, "order_id": oid, "ticket_id": ticket_id,
-                    "plan": p.as_dict()}
+            answer = {"ok": True, "status": status, "order_id": oid, "ticket_id": ticket_id,
+                      "plan": p.as_dict()}
+            if oid and self.status_reads_after_send:
+                t0 = time.monotonic()      # submit() starts the reads once the send lock is free
+                state["read_after"] = lambda: self._read_after_send(ticket_id, oid, t0)
+            return answer
         if r.status_code == 429:
             # Throttled before Schwab looked at the order: nothing was placed, a retry is safe
             # (it gets a new ticket id, so the record of this attempt stays intact).
@@ -2481,6 +2568,12 @@ class Trader:
                 row["protection"] = "UNKNOWN"
             elif t["status"] != "ACCEPTED":
                 row["protection"] = t["status"]
+                if t["status"] == "REJECTED" and t["order_id"]:
+                    # Rejected after Schwab's 201 (read at once by _read_after_send): its reason is
+                    # Schwab's statusDescription, shown like the orders poll shows it below.
+                    row["entry_status"] = "REJECTED"
+                    if t["detail"]:
+                        row["entry_reason"] = str(t["detail"])[:200]
             elif tree is None:
                 row["protection"] = "CHECKING"
             else:
@@ -2592,5 +2685,9 @@ class Trader:
         return {sym: {**c[0], "alts": c[1:]} for sym, c in cands.items()}
 
     def status(self) -> dict:
-        return {"armed": self.armed, "market_open": market_open(),
-                "blocked": bool(self.store.open_tickets()), "risk_choices": RISK_CHOICES}
+        """blocked: any ticket's outcome is unclear. blocked_names: the names those tickets block, with
+        SPX's option roots (SPXW, SPXP) spelled out so the page can match an option by its OCC root."""
+        names = {_name(t["symbol"]) for t in self.store.open_tickets()}
+        names |= {n + x for n in names & INDEX_ROOTS for x in "WP"}
+        return {"armed": self.armed, "market_open": market_open(), "blocked": bool(names),
+                "blocked_names": sorted(names), "risk_choices": RISK_CHOICES}
