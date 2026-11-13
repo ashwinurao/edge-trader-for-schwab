@@ -177,7 +177,8 @@ def make_trading_client() -> ReadOnlyClient:
     return make_client(_TRADING)
 
 
-def make_client(allowed: frozenset[str] = _ALLOWED) -> ReadOnlyClient:
+def make_client(allowed: frozenset[str] = _ALLOWED, timeout: float = 10) -> ReadOnlyClient:
+    """timeout: seconds to wait for each Schwab answer (schwabdev's default is 10)."""
     left = auth_hours_left()
     if left is None or left < SAFETY_HOURS:
         raise AuthExpired(
@@ -196,6 +197,7 @@ def make_client(allowed: frozenset[str] = _ALLOWED) -> ReadOnlyClient:
         app_secret=secret,
         callback_url=os.environ.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1"),
         tokens_db=str(TOKENS_DB),
+        timeout=timeout,
         call_on_auth=_no_prompt,
         open_browser_for_auth=False,
     )
