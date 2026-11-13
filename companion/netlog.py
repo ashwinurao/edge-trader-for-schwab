@@ -964,7 +964,9 @@ ACTIONS = frozenset({"/api/ticket/submit", "/api/ticket/cancel", "/api/ticket/ca
                      # the plan row buttons (PR #19, companion/plan_entries.py): ok, error, ticker
                      "/api/opening-plan/place", "/api/opening-plan/cancel", "/api/opening-plan/flip",
                      # the armed plan's Arm and Disarm clicks (Step 6, companion/plan_auto): ok, error
-                     "/api/opening-plan/arm", "/api/opening-plan/disarm"})
+                     "/api/opening-plan/arm", "/api/opening-plan/disarm",
+                     # Flat all and Add stop (Step 9, companion/plan_flat.py): ok, error (ticker on Add stop)
+                     "/api/opening-plan/flat-all", "/api/opening-plan/add-stop"})
 BODY_CAP = 65_536
 
 

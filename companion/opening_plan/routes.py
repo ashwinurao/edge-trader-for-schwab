@@ -71,7 +71,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     pb = load_playbook()
     bad_url = ""
     if demo:
-        from .demo_feed import DEMO_ET_ENV, DemoFeed, demo_account, demo_clock
+        from .demo_feed import DEMO_ET_ENV, DEMO_RV20_ENV, DemoFeed, demo_account, demo_clock, demo_rv20
         now = now or demo_clock(env.get(DEMO_ET_ENV) or None)
     now = now or (lambda: datetime.now(timezone.utc))
     feed = None
@@ -82,7 +82,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
             bad_url = str(e)
             log.error("opening plan: %s", bad_url)
     elif demo:
-        feed = DemoFeed(now)
+        feed = DemoFeed(now, demo_rv20(env.get(DEMO_RV20_ENV)))
     if url and feed is not None:
         # Step 5, shadow: off unless EDGE_TRADER_SHADOW=1. It shares this feed and logs what the
         # automatic plan would do; it sends nothing (companion/opening_plan/shadow.py).

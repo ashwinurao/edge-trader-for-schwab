@@ -25,9 +25,10 @@ These decide most review questions:
    the other side (a flip, at most 3 a row a day, counted with the Flip button) or the same side
    from a moved 09:30 bar (a re-level, at most once a pick a day), each only after Schwab confirms
    the cancel with nothing filled, so never two entries at once. It never retries, chases, exits or
-   moves a stop; one Disarm click stops it, and an unclear answer, a 429 or a reached bound disarms
-   it. A Place, Flip or Cancel click on a row makes that row the user's for the day, and the plan
-   never acts on it again (`PlanDesk._put_click`). Ash's go for this exception is quoted in the
+   moves a stop; one Disarm click stops it, so does a Flat all click (before Flat all builds its
+   list), and an unclear answer, a 429 or a reached bound disarms it. It arms only at the 1-share
+   size stage. A Place, Flip or Cancel click on a row makes that row the user's for the day, and the
+   plan never acts on it again (`PlanDesk._put_click`). Ash's go for this exception is quoted in the
    pull request that adds it. Any other change that would act without a click will not be merged.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
