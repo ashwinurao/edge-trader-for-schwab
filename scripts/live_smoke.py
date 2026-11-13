@@ -1111,11 +1111,27 @@ def sc_plan_flat(r: Run) -> None:
 
 
 def sc_restart_before(r: Run) -> None:
-    """Leave one plan entry resting, for a restart of Edge Trader. Run restart_after next."""
+    """Leave one entry resting, for a restart of Edge Trader. Run restart_after next. A plan row's
+    entry when a row can be used, else a ticket Break entry on the test name far from the price."""
     e, info, side, _ = r.find_row()
     if not info:
-        r.check("a plan row could be used (a pick's price inside its first-minute range)", False)
-        return
+        side = (r.a.side or "LONG").upper()
+        r.must_be_clean(r.sym)
+        r.arm(True)
+        q = r.quote(r.sym)
+        r.note("QUOTE", **q)
+        trig, stop = far(q, side)
+        ans, _ = r.submit(r.break_req(r.sym, side, trig, stop), "ticket entry before the restart")
+        r.must("Schwab accepted the break entry", ans.get("ok") is True and bool(ans.get("order_id")),
+               got=r.pick(ans))
+        oid = ans["order_id"]
+        rows, waited = r.wait(lambda: [o for o in r.orders(r.sym) if oid in (o["order_id"], o["group_id"])], 20, 1.0)
+        r.must("the entry shows in Schwab's order list", bool(rows), waited_s=round(waited, 1), orders=rows)
+        r.mem["restart"] = {"kind": "ticket", "ticker": r.sym, "side": side, "order_id": oid}
+        r._save_mem()
+        r.note("READY_FOR_RESTART", kind="ticket", ticker=r.sym, side=side, order_id=oid,
+               brackets=[b for b in r.brackets(r.sym) if b.get("order_id") == oid])
+        return                                   # ARM is left on: the restart itself must turn it off
     t = info["ticker"]
     r.arm(True)
     ans, _ = r.place(t, side, info["sides"][side]["expected"], "place before the restart")
@@ -1136,6 +1152,20 @@ def sc_restart_after(r: Run) -> None:
     r.touched.add(t)
     st = r.state()
     arm_off = r.check("ARM is off after the restart", r.trading(st).get("armed") is False, trading=r.trading(st))
+    if m.get("kind") == "ticket":
+        rows, waited = r.wait(lambda: [o for o in r.orders(t) if oid in (o["order_id"], o["group_id"])], 30, 1.0)
+        r.check("the entry still rests at Schwab and shows after the restart", bool(rows), waited_s=round(waited, 1),
+                orders=rows or r.orders(t))
+        br = [b for b in r.brackets(t) if b.get("order_id") == oid]
+        r.check("Edge Trader still knows the ticket after the restart", bool(br), brackets=br)
+        c, csecs = r.cancel_ticket(oid, "cancel with ARM off")
+        r.must("Cancel works with ARM off", c.get("ok") is True, got=r.pick(c), secs=round(csecs, 3))
+        gone, waited = r.wait(lambda: not r.orders(t), 20, 1.0)
+        r.check("nothing works on the name after Cancel", bool(gone), waited_s=round(waited, 1))
+        r.check("no share was bought or sold", r.shares(t) == 0)
+        r.mem.pop("restart", None)
+        r._save_mem()
+        return
     row, waited = r.row_resting(t, oid)
     r.check("the row still shows the same entry resting", bool(row), waited_s=round(waited, 1),
             row=r.row_brief(row) if row else r.row_brief(r.row_of(r.entries(), t) or {}))
