@@ -214,12 +214,17 @@ class AutoPlan:
             self.orders_pick[ticker] -= orders
             self.orders_day -= orders
             if calls:
-                # Remove the reservation itself (the newest entry of that size): a negative entry
-                # could leave the 60 s window before the reservation and undercount for a moment
-                # (architect's review, 2026-11-13 16:21 UTC).
+                # Take it off the reservation itself (the newest entry at least that size), keeping
+                # its time: a negative entry could leave the 60 s window before the reservation and
+                # undercount for a moment (architect's review, 2026-11-13 16:21 UTC). A part refund
+                # (Step 8: a chase refused after Schwab's quote keeps that one call) leaves the rest.
                 for i in range(len(self.sends) - 1, -1, -1):
-                    if self.sends[i][1] == calls:
-                        del self.sends[i]
+                    at, size = self.sends[i]
+                    if size >= calls:
+                        if size == calls:
+                            del self.sends[i]
+                        else:
+                            self.sends[i] = (at, size - calls)
                         break
 
     def order_for(self, ticker: str, pick: Mapping, side: str) -> Optional[dict]:

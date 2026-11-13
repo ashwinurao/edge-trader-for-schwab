@@ -129,8 +129,10 @@ def on_chase(lane: Lane) -> bool:
              reading_at=_iso(pick.get("fresh_at")) if isinstance(pick.get("fresh_at"), datetime)
              else pick.get("fresh_at"),
              decided_at=_iso(now), inside_cap=inside, pullback_wait_s=wait_s)
+    # view=lane.view: Step 2's view, read by the executor before the tape, so no Edge Scanner GET falls
+    # between the reading and the send (architect's review, 2026-11-13 16:21 UTC).
     r = lane.desk.chase_auto(ticker, side.upper(), o, quote_tries=int(lane.armed_rules.chase_quote_tries),
-                             pick=pick, log=lane.log, wait_s=wait_s)
+                             pick=pick, view=getattr(lane, "view", None), log=lane.log, wait_s=wait_s)
     if r.get("not_sent"):
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))

@@ -127,6 +127,39 @@ def test_timeline_of_one_chase_at_0_4_s_a_call(crig):
     assert d["decided_at"] == "2026-11-13T14:31:00.100+00:00" and d["last_age_s"] == 0.05
 
 
+def test_the_chase_reads_the_plan_view_before_the_tape_never_between_reading_and_send(crig):
+    """Architect's review, 2026-11-13 16:21 UTC: Step 2's view can wait on an Edge Scanner GET, so
+    the executor reads it at the start of the step and the chase hands lane.view to chase_auto. The
+    chase reads the tape again just before the send (lane.reread); still no view read after it."""
+    rig = crig
+    events = []
+    view, tape = rig.view, rig.tape
+
+    def timed_view():
+        events.append("view")
+        return view()
+
+    class TimedTape:
+        def read(self):
+            events.append("tape")
+            return tape.read()
+    rig.plan._view, rig.desk._view, rig.plan.tape = timed_view, timed_view, TimedTape()
+    real_place = rig.broker.place_order
+
+    def place(h, order):
+        events.append("place:" + order["orderType"])
+        return real_place(h, order)
+    rig.broker.place_order = place
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    events.clear()
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    (i,) = [n for n, k in enumerate(events) if k == "place:LIMIT"]          # the chase
+    last_tape = max(j for j in range(i) if events[j] == "tape")
+    assert "view" not in events[last_tape:i], events
+    assert events[:i].count("tape") >= 2                                   # the step's reading and the reread
+
+
 def test_the_calls_bound_counts_a_chase_like_any_send(crig):
     rig = crig
     rules = rig.plan.armed_rules
@@ -137,6 +170,29 @@ def test_the_calls_bound_counts_a_chase_like_any_send(crig):
     assert len(rig.broker.placed) == 2 and placed(rig)[0] == "AAAA"
     assert sum(c for _, c in rig.plan.sends) == 2 * rules.calls_per_send
     assert "Schwab calls a minute by the plan" in rig.plan.panel()["disarmed"]["why"]
+
+
+def test_a_chase_refused_after_the_quote_keeps_only_the_quote_call_in_the_bound(crig, monkeypatch):
+    """Schwab's quote is old at each try: chase_entry.prepare refuses after reading it, so each try
+    cost Schwab one call (the quote) and the plan gives back the other 4 of the send's 5. Three tries
+    (armed.chase_quote_tries), then the plan leaves the pick. The other three picks' break entries
+    count 5 each."""
+    rig = crig
+    real_quote = rig.trader.quote
+
+    def quote(sym, max_age=1.0):
+        q = real_quote(sym, max_age)
+        return {**q, "quote_time": q["quote_time"] - 60_000} if sym == "AAAA" else q
+    monkeypatch.setattr(rig.trader, "quote", quote)
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    tries = rig.plan.armed_rules.chase_quote_tries
+    assert [c for c in rig.broker.calls if c == ("quote", "AAAA")] == [("quote", "AAAA")] * tries
+    assert order_of(rig, "AAAA") == [] and f"{tries} times today" in rig.plan.left["AAAA"]
+    send = rig.plan.armed_rules.calls_per_send
+    assert rig.plan._calls_used() == 3 * send + tries          # 15 for the three sends, 1 per chase try
+    assert rig.plan.orders_day == 3
 
 
 # ---- Schwab says no ----------------------------------------------------------------------------
