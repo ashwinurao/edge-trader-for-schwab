@@ -163,9 +163,12 @@ def test_a_flip_into_a_side_already_past_its_trigger_fills_there():
     assert got[2]["side"] == "short" and got[2]["fill"] == 48.95
 
 
-def test_the_range_is_final_by_a_trade_stamped_0931():
+def test_a_trade_stamped_0931_does_not_make_the_range_final():
+    # Changed by brief 15 (was test_the_range_is_final_by_a_trade_stamped_0931, expecting a
+    # would_place): on 2026-11-13 that rule made YESTERDAY's day bar final. A range is final only
+    # when the reading says so (the 09:30 bar, companion/opening_plan/tape.py).
     _, got = run([reading("09:31:00.200", pick(49.80, "09:31:00.000", final=False))])
-    assert kinds(got) == [("would_place", None)]
+    assert kinds(got) == [("no_action", "waiting_for_range")]
 
 
 def test_the_fast_watch_end_cancels_a_working_entry():
@@ -334,15 +337,19 @@ def recorder_file(tmp_path: Path) -> Path:
 def test_replay_over_a_recorder_file(tmp_path):
     rows = replay.replay(recorder_file(tmp_path), PLAYBOOK, risk=Decimal("101"), calm=False)
     acts = [(r["kind"], r.get("code"), r.get("symbol")) for r in rows]
-    # The bars line brings no new price: the 09:31:00.1 trade is 1.0 s old by then, so stale.
-    assert acts == [("no_action", "waiting_for_range", "AAAA"), ("would_place", None, "AAAA"),
-                    ("no_action", "stale_price", "AAAA"), ("would_fill", None, "AAAA")]
-    place = rows[1]
+    # Changed by brief 15. Before: waiting_for_range, would_place at 09:31:00.2 from the day bar
+    # made final by a trade stamped 09:31, stale_price, would_fill. Now the range comes only from
+    # a 09:30 bar: this file has no snapshot minute bar, so there is no range until the bars line
+    # at 09:31:01.1. By then the 09:31:00.1 trade is 1.0 s old, so stale; the next snapshot
+    # (09:31:05.1, trade 50.04 at 05.05) places long and is inside the band, so would_fill.
+    assert acts == [("no_action", "no_range", "AAAA"), ("no_action", "stale_price", "AAAA"),
+                    ("would_place", None, "AAAA"), ("would_fill", None, "AAAA")]
+    place = rows[2]
     assert (place["side"], place["trigger"], place["limit"], place["stop"], place["shares"]) == \
         ("long", 50.01, 50.08, 49.00, 100)
-    assert place["t"] == "2026-11-13T14:31:00.200000Z" and place["price_age_s"] == 0.1
-    assert place["range"] == {"high": 50.0, "low": 49.0, "final": True, "from": "trade at or after 09:31"}
-    assert rows[2]["range"]["from"] == "09:30 bar"
+    assert place["t"] == "2026-11-13T14:31:05.100000Z" and place["price_age_s"] == 0.05
+    assert place["range"] == {"high": 50.0, "low": 49.0, "final": True, "from": "09:30 bar"}
+    assert rows[1]["range"]["from"] == "09:30 bar"
     assert rows[3]["fill"] == 50.04
 
 
@@ -353,7 +360,8 @@ def test_replay_command_writes_jsonl(tmp_path):
                            "--calm", "no", "--out", str(out)], cwd=ROOT, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
     rows = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
-    assert [r["kind"] for r in rows] == ["no_action", "would_place", "no_action", "would_fill"]
+    # Changed by brief 15 (was no_action, would_place, no_action, would_fill): see the test above.
+    assert [r["kind"] for r in rows] == ["no_action", "no_action", "would_place", "would_fill"]
     assert "would_place 1" in done.stderr
 
 
