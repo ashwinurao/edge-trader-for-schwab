@@ -349,7 +349,8 @@ def test_previews_at_the_listed_times_once_each_and_never_the_account_number():
     assert first["symbol"] == "NVDA" and first["http"] == 201 and first["ok"] is True
     assert first["status"] == "ACCEPTED" and first["at"] == "09:29:30" and first["wire_ms"] == 123.0
     assert first["accepts"] == ["Order accepted"] and first["warns"] == ["Stop limit order may not fill"]
-    assert first["rejects"] == [] and first["alerts"] == ["Account {n} reviewed"]
+    assert first["rejects"] == [] and first["alerts"] == ["x: Account {n} reviewed"]
+    assert first["error"] is None and first["error_text"] is None
     text = json.dumps(sink.lines)
     assert ACCOUNT_NUMBER not in text and HASH not in text and "orderLegs" not in text
 
@@ -367,6 +368,61 @@ def test_the_written_file_holds_no_account_number(tmp_path, monkeypatch):
     assert any(x.get("probe") == "preview" for x in lines)
     assert all(x["app"] == "edge-trader" and x["kind"] in ("probe", "note") for x in lines)
     assert ACCOUNT_NUMBER not in text and HASH not in text
+
+
+class RawAnswer(Answer):
+    """An answer whose body is plain text, not JSON."""
+
+    def __init__(self, status, text):
+        super().__init__(status, None)
+        self.text, self.content = text, text.encode()
+
+    def json(self):
+        raise ValueError("not JSON")
+
+
+def _refusing(clock, answer):
+    class Refusing(FakeClient):
+        def preview_order(self, account, order):
+            self.previews.append((clock.wall(), account, order))
+            return answer
+    return Refusing(clock)
+
+
+def test_a_refused_preview_keeps_schwabs_reason_without_the_account_number():
+    body = {"message": f"Order rejected for account {ACCOUNT_NUMBER}",
+            "errors": [f"Invalid stop for {ACCOUNT_NUMBER}",
+                       {"title": "Bad order", "detail": "A STOP_LIMIT parent cannot have a STOP child"},
+                       {"title": "Only a title"}, {"message": "Only a message"}, {"id": "nothing to say"},
+                       "sixth text, over the cap"]}
+    clock = Clock(et(9, 29, 29))
+    probe, sink, _ = make(clock, client=_refusing(clock, Answer(400, body)))
+    run(probe, clock, et(9, 29, 31))
+    (line,) = sink.probes("preview")
+    assert line["http"] == 400 and line["ok"] is False and line["error"] == "http_4xx"
+    assert line["error_text"] == ["Order rejected for account {n}", "Invalid stop for {n}",
+                                  "A STOP_LIMIT parent cannot have a STOP child", "Only a title", "Only a message"]
+    assert ACCOUNT_NUMBER not in json.dumps(sink.lines)
+
+
+def test_a_refused_preview_with_a_text_body_keeps_its_first_200_characters():
+    text = f"Bad Request: account {ACCOUNT_NUMBER} cannot take this order. " + "x" * 300
+    clock = Clock(et(9, 29, 29))
+    probe, sink, _ = make(clock, client=_refusing(clock, RawAnswer(400, text)))
+    run(probe, clock, et(9, 29, 31))
+    (line,) = sink.probes("preview")
+    assert line["error_text"] == [op._text(text[:200])]
+    assert line["error_text"][0].startswith("Bad Request: account {n} cannot take this order.")
+    assert ACCOUNT_NUMBER not in json.dumps(sink.lines) and line["readable"] is False
+
+
+def test_a_list_item_keeps_schwabs_rule_name_with_its_message():
+    assert op._text({"validationRuleName": "StopLimitRule", "message": "Stop price is invalid"}) == \
+        "StopLimitRule: Stop price is invalid"
+    assert op._text({"validationRuleName": "StopLimitRule", "activityMessage": "Check it"}) == "StopLimitRule: Check it"
+    assert op._text({"validationRuleName": "StopLimitRule"}) == "StopLimitRule"
+    assert op._text({"message": "Order accepted"}) == "Order accepted"
+    assert op._text({}) == ""
 
 
 def test_a_preview_time_missed_by_more_than_ten_seconds_is_skipped_not_sent_late():
@@ -538,4 +594,20 @@ def test_emit_off_switch_and_full_queue(monkeypatch):
     monkeypatch.setattr(netlog, "_ensure_writer", lambda: None)
     d = netlog.dropped
     netlog.emit("note", text="y")
+    assert netlog.dropped == d + 1
+
+
+def test_writer_encodes_each_line_on_its_own_and_skips_only_a_bad_one(tmp_path, monkeypatch):
+    from decimal import Decimal
+    monkeypatch.setattr(netlog, "DIR", tmp_path)
+    loop = {"ts": "2026-11-13T14:30:00.000+00:00", "kind": "note"}
+    loop["self"] = loop                                   # a circular line: no encoder can write it
+    batch = [{"ts": "2026-11-13T14:30:00.000+00:00", "kind": "note", "text": "good"},
+             {"ts": "2026-11-13T14:30:00.001+00:00", "kind": "probe", "bid": Decimal("100.25")},
+             loop]
+    d = netlog.dropped
+    netlog._write(batch)
+    lines = [json.loads(x) for x in (tmp_path / "2026-11-13.jsonl").read_text().splitlines()]
+    assert lines == [{"ts": "2026-11-13T14:30:00.000+00:00", "kind": "note", "text": "good"},
+                     {"ts": "2026-11-13T14:30:00.001+00:00", "kind": "probe", "bid": "100.25"}]
     assert netlog.dropped == d + 1

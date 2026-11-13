@@ -190,10 +190,31 @@ _LONG_ID = re.compile(r"[A-Za-z0-9]{20,}")
 
 def _text(x) -> str:
     """One item of a preview list as text, with anything that could be an account or order id
-    replaced (brief 08 rule 2)."""
+    replaced (brief 08 rule 2). A dict keeps both Schwab's rule name and its message ("RULE:
+    message"): the rule name says which check objected (architect's review of PR #21)."""
     if isinstance(x, dict):
-        x = x.get("message") or x.get("activityMessage") or x.get("validationRuleName") or ""
+        rule = x.get("validationRuleName")
+        msg = x.get("message") or x.get("activityMessage")
+        x = f"{rule}: {msg}" if rule and msg else (msg or rule or "")
     return _LONG_ID.sub("{id}", _LONG_NUM.sub("{n}", str(x)))[:200]
+
+
+def error_texts(body, raw: str) -> list[str]:
+    """Schwab's reason for a preview answer that is not 200/201, at most 5 texts, each through
+    _text: the body's "message" and each item of "errors" (a string, or a dict's detail, title or
+    message). A body that is not JSON gives the first 200 characters of the raw text."""
+    out: list[str] = []
+    if isinstance(body, (dict, list)):
+        errs = body if isinstance(body, list) else body.get("errors")
+        if isinstance(body, dict) and body.get("message"):
+            out.append(_text(body["message"]))
+        for e in errs if isinstance(errs, list) else []:
+            t = (e.get("detail") or e.get("title") or e.get("message")) if isinstance(e, dict) else e
+            if t:
+                out.append(_text(t))
+    elif raw:
+        out.append(_text(raw[:200]))
+    return [t for t in out if t][:5]
 
 
 def preview_fields(body) -> dict:
@@ -502,11 +523,17 @@ class OpenProbe:
         except Exception:
             body = None
         fields = preview_fields(body)
+        reason = None
         if err:
             self.counts["preview_errors"] += 1
+            try:
+                raw = r.text if body is None else ""
+            except Exception:
+                raw = ""
+            reason = error_texts(body, raw or "")
         self._line(probe="preview", symbol=sym, at=at, wire_ms=_wire_ms(r), total_ms=total,
                    http=r.status_code, ok=err is None and not fields["rejects"], error=err,
-                   retry_after=r.headers.get("Retry-After"), **fields)
+                   error_text=reason, retry_after=r.headers.get("Retry-After"), **fields)
         if r.status_code == 429:
             self._halt("Schwab answered 429 to a preview")
 

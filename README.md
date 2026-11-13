@@ -68,9 +68,9 @@ name are refused). It needs no account and sends no telemetry.
   09:30:30, 09:31:02, 09:32:00 and 09:35:00 it previews a long Break order for the first pick (SPY when there
   is none): trigger = ask + the larger of 5 cents and 0.2%, stop = trigger - 1% of the price. It writes
   `kind: "probe"` lines to `data/netlog/`: Schwab's quote and trade times and their age when the answer
-  arrived, bid, ask, last, the wire time, and for a preview only the status word and the texts of Schwab's
-  rejects, warns, alerts, accepts and reviews (never the rest of the answer, which holds the account
-  number). No retries: any 429, or the app's own 429 pause, stops it for the rest of the window. About 150
+  arrived, bid, ask, last, the wire time, and for a preview only the status word, the texts of Schwab's
+  rejects, warns, alerts, accepts and reviews (rule name and message), and on a refused preview the texts
+  of its message and errors (never the rest of the answer, which holds the account number). No retries: any 429, or the app's own 429 pause, stops it for the rest of the window. About 150
   Schwab requests per default window (144 quote calls and 6 previews in 12 minutes), on the same Schwab app
   limit as everything else. With `EDGE_SCANNER_URL` set it reads the picks from Edge Scanner once, a minute
   before each window (`companion/open_probe.py`).
