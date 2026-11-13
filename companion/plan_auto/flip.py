@@ -79,7 +79,7 @@ With four picks the bounds allow at most 8 sends (armed.orders_per_day_with_flip
 armed.calls_per_minute 40 at 5 a send) and one automatic cancel per order id, so at most 8 cancels:
 in one minute that is 56 calls usually and 136 at worst. The likely busy minute, four entries then
 four flips or re-levels, is 44 usually and 88 at worst. Brief 24 makes the poller read the order
-list first when the minute is tight (on main, not in this branch yet).
+list first when the minute is tight (#33, merged in here; companion/poll_budget.py).
 
 Flat all (Step 9, companion/plan_flat.py): its click disarms the plan first (Step 6's before_batch),
 and while its batch runs PlanDesk.held() holds new entries. flip_auto checks the hold before the
