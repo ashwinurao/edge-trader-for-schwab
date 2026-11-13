@@ -349,13 +349,20 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
   entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
   level and not through the stop. A quote that is old or back inside the level lets the plan try
-  again on a later reading, at most `CHASE_QUOTE_TRIES` (3) times a row a day.
+  again on a later reading, at most `armed.chase_quote_tries` (3, a start number in
+  `companion/opening_plan/playbook.json`) times a row a day.
 - Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
   a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name
   blocked until you press Resolve.
 - The row says "Chased by the armed plan: limit X, cap Y." and, while it rests, until when it waits.
   The plan's log (`data/opening_plan/auto/`) has the level, the cap, the last trade and its age, the
   limit sent and the times (reading, decision, send, answer).
+- The Arm dialog lists the chase under "It will" only while its switch is on, and then no longer says
+  that a pick past its trigger is left to you.
+- A click Flip on a resting chase works as on any row today: it cancels the chase, waits for Schwab's
+  confirmed cancel, then places the other side's break entry. The row keeps the chase's record, so it
+  still shows the chase line and the plan cancels the clicked entry when the chase's pullback wait
+  ends (`tests/test_plan_auto_chase_executor.py` pins this; not changed by Step 8).
 - Not confirmed at Schwab: how a marketable limit entry with an attached stop behaves in the first
   seconds after 09:31 (the first 1-share live morning answers it).
 

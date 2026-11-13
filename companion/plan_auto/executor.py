@@ -43,7 +43,8 @@ from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
-from .handlers import Lane, Registry, default_registry
+from .chase import ARM_NOT_TEXT as CHASE_ARM_NOT_TEXT
+from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
 
 log = logging.getLogger("companion.plan_auto")
 
@@ -526,7 +527,9 @@ class AutoPlan:
                 "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env)
         will_not = ["Flip, chase, exit, move a stop or resend." if kinds == ["would_place", "would_cancel"]
                     else "Exit, move a stop or resend.",
-                    "Send when the price is already at or past the trigger: that pick is left to you.",
+                    # Step 8: with the chase on, a pick past its trigger is chased, not left to Ash.
+                    "Send when the price is already at or past the trigger: that pick is left to you."
+                    if PAST_TRIGGER not in kinds else CHASE_ARM_NOT_TEXT,
                     "Act on an old or late tape, an old order list, an unclear order, or after any disarm.",
                     "Survive a restart: arming is in memory only."]
         return {"playbook": self.playbook_name, "picks": [r.get("ticker") for r in (view or {}).get("rows") or []],

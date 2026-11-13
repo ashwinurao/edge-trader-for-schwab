@@ -164,6 +164,10 @@
     "clock_ahead_seconds": {
       "value": 0.25,
       "note": "start number, not approved by Ash; data stamped more than this after our clock makes the reading unusable (the clock looks behind)"
+    },
+    "chase_quote_tries": {
+      "value": 3,
+      "note": "start number, not approved by Ash (Step 8, brief 18; architect, 2026-11-13 16:02 UTC); a chase refused at the send after Schwab's quote (an old quote, the price back inside the level) may try again on a later reading at most this many times a pick a day, one quote call each (companion/plan_entries.py PlanDesk.chase_auto)"
     }
   }
 }

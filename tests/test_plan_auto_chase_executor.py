@@ -1,0 +1,233 @@
+"""The capped chase (Step 8, brief 18) on Step 6's executor (companion/plan_auto/executor.py AutoPlan),
+with Step 6's rig from tests/test_plan_auto.py: the fake broker, the fake open tape and the fake
+clock. Nothing here talks to Schwab or Edge Scanner. tests/test_plan_auto_chase.py tests the handler
+case by case on a stand-in host; this file runs the same chase through the real worker.
+
+Hand-worked numbers as tests/test_plan_auto.py. AAAA (09:30 bar high 42.48, low 41.92): long trigger
+42.49, stop 41.92, 0.57 a share; cap min(0.15 x 0.57 = 0.0855, 0.15% x 42.49 = 0.0637) = 0.06; chase
+limit 42.55. Short: trigger 41.91, stop 42.48; cap 0.06; limit 41.85.
+"""
+import json
+from datetime import timedelta
+
+import pytest
+
+from companion import plan_entries
+from companion.plan_auto import CHASE_FLAG
+from companion.plan_auto import chase as C
+from companion.plan_auto import handlers as H
+from test_plan_auto import (ENV, NEAREST_FIRST, PICKS, arm, et, lines, placed, rig, run,  # noqa: F401 (rig: Step 6's fixture)
+                            want_req, without_id)
+from test_trading import Resp
+
+CHASE_ENV = {**ENV, CHASE_FLAG: "1"}
+CHASE_AAAA = {"symbol": "AAAA", "side": "LONG", "entry": "chase", "trigger": "42.49", "cap": "0.06",
+              "limit": "42.55", "stop": "41.92", "size_mode": "qty", "qty": 1, "risk": 0, "r": 0, "targets": 0,
+              "stop_type": "fixed", "expected_limit": "42.55", "expected_qty": 1, "expected_target": 0}
+
+
+@pytest.fixture
+def crig(rig, monkeypatch):
+    """Step 6's rig with the chase switch on, for the worker and for chase_entry.prepare (os.environ)."""
+    for k, v in CHASE_ENV.items():
+        monkeypatch.setenv(k, v)
+    rig.plan.env = dict(CHASE_ENV)
+    return rig
+
+
+def order_of(rig, sym):
+    return [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == sym]
+
+
+def row(rig, sym):
+    return {r["ticker"]: r for r in rig.desk.state()["rows"]}[sym]
+
+
+
+
+# ---- the Arm dialog --------------------------------------------------------------------------
+
+def test_the_arm_dialog_lists_the_chase_only_with_its_switch(rig):
+    off = rig.plan.terms()
+    assert C.ARM_TEXT not in off["will"] and H.PAST_TRIGGER not in off["handlers"]
+    assert "Send when the price is already at or past the trigger: that pick is left to you." in off["will_not"]
+    rig.plan.env = dict(CHASE_ENV)
+    on = rig.plan.terms()
+    assert on["will"] == off["will"] + [C.ARM_TEXT] and H.PAST_TRIGGER in on["handlers"]
+    assert C.ARM_NOT_TEXT in on["will_not"]
+    assert not any("left to you" in x for x in on["will_not"])
+    assert on["bounds"] == off["bounds"]                    # the chase adds no bound to confirm
+
+
+# ---- the chase through the worker --------------------------------------------------------------
+
+def test_a_pick_already_past_its_trigger_is_chased_by_the_worker(crig):
+    rig = crig
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51                         # past 42.49, inside the cap 42.55
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert sorted(placed(rig)) == sorted(PICKS) and rig.plan.left == {}
+    (req,) = [without_id(r) for r in rig.sent if r["symbol"] == "AAAA"]
+    assert req == CHASE_AAAA
+    assert [without_id(r) for r in rig.sent if r["symbol"] != "AAAA"] == \
+        [want_req(s) for s in placed(rig) if s != "AAAA"]   # the others: Step 3's break entry, unchanged
+    (o,) = order_of(rig, "AAAA")
+    assert (o["orderType"], o["price"], o["orderStrategyType"]) == ("LIMIT", "42.55", "TRIGGER")
+    assert o["orderLegCollection"][0]["instruction"] == "BUY" and o["orderLegCollection"][0]["quantity"] == 1
+    (child,) = o["childOrderStrategies"]
+    assert (child["orderType"], child["stopPrice"], child["orderLegCollection"][0]["instruction"]) == \
+        ("STOP", "41.92", "SELL")
+    e = row(rig, "AAAA")["entry"]
+    assert (e["origin"], e["kind"], e["state"]) == ("auto", "chase", plan_entries.SENT)
+    assert e["auto_text"].startswith("Chased by the armed plan: limit 42.55, cap 0.06.")
+    (d,) = lines(rig, "chase_decision")
+    assert (d["ticker"], d["trigger"], d["cap"], d["limit"], d["stop"], d["last"], d["inside_cap"]) == \
+        ("AAAA", "42.49", "0.06", "42.55", "41.92", "42.51", True)
+    assert [x["ticker"] for x in lines(rig, "chase_send_start")] == ["AAAA"]
+    assert rig.plan.orders_day == 4
+    run(rig, et(9, 31, 30))                                 # later readings send nothing new
+    assert len(rig.broker.placed) == 4 and len(order_of(rig, "AAAA")) == 1
+
+
+def test_past_the_cap_it_rests_and_the_worker_cancels_it_120_s_after_the_send(crig):
+    rig = crig
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.60                         # past the cap: the limit 42.55 rests
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    (o,) = order_of(rig, "AAAA")
+    oid = row(rig, "AAAA")["entry"]["order_id"]
+    assert o["price"] == "42.55" and row(rig, "AAAA")["entry"]["resting"]
+    assert "until 09:33:00 ET, then the plan cancels it" in row(rig, "AAAA")["entry"]["auto_text"]
+    run(rig, et(9, 33, 0))
+    assert oid not in rig.broker.cancelled                  # not before the 120 s
+    run(rig, et(9, 33, 5))
+    (c,) = [x for x in lines(rig, "cancel_start") if x["ticker"] == "AAAA"]
+    assert c["t"] == "2026-11-13T14:33:00.100Z" and rig.broker.cancelled == [oid]
+    e = row(rig, "AAAA")["entry"]
+    assert e["state"] == plan_entries.NONE and "Cancelled by the armed plan" in e["text"]
+    run(rig, et(9, 34, 30))                                 # still past the level: never chased again
+    assert len(order_of(rig, "AAAA")) == 1 and rig.broker.cancelled == [oid]
+
+
+def test_timeline_of_one_chase_at_0_4_s_a_call(crig):
+    """Brief 14's report: the tape reading at 09:31:00.1, the decision, then the quote in
+    chase_entry.prepare (0.4 s) and the POST (0.4 s). AAAA is past its trigger, so the engine ranks
+    it first (it is nearest)."""
+    rig = crig
+    arm(rig)
+    rig.broker.delay = 0.4
+    rig.tape.prices["AAAA"] = 42.51
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    got = [(s, round((t - et(9, 31)).total_seconds(), 2)) for s, t in rig.broker.at]
+    assert got[0] == ("AAAA", 0.9)
+    (start,), (answer,) = lines(rig, "chase_send_start"), lines(rig, "chase_send_answer")
+    assert start["send_at"].startswith("2026-11-13T14:31:00.100") and start["t"] == "2026-11-13T14:31:00.100Z"
+    assert answer["answer_at"].startswith("2026-11-13T14:31:00.900")
+    (d,) = lines(rig, "chase_decision")
+    assert d["decided_at"] == "2026-11-13T14:31:00.100+00:00" and d["last_age_s"] == 0.05
+
+
+def test_the_calls_bound_counts_a_chase_like_any_send(crig):
+    rig = crig
+    rules = rig.plan.armed_rules
+    rig.plan.armed_rules = type(rules)(**{**rules.__dict__, "calls_per_minute": 2 * rules.calls_per_send})
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert len(rig.broker.placed) == 2 and placed(rig)[0] == "AAAA"
+    assert sum(c for _, c in rig.plan.sends) == 2 * rules.calls_per_send
+    assert "Schwab calls a minute by the plan" in rig.plan.panel()["disarmed"]["why"]
+
+
+# ---- Schwab says no ----------------------------------------------------------------------------
+
+def test_a_4xx_on_the_chase_leaves_the_pick_and_the_others_go_on(crig):
+    rig = crig
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    rig.broker.fail["AAAA"] = lambda order: Resp(400, text="price is outside the allowed range")
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert sorted(placed(rig)) == sorted(PICKS) and len(order_of(rig, "AAAA")) == 1   # tried once
+    assert "Schwab rejected the chase" in rig.plan.left["AAAA"] and rig.plan.arming.is_armed(rig.clock.now())
+    run(rig, et(9, 31, 30))
+    assert len(order_of(rig, "AAAA")) == 1
+
+
+def test_a_429_on_the_chase_disarms_for_the_day(crig):
+    rig = crig
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    rig.broker.fail["AAAA"] = lambda order: Resp(429, {"Retry-After": "30"}, text="throttled")
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert placed(rig) == ["AAAA"]
+    p = rig.plan.panel()
+    assert not p["armed"] and "429" in p["disarmed"]["why"] and p["blocked_today"]
+
+
+def test_no_answer_to_the_chase_freezes_the_pick_and_disarms(crig):
+    rig = crig
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    rig.broker.fail["AAAA"] = TimeoutError("read timed out")
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert placed(rig) == ["AAAA"]
+    assert "no clear answer" in rig.plan.panel()["disarmed"]["why"]
+    assert "AAAA" in rig.trader.status()["blocked_names"]
+    assert row(rig, "AAAA")["entry"]["state"] == plan_entries.UNKNOWN
+
+
+# ---- Ash clicks Flip on a resting chase (architect, 2026-11-13 16:02 UTC: pin today's behaviour) --
+
+def _resting_chase(rig):
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.60                         # past the cap: the chase rests at 42.55
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    return row(rig, "AAAA")["entry"]["order_id"]
+
+
+def test_click_flip_on_a_resting_chase_cancels_it_then_places_the_short_break_entry(crig):
+    """What a click Flip does today on a chased row, not changed by Step 8. Step 4's flip cancels
+    the chase (LONG LIMIT 42.55, stop 41.92), waits for Schwab's CANCELED, then places the short
+    break entry from the Opening plan row: SELL_SHORT STOP_LIMIT trigger 41.91, limit 41.85, stop
+    42.48, 1 share. The row's record keeps origin "auto", kind "chase" and the chase's wait_from
+    (PlanDesk._put merges), so the row still shows the chase line, and the armed plan cancels the
+    clicked short entry 120 s after the CHASE was sent (09:33:00.1), as it would its own."""
+    rig = crig
+    chase_id = _resting_chase(rig)
+    rig.tape.prices["AAAA"] = 42.30                         # back inside the range
+    run(rig, et(9, 31, 10))
+    r = row(rig, "AAAA")
+    assert r["flip"] == "" and r["flip_to"] == "short"
+    f = rig.desk.flip("AAAA", r["send"]["short"])
+    assert f["ok"] and f["cancel"]["status"] == "CANCELED" and rig.broker.cancelled == [chase_id]
+    assert without_id(rig.sent[-1]) == {**want_req("AAAA"), "side": "SHORT", "trigger": "41.91", "limit": "41.85",
+                                        "stop": "42.48", "expected_limit": "41.85"}
+    o = order_of(rig, "AAAA")[-1]
+    assert (o["orderType"], o["stopPrice"], o["price"], o["orderLegCollection"][0]["instruction"]) == \
+        ("STOP_LIMIT", "41.91", "41.85", "SELL_SHORT")
+    rec = rig.desk.records()["AAAA"]
+    assert (rec["origin"], rec["kind"], rec["side"], rec["flips"], rec["chases"]) == ("auto", "chase", "SHORT", 1, 1)
+    assert rec["wait_from"] == "2026-11-13T14:31:00.100+00:00"
+    e = row(rig, "AAAA")["entry"]
+    assert e["side"] == "SHORT" and e["resting"]
+    assert e["auto_text"] == ("Chased by the armed plan: limit 42.55, cap 0.06. It waits for a pullback until "
+                              "09:33:00 ET, then the plan cancels it.")
+    run(rig, et(9, 33, 5))
+    (c,) = [x for x in lines(rig, "cancel_start") if x["ticker"] == "AAAA"]
+    assert c["t"] == "2026-11-13T14:33:00.100Z" and rig.broker.cancelled == [chase_id, f["order_id"]]
+    assert "Cancelled by the armed plan" in row(rig, "AAAA")["entry"]["text"]
+    assert len(order_of(rig, "AAAA")) == 2                  # nothing else is sent for AAAA
+
+
+def test_click_flip_on_a_resting_chase_above_the_high_cancels_it_and_places_nothing(crig):
+    """With the price still above the 09:30 high (42.60 against 42.48), the flip's short break
+    entry is refused by Trader.submit (its stop 42.48 is under the ask): the chase is cancelled
+    and nothing new rests. The row says why."""
+    rig = crig
+    chase_id = _resting_chase(rig)
+    f = rig.desk.flip("AAAA", row(rig, "AAAA")["send"]["short"])
+    assert not f["ok"] and "stop 42.48 must be above the ask 42.61" in f["error"]
+    assert f["cancel"]["status"] == "CANCELED" and rig.broker.cancelled == [chase_id]
+    assert len(order_of(rig, "AAAA")) == 1
+    e = row(rig, "AAAA")["entry"]
+    assert e["state"] == plan_entries.NONE and "Not sent: stop 42.48 must be above the ask 42.61" in e["text"]

@@ -20,7 +20,9 @@ The rule (the engine's numbers, playbook.json "automatic", start numbers Ash has
 It acts only when: armed; this switch on; no chase yet today for the pick; nothing resting or filled
 on the row; a tape reading taken just before is usable and still past the level; the range is the
 same; Schwab's order list is fresh; the bounds allow one more order. PlanDesk.chase_auto and
-Trader.submit check again at the send.
+Trader.submit check again at the send. A chase refused after Schwab's quote for a passing reason
+(an old quote, the price back inside the level) may try on a later reading, at most
+armed.chase_quote_tries times a pick a day (playbook.json, a start number).
 
 Schwab says no (brief 18 item 5): a 4xx ends the pick for the day with Schwab's text on the row and
 is never retried or answered with another order; a 429 disarms the plan for the day; no answer
@@ -49,10 +51,14 @@ CHASE_SEND_CALLS_WORST = 5
 # "unclear", "working" and "filled" never get a chase.
 FREE = ("none", "ended")
 
-ARM_TEXT = ("Chase (EDGE_TRADER_PLAN_AUTO_CHASE=1): when a pick has already traded at or past its level, "
-            "the plan sends one limit entry at the level plus the cap (0.15 x risk per share, 2 cents to "
-            "0.15% of the price) with the stop attached, at most once per pick a day. Past the cap it rests "
-            "and the plan cancels it after the pullback wait. The limit never moves.")
+# One line of the Arm dialog's "It will" (Registry.arm_texts), shown only when this switch is on.
+ARM_TEXT = ("When a pick has already traded at or past its trigger (EDGE_TRADER_PLAN_AUTO_CHASE=1): send one "
+            "limit entry at the trigger plus the cap (0.15 x risk per share, 2 cents to 0.15% of the price), "
+            "its stop attached, at most once per pick a day. Past the cap it rests, and the plan cancels it "
+            "after the pullback wait. The limit never moves.")
+# The line that replaces Step 6's "Send when the price is already at or past the trigger" in the Arm
+# dialog's "It will not" when this switch is on (executor.AutoPlan.terms).
+ARM_NOT_TEXT = "Chase a pick twice in a day, move a chase's limit, or fill a chase worse than its cap."
 
 
 def _iso(t: Optional[datetime]) -> Optional[str]:
@@ -123,7 +129,8 @@ def on_chase(lane: Lane) -> bool:
              reading_at=_iso(pick.get("fresh_at")) if isinstance(pick.get("fresh_at"), datetime)
              else pick.get("fresh_at"),
              decided_at=_iso(now), inside_cap=inside, pullback_wait_s=wait_s)
-    r = lane.desk.chase_auto(ticker, side.upper(), o, pick=pick, log=lane.log, wait_s=wait_s)
+    r = lane.desk.chase_auto(ticker, side.upper(), o, quote_tries=int(lane.armed_rules.chase_quote_tries),
+                             pick=pick, log=lane.log, wait_s=wait_s)
     if r.get("not_sent"):
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))
@@ -139,4 +146,4 @@ def on_chase(lane: Lane) -> bool:
     return True
 
 
-__all__ = ["on_chase", "ARM_TEXT", "CHASE_SEND_CALLS_WORST", "PAST_TRIGGER"]
+__all__ = ["on_chase", "ARM_TEXT", "ARM_NOT_TEXT", "CHASE_SEND_CALLS_WORST", "PAST_TRIGGER"]

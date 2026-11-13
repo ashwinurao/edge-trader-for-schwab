@@ -34,6 +34,7 @@ class ArmedRules:
     every_seconds: float
     end_grace_seconds: float
     clock_ahead_seconds: float
+    chase_quote_tries: int                 # Step 8 (brief 18): refused chase tries a pick a day after a quote
 
     def bounds(self) -> dict:
         """What the Arm dialog shows and the click confirms."""
@@ -62,12 +63,14 @@ def armed_rules_from(raw: Mapping) -> ArmedRules:
             calls_per_minute=int(_val(a, "calls_per_minute")), calls_per_send=int(_val(a, "calls_per_send")),
             calls_per_cancel=int(_val(a, "calls_per_cancel")), every_seconds=float(_val(a, "every_seconds")),
             end_grace_seconds=float(_val(a, "end_grace_seconds")),
-            clock_ahead_seconds=float(_val(a, "clock_ahead_seconds")))
+            clock_ahead_seconds=float(_val(a, "clock_ahead_seconds")),
+            chase_quote_tries=int(_val(a, "chase_quote_tries")))
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"playbook armed: {type(e).__name__}: {e}") from e
     if not (r.arm_from_et < r.arm_until_et <= r.act_from_et < r.watch_until_et):
         raise ValueError("playbook armed: the times must run arm_from < arm_until <= act_from < watch_until")
-    if min(r.orders_per_pick, r.orders_per_day, r.calls_per_minute, r.calls_per_send, r.calls_per_cancel) < 1 \
+    if min(r.orders_per_pick, r.orders_per_day, r.calls_per_minute, r.calls_per_send, r.calls_per_cancel,
+           r.chase_quote_tries) < 1 \
             or r.every_seconds <= 0 or r.end_grace_seconds <= 0 or r.clock_ahead_seconds <= 0:
         raise ValueError("playbook armed: a number is out of range")
     return r

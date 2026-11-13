@@ -74,13 +74,9 @@ ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
 ORDERS_OLD_CANCEL = ("Schwab's order list is old, so this row can't tell if its entry still rests. "
                      "Use the dashboard or thinkorswim.")
 OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
-# The armed plan's chase (Step 8, brief 18): one per row per day.
+# The armed plan's chase (Step 8, brief 18 "one chase per pick per day"): one per row per day. How
+# often a chase refused after the quote may try again is playbook.json armed.chase_quote_tries.
 CHASES_PER_ROW = 1
-# A chase refused at the send after Schwab's quote was read, for a passing reason (an old quote, the
-# price back inside the level), may try again on a later reading, at most this many times a row a
-# day: a quote that keeps disagreeing with the tape costs at most this many Schwab quote calls.
-# Start number, not approved by Ash (Step 8).
-CHASE_QUOTE_TRIES = 3
 TRADER_BUSY = "Another submission is in progress"      # Trader.submit's own lock: nothing was sent
 
 
@@ -820,7 +816,7 @@ class PlanDesk:
     # ---- the armed plan's capped chase (Step 8, brief 18; companion/plan_auto/chase.py) --------
 
     def _chase_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
-                       blocked: Optional[set], fresh: bool) -> str:
+                       blocked: Optional[set], fresh: bool, quote_tries: int) -> str:
         """Why the plan can't chase this row now, or "" when it can. Like _auto_refusal, except that
         a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once."""
         if rec and rec.get("origin") != "auto":
@@ -836,9 +832,9 @@ class PlanDesk:
             return f"{ticker} already has an entry today (resting or filled)."
         if int(rec.get("chases") or 0) >= CHASES_PER_ROW:
             return f"{ticker} was already chased today (one chase per pick per day)."
-        if self._chase_tries.get(self._key() + ticker, 0) >= CHASE_QUOTE_TRIES:
-            return (f"{ticker}: the chase was refused at the send {CHASE_QUOTE_TRIES} times today "
-                    "(CHASE_QUOTE_TRIES in companion/plan_entries.py). The armed plan leaves it.")
+        if self._chase_tries.get(self._key() + ticker, 0) >= quote_tries:
+            return (f"{ticker}: the chase was refused at the send {quote_tries} times today "
+                    "(armed.chase_quote_tries in playbook.json). The armed plan leaves it.")
         if not self._armed():
             return "ARM is off on the dashboard."
         if not self._market_open():
@@ -854,7 +850,7 @@ class PlanDesk:
             return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
         return ""
 
-    def chase_auto(self, ticker: str, side: str, o: Mapping, pick: Optional[Mapping] = None,
+    def chase_auto(self, ticker: str, side: str, o: Mapping, *, quote_tries: int, pick: Optional[Mapping] = None,
                    view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None,
                    wait_s: Optional[float] = None) -> dict:
         """place_auto's twin for the chase: chase_entry's LIMIT at the cap with its stop attached.
@@ -867,7 +863,7 @@ class PlanDesk:
         Answers Trader.submit's dict, plus `not_sent` when no request left. Then `again` says the
         reason passes (Trader's lock, an old quote, the price back inside the level, an old order
         list): the row is put back exactly as it was and the pick may try on a later reading, at most
-        CHASE_QUOTE_TRIES times after a quote. Otherwise the row keeps "Not sent" and the plan leaves
+        `quote_tries` times after a quote (playbook.json armed.chase_quote_tries). Otherwise the row keeps "Not sent" and the plan leaves
         it. `quoted` says Schwab's quote was read (one call)."""
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
         log = log or (lambda event, **kw: None)
@@ -892,7 +888,7 @@ class PlanDesk:
             prior = json.loads(json.dumps(recs[ticker])) if ticker in recs else None
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why = self._chase_refusal(ticker, rec, entry, orders, blocked, fresh)
+            why = self._chase_refusal(ticker, rec, entry, orders, blocked, fresh, int(quote_tries))
             if why:
                 return self._refuse(ticker, why, not_sent=True, again=why == ORDERS_OLD)
             shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)

@@ -1,8 +1,10 @@
 """The armed plan's capped chase (Step 8, brief 18): companion/plan_auto/chase.py on Step 6's seam,
 against the fake broker of tests/test_trading.py. Nothing here talks to Schwab or Edge Scanner.
 
-The executor is Step 6's (brief 16); these tests stand in a small host (`Host`) for it, with the
-real Lane, registry, PlanDesk, Trader and engine. Hand-worked numbers for AAAA (09:30 bar high
+The executor is Step 6's (brief 16); these tests stand in a small host (`Host`, handlers.LaneHost)
+for it, with the real Lane, registry, PlanDesk, Trader, engine and playbook "armed" numbers, so each
+case can be set up exactly. tests/test_plan_auto_chase_executor.py runs the chase through Step 6's
+real worker (executor.AutoPlan). Hand-worked numbers for AAAA (09:30 bar high
 42.48, low 41.92, risk $100, not calm), as tests/test_plan_entries.py:
 - long: trigger 42.49, stop 41.92, risk per share 0.57; cap = min(0.15 x 0.57 = 0.0855,
   0.15% x 42.49 = 0.0637) = 0.06 (cents, rounded down); limit 42.49 + 0.06 = 42.55;
@@ -23,6 +25,7 @@ from companion import break_entry, plan_entries, trading
 from companion.opening_plan import engine
 from companion.opening_plan import plan as P
 from companion.plan_auto import CHASE_FLAG, chase, handlers
+from companion.plan_auto.arming import armed_rules_from
 from companion.plan_auto.handlers import LEFT_PAST_TRIGGER, PAST_TRIGGER, Lane
 from companion.store import Store
 from companion.trading import Trader
@@ -31,7 +34,10 @@ from test_trading import Resp
 
 ET = P.ET
 NOW = datetime(2026, 11, 13, 9, 31, 10, tzinfo=ET).astimezone(timezone.utc)
-RULES = engine.rules_from(json.loads(plan_entries.PLAYBOOK_FILE.read_text(encoding="utf-8")))
+PB = json.loads(plan_entries.PLAYBOOK_FILE.read_text(encoding="utf-8"))
+RULES = engine.rules_from(PB)
+ARMED = armed_rules_from(PB)               # playbook.json "armed", as Step 6's executor loads it
+SEND = ARMED.calls_per_send
 ENV = {"EDGE_SCANNER_URL": "http://scanner.test:8772", "EDGE_TRADER_BREAK_ENTRY": "1",
        "EDGE_TRADER_PLAN_BUTTONS": "1", "EDGE_TRADER_PLAN_AUTO": "1", "EDGE_TRADER_PLAN_AUTO_CHASE": "1"}
 
@@ -73,7 +79,7 @@ class Host:
     def __init__(self, desk, env):
         self.desk, self.env = desk, env
         self.rules = RULES
-        self.armed_rules = SimpleNamespace(calls_per_send=4, calls_per_cancel=12)
+        self.armed_rules = ARMED
         self.registry = handlers.default_registry()
         self.armed_seq = None               # a list of answers for armed(), then True
         self.disarms, self.logs, self.said, self.left, self.reds = [], [], [], {}, {}
@@ -243,7 +249,10 @@ def test_the_chase_switch_alone_is_off(rig, unset):
 
 def test_switch_on_lists_the_chase_for_the_arm_dialog(rig):
     assert rig.host.registry.kinds(rig.host.env) == ["would_place", "would_cancel", PAST_TRIGGER]
+    assert rig.host.registry.arm_texts(rig.host.env) == [chase.ARM_TEXT]
     assert "once per pick a day" in chase.ARM_TEXT and "never moves" in chase.ARM_TEXT
+    rig.host.env.pop(CHASE_FLAG)
+    assert rig.host.registry.arm_texts(rig.host.env) == []
 
 
 # ---- inside the cap --------------------------------------------------------------------------
@@ -264,7 +273,7 @@ def test_inside_the_cap_sends_one_limit_at_the_cap_with_its_stop(rig):
                          "shares": 1, "cap": "0.06"}
     assert r["sent_at"] == r["wait_from"] == NOW.isoformat(timespec="milliseconds")
     assert r["range"] == {"high": "42.48", "low": "41.92"}
-    assert (rig.host.orders_pick, rig.host.calls) == (0, 36)        # one order, calls_per_send
+    assert (rig.host.orders_pick, rig.host.calls) == (0, 40 - SEND)  # one order, calls_per_send
     assert rig.host.left == {} and rig.host.disarms == []
 
 
@@ -337,7 +346,7 @@ def test_past_the_cap_no_fill_is_cancelled_120_s_after_the_send_and_confirmed(ri
     # The pick is done for the day: no new decision, and the desk refuses a second chase.
     assert rig.host.step(NOW + timedelta(seconds=130), 42.51) == []
     assert rig.host.handle("would_place", tape(42.51)) is False      # kind "chase" on the entry
-    r2 = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"))
+    r2 = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"), quote_tries=3)
     assert r2["not_sent"] and "already chased today" in r2["error"]
     assert len(rig.sent) == 1
 
@@ -396,7 +405,7 @@ def test_not_on_a_row_a_click_used(rig):
     assert rig.host.entry()["state"] == "hand"
     assert rig.host.handle("would_place", tape(42.51, entry=rig.host.entry())) is False
     nothing_sent(rig)
-    r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"))
+    r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"), quote_tries=3)
     assert r["not_sent"] and "a click used this row" in r["error"]
 
 
@@ -404,7 +413,7 @@ def test_not_when_the_row_holds_a_fill(rig):
     rig.host.handle("would_place", tape(42.51))
     entry_order(rig).update(status="FILLED", filledQuantity=1)
     rig.desk.records()                                   # the row follows the poller's list
-    r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"))
+    r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"), quote_tries=3)
     assert r["not_sent"] and ("already has an entry" in r["error"] or "already chased" in r["error"])
     assert len(rig.sent) == 1
 
@@ -505,14 +514,16 @@ def test_the_tape_disagreeing_with_the_plan_row_turns_it_red(rig):
 
 def test_quote_refusals_are_tried_at_most_three_times_a_day(rig):
     rig.quote.update(bid=42.46, ask=42.48)              # Schwab's quote is back under the level
-    for n in range(plan_entries.CHASE_QUOTE_TRIES):
+    tries = ARMED.chase_quote_tries                     # playbook.json armed.chase_quote_tries, start number 3
+    assert tries == 3
+    for n in range(tries):
         assert rig.host.handle("would_place", tape(42.51)) is True
         assert rig.host.left == {} and "back under the level" in rig.host.said[-1][2]
-    assert len(rig.quotes) == 3 and rec(rig) == {}
+    assert len(rig.quotes) == tries and rec(rig) == {}
     rig.host.handle("would_place", tape(42.51))
-    assert len(rig.quotes) == 3                         # no fourth quote: refused at the desk
-    assert "3 times today" in rig.host.left["AAAA"]
-    assert len(rig.sent) == 3 and rig.broker.placed == [] and rig.trader.store.open_tickets() == []
+    assert len(rig.quotes) == tries                     # no fourth quote: refused at the desk
+    assert "3 times today (armed.chase_quote_tries in playbook.json)" in rig.host.left["AAAA"]
+    assert len(rig.sent) == tries and rig.broker.placed == [] and rig.trader.store.open_tickets() == []
 
 
 # ---- after a flip (brief 17) -------------------------------------------------------------------
@@ -570,7 +581,7 @@ def test_no_answer_freezes_the_pick_disarms_and_blocks_the_name(rig):
     assert rec(rig)["state"] == "UNKNOWN"
     assert "AAAA" in rig.trader.status()["blocked_names"]
     rig.broker.fail = None
-    r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"))
+    r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"), quote_tries=3)
     assert r["not_sent"] and len(rig.broker.placed) == 1
 
 
