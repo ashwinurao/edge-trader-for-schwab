@@ -57,7 +57,9 @@ send_answer lines with kind "chase", so the executor's hold of the poller's late
 after a chase sent inside it, never past its latest end (Step 6, 8f6b68c). The wait, wait_over and
 leave lines of a side-rule refusal keep its code and the side (PlanDesk.chase_auto's log_fields,
 left_fields), never plan_side's words, which can name the shares Ash holds by hand; the page keeps the
-words. A side rule that cannot be read is not clear: nothing is sent and the pick waits.
+words. A side rule that cannot be read is not clear: nothing is sent and the pick waits. Schwab's
+words in send_answer's `error` and entry_rejected's `reason` reach the log without any dollar amount
+(AutoPlan.log masks them, Step 7 c6052c6; architect's review 5 of PR #25); the row keeps them.
 """
 from __future__ import annotations
 

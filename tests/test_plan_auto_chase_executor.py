@@ -346,6 +346,28 @@ def test_a_4xx_on_the_chase_leaves_the_pick_and_the_others_go_on(crig):
     assert len(order_of(rig, "AAAA")) == 1
 
 
+def test_a_chases_4xx_with_a_dollar_amount_leaves_none_in_the_days_log(crig):
+    """Architect's review 5 of PR #25 (2026-11-13 23:53 UTC): no balance reaches a log (brief 23).
+    Schwab's 4xx body reaches the chase's send_answer `error`; Step 7's mask in AutoPlan.log
+    (c6052c6) keeps the words without the amount. The page keeps Schwab's words."""
+    rig = crig
+    body = (f"Order rejected: buying power is {WITH_DOLLARS[0]} after a cost of {WITH_DOLLARS[1]} and fees of "
+            f"{WITH_DOLLARS[2]}.")
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.51
+    rig.broker.fail["AAAA"] = lambda order: Resp(400, text=body)
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert len(order_of(rig, "AAAA")) == 1 and "AAAA" in rig.plan.left
+    no_dollar_amount(rig)
+    (answer,) = chase_lines(rig, "send_answer")
+    assert answer["ok"] is False and answer["error"] == (
+        "Schwab rejected the order (HTTP 400): Order rejected: buying power is below zero ($[masked]) after a cost "
+        "of $[masked] and fees of $[masked].")
+    assert rig.plan.left["AAAA"] == "Schwab rejected the chase; not retried"
+    # The page keeps Schwab's words: the row, as a click's own refusal would say them.
+    assert row(rig, "AAAA")["entry"]["text"] == f"Not sent: Schwab rejected the order (HTTP 400): {body}"
+
+
 def test_a_429_on_the_chase_disarms_for_the_day(crig):
     rig = crig
     arm(rig)
@@ -454,7 +476,7 @@ def test_no_chase_after_a_click_cancel(crig):
 # flip finds the short already traded, reads the tape again and hands a new lane, from that reading,
 # to the chase, with the cancelled order's id (cancelled_order_id).
 
-from test_plan_auto_flip import FLIP_ON, all_four_rest, frig  # noqa: E402,F401  (frig: Step 7's fixture)
+from test_plan_auto_flip import FLIP_ON, WITH_DOLLARS, all_four_rest, frig, no_dollar_amount  # noqa: E402,F401
 
 CHASE_SHORT = {"symbol": "AAAA", "side": "SHORT", "entry": "chase", "trigger": "41.91", "cap": "0.06",
                "limit": "41.85", "stop": "42.48", "size_mode": "qty", "qty": 1, "risk": 0, "r": 0, "targets": 0,
@@ -1041,6 +1063,26 @@ def test_any_other_rejection_ends_the_pick_as_before(fcrig):
     assert (r["through"], r["rejected_today"], r["through_today"]) == (False, 1, 0)
     assert "Schwab: Order rejected: account restriction." in row(rig, "AAAA")["entry"]["text"]
     assert rig.plan.armed() and rig.desk.records()["AAAA"]["kind"] == "break"
+
+
+def test_an_entry_rejected_with_a_dollar_amount_leaves_none_in_the_days_log(fcrig):
+    """Review 5 of PR #25: entry_rejected's `reason` is Schwab's statusDescription; the log keeps it
+    without the amount (Step 7's mask, c6052c6). The "already through" match reads the order, not the
+    log: AAAA's other rejection ends the pick (through false), BBBB's through rejection is chased."""
+    rig = fcrig
+    ids = all_four_rest(rig)
+    text = f"Order rejected: buying power is {WITH_DOLLARS[0]}, the order needs {WITH_DOLLARS[1]}."
+    reject(rig, ids["AAAA"], text)
+    reject(rig, ids["BBBB"])
+    rig.tape.prices["AAAA"], rig.tape.prices["BBBB"] = 42.51, THROUGH["BBBB"]
+    run(rig, et(9, 31, 8))
+    no_dollar_amount(rig)
+    got = {x["ticker"]: (x["through"], x["reason"]) for x in rejected_lines(rig)}
+    assert got == {"AAAA": (False, "Order rejected: buying power is below zero ($[masked]), the order needs "
+                                   "$[masked]."),
+                   "BBBB": (True, C.THROUGH_REJECTED)}
+    assert [r["symbol"] for r in rig.sent if r.get("entry") == "chase"] == ["BBBB"]
+    assert f"Schwab: {text}" in row(rig, "AAAA")["entry"]["text"]          # the page keeps Schwab's words
 
 
 def test_a_rejected_chase_ends_the_pick_and_nothing_is_sent_again(fcrig):
