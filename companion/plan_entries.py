@@ -1338,13 +1338,21 @@ class PlanDesk:
                                           "thinkorswim for it today.")
                         return done(stage="recheck", code="disagree", error=text, red=True)
                 if why:
+                    log_text = ""
+                    if code == "other_side":
+                        # The row (the page) shows plan_side's full text; the plan's log carries the code,
+                        # the ticker and the side word, never the user's share count (architect,
+                        # 2026-11-13 21:59 UTC).
+                        log_text = (f"Cancelled the {old.lower()} entry by the armed plan. Did not place the "
+                                    f"{side.lower()}: other_side, you trade {ticker} on the {OTHER[side].lower()} "
+                                    "side by hand.")
                     text = (f"Cancelled by the armed plan, nothing rests: {why}." if code == "disarmed" else
                             f"Cancelled by the armed plan, nothing rests. {why}" if code == "held" else
                             f"Cancelled the {old.lower()} entry by the armed plan; {why}, so nothing rests."
                             if code in ("traded", "busy", "watch", "orders_old", "not_clear") else
                             f"Cancelled the {old.lower()} entry by the armed plan. Did not place the {side.lower()}: {why}")
                     self._put(ticker, state=NONE, order_id=None, text=text)
-                    return done(stage="recheck", code=code, error=text)
+                    return done(stage="recheck", code=code, error=log_text or text)
                 stamp("send_start")
                 self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
                           kind="break", range=dict(rng) if rng else rec.get("range"), sent_at=times["send_start"],

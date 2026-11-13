@@ -668,6 +668,19 @@ def test_an_old_order_list_before_the_cancel_waits_for_the_next_reading(r, kind)
 # and again before the send.
 
 OTHER_SIDE_TAIL = " The plan does not take the other side of a name you trade. Nothing was sent."
+
+
+def other_side_line(theirs):
+    """The plan's line for the other side before the cancel. It is logged, so it carries plan_side's
+    code, the ticker and the side word, never Ash's share count (architect, 2026-11-13 21:59 UTC)."""
+    return (f"other_side: you trade AAAA on the {theirs} side by hand; the plan does not take the other side of a "
+            "name you trade, so the long entry stays")
+
+
+def no_share_count(lines):
+    """No line of the plan's log carries Ash's share count (100 shares by hand in these tests)."""
+    text = json.dumps(lines, default=str)
+    assert "100 AAAA" not in text and "by hand." not in text.replace("side by hand.", "")
 BOTH_SIDES = ("You are on both sides of AAAA (shares or working orders), so the plan cannot tell which side "
               "you trade. Nothing was sent.")
 
@@ -725,7 +738,9 @@ def test_before_the_cancel_your_other_side_keeps_the_entry_and_its_one_cancel(r,
     nothing_at_schwab(r)
     assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.busied == []
     k = kind[len("would_"):]
-    assert r.host.said == [(f"{k}_other_side", what + OTHER_SIDE_TAIL)] * 3   # the executor says it once
+    theirs = "long" if kind == "would_flip" else "short"
+    assert r.host.said == [(f"{k}_other_side", other_side_line(theirs))] * 3   # the executor says it once
+    no_share_count(r.host.said)
     got = rec(r)
     assert (got["state"], got["side"], got["order_id"]) == (plan_entries.SENT, "LONG", oid)
     assert got.get("flips", 0) == 0 and got.get("relevels", 0) == 0
@@ -846,11 +861,16 @@ def test_after_the_cancel_your_other_side_places_nothing_and_leaves_the_pick(r, 
     assert r.broker.cancelled == [oid] and len(r.broker.placed) == 1 and len(r.sent) == 1   # nothing sent
     want = f"Cancelled the long entry by the armed plan. Did not place the {new}: {what}{OTHER_SIDE_TAIL}"
     got = rec(r)
-    assert (got["state"], got["order_id"], got["text"]) == (plan_entries.NONE, None, want)
-    assert r.host.gone == [want] and r.host.disarms == []
+    assert (got["state"], got["order_id"], got["text"]) == (plan_entries.NONE, None, want)   # the page: in full
+    theirs = "long" if new == "short" else "short"
+    logged = (f"Cancelled the long entry by the armed plan. Did not place the {new}: other_side, you trade AAAA on "
+              f"the {theirs} side by hand.")
+    assert r.host.gone == [logged] and r.host.disarms == []
+    no_share_count([r.host.gone, r.host.logs])
     assert r.host.left == left                       # the send's reservation, if made, went back
     (line,) = [f for e, t, f in r.host.logs if e == f"{kind[len('would_'):]}_auto"]
     assert (line["stage"], line["code"], line["cancelled_order_id"]) == ("recheck", "other_side", oid)
+    assert line["error"] == logged and line["side"] == new.upper()
 
 
 @pytest.mark.parametrize("when", ["cancel", "recheck"])
@@ -2477,9 +2497,10 @@ def test_executor_your_other_side_before_the_flip_is_said_once_and_the_entry_sta
     by_hand(frig, {"AAAA": 100})
     run_plan(frig, et(9, 31, 9))
     assert frig.broker.cancelled == [] and len(frig.broker.placed) == 4
-    want = "You are long 100 AAAA by hand." + OTHER_SIDE_TAIL
+    want = other_side_line("long")
     said = [x["text"] for x in plan_lines(frig, "note") if x["ticker"] == "AAAA" and x["code"] == "flip_other_side"]
     assert said == [want] and note(frig) == want
+    no_share_count(plan_lines(frig))
     assert not [x for x in plan_lines(frig) if x["event"] == "flip_auto"]
     assert frig.desk.records()["AAAA"]["state"] == plan_entries.SENT
     assert frig.plan.arming.is_armed(frig.clock.now())

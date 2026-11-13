@@ -746,10 +746,11 @@ stays" (or "re-level is not on") and the entry stays.
   side twice: before the cancel and again just before the send. Same side, or not in the name: it goes,
   beside your shares and orders, and never touches them. Other side, before the cancel: nothing is
   cancelled or written, the entry stays, the plan keeps its one try to cancel that order, and the panel
-  says once "You are long 100 T by hand. The plan does not take the other side of a name you trade.
-  Nothing was sent." Other side after the cancel (you traded during it): nothing is placed and the row
-  says "Cancelled the long entry by the armed plan. Did not place the short: You are long 100 T by
-  hand. ..." Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
+  says once "other_side: you trade T on the long side by hand; the plan does not take the other side of
+  a name you trade, so the long entry stays". Other side after the cancel (you traded during it):
+  nothing is placed and the row says "Cancelled the long entry by the armed plan. Did not place the
+  short: You are long 100 T by hand. ..." The plan's log (`data/opening_plan/auto/`) carries the side
+  rule's code, the name and the side, never your share count; only the row shows the full text. Not clear (both sides, an order that is not a plain buy or sell, the plan's stop gone,
   Schwab's positions old), before the cancel: the entry stays and the next reading decides again. For
   old positions no pick acts on that reading, as for an old order list; for a name that is not clear
   only that pick waits, so the other picks go on. Not clear after the cancel: the same wait as for an old

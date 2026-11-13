@@ -463,8 +463,12 @@ def _swap(lane: Lane, kind: str) -> bool:
         if r.get("code") == "other_side":
             # Brief 25 (architect, 2026-11-13 21:31 UTC): you trade the other side of this name. Nothing
             # was cancelled or written and the order keeps its one automatic cancel; the entry stays and
-            # the pick's line says it once. The next reading decides again.
-            lane.say(f"{kind}_other_side", str(r.get("error") or ""))
+            # the pick's line says it once. The next reading decides again. The line is logged too, so it
+            # carries plan_side's code, the ticker and the side word, never your share count (architect,
+            # 21:59 UTC).
+            lane.say(f"{kind}_other_side", f"other_side: you trade {ticker} on the {OTHER[side]} side by hand; the "
+                                           "plan does not take the other side of a name you trade, so the "
+                                           f"{old_side} entry stays")
             return False
         if r.get("again") and r.get("this_name"):
             # Brief 25: your side on this name is not clear. A wait of this pick only, as Step 6's
