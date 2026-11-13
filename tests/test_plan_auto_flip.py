@@ -1437,6 +1437,8 @@ from test_plan_auto import rig  # noqa: E402,F401  (Step 6's rig fixture)
 from test_plan_auto import run as run_plan  # noqa: E402
 from test_plan_auto import _hold_lock, _spy  # noqa: E402
 
+from test_plan_auto import BAL  # noqa: E402
+from companion.opening_plan import plan as P  # noqa: E402
 from companion.opening_plan import tape as T  # noqa: E402
 from companion.plan_auto import executor as X  # noqa: E402
 
@@ -1739,6 +1741,42 @@ def test_executor_hands_the_chase_a_lane_read_after_the_flips_cancel(frig, monke
     assert note(frig) == ("cancelled by the armed plan; the short trigger has already traded and the chase did "
                           "not go, nothing rests")
     assert [x["why"] for x in plan_lines(frig, "leave") if x["ticker"] == "AAAA"] == [note(frig)]
+
+
+def test_no_balance_reaches_the_log_through_a_flip_a_relevel_and_a_hand_over(frig, monkeypatch):
+    """Step 6's rule since main 9f15270 (#30): Step 2's view carries buying power in dollars, and no
+    line the armed plan logs holds one of those numbers. The flip, the re-level and the chase's lane
+    get the view in memory only."""
+    def with_balances():
+        v = frig.view()
+        v["buying_power"] = P.buying_power({"balances": BAL, "ok_at": frig.clock.now()}, frig.clock.now())
+        return v
+    frig.plan._view = frig.plan._row_view = with_balances
+    handed = []
+    use_chase(frig.plan.registry, lambda ln: handed.append(ln.view) or False)
+    ids = aaaa_past_its_flip_line(frig)
+    run_plan(frig, et(9, 31, 6))                       # AAAA flips to the short
+    frig.tape.ranges["CCCC"] = (71.96, 71.20)          # CCCC's 09:30 bar: high 12 cents up
+    frig.view.bars["CCCC"] = (71.96, 71.20, 71.70)
+    run_plan(frig, et(9, 31, 9))                       # CCCC re-levels
+    real_cancel = frig.trader.cancel_entry
+
+    def cancel_then_run(oid):
+        got = real_cancel(oid)
+        frig.tape.prices["AAAA"] = 42.50               # through the long trigger 42.49 during the cancel
+        return got
+    monkeypatch.setattr(frig.trader, "cancel_entry", cancel_then_run)
+    frig.tape.prices["AAAA"] = 42.30                   # back past the short's flip line
+    frig.view.bars["AAAA"] = (42.48, 41.92, 42.30)
+    run_plan(frig, et(9, 31, 12))                      # AAAA flips back: the long trigger traded
+    events = [(x["event"], x["ticker"]) for x in plan_lines(frig)]
+    assert ("flip_auto", "AAAA") in events and ("relevel_auto", "CCCC") in events
+    assert ids["AAAA"] in frig.broker.cancelled and ids["CCCC"] in frig.broker.cancelled
+    assert len(handed) == 1 and handed[0]["buying_power"]["equity"] == 81234.57
+    text = (frig.tmp / "auto" / "2026-11-13.jsonl").read_text()
+    for n in BAL.values():
+        for form in (f"{n}", f"{n:.1f}", f"{n:.0f}", f"{int(n)}", f"{n:,.2f}", f"{n:,.0f}"):
+            assert form not in text
 
 
 # ---------------------------------------------------------------- the fast watch ends during the cancel

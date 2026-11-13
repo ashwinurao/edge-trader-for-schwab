@@ -540,8 +540,16 @@ stays" (or "re-level is not on") and the entry stays.
 - **After the cancel, one entry to place.** When the new tape reading is unusable or its price stale,
   the plan reads again a tick (`armed.every_seconds`, 0.25 s) later, for at most
   `armed.swap_recheck_seconds` (1.5 s, a start number Ash has not approved), then gives up with nothing
-  resting and says how long it looked. Any other answer (disarmed, the range changed or disputed, the
-  new trigger traded, a bound, a click) ends at once.
+  resting and says how long it looked. Any other answer (disarmed, the fast watch over, the range
+  changed or disputed, the new trigger traded, a bound, a click) ends at once.
+- **The fast watch ends during the cancel.** The plan decides only before 09:35:00 ET, but a flip or
+  re-level that starts just before it confirms its cancel later (about 1.45 s, up to 7.3 s). Every look
+  after the cancel first checks the desk's clock: at or past the watch end
+  (`armed.watch_until_et`), nothing is placed, nothing goes to the chase, and the plan leaves the pick.
+  The row says "Cancelled the long entry by the armed plan; the fast watch ended during the cancel, so
+  nothing rests."
+- While a flip or re-level runs, the plan does nothing for the other picks: another pick's entry, or
+  its 09:35 cancel, waits until the flip ends (about 2.25 s at 0.4 s a Schwab call, up to 7.3 s).
 - **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
   from the range the entry was built on, while the entry rests unfilled and its trigger has not
   traded. The plan cancels the entry the same way and places the same side from the new range, at most
@@ -570,7 +578,11 @@ stays" (or "re-level is not on") and the entry stays.
 - When the cancel is not confirmed, or Schwab answers 429, nothing new is placed, the row turns red and
   the plan disarms (for the day on a 429). A fill during the cancel turns the row red, and the plan
   leaves that pick. When the plan was disarmed between the cancel and the place, or the other side's
-  trigger has already traded, nothing is placed and the row says nothing rests. No answer to the new
+  trigger has already traded, nothing is placed and the row says nothing rests. In the second case,
+  with Step 8's chase switch on (`EDGE_TRADER_PLAN_AUTO_CHASE=1`), the chase may take the pick: it gets
+  a new tape reading taken after the cancel and the id of the cancelled order, the one order it may
+  ignore on the name. When that reading is unusable, or the chase does not go, the plan leaves the
+  pick and its panel line says nothing rests. No answer to the new
   entry blocks the name, as for any unclear order, and disarms the plan. A 4xx is never retried.
 - The armed plan's log has one line per flip or re-level with its times: the reading, the decision,
   the cancel's start, answer and confirmation, and the new entry's send and Schwab's answer.

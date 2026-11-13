@@ -40,6 +40,12 @@ flip waits for the lock a tick (armed.every_seconds) at a time, the row and the 
 and when the lock is free the recheck and the desk's checks run again before the send. It stops
 waiting when the plan is disarmed or the fast watch ends; nothing rests then.
 
+The fast watch's end (architect's review 1 of Step 7, 2026-11-13 17:14 UTC, must 2): the executor
+filters decisions at the start of a step only, and the plan stays armed for
+armed.end_grace_seconds after the watch end so the 09:35 cancels can run. So each look after the
+cancel first checks the desk's clock: at or past armed.watch_until_et it places nothing and hands
+nothing to the chase (code "watch"), and the pick is left.
+
 When unsure, stop acting (brief 14 rule 3): an unclear cancel or a 429 turns the row red and
 disarms (a 429 for the day); a fill during the cancel turns the row red and the plan leaves the
 pick (any fill ends flips); no answer to the place freezes the pick and disarms; a 4xx is never
