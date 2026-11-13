@@ -31,6 +31,10 @@ What a Lane gives a handler (names fixed with Step 7's thread, 2026-11-13):
 - disarm(reason, for_day=False): the whole plan disarms; for_day stops a new Arm today (a 429).
 - delegate(kind) -> None when no handler for `kind` is on, else that handler's answer.
 - once(key) -> True the first time this key is seen today (one automatic cancel per order id).
+- busy(what): Trader's order lock was busy (a desk answer with `busy`: a click, a ticket send or
+  Flat all holds it), so nothing reached Schwab. Not an action: return True after it; the executor
+  ends the step, tries no other pick on that reading and waits one tick (architect's review 1,
+  2026-11-13 16:45 UTC). Said once per pick while it lasts.
 
 The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces brief 16's counts):
 - A send counts its worst case, armed.calls_per_send = 5 (architect, 2026-11-13 16:02 UTC). The
@@ -137,6 +141,7 @@ class LaneHost(Protocol):
     def disarm(self, reason: str, for_day: bool = False) -> None: ...
     def once(self, key: str) -> bool: ...
     def forget(self, key: str) -> None: ...
+    def busy(self, ticker: str, what: str) -> None: ...
 
 
 class Lane:
@@ -192,6 +197,9 @@ class Lane:
 
     def once(self, key: str) -> bool:
         return self.host.once(key)
+
+    def busy(self, what: str) -> None:
+        self.host.busy(self.ticker, what)
 
     def delegate(self, kind: str) -> Optional[bool]:
         h = self.host.registry.get(kind, self.host.env)
@@ -255,9 +263,11 @@ def on_place(lane: Lane) -> bool:
     r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log)
     if r.get("not_sent"):
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
-        # Schwab, so the order and calls go back. The desk said whether the pick may try again.
+        # Schwab, so the order and calls go back.
         lane.refund(orders=1, calls=calls)
-        if not r.get("again"):
+        if r.get("busy") or r.get("again"):
+            lane.busy("send")                   # the step ends; the pick tries one tick later
+        else:
             lane.leave(f"not sent: {r.get('error')}")
         return True
     outcome(lane, r, "send")
@@ -278,9 +288,15 @@ def on_cancel(lane: Lane) -> bool:
     if not lane.once(key):
         return False                           # tried once already: never repeated
     r = lane.desk.cancel_auto(lane.ticker, str(lane.decision.get("why") or ""), log=lane.log)
-    if r.get("not_sent"):
+    if r.get("not_sent") and r.get("busy"):
         lane.host.forget(key)                  # Trader's lock was busy: nothing reached Schwab
+        lane.busy("cancel")                    # the step ends; the cancel tries one tick later
         return True
+    if r.get("not_sent"):
+        # The desk found no resting plan entry on the row (a click took it, or the record moved):
+        # nothing reached Schwab. The attempt for this order id is used; the plan leaves the pick.
+        lane.leave(f"not cancelled: {r.get('error')}")
+        return False
     if r.get("ok"):
         return True
     if "HTTP 429" in str(r.get("error") or "") or r.get("status") == "RATE_LIMITED":
