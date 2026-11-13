@@ -1256,3 +1256,31 @@ def test_a_click_clears_the_flips_row_line_and_the_relevel_count(r):
     got = rec(r)
     assert got["origin"] == "click" and got["flips"] == 1                   # the click's counter stays
     assert not {"relevels", "auto_note", "auto_note_for"} & set(got)
+
+
+@pytest.mark.parametrize("kind,last,high", [("would_flip", 42.10, 42.48), ("would_relevel", 42.40, 42.60)])
+def test_no_flip_or_relevel_while_the_0930_bar_is_disputed(r, kind, last, high):
+    # Brief 15 review 1: the snapshot's 09:30 bar changed by more than a cent; nothing moves until
+    # the bars request settles it. The decision came from an earlier reading; the new one is disputed.
+    place_long(r)
+    if kind == "would_relevel":
+        new_bar(r)
+    disputed = {**tape_pick(last, high=high), "range_disputed": {"old": {}, "new": {}}}
+    assert run(r, kind, last=last, high=high, tape=[(disputed, True, "")]) is False
+    assert [c for c in r.broker.calls if c[0] not in ("armed", "reread")] == [] and r.broker.cancelled == []
+    assert r.host.said[-1][0] == ("flip_wait" if kind == "would_flip" else "relevel_wait")
+    assert "disputed" in r.host.said[-1][1]
+
+
+def test_the_send_half_uses_the_steps_own_step_2_view(r, monkeypatch):
+    # Step 6 (architect's review 16:21 UTC): the executor reads Step 2's view before the tape, and
+    # the send half checks the row against it, so no Edge Scanner GET falls between them.
+    place_long(r)
+    view = r.desk._view()
+    reads = []
+    monkeypatch.setattr(r.desk, "_view", lambda: reads.append(1) or view)
+    ln = lane(r)
+    ln.view = view
+    r.host.tape = [(tape_pick(42.10), True, "")]
+    assert flip.on_flip(ln) is True
+    assert reads == [] and rec(r)["side"] == "SHORT"

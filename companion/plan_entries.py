@@ -897,7 +897,8 @@ class PlanDesk:
                   rng: Optional[Mapping] = None,
                   recheck: Callable[[], tuple[str, str]] = lambda: ("", ""),
                   may_cancel: Callable[[int], bool] = lambda order_id: True,
-                  log: Optional[Callable[..., None]] = None, times: Optional[dict] = None) -> dict:
+                  log: Optional[Callable[..., None]] = None, times: Optional[dict] = None,
+                  view: Optional[Mapping] = None) -> dict:
         """Flip's twin for the armed plan (Step 7, brief 17 item 2), and the re-level (item 4).
 
         kind "flip" cancels the row's resting entry and places the other side; "relevel" places
@@ -912,7 +913,8 @@ class PlanDesk:
         CANCELED with nothing filled. Only then `recheck()` runs, with no lock held (it may read the
         tape and reserve the send's bounds): ("", "") to go on, or (why, code) with code
         "disarmed", "traded" or another word. Then the click's checks run again on a fresh order
-        list, Step 2's final row must agree with the tape (as place_auto), and Trader.submit sends.
+        list, Step 2's final row (`view`, else read here) must agree with the tape (as place_auto), and
+        Trader.submit sends.
 
         Returns {"ok", "ticker", "side", "kind", "stage", "code", "error", "red", "unclear",
         "throttled", "filled", "again", "cancel_not_sent", "not_sent", "cancel", "send", "times"}.
@@ -1014,10 +1016,15 @@ class PlanDesk:
         stamp("recheck_done")
         orders = self._orders()
         fresh = self._orders_fresh()
-        try:
-            view = self._view() if not why else None   # may ask Edge Scanner: no lock held
-        except Exception:
+        if why:
             view = None
+        elif view is None:
+            try:
+                view = self._view()                   # may ask Edge Scanner: no lock held
+            except Exception:
+                view = None
+        # else Step 2's view the executor read at the start of the step, before the tape (Step 6,
+        # architect's review 16:21 UTC): no Edge Scanner GET between the reading and the send.
         with self._lock:
             now_rec = self._load().get(ticker) or {}
             if now_rec.get("origin") != "auto" or now_rec.get("state") != FLIPPING:

@@ -160,6 +160,9 @@ def _why_not(kind: str, entry: Mapping, pick: Optional[Mapping], usable: bool, w
     stale = _stale(pick, lane.rules)
     if stale:
         return f"no {what}: {stale}", None
+    if pick.get("range_disputed"):
+        # Brief 15 review 1: the snapshot's 09:30 bar changed; nothing moves until the bars request settles it.
+        return f"no {what}: the 09:30 bar is disputed until the bars request answers", None
     rng = _range(pick)
     if rng is None:
         return f"no {what}: no final 09:30 range on the tape", None
@@ -237,6 +240,8 @@ def _swap(lane: Lane, kind: str) -> bool:
         stale = _stale(p2, lane.rules)
         if stale:
             return stale, "stale"
+        if p2.get("range_disputed"):
+            return "the 09:30 bar is disputed", "range"
         o2 = lane.host.order_for(ticker, p2, side)
         if o2 is None or abs(o2["trigger"] - o["trigger"]) > CENT or abs(o2["stop"] - o["stop"]) > CENT:
             return "the range changed during the cancel", "range"
@@ -258,7 +263,7 @@ def _swap(lane: Lane, kind: str) -> bool:
     r = lane.desk.flip_auto(
         ticker, side.upper(), o, kind=kind, limit=limit, rng=rng, recheck=recheck, may_cancel=may_cancel,
         log=lane.log, times={"reading": _iso((lane.pick or {}).get("received") or lane.reading.get("received")),
-                             "decision": _iso(decided)})
+                             "decision": _iso(decided)}, view=getattr(lane, "view", None))
     stage = r.get("stage")
     if spent["send"] and (stage == "recheck" or r.get("not_sent")):
         lane.refund(orders=1, calls=calls)        # reserved, then refused before any request left

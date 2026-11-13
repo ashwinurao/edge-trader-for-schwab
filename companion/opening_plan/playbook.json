@@ -158,8 +158,8 @@
       "note": "start number, not approved by Ash; how often the armed plan reads the open tape (brief 15 tape.every_seconds)"
     },
     "end_grace_seconds": {
-      "value": 20,
-      "note": "start number, not approved by Ash; the watch-end cancels run from watch_until_et until this much later, then the arm ends"
+      "value": 45,
+      "note": "start number, not approved by Ash; a backstop: the watch-end cancels run from watch_until_et until this much later, then the arm ends. Sized from the worst case (architect's review, 2026-11-13 16:21 UTC): one confirmed cancel is up to about 6.7 s (a read, the cancel and ten read-backs 0.25 s apart at 0.35 s a call), so four take up to about 27 s"
     },
     "clock_ahead_seconds": {
       "value": 0.25,

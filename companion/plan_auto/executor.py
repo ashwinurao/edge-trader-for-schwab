@@ -50,6 +50,9 @@ log = logging.getLogger("companion.plan_auto")
 
 OUT_DIR = Path("data/opening_plan/auto")
 PLAYBOOK_FILE = Path(__file__).resolve().parent.parent / "opening_plan" / "playbook.json"
+# Only for a tape pick that is not a dict (the tape's own picks are dicts: tape.py reading_from).
+KNOWN_KEYS = ("rank", "last", "last_at", "fresh_at", "bid", "ask", "quote_at", "high", "low", "final", "from",
+              "range_changed", "range_disputed")
 IDLE_SECONDS = 1.0                 # the longest sleep while not armed (an Arm click wakes it)
 ACTION_KINDS = ("would_place", "would_cancel", "would_flip", "would_relevel")
 NOT_ON = {"would_flip": "flip is not on: the entry stays",
@@ -214,7 +217,13 @@ class AutoPlan:
             self.orders_pick[ticker] -= orders
             self.orders_day -= orders
             if calls:
-                self.sends.append((self._mono(), -calls))
+                # Remove the reservation itself (the newest entry of that size): a negative entry
+                # could leave the 60 s window before the reservation and undercount for a moment
+                # (architect's review, 2026-11-13 16:21 UTC).
+                for i in range(len(self.sends) - 1, -1, -1):
+                    if self.sends[i][1] == calls:
+                        del self.sends[i]
+                        break
 
     def order_for(self, ticker: str, pick: Mapping, side: str) -> Optional[dict]:
         high, low = _dec(pick.get("high")), _dec(pick.get("low"))
@@ -322,10 +331,12 @@ class AutoPlan:
                 sym = str(_get(p, "symbol") or _get(p, "ticker") or "").upper()
                 if not sym:
                     continue
+                # The whole pick, not a fixed list of keys: a list dropped brief 15's range_disputed
+                # (architect, 2026-11-13 16:25 UTC), and the engine then saw "no range yet".
+                kp = dict(p) if isinstance(p, Mapping) else {k: _get(p, k) for k in KNOWN_KEYS}
+                kp.pop("entry", None)
                 with self._lock:
-                    self.known[sym] = {k: _get(p, k) for k in ("rank", "last", "last_at", "fresh_at", "bid", "ask",
-                                                               "quote_at", "high", "low", "final", "from",
-                                                               "range_changed")}
+                    self.known[sym] = kp
         recs = self.desk.records()
         orders = self._orders()
         picks = []
@@ -419,6 +430,9 @@ class AutoPlan:
         day = now.astimezone(ET).date()
         if now < datetime.combine(day, self.armed_rules.act_from_et, tzinfo=ET):
             return False
+        # Step 2's view first, then the tape: a view read can wait on an Edge Scanner GET, and it
+        # must never fall between the reading and the send (architect's review, 2026-11-13 16:21 UTC).
+        view = self._safe_view()
         reading, ok, why = self._read(now)
         if not ok:
             self.say("*", "tape", f"no price-based action: {why}")
@@ -433,6 +447,11 @@ class AutoPlan:
         self._note_decisions(decisions, er)
         picks = {p["symbol"]: p for p in er["picks"]}
         acts = [d for d in decisions if d.get("kind") in ACTION_KINDS and d.get("symbol") in picks]
+        watch_over = now >= self.arming.watch_end(day)
+        if watch_over:
+            # After the watch end only cancels run, whatever a later step registers: no send, flip,
+            # re-level or chase (architect's review, 2026-11-13 16:21 UTC).
+            acts = [d for d in acts if d.get("kind") == "would_cancel"]
         acts.sort(key=lambda d: self._distance(d, picks[d["symbol"]]))
         for d in acts:
             sym = d["symbol"]
@@ -445,9 +464,9 @@ class AutoPlan:
                 continue
             if not self.armed():
                 return False
-            if h(Lane(self, d, picks[sym], er)):
+            if h(Lane(self, d, picks[sym], er, view=view)):
                 return True
-        if now >= self.arming.watch_end(day):
+        if watch_over:
             self.disarm(f"the fast watch ended at {self.armed_rules.watch_until_et:%H:%M} ET")
         return False
 
@@ -576,8 +595,11 @@ class AutoPlan:
                           "note": n.get("note") or "", "left": left.get(t, "")} for t, n in sorted(notes.items()) if t != "*"],
                "tape_note": (notes.get("*") or {}).get("note") or "",
                "resting": sorted(resting),
-               "resting_text": (f"{len(resting)} plan entr{'y' if len(resting) == 1 else 'ies'} still rest at Schwab "
-                                f"({', '.join(resting)}). The armed plan does nothing more: each row's Cancel works."
+               # Architect's review, 2026-11-13 16:21 UTC: after any disarm the plan cancels nothing,
+               # also not at 09:35, so the page says it in red and names the remedy.
+               "resting_text": (f"{len(resting)} plan entr{'y still rests' if len(resting) == 1 else 'ies still rest'} "
+                                f"at Schwab ({', '.join(sorted(resting))}). The armed plan is disarmed and cancels nothing, "
+                                "also not at 09:35. Cancel each with its row's Cancel (or Flat all, when it is on)."
                                 if resting and not armed else "")}
         if check and self.demo:
             out["refusals"] = ["Demo mode: no orders and no Schwab calls."]

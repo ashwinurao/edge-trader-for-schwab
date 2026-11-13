@@ -75,6 +75,7 @@ class Tape:
         self.prices = {s: v[3] for s, v in PICKS.items()}
         self.ranges = {s: (v[1], v[2]) for s, v in PICKS.items()}
         self.problem, self.snap_lag, self.feed_age, self.data_lag = "", 0.05, 0.1, 0.05
+        self.disputed = {}                 # symbol -> brief 15's range_disputed list (high and low None)
 
     def read(self):
         now = self.clock.now()
@@ -84,12 +85,13 @@ class Tape:
         at = now - timedelta(seconds=self.data_lag)
         picks = []
         for sym, (rank, *_rest) in PICKS.items():
-            hl = self.ranges[sym]
+            hl = None if sym in self.disputed else self.ranges[sym]
             p = self.prices[sym]
             picks.append({"symbol": sym, "rank": rank, "last": p, "last_at": at, "fresh_at": at,
                           "bid": round(p - 0.01, 2), "ask": round(p + 0.01, 2), "quote_at": at,
                           "high": hl and hl[0], "low": hl and hl[1], "final": hl is not None,
-                          "from": "snapshot minute bar" if hl else None, "range_seen": None, "range_changed": None})
+                          "from": "snapshot minute bar" if hl else None, "range_seen": None, "range_changed": None,
+                          "range_disputed": self.disputed.get(sym)})
         return {"received": now, "read_at": now, "problem": "", "seq": self.reads, "day": "2026-11-13",
                 "state": {"code": "recording", "why": ""}, "tape_now": now,
                 "snapshot_at": now - timedelta(seconds=self.snap_lag), "tape_age_s": self.snap_lag,
@@ -123,6 +125,7 @@ class Broker(PlanBroker):
         self.clock, self.delay, self.locks, self.at = clock, 0.0, [], []
         self.after_place = None
         self.fail = {}                     # symbol -> callable(order) -> Resp, or an exception to raise
+        self.slow_cancel, self._slow = {}, set()   # order id -> read-backs that still say PENDING_CANCEL
 
     def _wire(self):
         for lk in self.locks:
@@ -147,10 +150,20 @@ class Broker(PlanBroker):
 
     def cancel_order(self, h, oid):
         self._wire()
-        return super().cancel_order(h, oid)
+        r = super().cancel_order(h, oid)
+        if oid in self.slow_cancel:
+            self._find(oid)["status"] = "PENDING_CANCEL"
+            self._slow.add(oid)
+        return r
 
     def order_details(self, h, oid):
         self._wire()
+        if oid in self._slow:
+            if self.slow_cancel[oid] <= 0:
+                self._find(oid)["status"] = "CANCELED"
+                self._slow.discard(oid)
+            else:
+                self.slow_cancel[oid] -= 1
         return super().order_details(h, oid)
 
 
@@ -392,9 +405,9 @@ def test_a_restart_is_not_armed(rig):
 
 def test_the_arm_ends_after_the_watch(rig):
     arm(rig)
-    assert rig.plan.arming.is_armed(et(9, 35, 19.9))
-    assert not rig.plan.arming.is_armed(et(9, 35, 20))
-    rig.clock.t = et(9, 35, 21)
+    assert rig.plan.arming.is_armed(et(9, 35, 44.9))         # end_grace_seconds 45, a backstop
+    assert not rig.plan.arming.is_armed(et(9, 35, 45))
+    rig.clock.t = et(9, 35, 46)
     assert not rig.plan.safe_step()
     assert "the end of the fast watch passed" in rig.plan.panel()["disarmed"]["why"]
 
@@ -583,6 +596,75 @@ def test_timeline_at_0_4_s_a_call(rig):
     assert start["DDDD"] == "2026-11-13T14:31:00.100Z" and answer["DDDD"] == "2026-11-13T14:31:00.900Z"
 
 
+def test_steps_read_the_plan_view_before_the_tape_never_between_reading_and_send(rig):
+    """Architect's review, 2026-11-13 16:21 UTC: Step 2's view can wait on an Edge Scanner GET, so
+    it is read at the start of the step, before the tape, and handed to place_auto."""
+    events = []
+    view, tape = rig.view, rig.tape
+
+    def timed_view():
+        events.append(("view", rig.clock.now()))
+        return view()
+
+    class TimedTape:
+        def read(self):
+            events.append(("tape", rig.clock.now()))
+            return tape.read()
+    rig.plan._view, rig.desk._view, rig.plan.tape = timed_view, timed_view, TimedTape()
+    real_place = rig.broker.place_order
+
+    def place(h, order):
+        events.append(("place", rig.clock.now()))
+        return real_place(h, order)
+    rig.broker.place_order = place
+    arm(rig)
+    events.clear()
+    rig.broker.delay = 0.4
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    kinds = [k for k, _ in events]
+    for i, k in enumerate(kinds):
+        if k == "place":
+            last_tape = max(j for j in range(i) if kinds[j] == "tape")
+            assert "view" not in kinds[last_tape:i], kinds        # no view read between reading and send
+            assert kinds[last_tape - 1] == "view"                  # the step's view came just before
+
+
+def test_refund_removes_the_reservation(rig):
+    """Architect's review, 2026-11-13 16:21 UTC: a refund used to add a negative entry, which could
+    leave the 60 s window before the reservation and undercount for a moment."""
+    arm(rig)
+    rig.clock.t = et(9, 31, 0)
+    assert rig.plan.spend("AAAA", orders=1, calls=5) == ""
+    rig.clock.advance(1)
+    assert rig.plan.spend("BBBB", orders=1, calls=5) == ""
+    rig.plan.refund("BBBB", orders=1, calls=5)
+    assert [n for _, n in rig.plan.sends] == [5]
+    rig.clock.advance(59.5)                              # AAAA's reservation leaves the window
+    assert rig.plan._calls_used() == 0 and list(rig.plan.sends) == []
+
+
+def test_a_quote_older_than_5_s_leaves_the_pick_for_the_day(rig, monkeypatch):
+    """break_entry.prepare refuses a Schwab quote older than MAX_QUOTE_AGE_MS (5 s, R-03) before any
+    order request. The plan does not try again: that pick is left (2026-11-13 11:00 ET probe: the
+    quote was up to 3.6 s old on COIN and 7.2 s on CRWD)."""
+    arm(rig)
+    real_quote = rig.trader.quote
+
+    def quote(sym, max_age=1.0):
+        q = real_quote(sym, max_age)
+        if sym == "DDDD":
+            q = {**q, "quote_time": _time.time() * 1000 - 6000}
+        return q
+    monkeypatch.setattr(rig.trader, "quote", quote)
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert placed(rig) == ["AAAA", "BBBB", "CCCC"]
+    assert "quote is 6.0 s old" in rig.plan.left["DDDD"]
+    assert rig.plan.orders_pick["DDDD"] == 0 and rig.plan.arming.is_armed(rig.clock.now())
+    rec = rig.desk.records()["DDDD"]
+    assert rec["state"] == plan_entries.NONE and rec["order_id"] is None and "Not sent" in rec["text"]
+
+
 # ---------------------------------------------------------------- Schwab says no
 
 def test_a_4xx_is_not_retried_and_the_other_picks_go_on(rig):
@@ -670,6 +752,68 @@ def test_no_pullback_in_the_wait_cancels_that_entry_before_the_watch_end(rig):
     assert rig.broker.cancelled == [oid] and len(rig.broker.placed) == 4    # no resend
 
 
+def test_four_slow_cancels_at_the_watch_end_each_get_their_attempt(rig):
+    """Architect's review, 2026-11-13 16:21 UTC: at 0.35 s a call a cancel Schwab confirms only on
+    its ninth read-back takes about 6.1 s, so four take about 24 s, past the old 20 s grace. Each
+    gets its one attempt before the arm ends (end_grace_seconds 45, a backstop)."""
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.broker.delay = 0.35
+    for oid in ids(rig).values():
+        rig.broker.slow_cancel[oid] = 8                  # PENDING_CANCEL for 8 read-backs, then CANCELED
+    run(rig, et(9, 36, 0), start=et(9, 35, 0))
+    answers = lines(rig, "cancel_answer")
+    assert [x["ticker"] for x in answers] == ["DDDD", "AAAA", "BBBB", "CCCC"] and all(x["ok"] for x in answers)
+    assert (rig.clock.now() - et(9, 35)).total_seconds() > 20                 # the old grace would have cut CCCC
+    p = rig.plan.panel()
+    assert "fast watch ended" in p["disarmed"]["why"] and p["resting"] == []
+
+
+def test_no_send_after_the_watch_end(rig, monkeypatch):
+    """Only cancels run after the watch end, whatever the engine or a later step says."""
+    arm(rig)
+    real = engine.decide
+
+    def late(state, reading, rules):
+        st, out = real(state, reading, rules)
+        return st, out + [{"kind": "would_place", "symbol": "AAAA", "side": "long", "why": "late"}]
+    monkeypatch.setattr(X.engine, "decide", late)
+    run(rig, et(9, 35, 30), start=et(9, 35, 0))
+    assert rig.broker.placed == []
+
+
+DISPUTE = [{"high": 42.48, "low": 41.92, "from": "snapshot minute bar", "seen": "2026-11-13T14:31:00.100Z"},
+           {"high": 42.61, "low": 41.92, "from": "snapshot minute bar", "seen": "2026-11-13T14:31:00.600Z"}]
+
+
+def test_a_disputed_range_sends_nothing_for_that_pick(rig):
+    """Brief 15 (open tape b518b05): the snapshot's 09:30 bar versions disagree by more than a cent
+    and no bars bar has come: high and low None, not final. The armed plan sends nothing for it."""
+    arm(rig)
+    rig.tape.disputed["AAAA"] = DISPUTE
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC"]
+    assert rig.plan.known["AAAA"]["range_disputed"] == DISPUTE      # the executor keeps the tape's key
+    d = [x for x in lines(rig, "decision") if x["ticker"] == "AAAA"]
+    assert d and d[-1]["kind"] == "no_action" and d[-1]["code"] == engine.RANGE_DISPUTED
+    rig.tape.disputed.clear()                                          # the bars bar settles it
+    run(rig, et(9, 31, 5))
+    assert placed(rig) == ["DDDD", "BBBB", "CCCC", "AAAA"]
+
+
+def test_a_working_entry_waits_while_its_range_is_disputed_and_the_watch_end_still_cancels(rig):
+    arm(rig)
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    rig.tape.disputed["AAAA"] = DISPUTE
+    rig.tape.prices["AAAA"] = 42.10                    # past AAAA's flip line 42.144: no flip while disputed
+    run(rig, et(9, 32))
+    assert not [x for x in lines(rig, "note") if x["ticker"] == "AAAA" and x["code"] == "off:would_flip"]
+    assert not [x for x in lines(rig, "decision") if x["ticker"] == "AAAA" and x["kind"] == "would_flip"]
+    oid = ids(rig)["AAAA"]
+    run(rig, et(9, 35, 10), start=et(9, 35, 0))
+    assert oid in rig.broker.cancelled                 # the time-based cancel still runs
+
+
 def test_a_filled_entry_is_left_alone(rig):
     arm(rig)
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
@@ -702,7 +846,9 @@ def test_after_a_disarm_nothing_is_cancelled_and_the_page_says_so(rig):
     assert rig.broker.cancelled == []
     p = rig.plan.panel()
     assert p["resting"] == ["AAAA", "BBBB", "CCCC", "DDDD"]
-    assert "4 plan entries still rest at Schwab" in p["resting_text"] and "Cancel works" in p["resting_text"]
+    assert p["resting_text"] == ("4 plan entries still rest at Schwab (AAAA, BBBB, CCCC, DDDD). The armed plan is "
+                                 "disarmed and cancels nothing, also not at 09:35. Cancel each with its row's "
+                                 "Cancel (or Flat all, when it is on).")
 
 
 def test_the_cancel_is_tried_once_per_order(rig):
