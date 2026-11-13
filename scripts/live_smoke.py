@@ -1236,12 +1236,15 @@ def sc_pick_ticket(r: Run) -> None:
     cur = row or r.row_of(r.entries(), t) or {}
     r.check(f"{t}: the plan row's Place buttons are off while a ticket entry works on the name", bool(row),
             waited_s=round(waited, 1), row=r.row_brief(cur))
-    sides = r.sides_now(cur, r.quote(t))
-    s2 = next((s for s in ("LONG", "SHORT") if sides[s].get("ok")), side)
-    n = (cur.get("send") or {}).get(s2.lower())
-    exp = None if not isinstance(n, dict) else {k: n.get(k) for k in ("trigger", "stop", "shares")}
-    ans2, _ = r.place(t, s2, exp, "plan Place while a ticket entry works on the name")
-    refused(r, f"{t}: plan Place is refused while a ticket entry works on the name", ans2, "already at Schwab")
+    if row:                                      # clicked only when the row itself says it will refuse
+        sides = r.sides_now(cur, r.quote(t))
+        s2 = next((s for s in ("LONG", "SHORT") if sides[s].get("ok")), side)
+        n = (cur.get("send") or {}).get(s2.lower())
+        exp = None if not isinstance(n, dict) else {k: n.get(k) for k in ("trigger", "stop", "shares")}
+        ans2, _ = r.place(t, s2, exp, "plan Place while a ticket entry works on the name")
+        refused(r, f"{t}: plan Place is refused while a ticket entry works on the name", ans2, "already at Schwab")
+    else:
+        r.note("PLAN_PLACE_NOT_CLICKED", why="the row does not say it refuses: a click could place a second entry")
     f, items, mine = flat_mine()
     r.check(f"{t}: Flat all's list does nothing with the ticket's resting entry",
             len(mine) == 1 and mine[0]["action"] == "nothing" and mine[0]["order_id"] != oid, mine=mine)
