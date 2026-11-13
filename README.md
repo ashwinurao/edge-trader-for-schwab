@@ -46,10 +46,25 @@ name are refused). It needs no account and sends no telemetry.
 - Everything the app records: positions, orders, fills, the action log and your settings, in `data/companion.db`.
   Your fills (without the account number) can be read at `/api/fills` by apps that reach Edge Trader's
   address, such as Trading Journal AI on the same server (see "Running on a home server").
-- A timing record of Schwab's answers in `data/netlog/YYYY-MM-DD.jsonl` (UTC date): one line per answer with
-  the time, the method, the path with account and order ids removed, the status, the time on the wire and
-  Schwab's own clock. No tokens, account numbers or order details. Nothing in the app reads it back
-  (`companion/netlog.py`).
+- A record of every network call in `data/netlog/YYYY-MM-DD.jsonl` (UTC date, one JSON line each,
+  `companion/netlog.py`). An `answer` line per HTTP answer (Schwab, Edge Scanner, GitHub): the path with
+  account and order ids removed, the status, the time on the wire and the vendor's own clock. A `call`
+  line per call as the app sees it: who asked (the poller, a ticket click, the status reads after a send,
+  Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
+  and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
+  quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
+  `skip` line for a read the 429 pause held back, `pause` lines for the pause's start and end, a `token`
+  line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
+  web server wake, CPU, memory, the token's time left).
+  Each request to the state, fills, Opening plan, ticket, position and spread routes gets a `route` line
+  with its duration and an id that its `call` lines carry too, so a click and its Schwab calls line up. An
+  order action that sends nothing writes a `refusal` line with the message you saw, its digits replaced by
+  `#`. No tokens, keys, account numbers, request or answer bodies, order prices or sizes. Nothing in the
+  app reads it back to decide anything. About 40 to 70 MB a day while the app runs; nothing deletes it yet.
+  `GET /api/netlog/summary` shows, from memory, each vendor and endpoint's count, errors and p50/p95/max
+  times for the last 5 minutes and since 09:25 ET, the calls in flight, the pause and the last lag line.
+- Warnings and errors in `data/logs/edge-trader-YYYY-MM-DD.log` (UTC date), next to `data/companion.log`.
+  On a home server a rebuild deletes the container's own log; this file stays.
 
 ### What leaves your computer
 
@@ -61,6 +76,8 @@ name are refused). It needs no account and sends no telemetry.
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
   (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
   and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
+  Each read carries `X-Edge-App: edge-trader` and the call's id in `X-Edge-Req`, so Edge Scanner's own
+  record can name it.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews a 1-share Break order, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -327,7 +344,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
 | `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
-| `EDGE_TRADER_NETLOG` | `0` turns off the timing record of Schwab's answers in `data/netlog/`. On by default. |
+| `EDGE_TRADER_NETLOG` | `0` turns off the network record in `data/netlog/` (answers, calls, waits, routes, refusals, lag) and its threads. On by default. |
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 

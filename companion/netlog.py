@@ -806,8 +806,10 @@ def _rollup_add(epoch: float, kind: str, rec: dict) -> None:
     if kind not in ("call", "skip", "route"):
         return
     et = datetime.fromtimestamp(epoch, ET)
-    if kind == "route":
-        key, ok, err = ("route", str(rec.get("route"))), rec.get("http") == 200, None
+    if kind == "route":       # ok: answered 200, and for an order action, did what was asked
+        key = ("route", str(rec.get("route")))
+        ok = rec["ok"] if isinstance(rec.get("ok"), bool) else rec.get("http") == 200
+        err = None if ok else (http_class(rec.get("http")) or "refused")
         wire, wait = rec.get("ms"), None
     else:
         key = (str(rec.get("vendor")), str(rec.get("endpoint")))

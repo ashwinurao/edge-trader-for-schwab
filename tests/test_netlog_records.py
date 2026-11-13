@@ -450,6 +450,19 @@ def test_summary_starts_a_new_day_and_holds_nothing_before_0925(monkeypatch):
     assert a["since_0925_et"]["count"] == 0 and a["last_5_min"]["count"] == 1
 
 
+def test_summary_counts_a_refused_action_as_not_ok(monkeypatch):
+    monkeypatch.setattr(netlog, "_roll", {})
+    now = datetime(2026, 11, 13, 14, 40, tzinfo=timezone.utc).timestamp()
+    netlog._rollup_add(now - 2, "route", {"route": "/api/ticket/submit", "http": 200, "ms": 12.0, "ok": False})
+    netlog._rollup_add(now - 1, "route", {"route": "/api/ticket/submit", "http": 200, "ms": 340.0, "ok": True})
+    netlog._rollup_add(now, "route", {"route": "/api/state", "http": 403, "ms": 0.2})
+    r = netlog.summary(now=now)["routes"]
+    sub = r["/api/ticket/submit"]["since_0925_et"]
+    assert (sub["count"], sub["ok"], sub["errors"]) == (2, 1, {"refused": 1})
+    assert sub["ms"] == {"p50": 12.0, "p95": 340.0, "max": 340.0}
+    assert r["/api/state"]["last_5_min"]["errors"] == {"http_4xx": 1}
+
+
 def test_summary_route_answers_from_memory():
     from companion.app import app
     body = TestClient(app, base_url="http://127.0.0.1:8770").get("/api/netlog/summary").json()
