@@ -25,7 +25,11 @@ These decide most review questions:
    answer, a 429 or a reached bound disarms it. It arms only at the 1-share size stage. A Place, Flip or
    Cancel click on a row makes that row the user's for the day, and the plan never acts on it again
    (`PlanDesk._put_click`). Ash's go for this exception is quoted in the
-   pull request that adds it. Any other change that would act without a click will not be merged.
+   pull request that adds it. Any other change that would act without a click will not be merged. No order request (place, replace, cancel, preview) is ever
+   tried again. Only two reads of the order path are: the click's quote and a read of one order are
+   sent once more, at once, when Schwab drops the connection before any answer (reset, aborted,
+   refused), never after a timeout or an HTTP answer and never during a 429 pause
+   (`companion/read_retry.py`, brief 26, Ash's go 2026-11-13 20:01 UTC). The poller never tries again.
 2. **Protection is never removed first.** Exits change in place with one replace request, including
    Close, which replaces the working stop with a market order. Never cancel the stop and then send
    a new order, and never cancel an exit until the close has filled. A new exit next to working
@@ -92,6 +96,9 @@ What to add:
   (the Arm window, refusals and bounds), `executor.py` (the worker thread, the panel and its routes),
   `handlers.py` (one handler per decision kind; Steps 7 and 8 add theirs). It sends and cancels only
   through `companion/plan_entries.py` and so through `Trader.submit` and `Trader.cancel_entry`.
+- `companion/plan_side.py`, `companion/plan_close.py`: the Opening plan beside your own trades on the
+  same name (brief 25): which side you are on, which shares are the plan's (told apart by the plan's
+  own stop), and Flat all's close of only the plan's shares, inside Trader's one-at-a-time lock.
 - `companion/app.py`: the local FastAPI server. `companion/static/index.html`: the whole UI.
 - `companion/floating.py`: the always-on-top windows (pywebview).
 
