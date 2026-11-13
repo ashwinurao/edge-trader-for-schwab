@@ -459,5 +459,6 @@ def test_routes_start_the_shadow_on_the_plan_feed_when_asked(tmp_path, monkeypat
 
 
 def test_the_shadow_folder_is_ignored_by_git():
-    out = subprocess.run(["git", "check-ignore", "-q", "data/opening_plan/shadow/2026-11-13.jsonl"], cwd=ROOT)
-    assert out.returncode == 0
+    # Read .gitignore rather than run git: the CI image (python:3.11-slim) has no git.
+    rules = [x.strip() for x in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()]
+    assert "data/" in rules and str(shadow.OUT_DIR).startswith("data/")
