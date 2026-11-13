@@ -27,6 +27,11 @@ in playbook.json "automatic", each a start number Ash has not approved):
   from this side's level to the other) would flip to the other side; at most max_flips. Any
   (estimated) fill ends flips. The fast watch ends at watch_until_et: unfilled orders would cancel.
 - A price older than stale_after_seconds: no action on it, ever. Time-based cancels still happen.
+- Re-level (Step 7, brief 17): while unfilled and not yet triggered, a final range in the reading
+  that differs by more than one cent from the range the entry was built on (the 09:30 bar from
+  the bars request after a range taken earlier) would cancel and place the SAME side from the new
+  range, at most relevels_per_pick times (playbook "armed"; 0 or missing: never). Not when the
+  new trigger has already traded. After a fill the stop is never moved: it is only said.
 
 Fills are estimates: a snapshot shows the latest trade only, so a fill counts when a seen trade
 is inside the order's price band; trades between two readings are not seen.
@@ -71,6 +76,9 @@ EVEN = "even"
 NO_SHARES = "no_shares"
 AFTER_WATCH = "after_watch"
 FLIP_REFUSED = "flip_refused"
+RELEVEL_REFUSED = "relevel_refused"        # Step 7: the re-level limit is used
+RELEVEL_TRADED = "relevel_traded"          # Step 7: the new range's trigger already traded
+RANGE_AFTER_FILL = "range_after_fill"      # Step 7: the range changed after a fill; the stop stays
 
 
 @dataclass(frozen=True)
@@ -92,6 +100,9 @@ class Rules:
     stale_after_seconds: float
     max_shares: int
     max_notional: Decimal
+    # Step 7 (brief 17): re-levels per pick per day, playbook "armed" relevels_per_pick. The
+    # default 0 keeps a playbook without that key exactly as before Step 7.
+    relevels_per_pick: int = 0
 
 
 def rules_from(raw: Mapping) -> Rules:
@@ -112,15 +123,23 @@ def rules_from(raw: Mapping) -> Rules:
             flip_line=Decimal(str(v["flip_line"])), max_flips=int(v["max_flips"]),
             watch_until_et=time.fromisoformat(v["watch_until_et"]),
             stale_after_seconds=float(v["stale_after_seconds"]),
-            max_shares=int(v["max_shares"]), max_notional=Decimal(str(v["max_notional"])))
+            max_shares=int(v["max_shares"]), max_notional=Decimal(str(v["max_notional"])),
+            relevels_per_pick=_relevels(raw))
     except (KeyError, TypeError, ValueError, InvalidOperation) as e:
         raise ValueError(f"playbook automatic: {type(e).__name__}: {e}") from e
     if r.bar_start_et != time(9, 30):
         raise ValueError("playbook automatic: only the 09:30 ET first minute is known")
     if not (Decimal("0.5") < r.flip_line < 1 and 0 < r.cap_r and r.cap_min > 0 and r.max_flips >= 0
-            and r.stale_after_seconds > 0 and r.pullback_wait_seconds > 0 and r.offset > 0):
+            and r.stale_after_seconds > 0 and r.pullback_wait_seconds > 0 and r.offset > 0
+            and r.relevels_per_pick >= 0):
         raise ValueError("playbook automatic: a number is out of range")
     return r
+
+
+def _relevels(raw: Mapping) -> int:
+    """armed.relevels_per_pick (a bare number or {"value": n}); 0 when the playbook has none."""
+    v = (raw.get("armed") or {}).get("relevels_per_pick", 0)
+    return int(v["value"] if isinstance(v, Mapping) else v)
 
 
 def _dec(value: Any) -> Optional[Decimal]:
@@ -210,6 +229,8 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
     entry = pick.get("entry") if isinstance(pick.get("entry"), Mapping) else None
     if entry is not None:
         _follow(ps, entry, pick, reading, rules)
+    if ps["state"] == FILLED and rules.relevels_per_pick > 0:
+        _range_after_fill(st, out, sym, ps, pick, now, entry)
     if ps["state"] in (FILLED, DONE):
         return
     watch_end = datetime.combine(day, rules.watch_until_et, tzinfo=ET)
@@ -233,6 +254,8 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
                 return
         if last is None or age is None or age > rules.stale_after_seconds:
             _say(st, out, sym, STALE, _stale_why(age), now, seen)
+            return
+        if _relevel(st, out, sym, ps, pick, last, now, rules, seen, entry):
             return
         _on_price(st, out, sym, ps, last, now, rules, seen, real=entry is not None)
         return
@@ -398,3 +421,84 @@ def _on_price(st: dict, out: list, sym: str, ps: dict, last: Decimal, now: datet
          f"cancel the {o['side']} entry, place the {new_side} one", flips=ps["flips"],
          **{"from": o["side"]}, **_order_out(n), **seen)
     _on_price(st, out, sym, ps, last, now, rules, seen)
+
+
+def _new_range(ps: Mapping, pick: Mapping) -> Optional[tuple[Decimal, Decimal]]:
+    """The reading's final range when it differs by more than one cent from the range the entry
+    was built on (ps high / low), else None. Only a range the reading itself calls final counts
+    (brief 15: the 09:30 bar); a range "so far" never moves an order."""
+    if not pick.get("final"):
+        return None
+    high, low = _dec(pick.get("high")), _dec(pick.get("low"))
+    if high is None or low is None or ps.get("high") is None or ps.get("low") is None:
+        return None
+    if abs(high - ps["high"]) <= CENT and abs(low - ps["low"]) <= CENT:
+        return None
+    return high, low
+
+
+def _range_out(high: Decimal, low: Decimal) -> dict:
+    return {"high": _f(high), "low": _f(low)}
+
+
+def _relevel(st: dict, out: list, sym: str, ps: dict, pick: Mapping, last: Decimal, now: datetime,
+             rules: Rules, seen: dict, entry: Optional[Mapping] = None) -> bool:
+    """Step 7 (brief 17 item 4): a working, untriggered entry built on a range that the final
+    09:30 bar has since moved by more than one cent would cancel and place the SAME side from the
+    new range. True when it decided to re-level; otherwise it may say why not (once), and the
+    price rules (_on_price) still run on this reading. With a real entry (Step 6) the count is
+    the row's own (entry["relevels"]), nothing here changes the pick's state, and it is said on
+    each reading while it holds: the handler acts, or declines and gets it again."""
+    if rules.relevels_per_pick <= 0 or ps.get("triggered_at") is not None:
+        return False
+    new = _new_range(ps, pick)
+    if new is None:
+        return False
+    o = ps["order"]
+    s = _sign(o["side"])
+    if s * (last - o["trigger"]) >= 0:
+        return False                       # the old trigger has traded: _on_price decides
+    high, low = new
+    both = {"range_from": _range_out(ps["high"], ps["low"]), "range_to": _range_out(high, low)}
+    used = int((entry.get("relevels") if entry is not None else ps.get("relevels")) or 0)
+    if used >= rules.relevels_per_pick:
+        _say(st, out, sym, RELEVEL_REFUSED, f"the range changed again ({ps['high']}/{ps['low']} to "
+             f"{high}/{low}); re-level refused (at most {rules.relevels_per_pick})", now, {**seen, **both})
+        return False
+    if high <= low:
+        _say(st, out, sym, ZERO_WIDTH, f"the new range has no width (high {high}, low {low}); the entry "
+             "stays on the old range", now, {**seen, **both})
+        return False
+    n = order_for(o["side"], high, low, ps["risk_used"], rules)
+    if s * (last - n["trigger"]) >= 0:
+        # Placing there would be an entry already through its level: the entry stays as it is.
+        _say(st, out, sym, RELEVEL_TRADED, f"the range changed to {high}/{low} but the new trigger "
+             f"{n['trigger']} has already traded (last {last}); the entry stays on the old range",
+             now, {**seen, **both})
+        return False
+    if n["shares"] < 1:
+        _say(st, out, sym, NO_SHARES, f"the new range gives 0 shares at risk ${ps['risk_used']}; the entry "
+             "stays on the old range", now, {**seen, **both})
+        return False
+    if entry is None:
+        ps.update(order=n, high=high, low=low, relevels=used + 1)
+    _act(st, out, sym, "would_relevel", f"the range changed from {both['range_from']['high']}/"
+         f"{both['range_from']['low']} to {_f(high)}/{_f(low)}: cancel the {o['side']} entry, place it "
+         "again from the new range", relevels=used + 1, **_order_out(n), **both, **seen)
+    return True
+
+
+def _range_after_fill(st: dict, out: list, sym: str, ps: dict, pick: Mapping, now: datetime,
+                      entry: Optional[Mapping] = None) -> None:
+    """Step 7: a fill came first, so nothing moves (the plan never moves a stop); say it once.
+    With a real entry the range it was built on is the record's own, when it has one."""
+    built = {"high": ps.get("high"), "low": ps.get("low")}
+    if entry is not None and _dec(entry.get("high")) is not None and _dec(entry.get("low")) is not None:
+        built = {"high": _dec(entry.get("high")), "low": _dec(entry.get("low"))}
+    new = _new_range(built, pick)
+    if new is None:
+        return
+    high, low = new
+    _say(st, out, sym, RANGE_AFTER_FILL, f"the range changed after the fill: {built['high']}/{built['low']} "
+         f"to {high}/{low}. Nothing automatic: the stop stays where it is", now,
+         {"range_from": _range_out(built["high"], built["low"]), "range_to": _range_out(high, low)})

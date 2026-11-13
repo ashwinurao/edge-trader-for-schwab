@@ -94,5 +94,12 @@
       "value": 0.5,
       "note": "how often the live shadow reads Step 2's feed; the feed itself asks Edge Scanner at most every feed.picks_every_seconds"
     }
+  },
+  "armed": {
+    "_about": "The armed plan's bounds (companion/plan_auto). Step 7 (brief 17): re-levels; flips use automatic.max_flips, shared with the row's Flip button.",
+    "relevels_per_pick": {
+      "value": 1,
+      "note": "start number, not approved by Ash"
+    }
   }
 }
