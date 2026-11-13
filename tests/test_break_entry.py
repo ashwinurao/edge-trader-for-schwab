@@ -239,9 +239,56 @@ def test_a_limit_other_than_the_displayed_one_is_refused(trader):
     _refused(trader, trader.submit(long_req(expected_limit="50.10")), "missing the displayed plan")
 
 
-def test_stop_at_or_above_the_bid_is_refused_as_on_the_limit_ticket(trader):
+def test_stop_at_or_above_the_bid_is_refused_in_the_break_entrys_own_words(trader):
+    # Brief 29 part A changed only the words (was "must be below the bid", the limit ticket's).
     trader.fake_quote = _q(48.90, 48.95)            # price fell under the stop: no long break now
-    _refused(trader, trader.submit(long_req()), "must be below the bid")
+    _refused(trader, trader.submit(long_req()), "The bid 48.90 is at or below this entry's stop 49.00")
+
+
+# ---- brief 29 part A: the price band in the break entry's own words (finding 1, 2026-11-13) ----
+
+LONG_BAND = ("A long break entry is sent only while the price is between its stop 49.00 and its "
+             "level 50.00. Nothing was sent.")
+SHORT_BAND = ("A short break entry is sent only while the price is between its level 49.00 and its "
+              "stop 50.00. Nothing was sent.")
+
+
+@pytest.mark.parametrize("bid,ask", [(48.90, 48.95), (49.00, 49.02)])   # under the stop, and on it
+def test_long_with_the_bid_at_or_below_its_stop_says_the_band(trader, bid, ask):
+    trader.fake_quote = _q(bid, ask)
+    r = trader.submit(long_req())
+    _refused(trader, r, f"The bid {bid:.2f} is at or below this entry's stop 49.00. " + LONG_BAND)
+    assert "must be below the bid" not in r["error"]
+
+
+@pytest.mark.parametrize("bid,ask", [(50.10, 50.12), (49.98, 50.00)])   # over the stop, and on it
+def test_short_with_the_ask_at_or_above_its_stop_says_the_band(trader, bid, ask):
+    trader.fake_quote = _q(bid, ask)
+    r = trader.submit(short_req())
+    _refused(trader, r, f"The ask {ask:.2f} is at or above this entry's stop 50.00. " + SHORT_BAND)
+    assert "must be above the ask" not in r["error"]
+
+
+def test_inside_the_band_both_sides_still_go(trader):
+    # The case where the rule must not fire: the price between stop and level.
+    trader.fake_quote = _q(49.01, 49.99)          # long: bid over 49.00, ask under 50.00
+    assert trader.submit(long_req())["ok"]
+    trader.fake_quote = _q(49.01, 49.99)          # short: bid over 49.00, ask under 50.00
+    assert trader.submit(short_req(ticket_id="ticket-short-0002"))["ok"]
+    assert len(trader._client.placed) == 2
+
+
+def test_through_the_level_keeps_its_own_words(trader):
+    trader.fake_quote = _q(50.00, 50.02)
+    _refused(trader, trader.submit(long_req()), "already through the break level: ask 50.02")
+
+
+def test_the_limit_ticket_keeps_its_own_stop_words():
+    # bracket.py's rule and text are unchanged for the limit ticket.
+    p = plan("ABCD", "LONG", "49.00", 100, 2, 48.90, 48.95, entry="limit", limit_price="49.50")
+    assert p.errors == ["stop 49.00 must be below the bid 48.90"]
+    p = plan("ABCD", "SHORT", "50.00", 100, 2, 50.05, 50.10, entry="limit", limit_price="49.50")
+    assert p.errors == ["stop 50.00 must be above the ask 50.10"]
 
 
 def test_an_option_is_refused(trader):
