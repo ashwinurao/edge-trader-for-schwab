@@ -133,7 +133,20 @@ class Poller:
 
     def snapshot(self) -> dict:
         with self._lock:
-            return self.state
+            st = self.state
+        if "trading" in st or self.trader is None:
+            return st
+        # Brief 29 part C (2026-11-13 18:58 and 19:52 UTC): until the first rebuild adds it, the
+        # trading block comes from Trader.status(), which reads only the clock and the local ticket
+        # table (no Schwab call). ARM is always off after a start (app.py lifespan). The flag says
+        # the first read of Schwab is not done; the page says so, and every order button stays off
+        # (the page's health check needs the poller's last_rebuild).
+        try:
+            trading = self.trader.status()
+        except Exception:
+            log.exception("trading status before the first rebuild could not be read")
+            return st
+        return {**st, "trading": trading, "first_read_done": False}
 
     # ---- requests --------------------------------------------------------
 

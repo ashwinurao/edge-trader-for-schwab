@@ -1202,7 +1202,9 @@ function render(st) {
     : "Click to sign in to Schwab again (the login lasts 7 days)";
   renderSignin(st);
   const banner = $("banner");
-  if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
+  // Brief 29 part C: right after a start, until the first read of Schwab is in (poller.snapshot).
+  if (st.first_read_done === false) { banner.style.display = "block"; banner.textContent = "Edge Trader just started. Reading Schwab."; }
+  else if (st.status && st.status !== "live" && !st.booting) { banner.style.display = "block"; banner.textContent = st.status; }
   else banner.style.display = "none";
   if (!st.summary) return;
 

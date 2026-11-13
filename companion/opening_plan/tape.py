@@ -409,8 +409,32 @@ class EsTape:
             return empty(datetime.now(timezone.utc), f"{type(e).__name__}: {str(e)[:160]}")
 
 
+    def last(self) -> Optional[dict]:
+        """The last answer's reading, WITHOUT asking Edge Scanner, or None before any good answer.
+        Brief 29 part B: the plan rows' price line reads the tape only while the shadow (or the
+        armed plan) asks it, so the line adds no GET. `read_at` is when last() handed it out."""
+        with self._lock:
+            if self._parsed is None:
+                return None
+            reading = copy.deepcopy(self._parsed[1])
+        reading["read_at"] = self._wall()
+        return reading
+
+
 _shared: dict[str, EsTape] = {}
 _shared_lock = threading.Lock()
+
+
+def peek(base_url: str) -> Optional[dict]:
+    """The shared tape's last reading for this address, or None when no tape was made for it or it
+    has no answer yet. Never creates a tape and never asks Edge Scanner (brief 29 part B)."""
+    try:
+        base = check_base_url(base_url)
+    except ValueError:
+        return None
+    with _shared_lock:
+        tape = _shared.get(base)
+    return tape.last() if tape is not None else None
 
 
 def shared(base_url: str, rules: TapeRules) -> EsTape:
