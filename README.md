@@ -652,7 +652,9 @@ stays" (or "re-level is not on") and the entry stays.
   The row says "Cancelled the long entry by the armed plan; the fast watch ended during the cancel, so
   nothing rests."
 - While a flip or re-level runs, the plan does nothing for the other picks: another pick's entry, or
-  its 09:35 cancel, waits until the flip ends (about 2.25 s at 0.4 s a Schwab call, up to 7.3 s).
+  its 09:35 cancel, waits until the flip ends (about 2.25 s at 0.4 s a Schwab call, up to 7.3 s for an
+  unconfirmed cancel, and longer while it waits for the order lock or a fresh order list, at most until
+  the fast watch ends).
 - **Re-level.** The 09:30 bar from Edge Scanner's bars request moves the range by more than one cent
   from the range the entry was built on, while the entry rests unfilled and its trigger has not
   traded. The plan cancels the entry the same way and places the same side from the new range, at most
@@ -669,6 +671,21 @@ stays" (or "re-level is not on") and the entry stays.
   Schwab calls this minute (`armed.calls_per_send`), is left for the new entry, nothing is cancelled and
   the entry stays as it is. When the 09:30 range moved since the entry was built, only a re-level moves
   it; with no re-level left the panel says the entry stays.
+- **Schwab's order list old** (its last read failed or is older than three polling intervals; live on
+  2026-11-13 the poller read it only every 12 to 19 s while order calls ran, and brief 24 changes the
+  poller). Nothing is sent on an old list, and an old list is a wait, never an end. Before the cancel
+  the flip or re-level does nothing on that reading, the entry stays, the panel gives the reason once
+  and the next reading decides again. After the confirmed cancel it waits a tick at a time; the row
+  says "The armed plan cancelled the long entry. It places the short when Schwab's order list is fresh
+  again." When the list is fresh it checks everything again and places. At a disarm or the end of the
+  fast watch it stops with nothing resting: "Cancelled the long entry by the armed plan; the fast watch
+  ended while Schwab's order list was old, so nothing rests."
+- **Schwab calls.** A flip or a re-level is one cancel (3 calls usually: a read, the cancel, a
+  read-back; 12 at worst) and one send (4 usually: the quote, the order, two status reads; 5 at worst),
+  so 7 usually and 17 at worst. Waiting costs no call. With four picks the bounds allow at most 8 sends
+  and 8 cancels a day: if all fell in one minute, 56 calls usually and 136 at worst. Four entries then four
+  flips or re-levels in one minute are 44 usually and 88 at worst. Edge Trader as a whole keeps to 70
+  calls a minute (`companion/poller.py` `MAX_PER_MIN`), so the poller's own reads wait.
 - **Another order action running** (a click, a ticket send, Flat all) holds the dashboard's one order
   lock. Before the cancel the flip tries nothing: no record, one `busy` line, and the next reading
   decides again. After the confirmed cancel nothing rests, so the flip waits for the lock a tick at a

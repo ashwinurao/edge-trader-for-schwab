@@ -43,10 +43,11 @@ waiting when the plan is disarmed or the fast watch ends; nothing rests then.
 Schwab's order list old (architect's notes on the live test, 2026-11-13 20:12 UTC, N1): the
 poller holds itself to 70 calls a minute (poller.MAX_PER_MIN) and Trader's order calls count in the
 same window, so with the plan's calls the list was read only every 12 to 19 s live. Nothing is ever
-sent on an old list, and an old list is a wait, never an end. Before the cancel the step does
-nothing on that reading, says so once, and the next reading decides again (the entry stays). After
-the confirmed cancel the flip waits a tick at a time, as for Trader's lock, until the list is fresh
-(then everything is checked again before the send), the plan is disarmed or the fast watch ends.
+sent on an old list, and an old list is a wait, never an end. Before the cancel it is Step 6's
+wait (lane.busy with the desk's reason): the step ends, the entry stays and the next reading decides
+again. After the confirmed cancel the flip waits a tick at a time, as for Trader's lock, until the
+list is fresh (then everything is checked again before the send), the plan is disarmed or the fast
+watch ends.
 
 Schwab calls (fork PR #15's two status reads after a 201 included; the tape reads go to Edge Scanner,
 not Schwab): a flip or a re-level is one cancel and one send. The cancel is 3 calls usually (a read,
@@ -433,9 +434,10 @@ def _swap(lane: Lane, kind: str) -> bool:
         lane.refund(orders=1, calls=calls)        # reserved, then refused before any request left
     if stage == "refused":
         if r.get("code") == "orders_old":
-            # N1: nothing was cancelled and nothing written; the next reading decides again.
-            lane.say(f"{kind}_orders_old", f"no {what} yet: Schwab's order list is old; the next reading decides again")
-            return False
+            # An old list is a wait (N1), as Step 6's on_place and on_cancel: nothing was cancelled or
+            # written, the step ends, and the next reading decides again; the pick's line gives the reason.
+            lane.busy("cancel", str(r.get("error") or ""))
+            return True
         if r.get("cancel_not_sent") and keys:
             lane.host.forget(keys[-1])            # Trader's lock was busy: nothing reached Schwab
         if r.get("busy"):

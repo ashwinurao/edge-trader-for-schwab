@@ -89,7 +89,7 @@ class Host:
         self.tape = []                  # what reread() answers, in order; the last one repeats
         self.left = {"orders_pick": 5, "orders_day": 20, "calls_minute": 40}
         self.said, self.gone, self.disarms, self.logs, self.keys = [], [], [], [], set()
-        self.busied = []
+        self.busied, self.busy_why = [], []
         self.orders = lambda: []        # the order list reread() gives auto_entry (the fixture sets it)
 
     def armed(self):
@@ -154,8 +154,9 @@ class Host:
     def forget(self, key):
         self.keys.discard(key)
 
-    def busy(self, ticker, what):
+    def busy(self, ticker, what, why=plan_entries.TRADER_BUSY):
         self.busied.append(what)
+        self.busy_why.append(why)
 
 
 def tape_pick(last, high=42.48, low=41.92, final=True, age=0.1, entry=None):
@@ -631,9 +632,10 @@ def test_not_on_an_old_price(r):
 
 @pytest.mark.parametrize("kind", ["would_flip", "would_relevel"])
 def test_an_old_order_list_before_the_cancel_waits_for_the_next_reading(r, kind):
-    # Architect's notes on the live test (2026-11-13 20:12 UTC, N1): an old list is a wait. Nothing
-    # is cancelled or written, no line per try (it can last 15 s), the order's one automatic cancel
-    # is not used up, and the panel says it once. On the next reading, with the list fresh, it goes once.
+    # Architect's notes on the live test (2026-11-13 20:12 UTC, N1): an old list is a wait, Step 6's
+    # lane.busy with the desk's reason. Nothing is cancelled or written, no flip line per try (it can
+    # last 15 s), and the order's one automatic cancel is not used up. On the next reading, with the
+    # list fresh, it goes once.
     oid = place_long(r)
     wrote = []
     real_save = r.desk._save
@@ -642,14 +644,12 @@ def test_an_old_order_list_before_the_cancel_waits_for_the_next_reading(r, kind)
     args = {} if kind == "would_flip" else {"last": 42.40, "high": 42.60}
     if kind == "would_relevel":
         new_bar(r)                                  # defined with the re-level tests below
-    what = "flip" if kind == "would_flip" else "re-level"
     for _ in range(3):
-        assert run(r, kind, **args) is False
+        assert run(r, kind, **args) is True         # not an action: the step ends, a tick later again
     nothing_at_schwab(r)
     assert wrote == [] and r.host.logs == [] and r.host.keys == set() and r.host.gone == []
-    code = "flip" if kind == "would_flip" else "relevel"
-    assert r.host.said == [(f"{code}_orders_old",
-                            f"no {what} yet: Schwab's order list is old; the next reading decides again")] * 3
+    assert r.host.busied == ["cancel"] * 3 and r.host.busy_why == [plan_entries.ORDERS_OLD] * 3
+    assert r.host.said == []
     assert rec(r)["state"] == plan_entries.SENT and rec(r)["flips"] == 0 and rec(r).get("relevels", 0) == 0
     r.desk._orders_fresh_fn = lambda: True
     assert run(r, kind, **args) is True
@@ -2138,6 +2138,25 @@ def old_list_after_the_cancel(frig, monkeypatch, fresh_after=None):
                 frig.knobs["fresh"] = True
     monkeypatch.setattr(trading.time, "sleep", sleep)
     return waits
+
+
+@pytest.mark.parametrize("ready, side", [(aaaa_past_its_flip_line, "short"), (relevel_ready, "long")],
+                         ids=["flip", "relevel"])
+def test_an_order_list_old_at_one_reading_and_fresh_at_the_next_sends_once(frig, ready, side):
+    # N1 through the executor (Step 6's _plan_problem no longer disarms on an old list): the
+    # readings while the list is old cancel nothing and say why once; the first fresh one goes once.
+    ids = ready(frig)
+    frig.knobs["fresh"] = False
+    run_plan(frig, et(9, 31, 6))
+    assert frig.broker.cancelled == [] and len(frig.broker.placed) == 4
+    assert frig.plan.arming.is_armed(frig.clock.now())
+    waits = [x for x in plan_lines(frig, "wait") if x["ticker"] == "AAAA"]
+    assert [(x["what"], x["why"]) for x in waits] == [("cancel", plan_entries.ORDERS_OLD)]
+    assert note(frig) == plan_entries.ORDERS_OLD
+    frig.knobs["fresh"] = True
+    run_plan(frig, et(9, 31, 9))
+    assert frig.broker.cancelled == [ids["AAAA"]] and len(frig.broker.placed) == 5 and max(frig.working) == 1
+    assert frig.broker.placed[-1]["orderLegCollection"][0]["instruction"] == ("SELL_SHORT" if side == "short" else "BUY")
 
 
 @pytest.mark.parametrize("ready, kind, side, text", [
