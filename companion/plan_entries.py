@@ -144,6 +144,7 @@ class PlanDesk:
         self._lock = threading.Lock()
         self._mem: Optional[dict] = {} if demo else None   # demo: records in memory, never the db
         self._chase_tries: dict[str, int] = {}          # Step 8: refused chase tries a row a day, in memory
+        self._chase_tried_at: dict[str, datetime] = {}  # Step 8: when the last of them was refused (review 1 of #25)
 
     # ---- records (one JSON per ET day in the settings table) --------------------------------
 
@@ -1158,9 +1159,14 @@ class PlanDesk:
     # ---- the armed plan's capped chase (Step 8, brief 18; companion/plan_auto/chase.py) --------
 
     def _chase_refusal(self, ticker: str, rec: Mapping, entry: Mapping, orders: list[dict],
-                       blocked: Optional[set], fresh: bool, quote_tries: int) -> str:
+                       blocked: Optional[set], fresh: bool, quote_tries: int,
+                       cancelled_order_id: Any = None) -> str:
         """Why the plan can't chase this row now, or "" when it can. Like _auto_refusal, except that
-        a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once."""
+        a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once.
+        `cancelled_order_id`: the entry the plan's own flip cancelled, confirmed by Trader.cancel_entry
+        (CANCELED, nothing filled). The poller's list, up to 5 s old, may still show it working; only
+        that one id is not counted as a working order on the name (architect's review 1 of PR #25,
+        2026-11-13 17:08 UTC). Any other working order still refuses."""
         if rec and rec.get("origin") != "auto":
             return CLICK_TAKES_ROW                   # a click takes the row for the day (brief 14)
         state = entry["state"]
@@ -1183,7 +1189,8 @@ class PlanDesk:
             return "The market is closed."
         if not fresh:
             return ORDERS_OLD
-        f = self._foreign(ticker, rec, orders)
+        gone = None if cancelled_order_id is None else str(cancelled_order_id)
+        f = self._foreign(ticker, rec, [o for o in orders if gone is None or str(o.get("orderId")) != gone])
         if f is not None:
             return f"A working {ticker} order is already at Schwab (order {f.get('orderId')}). One entry per name."
         if blocked is None:
@@ -1192,9 +1199,21 @@ class PlanDesk:
             return f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press Resolve."
         return ""
 
+    def chase_retry_left(self, ticker: str, seconds: float) -> float:
+        """Seconds before this row may read Schwab's quote for a chase again: after a try refused
+        after the quote for a passing reason, `seconds` (playbook.json armed.chase_retry_seconds), so
+        the armed.chase_quote_tries tries are not used up in about a second (architect's review 1 of
+        PR #25, 2026-11-13 17:08 UTC). 0 when it may."""
+        ticker = str(ticker or "").upper().strip()
+        with self._lock:
+            at = self._chase_tried_at.get(self._key() + ticker)
+        if at is None:
+            return 0.0
+        return max(0.0, float(seconds) - (self._now() - at).total_seconds())
+
     def chase_auto(self, ticker: str, side: str, o: Mapping, *, quote_tries: int, pick: Optional[Mapping] = None,
                    view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None,
-                   wait_s: Optional[float] = None) -> dict:
+                   wait_s: Optional[float] = None, cancelled_order_id: Any = None) -> dict:
         """place_auto's twin for the chase: chase_entry's LIMIT at the cap with its stop attached.
 
         `o` is engine.order_for of the tape's final range (trigger, limit, stop, cap, shares); shares
@@ -1209,7 +1228,8 @@ class PlanDesk:
         Trader's lock was held (by a click): nothing was written or spent, and the worker waits a
         tick (review 1 of Step 6). `view` is the executor's cached view; None or {} skips the row
         check, never a GET. Otherwise the row keeps "Not sent" and the plan leaves
-        it. `quoted` says Schwab's quote was read (one call)."""
+        it. `quoted` says Schwab's quote was read (one call). `cancelled_order_id`: after Step 7's
+        flip, the entry its confirmed cancel ended (see _chase_refusal)."""
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
         log = log or (lambda event, **kw: None)
         if self.demo:
@@ -1237,7 +1257,8 @@ class PlanDesk:
             prior = json.loads(json.dumps(recs[ticker])) if ticker in recs else None
             rec = recs.get(ticker) or {}
             entry = self._entry_state(rec, orders)
-            why = self._chase_refusal(ticker, rec, entry, orders, blocked, fresh, int(quote_tries))
+            why = self._chase_refusal(ticker, rec, entry, orders, blocked, fresh, int(quote_tries),
+                                      cancelled_order_id=cancelled_order_id)
             if why:
                 return self._refuse(ticker, why, not_sent=True, again=why == ORDERS_OLD)
             shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
@@ -1289,6 +1310,7 @@ class PlanDesk:
                     if r.get("quoted") and not busy:
                         k = self._key() + ticker
                         self._chase_tries[k] = self._chase_tries.get(k, 0) + 1
+                        self._chase_tried_at[k] = self._now()
             return {**r, "not_sent": True, "again": again, "quoted": bool(r.get("quoted")), "busy": busy}
         return r
 

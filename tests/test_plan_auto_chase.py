@@ -520,15 +520,59 @@ def test_the_tape_disagreeing_with_the_plan_row_turns_it_red(rig):
 def test_quote_refusals_are_tried_at_most_three_times_a_day(rig):
     rig.quote.update(bid=42.46, ask=42.48)              # Schwab's quote is back under the level
     tries = ARMED.chase_quote_tries                     # playbook.json armed.chase_quote_tries, start number 3
-    assert tries == 3
+    wait = timedelta(seconds=ARMED.chase_retry_seconds)  # armed.chase_retry_seconds, start number 1.0
+    assert (tries, ARMED.chase_retry_seconds) == (3, 1.0)
     for n in range(tries):
-        assert rig.host.handle("would_place", tape(42.51)) is True
+        if n:
+            rig.clock[0] += wait                        # each try waits the retry seconds (review 1 of #25)
+        assert rig.host.handle("would_place", tape(42.51, at=rig.clock[0])) is True
         assert rig.host.left == {} and "back under the level" in rig.host.said[-1][2]
     assert len(rig.quotes) == tries and rec(rig) == {}
-    rig.host.handle("would_place", tape(42.51))
+    rig.clock[0] += wait
+    rig.host.handle("would_place", tape(42.51, at=rig.clock[0]))
     assert len(rig.quotes) == tries                     # no fourth quote: refused at the desk
     assert "3 times today (armed.chase_quote_tries in playbook.json)" in rig.host.left["AAAA"]
     assert len(rig.sent) == tries and rig.broker.placed == [] and rig.trader.store.open_tickets() == []
+
+
+def test_inside_the_retry_wait_no_quote_is_read_and_nothing_is_spent(rig):
+    """Architect's review 1 of PR #25 (2026-11-13 17:08 UTC), must 2: after a try refused after the
+    quote, the same pick reads no quote before armed.chase_retry_seconds, says so once, spends
+    nothing; at the wait's end it tries again."""
+    rig.quote.update(bid=42.46, ask=42.48)              # back under the level: a passing refusal
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert len(rig.quotes) == 1
+    bounds = (rig.host.orders_pick, rig.host.orders_day, rig.host.calls)
+    assert bounds == (1, 4, 40 - 1)                     # the quote call stays spent
+    for dt in (0.0, 0.25, 0.5, 0.99):
+        rig.clock[0] = NOW + timedelta(seconds=dt)
+        assert rig.host.handle("would_place", tape(42.51, at=rig.clock[0])) is False
+    assert len(rig.quotes) == 1 and (rig.host.orders_pick, rig.host.orders_day, rig.host.calls) == bounds
+    waits = [x for x in rig.host.said if x[1] == "chase_retry_wait"]
+    assert len({x[2] for x in waits}) == 1 and "armed.chase_retry_seconds" in waits[0][2]
+    assert rig.host.left == {} and rec(rig) == {} and rig.sent[1:] == []
+    rig.clock[0] = NOW + timedelta(seconds=1.0)
+    assert rig.host.handle("would_place", tape(42.51, at=rig.clock[0])) is True
+    assert len(rig.quotes) == 2
+
+
+def test_a_quote_good_at_the_second_try_is_chased(rig):
+    rig.quote.update(bid=42.46, ask=42.48)
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert rig.broker.placed == []
+    rig.quote.update(bid=42.50, ask=42.52)              # through the level again a second later
+    rig.clock[0] = NOW + timedelta(seconds=ARMED.chase_retry_seconds)
+    assert rig.host.handle("would_place", tape(42.51, at=rig.clock[0])) is True
+    assert [no_id(r) for r in rig.sent[1:]] == [CHASE_LONG] and rec(rig)["chases"] == 1
+    assert len(rig.quotes) == 2
+
+
+def test_the_retry_wait_is_per_pick(rig):
+    """Another pick is not held up by one pick's wait."""
+    rig.quote.update(bid=42.46, ask=42.48)
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert rig.desk.chase_retry_left("AAAA", ARMED.chase_retry_seconds) == pytest.approx(1.0)
+    assert rig.desk.chase_retry_left("BBBB", ARMED.chase_retry_seconds) == 0.0
 
 
 # ---- Trader's lock held by a click (architect's review 1 of Step 6, 2026-11-13 16:45 UTC) -------

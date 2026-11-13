@@ -192,24 +192,35 @@ def test_the_calls_bound_counts_a_chase_like_any_send(crig):
 def test_a_chase_refused_after_the_quote_keeps_only_the_quote_call_in_the_bound(crig, monkeypatch):
     """Schwab's quote is old at each try: chase_entry.prepare refuses after reading it, so each try
     cost Schwab one call (the quote) and the plan gives back the other 4 of the send's 5. Three tries
-    (armed.chase_quote_tries), then the plan leaves the pick. The other three picks' break entries
+    (armed.chase_quote_tries), each armed.chase_retry_seconds after the last refused one (architect's
+    review 1 of PR #25, must 2), then the plan leaves the pick. The other three picks' break entries
     count 5 each."""
     rig = crig
     real_quote = rig.trader.quote
+    asked = []
 
     def quote(sym, max_age=1.0):
+        if sym == "AAAA":
+            asked.append(rig.clock.t)
         q = real_quote(sym, max_age)
         return {**q, "quote_time": q["quote_time"] - 60_000} if sym == "AAAA" else q
     monkeypatch.setattr(rig.trader, "quote", quote)
     arm(rig)
     rig.tape.prices["AAAA"] = 42.51
-    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    run(rig, et(9, 31, 6), start=et(9, 31, 0.1))
     tries = rig.plan.armed_rules.chase_quote_tries
+    retry = rig.plan.armed_rules.chase_retry_seconds
     assert [c for c in rig.broker.calls if c == ("quote", "AAAA")] == [("quote", "AAAA")] * tries
     assert order_of(rig, "AAAA") == [] and f"{tries} times today" in rig.plan.left["AAAA"]
     send = rig.plan.armed_rules.calls_per_send
     assert rig.plan._calls_used() == 3 * send + tries          # 15 for the three sends, 1 per chase try
     assert rig.plan.orders_day == 3
+    # Spaced: each new quote at least the retry wait after the last refused try, so the three tries
+    # take at least 2 s, not three steps in about 1.2 s.
+    gaps = [(b - a).total_seconds() for a, b in zip(asked, asked[1:])]
+    assert len(asked) == tries and all(g >= retry - 1e-6 for g in gaps), gaps
+    assert (asked[-1] - asked[0]).total_seconds() >= 2.0
+    assert len([x for x in lines(rig, "note") if x.get("code") == "chase_retry_wait"]) == tries   # once per wait
 
 
 # ---- Trader's lock held by a click (architect's review 1 of Step 6, 2026-11-13 16:45 UTC) -------
@@ -374,3 +385,134 @@ def test_no_chase_after_a_click_cancel(crig):
     assert r["not_sent"] and not r["again"] and r["error"] == plan_entries.CLICK_TAKES_ROW
     assert rig.desk.records()["AAAA"]["origin"] == "click"
     assert len(order_of(rig, "AAAA")) == 1
+
+
+# ---- after Step 7's flip: the hand-over to the chase (architect's review 1 of PR #25, must 1) ------
+#
+# Step 7's real on_flip through the worker, on its rig (tests/test_plan_auto_flip.py frig) with the
+# chase switch on too. AAAA's long entry rests (trigger 42.49); a trade at 42.14 passes its flip line
+# 42.144 (0.6 of the way down to 41.92); the plan cancels the long, and while it does, the short
+# trigger 41.91 trades (41.88, inside the short cap: limit 41.85). After the confirmed cancel the
+# flip finds the short already traded, reads the tape again and hands a new lane, from that reading,
+# to the chase, with the cancelled order's id (cancelled_order_id).
+
+from test_plan_auto_flip import FLIP_ON, all_four_rest, frig  # noqa: E402,F401  (frig: Step 7's fixture)
+
+CHASE_SHORT = {"symbol": "AAAA", "side": "SHORT", "entry": "chase", "trigger": "41.91", "cap": "0.06",
+               "limit": "41.85", "stop": "42.48", "size_mode": "qty", "qty": 1, "risk": 0, "r": 0, "targets": 0,
+               "stop_type": "fixed", "expected_limit": "41.85", "expected_qty": 1, "expected_target": 0}
+LEFT_TRADED = "cancelled by the armed plan; the short trigger has already traded, nothing rests"
+
+
+@pytest.fixture
+def fcrig(frig, monkeypatch):  # noqa: F811
+    """Step 7's rig (the worker with its flip on) with the chase switch on as well."""
+    env = {**FLIP_ON, CHASE_FLAG: "1"}
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    frig.plan.env = env
+    return frig
+
+
+def short_trades_during_the_cancel(rig, price=41.88, during=None):
+    """AAAA rests long and passes its flip line; the short trigger trades while the plan cancels."""
+    ids = all_four_rest(rig)
+    rig.tape.prices["AAAA"] = 42.14
+    rig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    real = rig.broker.cancel_order
+
+    def cancel(h, oid):
+        out = real(h, oid)
+        if oid == ids["AAAA"]:
+            rig.tape.prices["AAAA"] = price
+            if during:
+                during(ids)
+        return out
+    rig.broker.cancel_order = cancel
+    return ids
+
+
+def test_after_a_flip_the_other_side_is_chased_at_its_cap(fcrig):
+    rig = fcrig
+    ids = short_trades_during_the_cancel(rig)
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]]
+    (req,) = [without_id(r) for r in rig.sent if r["symbol"] == "AAAA" and r.get("entry") == "chase"]
+    assert req == CHASE_SHORT
+    last = rig.broker.placed[-1]
+    leg = last["orderLegCollection"][0]
+    assert (leg["instrument"]["symbol"], leg["instruction"], last["orderType"], last["price"]) == \
+        ("AAAA", "SELL_SHORT", "LIMIT", "41.85")
+    (child,) = last["childOrderStrategies"]
+    assert (child["orderType"], child["stopPrice"]) == ("STOP", "42.48")
+    assert len(rig.broker.placed) == 5 and max(rig.working) == 1
+    got = rig.desk.records()["AAAA"]
+    assert (got["kind"], got["chases"], got["flips"], got["origin"], got["side"]) == \
+        ("chase", 1, 1, "auto", "SHORT")
+    assert "AAAA" not in rig.plan.left
+    (d,) = [x for x in lines(rig, "chase_decision") if x["ticker"] == "AAAA"]
+    assert (d["side"], d["limit"], d["last"], d["inside_cap"]) == ("short", "41.85", "41.88", True)
+
+
+def test_after_a_flip_an_old_order_list_still_showing_the_cancelled_entry_does_not_stop_the_chase(fcrig):
+    """The poller's list is up to 5 s old and can still show the entry the plan cancelled a moment
+    ago as working. Only that one id, confirmed CANCELED by Trader.cancel_entry, is skipped."""
+    rig = fcrig
+    ids = short_trades_during_the_cancel(rig)
+    for owner in (rig.desk, rig.plan):
+        real = owner._orders
+
+        def old(real=real):
+            return [{**o, "status": "WORKING"} if o.get("orderId") == ids["AAAA"] else o for o in real()]
+        owner._orders = old
+    run(rig, et(9, 31, 6))
+    assert rig.broker.orders[ids["AAAA"]]["status"] == "CANCELED"      # at Schwab, confirmed
+    assert [without_id(r) for r in rig.sent if r.get("entry") == "chase"] == [CHASE_SHORT]
+    assert rig.desk.records()["AAAA"]["kind"] == "chase" and "AAAA" not in rig.plan.left
+
+
+def test_after_a_flip_another_working_order_on_the_name_still_refuses_the_chase(fcrig):
+    rig = fcrig
+
+    def foreign(ids):                       # a thinkorswim order on AAAA appears during the cancel
+        o = copy.deepcopy(rig.broker.orders[ids["AAAA"]])
+        o.update(orderId=999, status="WORKING")
+        rig.broker.orders[999] = o
+    ids = short_trades_during_the_cancel(rig, during=foreign)
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert not [r for r in rig.sent if r.get("entry") == "chase"] and not lines(rig, "chase_send_start")
+    assert "A working AAAA order is already at Schwab (order 999). One entry per name." in rig.plan.left["AAAA"]
+    assert rig.desk.records()["AAAA"]["state"] == plan_entries.NONE
+
+
+def test_after_a_flip_an_unusable_reading_gives_no_chase_and_says_nothing_rests(fcrig):
+    """Step 7 reads the tape once more after the confirmed cancel to build the chase's lane. When that
+    reading is not usable there is no hand-over: the row and the panel say nothing rests."""
+    rig = fcrig
+    ids = short_trades_during_the_cancel(rig)
+    real_read, after = rig.tape.read, []
+
+    def read():
+        if rig.broker.cancelled:
+            after.append(rig.clock.now())
+            if len(after) == 2:             # the flip's look sees the trade; the hand-over's read fails
+                rig.tape.problem = "the open tape timed out"
+        return real_read()
+    rig.tape.read = read
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert not lines(rig, "chase_decision") and not [r for r in rig.sent if r.get("entry") == "chase"]
+    assert rig.plan.left["AAAA"].startswith(LEFT_TRADED + " (the new tape reading is not usable")
+    got = rig.desk.records()["AAAA"]
+    assert got["state"] == plan_entries.NONE and "nothing rests" in got["text"]
+    assert {p["ticker"]: p["left"] for p in rig.plan.panel()["picks"]}["AAAA"] == rig.plan.left["AAAA"]
+
+
+def test_after_a_flip_with_the_chase_switch_off_step_7s_sentence_stays(frig):  # noqa: F811
+    rig = frig
+    ids = short_trades_during_the_cancel(rig)
+    run(rig, et(9, 31, 6))
+    assert rig.broker.cancelled == [ids["AAAA"]] and len(rig.broker.placed) == 4
+    assert rig.plan.left["AAAA"] == LEFT_TRADED + " (the chase step is not on)"
+    assert not lines(rig, "chase_decision")

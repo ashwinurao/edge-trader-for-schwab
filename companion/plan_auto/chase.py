@@ -22,7 +22,8 @@ on the row; a tape reading taken just before is usable and still past the level;
 same; Schwab's order list is fresh; the bounds allow one more order. PlanDesk.chase_auto and
 Trader.submit check again at the send. A chase refused after Schwab's quote for a passing reason
 (an old quote, the price back inside the level) may try on a later reading, at most
-armed.chase_quote_tries times a pick a day (playbook.json, a start number).
+armed.chase_quote_tries times a pick a day and not before armed.chase_retry_seconds after the last
+refused try (playbook.json, start numbers).
 
 Schwab says no (brief 18 item 5): a 4xx ends the pick for the day with Schwab's text on the row and
 is never retried or answered with another order; a 429 disarms the plan for the day; no answer
@@ -96,11 +97,23 @@ def on_chase(lane: Lane) -> bool:
         return False
     if not lane.armed():
         return False
+    # Spaced tries (architect's review 1 of PR #25, 2026-11-13 17:08 UTC): after a try refused after
+    # Schwab's quote, the worker steps again at once, so without a wait the armed.chase_quote_tries
+    # tries were gone in about 1.2 s at 0.3 to 0.4 s a call. No quote, no spend, said once.
+    retry_s = float(lane.armed_rules.chase_retry_seconds)
+    if lane.desk.chase_retry_left(ticker, retry_s) > 0:
+        lane.say("chase_retry_wait", f"the last chase try was refused after Schwab's quote; the next one waits "
+                                     f"{retry_s:g} s (armed.chase_retry_seconds)")
+        return False
     o = lane.order_for(side)
     if o is None:
         lane.say("no_numbers", "no range, risk or calm flag to build the chase from")
         return False
-    # A new reading just before the send: the price may have come back since the decision.
+    # The tape again just before the send. Inside tape.every_seconds (0.25 s) the tape gives its last
+    # answer again, so in the same step this is usually the step's own reading (architect's review 1
+    # of PR #25, item 3). It still catches a reading that became old, a price back inside the level
+    # and a range that changed, and after Step 7's flip the lane comes from a reading taken after the
+    # confirmed cancel.
     pick, usable, why = lane.reread()
     if not usable or pick is None:
         lane.say("chase_unusable", f"no chase on this reading: the tape reading is not usable ({why})")
@@ -131,8 +144,11 @@ def on_chase(lane: Lane) -> bool:
              decided_at=_iso(now), inside_cap=inside, pullback_wait_s=wait_s)
     # view=lane.view: Step 2's view, read by the executor before the tape, so no Edge Scanner GET falls
     # between the reading and the send (architect's review, 2026-11-13 16:21 UTC).
+    # cancelled_order_id: set only by Step 7's flip hand-over, for the entry its confirmed cancel
+    # ended; the poller's order list may still show it working (review 1 of PR #25, must 1).
     r = lane.desk.chase_auto(ticker, side.upper(), o, quote_tries=int(lane.armed_rules.chase_quote_tries),
-                             pick=pick, view=getattr(lane, "view", None), log=lane.log, wait_s=wait_s)
+                             pick=pick, view=getattr(lane, "view", None), log=lane.log, wait_s=wait_s,
+                             cancelled_order_id=d.get("cancelled_order_id"))
     if r.get("not_sent"):
         # No order reached Schwab. The quote, when it was read, was one real call; the rest goes back.
         lane.refund(orders=1, calls=calls - (1 if r.get("quoted") else 0))

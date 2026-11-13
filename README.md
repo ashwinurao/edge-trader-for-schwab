@@ -576,18 +576,27 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   SHORT) LIMIT at the level plus (minus) the cap, the stop at the other side of the 09:30 range,
   1 share (`BREAK_MAX_SHARES`). The cap is 0.15 x the risk per share, at least 2 cents, at most
   0.15% of the price, rounded down to the cent (`companion/opening_plan/playbook.json` "automatic";
-  `companion/chase_entry.py` refuses any cap above that rule). A fill at the cap loses at most 1.15 R.
+  `companion/chase_entry.py` refuses any cap above that rule). Shares come from the trigger to the
+  stop, so a fill at the cap loses up to the risk per share plus the cap: 1.15 x the Risk per pick,
+  more when the 2 cent floor decides (1.2 x at 10 cents a share of risk). A break entry has the same worst
+  case, but a chase is expected to pay most of its cap.
 - Inside the cap it should fill at once. Past the cap it rests at the cap; the plan cancels it
   `pullback_wait_seconds` (120) after the send if it has not filled, and waits for Schwab's confirmed
   cancel. The limit never moves. The end of the fast watch (09:35 ET) cancels it like any plan entry.
 - One chase per pick a day. A chased entry is never flipped and never chased again. After a flip,
-  the other side may be chased once when its level has already traded.
+  the other side may be chased once when its level has already traded: Step 7 reads the tape again
+  after its confirmed cancel and hands the pick to the chase from that reading. The entry that cancel
+  ended does not count as a working order on the name, even while Schwab's order list (up to 5 s
+  old) still shows it; any other working order on the name still stops the chase. When that reading
+  is not usable, nothing is sent and the row and the panel say nothing rests.
 - Just before the send the plan reads the tape again: the reading must be usable, still at or past
   the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
   entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
   level and not through the stop. A quote that is old or back inside the level lets the plan try
-  again on a later reading, at most `armed.chase_quote_tries` (3, a start number in
-  `companion/opening_plan/playbook.json`) times a row a day.
+  again on a later reading, at most `armed.chase_quote_tries` (3) times a row a day, each try at
+  least `armed.chase_retry_seconds` (1.0 s) after the last refused one (both start numbers in
+  `companion/opening_plan/playbook.json`). Until then the plan reads no quote for that pick and
+  spends nothing; the panel says so once.
 - While a click (or Flat all) holds Edge Trader's order lock, the chase writes nothing and uses
   neither its one chase nor a quote try; the plan tries on its next reading, which must still be past
   the level. The row check uses the plan's cached Step 2 view, never a new request to Edge Scanner,
@@ -604,6 +613,8 @@ instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_e
   Schwab's confirmed cancel, then places the other side's break entry, which is then the click's: the
   chase line goes, and the plan cancels it neither at the chase's pullback wait nor at 09:35. After a
   click Cancel the plan does not chase that row.
+- A chase can fill on the wrong side of the level when the price comes back between Schwab's quote
+  check and the fill (about 0.4 s). Its stop is attached either way.
 - Not confirmed at Schwab: how a marketable limit entry with an attached stop behaves in the first
   seconds after 09:31 (the first 1-share live morning answers it).
 
