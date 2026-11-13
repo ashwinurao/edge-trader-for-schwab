@@ -20,12 +20,16 @@ and a 429 pauses ALL companion requests. Each endpoint keeps its own last-succes
 
 When order traffic is busy (brief 24, companion/poll_budget.py), the account and order reads go
 first: they wait only when the minute is full, as before (the 59-day sweep lets the 5 s reads go
-ahead of it then, for up to 60 s). Transactions, quotes, corrections and hours give way instead of
-waiting, unless an Auto B/E or a spread stop with Send needs them, and keep their old last-success
-time, so the page shows them as old. One netlog `skip` line per poll interval says so. In a quiet
-minute (5 order calls or fewer) and under a ticket window's steady repricing, every poll runs as
-before. Order traffic never waits for the poller. `hold_later` lets a caller that knows a burst is
-coming hold the later polls ahead of time.
+ahead of it then, for up to 60 s). Transactions, quotes, corrections and hours slow down or give way,
+unless an Auto B/E or a spread stop with Send needs them. What the trader sees:
+- a quiet minute (5 order calls or fewer): every poll as before;
+- a ticket window in focus, or a few clicks a minute (below 30 order calls): position marks every
+  6 s instead of 3, fills every 10 s as before; neither shows as old;
+- heavier traffic: marks, fills and realized P&L keep their old time and show as old until the
+  traffic eases.
+One netlog `skip` line per poll interval records each read not sent. Order traffic never waits for
+the poller. `hold_later` lets a caller that knows a burst is coming hold the later polls ahead of
+time (fills still come every 15 s).
 """
 from __future__ import annotations
 

@@ -137,7 +137,11 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
 - **Dashboard:** open positions (day trades and carried positions apart) with open P&L, live R, stop
   and target, protection (FULL, PARTIAL, NO STOP SEEN) and P&L at the stop; working orders including
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
-  STALE, DISCONNECTED) that disables every order button when data is not current.
+  STALE, DISCONNECTED) that disables every order button when data is not current. The account and
+  order list are read every 5 s, marks every 3 s and fills every 10 s. While a ticket window has
+  focus or after a click, marks come every 6 s instead of 3, so the account and order list keep
+  their pace within Schwab's 70 calls a minute. In heavier order traffic (30 or more order calls a
+  minute) marks, fills and realized P&L can show as old until it eases (`companion/poll_budget.py`).
 - **New trade:** symbol, side, stop, risk in dollars (four buttons you set yourself), entry at the mid,
   market, ask, bid or your own limit price (Lmt), one or two targets by R or by price, and a fixed stop, a trailing stop, or "Auto
   B/E 1R": a fixed stop that the app moves to break-even once when the mark reaches +1R of your fill
