@@ -21,8 +21,8 @@ Every send is the user's click (CONTRIBUTING rule 1):
   resting for one name. At most max_flips_per_row flips per row per day (playbook.json).
 
 When unsure, refuse (CONTRIBUTING rule 4): ARM off, market closed, the first minute not final,
-old data, the calm flag unknown, the name blocked by an unclear order, or an entry already
-working, unclear or filled on the row. Nothing is retried. No lock of this file is held across a
+old data, the calm flag unknown, the name blocked by an unclear order, an entry already working,
+unclear or filled on the row, or a hold (PlanDesk.add_hold: Flat all's batch, Step 9). Nothing is retried. No lock of this file is held across a
 Schwab call: a click claims its row (SENDING, FLIPPING) under the lock, lets go, and then
 Trader.submit / Trader.cancel_entry run under their own one-at-a-time lock, as today.
 """
@@ -109,9 +109,11 @@ class PlanDesk:
                  flips: int, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  armed: Optional[Callable[[], bool]] = None,
                  market_open: Optional[Callable[[], bool]] = None, demo: bool = False,
-                 orders_fresh: Optional[Callable[[], bool]] = None, stage: Any = plan_size.DEFAULT) -> None:
+                 orders_fresh: Optional[Callable[[], bool]] = None, stage: Any = plan_size.DEFAULT,
+                 hold: Optional[Callable[[], str]] = None) -> None:
         """`orders_fresh` says whether the poller's order list is fresh (Poller._fresh("orders_today")).
-        `stage` is the playbook's size stage (companion/plan_size.py, Step 9); the default is 1 share."""
+        `stage` is the playbook's size stage (companion/plan_size.py, Step 9); the default is 1 share.
+        `hold` returns why no new entry may go now, or "" (see add_hold)."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
         self.stage = plan_size.parse_stage(stage)
         self._orders_fresh_fn = orders_fresh or (lambda: True)
@@ -120,6 +122,28 @@ class PlanDesk:
         self.demo = demo
         self._lock = threading.Lock()
         self._mem: Optional[dict] = {} if demo else None   # demo: records in memory, never the db
+        self._holds: list[Callable[[], str]] = [hold] if hold is not None else []
+
+    # ---- holds: no new entry while something else runs --------------------------------------
+
+    def add_hold(self, fn: Callable[[], str]) -> None:
+        """Add a check that returns why no new entry may go now, or "". Place and Flip (and every
+        send that goes through _send_refusal) refuse while any hold gives a reason; Cancel does not
+        look at holds, since a cancel only removes risk. Flat all holds new entries for the length
+        of its batch (companion/plan_flat.py; architect's review 1 of Step 9, 2026-11-13)."""
+        self._holds.append(fn)
+
+    def held(self) -> str:
+        """The first hold's reason, or "". A hold that cannot be read holds (when unsure, refuse)."""
+        for fn in list(self._holds):
+            try:
+                why = fn()
+            except Exception as e:
+                log.exception("opening plan: a hold could not be read")
+                return f"Could not check whether new entries are held ({e}). Nothing was sent."[:300]
+            if why:
+                return str(why)
+        return ""
 
     # ---- records (one JSON per ET day in the settings table) --------------------------------
 
@@ -234,6 +258,9 @@ class PlanDesk:
 
     def _send_refusal(self, view: Mapping, ticker: str, side: str, blocked: Optional[set]) -> str:
         """Why a new entry for this row and side can't go now, or "" when it can."""
+        held = self.held()
+        if held:
+            return held
         if not self._armed():
             return "ARM is off. Arm entries on the dashboard first."
         if not self._market_open():

@@ -11,6 +11,7 @@ A plan size of 3 at 0.10 is floor(0.3) = 0, raised to the minimum of 1. A plan s
 """
 import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,6 +29,14 @@ def test_the_default_stage_is_one_share_and_the_allowed_set_is_pinned():
     raw = json.loads(plan_size.PLAYBOOK_FILE.read_text(encoding="utf-8"))
     assert raw["size"]["stage"] == "1_share"
     assert "Ash's go" in raw["size"]["_stage_about"]
+
+
+def test_the_stage_note_points_at_the_readmes_list_before_any_stage_above_one_share():
+    # Architect's review 1 of Step 9 (2026-11-13): what must be true before the stage is raised.
+    raw = json.loads(plan_size.PLAYBOOK_FILE.read_text(encoding="utf-8"))
+    assert "Before any stage above 1 share" in raw["size"]["_stage_about"]
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "**Before any stage above 1 share.**" in readme
 
 
 @pytest.mark.parametrize("stage,want,why", [

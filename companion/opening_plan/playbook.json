@@ -20,7 +20,7 @@
     "calm_multiplier": 0.5,
     "rv20_through_max_days": 4,
     "stage": "1_share",
-    "_stage_about": "Step 9 size stage (companion/plan_size.py, brief 19): what a plan entry sends. \"1_share\" (the default, the test stage) sends 1 share; 0.10, 0.25, 0.50 or 1.0 send floor(plan shares x stage), at least 1, inside the ticket's limits. Nothing else is allowed. Raising it is its own one-line PR that quotes Ash's go for that stage (who, when, where), and a stage above 1 share needs EDGE_TRADER_PLAN_FLAT=1 (the cover watch)."
+    "_stage_about": "Step 9 size stage (companion/plan_size.py, brief 19): what a plan entry sends. \"1_share\" (the default, the test stage) sends 1 share; 0.10, 0.25, 0.50 or 1.0 send floor(plan shares x stage), at least 1, inside the ticket's limits. Nothing else is allowed. Raising it is its own one-line PR that quotes Ash's go for that stage (who, when, where). A stage above 1 share needs EDGE_TRADER_PLAN_FLAT=1 (the cover watch) and the four points of README section \"Before any stage above 1 share\"."
   },
   "exit": {
     "flat_et": "10:00"

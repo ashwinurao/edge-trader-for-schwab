@@ -25,6 +25,9 @@ Flat all (Part A): one button ends the morning's plan trades.
 - It refuses: ARM off, market closed, Schwab's order list or positions old, a 429 pause, a batch
   already running; per row: a name blocked by an unclear order, a click still running, an entry
   partly filled and still working.
+- While a batch runs, PlanDesk holds new entries (HOLD): Place and Flip refuse, Cancel works. The
+  batch first calls `before_batch` (Step 6 wires its Disarm there); if that raises, it is logged
+  and the batch goes on. Architect's review 1 of Step 9, 2026-11-13.
 - From STAND_OUT before the playbook's exit.flat_et the button stands out and says the flat time.
 
 Cover watch (Part C, needed before any size stage above 1 share): for each plan row that holds
@@ -35,6 +38,8 @@ shares at the row's stop price (the stop its entry was sent with) through the da
 path (Trader.move_stop), with that path's refusals. That path creates a stop only when the position
 has none, for the whole position; when part is covered it would move the working stop instead, so a
 partly covered row refuses and says to set the rest in thinkorswim. Nothing is added automatically.
+The grace is measured when the page asks (GET /api/opening-plan/flat, every 2 s), not by a server
+clock: with the page closed no row turns red (README, "Before any stage above 1 share").
 
 Not confirmed at Schwab: whether the attached stop starts on the first partial fill of the entry.
 No lock of this file is held across a Schwab call.
@@ -72,6 +77,9 @@ CANCEL, CLOSE, NOTHING, REFUSE = "cancel", "close", "nothing", "refuse"
 DONE, REFUSED, UNCLEAR, NOT_SENT = "done", "refused", "unclear", "not_sent"
 
 THROTTLED = "Not sent: Schwab is throttling (HTTP 429). Use the dashboard once the pause ends."
+# PlanDesk's hold while a batch runs (architect's review 1 of Step 9, 2026-11-13): Place, Flip and
+# the automatic sends of Steps 6 to 8 refuse with this; Cancel stays allowed.
+HOLD = "Flat all is running: no new entries until it ends. Nothing was sent."
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
 POSITIONS_OLD = "Schwab's positions are old. Nothing is sent until they are fresh."
 
@@ -141,7 +149,8 @@ class PlanFlat:
                  positions: Callable[[], dict], terminal: Callable[[], set],
                  fresh: Callable[[], tuple], brackets: Callable[[], list], flat_et: time, grace: float,
                  cooldown: Callable[[], float] = lambda: 0.0, demo: bool = False,
-                 mono: Callable[[], float] = _time.monotonic) -> None:
+                 mono: Callable[[], float] = _time.monotonic,
+                 before_batch: Optional[Callable[[], Any]] = None) -> None:
         self.trader, self.desk = trader, desk
         self._orders, self._positions, self._terminal = orders, positions, terminal
         self._fresh_fn, self._brackets, self._cooldown_fn = fresh, brackets, cooldown
@@ -150,6 +159,13 @@ class PlanFlat:
         self._running = False
         self._uncovered: dict[str, float] = {}
         self._mem: Optional[dict] = {} if demo else None
+        # Called first in every batch, before the list is rebuilt. Step 6 wires it to its Disarm, so
+        # no automatic send starts once Flat all is clicked (architect's review 1 of Step 9).
+        self.before_batch = before_batch
+        desk.add_hold(self._hold)
+
+    def _hold(self) -> str:
+        return HOLD if self._running else ""
 
     # ---- the day's last batch ---------------------------------------------------------------
 
@@ -337,6 +353,13 @@ class PlanFlat:
                 self._running = False
 
     def _run(self, expected: Any) -> dict:
+        # The hold is on from here (self._running): no new entry goes while the batch runs.
+        if self.before_batch is not None:
+            try:
+                self.before_batch()
+            except Exception:
+                # Flat all only removes risk, and the hold already refuses new sends: carry on.
+                log.exception("flat all: before_batch failed; the batch goes on")
         why = self._refusal()
         if why:
             return {"ok": False, "error": why}

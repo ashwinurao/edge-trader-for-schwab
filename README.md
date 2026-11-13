@@ -378,7 +378,8 @@ buttons stay off, the log says why, and the rest of Edge Trader runs as usual.
   ticket's 10,000-share and $250,000 limits. With a plan size of 175: 17, 43, 87 and 175 shares.
 
 Any other value turns the plan buttons off, like any bad playbook, and the log says why. A stage
-above 1 share also needs `EDGE_TRADER_PLAN_FLAT=1` (the cover watch below), or the buttons stay off.
+above 1 share also needs `EDGE_TRADER_PLAN_FLAT=1` (the cover watch below), or the buttons stay off,
+and the four points under "Before any stage above 1 share" below.
 The size is decided on the server only: the page sends the shares it showed, and a difference
 refuses. The ticket's own Break entry stays at `BREAK_MAX_SHARES` (1); only a plan entry may go above
 it, by its stage, which the server passes inside itself (`break_entry.plan_cap`), never from a
@@ -406,6 +407,9 @@ by the clock: every order is your click.
 - It refuses when entries are not armed, the market is closed, Schwab's order list or positions are
   old, Schwab is throttling, or a batch is already running. A name blocked by an unclear order is
   refused for that row only.
+- While a batch runs, no new plan entry goes: Place and Flip refuse with "Flat all is running: no new
+  entries until it ends. Nothing was sent." Cancel still works. So Flat all never says "done" while a
+  new order rests. A batch first calls the hook Step 6 wires to its Disarm.
 - From 2 minutes before the playbook's flat time (`exit.flat_et`, 10:00 ET) the button turns red and
   says the flat time.
 - **Cover watch:** for each plan row that holds shares, the dashboard's own stop protection of the
@@ -415,10 +419,23 @@ by the clock: every order is your click.
   stop price (the stop its entry was sent with) through the dashboard's own Set stop path, with that
   path's refusals; it needs entries armed. That path creates a stop only when the position has none,
   so a row whose position is partly covered stays red and says to set the rest in thinkorswim.
-  Nothing is added automatically.
+  Nothing is added automatically. The grace counts only while the Opening plan page is open: the
+  server measures it when the page asks (every 2 s), so with the page closed no row turns red.
 
 Not confirmed at Schwab: whether the stop attached to a break entry starts working on the entry's
 first partial fill. The cover watch is there for that case.
+
+**Before any stage above 1 share.** At 1 share an entry cannot fill in part, so the gaps below cannot
+happen. Above 1 share they can. Each must be closed before the PR that raises `size.stage` (architect's
+review 1 of Step 9, 2026-11-13):
+1. Flat all handles an entry that is partly filled and still working: cancel the rest, read it back,
+   then close what filled. Today that row is refused.
+2. Add stop covers a partly covered position. Today that row is refused, because the dashboard's stop
+   path moves the working stop instead of adding one. This needs a `companion/trading.py` change and
+   Ash's go.
+3. Schwab's behavior for the attached stop on an entry's first partial fill is confirmed on a real
+   order.
+4. The cover's grace runs on a server clock, or the page says it counts only while the page is open.
 
 ## Updating to a new release
 

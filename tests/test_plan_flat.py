@@ -404,6 +404,129 @@ def test_a_double_click_while_a_batch_runs_is_refused(fr):
     assert out["first"]["ok"] and [c for c in mutating(fr) if c[0] == "cancel"] == [("cancel", a)]
 
 
+# ---------------------------------------------------------------- no new entry while a batch runs
+# Architect's review 1 of Step 9 (2026-11-13): a Place or Flip between two rows of a batch, or an
+# automatic send of Steps 6 to 8 after the batch built its list, would leave a new order resting
+# while Flat all says "done". PlanDesk's hold refuses them; Cancel stays allowed.
+
+def wait_for_gate(fr):
+    pause = threading.Event()                 # time.sleep is the fake broker's clock in these tests
+    for _ in range(400):
+        if fr.broker.gate is None:            # the batch is inside its first cancel
+            return
+        pause.wait(0.005)
+    raise AssertionError("the batch never reached its first cancel")
+
+
+def test_a_place_and_a_flip_during_a_batch_are_refused_and_send_nothing(fr):
+    a, b_, c = place(fr, "AAAA"), place(fr, "BBBB"), place(fr, "CCCC")
+    fr.broker.fill_entry(a)
+    items = fr.flat.items()
+    n_placed = len(fr.broker.placed)
+    gate = threading.Event()
+    fr.broker.gate = gate                     # the batch's first cancel (BBBB) waits on it
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("batch", fr.flat.run(expected(items))))
+    th.start()
+    wait_for_gate(fr)
+    assert plan_flat.HOLD in fr.desk.held()
+    p = fr.desk.place("DDDD", "LONG", LONG)
+    f = fr.desk.flip("CCCC", SHORT)
+    gate.set()
+    th.join(5)
+    assert not p["ok"] and p["error"] == plan_flat.HOLD
+    assert not f["ok"] and f["error"] == plan_flat.HOLD
+    assert out["batch"]["ok"], out["batch"]
+    stop_a = fr.broker.orders[a]["childOrderStrategies"][0]["orderId"]
+    assert mutating(fr)[-3:] == [("cancel", b_), ("cancel", c), ("replace", stop_a)]   # the batch's own
+    assert len(fr.broker.placed) == n_placed                                           # no new entry
+    assert int(fr.desk._load()["CCCC"].get("flips") or 0) == 0                         # the flip used none
+    assert fr.desk.held() == ""                                                        # the hold ends with it
+    assert fr.desk.place("DDDD", "LONG", LONG)["ok"]
+
+
+def test_the_page_shows_the_hold_and_a_cancel_still_works_during_a_batch(fr):
+    a, c = place(fr, "AAAA"), place(fr, "CCCC")
+    fr.broker.fill_entry(a)
+    seen = {}
+
+    def before():                             # runs inside the batch, with the hold on
+        seen["state"] = fr.desk.state()
+        seen["cancel"] = fr.desk.cancel("CCCC")
+    fr.flat.before_batch = before
+    r = fr.flat.run(expected(fr.flat.items()))
+    rows = {x["ticker"]: x for x in seen["state"]["rows"]}
+    assert rows["DDDD"]["place"] == {"long": plan_flat.HOLD, "short": plan_flat.HOLD}
+    assert seen["cancel"]["ok"] and ("cancel", c) in mutating(fr)
+    # CCCC's entry is gone since the page showed the list, so the batch itself sends nothing.
+    assert not r["ok"] and "list changed" in r["error"]
+    assert [x for x in mutating(fr) if x[0] == "replace"] == []
+
+
+def test_a_hold_that_cannot_be_read_refuses_new_entries(fr):
+    def broken():
+        raise RuntimeError("no answer")
+    fr.desk.add_hold(broken)
+    r = fr.desk.place("AAAA", "LONG", LONG)
+    assert not r["ok"] and "Nothing was sent" in r["error"] and fr.broker.placed == []
+
+
+def test_the_hold_ends_with_the_batch_whatever_its_end(fr, monkeypatch):
+    r = fr.flat.run([{"ticker": "ZZZZ", "action": "close", "order_id": 1, "shares": 1}])
+    assert not r["ok"] and fr.desk.held() == ""                      # refused: the list differs
+
+    def boom(expected):
+        raise RuntimeError("bug")
+    monkeypatch.setattr(fr.flat, "_run", boom)
+    with pytest.raises(RuntimeError):
+        fr.flat.run([])
+    assert fr.desk.held() == ""
+    assert place(fr, "AAAA")
+
+
+# ---------------------------------------------------------------- before_batch (Step 6 wires Disarm)
+
+def test_before_batch_runs_first_before_the_list_is_rebuilt(fr, monkeypatch):
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+    items = fr.flat.items()
+    order = []
+    real = fr.flat.items
+    monkeypatch.setattr(fr.flat, "items", lambda: (order.append("list"), real())[1])
+    fr.flat.before_batch = lambda: order.append("before")
+    r = fr.flat.run(expected(items))
+    assert r["ok"] and order[:2] == ["before", "list"]
+
+
+def test_before_batch_runs_even_when_the_batch_is_refused(fr):
+    called = []
+    fr.flat.before_batch = lambda: called.append(1)
+    fr.trader.arm(False)
+    r = fr.flat.run([])
+    assert not r["ok"] and "ARM is off" in r["error"] and called == [1]
+
+
+def test_a_before_batch_that_raises_does_not_stop_the_batch(fr, caplog):
+    a = place(fr, "AAAA")
+    fr.broker.fill_entry(a)
+
+    def boom():
+        raise RuntimeError("disarm failed")
+    fr.flat.before_batch = boom
+    r = fr.flat.run(expected(fr.flat.items()))
+    assert r["ok"] and fr.broker.pos["AAAA"] == 0
+    assert "disarm failed" in caplog.text
+
+
+def test_before_batch_is_a_constructor_argument_too(fr):
+    called = []
+    f = plan_flat.PlanFlat(fr.trader, fr.desk, fr.flat._orders, fr.flat._positions, fr.flat._terminal,
+                           fr.flat._fresh_fn, fr.flat._brackets, time(10, 0), 3.0,
+                           before_batch=lambda: called.append(1))
+    f.run([])
+    assert called == [1]
+
+
 def test_an_etf_position_closes_like_shares(fr):
     # The brief's "known gap" (Close refuses ETFs) was closed on 2026-11-06 (trading._trade_asset).
     a = place(fr, "AAAA")
