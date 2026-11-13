@@ -55,7 +55,8 @@ name are refused). It needs no account and sends no telemetry.
 - **Google Fonts**: the page loads the Inter and JetBrains Mono fonts. Offline it falls back to system fonts.
 - **Edge Scanner, only if you set `EDGE_SCANNER_URL`** (off by default): the Opening plan screen reads
   Edge Scanner's OV picks (`GET /api/v2/ov-picks`, at most every 2 seconds) and its clock
-  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open.
+  (`GET /api/v2/clock`, for SPY RV20, at most once a minute) on your LAN, only while the screen is open,
+  and on weekdays from 09:29 to 09:36 ET when the shadow log is on (`EDGE_TRADER_SHADOW=1`, below).
 
 ### API keys
 
@@ -227,6 +228,20 @@ e.g. `http://192.168.1.10:8772`, and rebuild. Use the address you open Edge Scan
 refuses a request whose host is not in its `SCANNER_ALLOWED_HOSTS` (`scanner/local_guard.py`), so a
 Docker service name does not work. Unset (the default), there is no Opening plan button, no route and
 no request to Edge Scanner.
+
+**Shadow log of the automatic plan (Step 5, sends nothing).** With the Opening plan on, set
+`EDGE_TRADER_SHADOW=1` in `.env` and rebuild. On weekdays from 09:29 to 09:36 ET a background thread
+reads the plan's Edge Scanner feed every half second and writes what an automatic OR1 plan WOULD do,
+one JSON line per decision, to `data/opening_plan/shadow/YYYY-MM-DD.jsonl`: the side nearer the last
+trade, a stop-limit entry one cent past the 09:30 minute's level with its limit capped, the stop at the
+other side and the shares; a fill (an estimate), a flip to the other side, a cancel, or no action and
+why (for example "price is 1.2 s old"). It has no button and no route, places, changes and cancels
+nothing, and imports no order code. Its numbers are in `companion/opening_plan/playbook.json` under
+`automatic`, each a start number not approved yet. Edge Scanner's picks route has no price after
+09:31, so the live log mostly shows the first decision and then old prices. For the full picture, replay
+Edge Scanner's opening-recorder file (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
+
+    python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
 
 ## Updating to a new release
 
