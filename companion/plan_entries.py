@@ -24,7 +24,9 @@ Step 6 (brief 16 item 5) adds the armed plan's twins, place_auto and cancel_auto
 companion/plan_auto (off unless EDGE_TRADER_PLAN_AUTO=1, and only after Ash's Arm click): the same
 claim, Trader.submit / Trader.cancel_entry, records and refusals as the clicks, with the numbers
 from the open tape's final range. Their records carry origin "auto"; the page says "sent by the
-armed plan" on the row.
+armed plan" on the row. A Place, Flip or Cancel click takes the row for the day (_put_click, the
+architect's ruling of 2026-11-13 16:17 UTC): origin "click", the automatic keys (AUTO_KEYS) cleared,
+and each automatic twin checks the origin under the lock just before its own request.
 
 When unsure, refuse (CONTRIBUTING rule 4): ARM off, market closed, the first minute not final,
 old data, the calm flag unknown, the name blocked by an unclear order, or an entry already
@@ -78,6 +80,12 @@ OTHER = {"LONG": "SHORT", "SHORT": "LONG"}
 # often a chase refused after the quote may try again is playbook.json armed.chase_quote_tries.
 CHASES_PER_ROW = 1
 TRADER_BUSY = "Another submission is in progress"      # Trader.submit's own lock: nothing was sent
+# Architect's ruling of 2026-11-13 16:17 UTC (brief 14), "a click takes the row for the day": a
+# Place, Flip or Cancel click on a row makes it the click's (origin "click") and clears every key
+# an automatic step wrote. A step that adds a key adds it here. The click's own counters (flips) stay,
+# and so does the chase's per-day counter (chases): a click never frees a row for another chase.
+AUTO_KEYS = ("kind", "sent", "sent_at", "wait_from", "wait_until", "range")
+CLICK_TAKES_ROW = "Yours since your click. The armed plan leaves this row for today."
 
 
 def enabled(env: Mapping[str, str] = os.environ) -> bool:
@@ -156,6 +164,17 @@ class PlanDesk:
     def _put(self, ticker: str, **kw) -> dict:
         recs = self._load()
         rec = {**(recs.get(ticker) or {}), **kw, "at": self._now().isoformat(timespec="seconds")}
+        recs[ticker] = rec
+        self._save(recs)
+        return rec
+
+    def _put_click(self, ticker: str, **kw) -> dict:
+        """Under the lock: the row becomes the click's for the day (ruling of 2026-11-13 16:17 UTC).
+        _put merges keys, so without this a click after the armed plan's entry kept origin "auto"
+        and the plan acted on the click's order (found by the Step 8 engineer)."""
+        recs = self._load()
+        rec = {k: v for k, v in (recs.get(ticker) or {}).items() if k not in AUTO_KEYS}
+        rec.update(kw, origin="click", at=self._now().isoformat(timespec="seconds"))
         recs[ticker] = rec
         self._save(recs)
         return rec
@@ -440,11 +459,7 @@ class PlanDesk:
             req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"])
         except ValueError as e:
             return None, f"Could not build the order: {e}"
-        # origin "click": _put merges keys, so without it a click after an armed-plan entry on this
-        # row (a click Flip, or Place after the plan's cancel) kept origin "auto", and the plan
-        # cancelled the click's entry at 09:35 (found by the Step 8 engineer, 2026-11-13).
-        self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
-                  origin="click", sent=None, sent_at=None, wait_from=None,
+        self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
                   text=f"Sending the {side.lower()} break entry." if not flip_from else
                   f"Cancelled the {flip_from.lower()} entry; sending the {side.lower()} break entry.")
         log.warning("OPENING PLAN %s %s break: trigger %s stop %s, %s sh (plan %s)", side, ticker,
@@ -516,6 +531,9 @@ class PlanDesk:
             oid = rec.get("order_id")
             if not oid or rec.get("state") not in (SENT, RED):
                 return self._refuse(ticker, "Nothing to cancel on this row.")
+            # The click takes the row before its request: whatever Schwab answers, the armed plan
+            # leaves this row today (ruling of 2026-11-13 16:17 UTC).
+            self._put_click(ticker)
         try:
             r = self.trader.cancel_entry(int(oid))
         except Exception as e:
@@ -560,8 +578,8 @@ class PlanDesk:
                 return self._refuse(ticker, "The plan changed since the page showed it. Review and click again.")
             oid = int(rec["order_id"])
             # The flip counts from the click: a flip that stops half-way still used one.
-            self._put(ticker, state=FLIPPING, flips=int(rec.get("flips") or 0) + 1,
-                      text=f"Flipping to {new.lower()}: cancelling the {old.lower()} entry.")
+            self._put_click(ticker, state=FLIPPING, flips=int(rec.get("flips") or 0) + 1,
+                            text=f"Flipping to {new.lower()}: cancelling the {old.lower()} entry.")
         log.warning("OPENING PLAN flip %s: cancel %s entry %s, then %s", ticker, old, oid, new)
         try:
             c = self.trader.cancel_entry(oid)
@@ -612,6 +630,8 @@ class PlanDesk:
                       blocked: Optional[set], fresh: bool) -> str:
         """Place's row checks without Step 2's view: the tape's own tests (executor.py) replace
         "the row's first minute is final and fresh". The plan sends only on an empty row."""
+        if rec.get("origin") == "click":
+            return CLICK_TAKES_ROW
         if rec:
             return f"{ticker} already has an entry record today ({rec.get('state')})."
         if not self._armed():
@@ -752,6 +772,8 @@ class PlanDesk:
         disagreeing). Its entry's Cancel works as on any red row."""
         ticker = str(ticker or "").upper().strip()
         with self._lock:
+            if (self._load().get(ticker) or {}).get("origin") != "auto":
+                return                                   # a click took the row: the plan leaves it
             self._put(ticker, state=RED, text=text,
                       red_why=f"{ticker}: the armed plan stopped on this row. Use the ticket or thinkorswim for it today.")
 
@@ -824,7 +846,7 @@ class PlanDesk:
         """Why the plan can't chase this row now, or "" when it can. Like _auto_refusal, except that
         a row whose plan entry ended unfilled (a flip cancelled it, brief 17) may be chased, once."""
         if rec and rec.get("origin") != "auto":
-            return f"{ticker}: a click used this row today. The armed plan leaves it."
+            return CLICK_TAKES_ROW                   # a click takes the row for the day (brief 14)
         state = entry["state"]
         if state in BUSY:
             return f"{ticker}: an action on this row is still running."

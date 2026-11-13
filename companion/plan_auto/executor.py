@@ -38,7 +38,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import break_entry
+from .. import break_entry, plan_entries
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, enabled
@@ -348,7 +348,7 @@ class AutoPlan:
     def _for_engine(self, sym: str, entry: dict, left: Mapping) -> dict:
         state = entry.get("state")
         if state == "hand":
-            self.leave(sym, f"{sym} has an entry placed by a click: the armed plan leaves it")
+            self.leave(sym, plan_entries.CLICK_TAKES_ROW)
             state = "ended"
         elif state == "red":
             self.leave(sym, entry.get("text") or f"{sym} is red: the armed plan leaves it")
@@ -534,6 +534,7 @@ class AutoPlan:
                     "Send when the price is already at or past the trigger: that pick is left to you."
                     if PAST_TRIGGER not in kinds else CHASE_ARM_NOT_TEXT,
                     "Act on an old or late tape, an old order list, an unclear order, or after any disarm.",
+                    "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",
                     "Survive a restart: arming is in memory only."]
         return {"playbook": self.playbook_name, "picks": [r.get("ticker") for r in (view or {}).get("rows") or []],
                 "shares": break_entry.BREAK_MAX_SHARES, "risk": (view.get("risk") or {}).get("per_pick") if view else None,

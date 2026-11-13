@@ -406,7 +406,7 @@ def test_not_on_a_row_a_click_used(rig):
     assert rig.host.handle("would_place", tape(42.51, entry=rig.host.entry())) is False
     nothing_sent(rig)
     r = rig.desk.chase_auto("AAAA", "LONG", rig.host.order_for("AAAA", tape(42.51), "long"), quote_tries=3)
-    assert r["not_sent"] and "a click used this row" in r["error"]
+    assert r["not_sent"] and r["error"] == plan_entries.CLICK_TAKES_ROW
 
 
 def test_not_when_the_row_holds_a_fill(rig):

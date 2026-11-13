@@ -247,5 +247,6 @@ def test_no_chase_after_a_click_cancel(crig):
     rules = rig.plan.armed_rules
     o = rig.plan.order_for("AAAA", {"high": 42.48, "low": 41.92}, "long")
     r = rig.desk.chase_auto("AAAA", "LONG", o, quote_tries=rules.chase_quote_tries)
-    assert r["not_sent"] and not r["again"] and "a click used this row today" in r["error"]
+    assert r["not_sent"] and not r["again"] and r["error"] == plan_entries.CLICK_TAKES_ROW
+    assert rig.desk.records()["AAAA"]["origin"] == "click"
     assert len(order_of(rig, "AAAA")) == 1
