@@ -432,14 +432,15 @@ def test_rejected_at_the_second_read(trader, monkeypatch):
     assert trader.store.get_ticket("ticket-0001")["status"] == "REJECTED"
 
 
-@pytest.mark.parametrize("first, second", [
+@pytest.mark.parametrize("script", [
     (TimeoutError("read timed out"), 500),
-    (404, ConnectionResetError()),
+    # Brief 26: a read whose connection dropped is tried once more (the third read), and fails too.
+    (404, ConnectionResetError(), ConnectionResetError()),
     (429, 429),
 ])
-def test_a_failed_read_changes_nothing_and_the_poll_still_catches_it(trader, monkeypatch, first, second):
-    _send_then_read(trader, monkeypatch, first, second)
-    assert trader._status_client.asked == [555, 555]
+def test_a_failed_read_changes_nothing_and_the_poll_still_catches_it(trader, monkeypatch, script):
+    _send_then_read(trader, monkeypatch, *script)
+    assert trader._status_client.asked == [555] * len(script)
     assert trader.store.get_ticket("ticket-0001")["status"] == "ACCEPTED"
     refused = {**_tree(555), "status": "REJECTED", "statusDescription": BUYING_POWER}
     (row,) = trader.brackets([refused], pend=[], positions={}, orders_fresh=True)
