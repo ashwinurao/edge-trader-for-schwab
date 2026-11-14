@@ -2727,7 +2727,7 @@ WITH_DOLLARS = ("below zero ($1,234.56)", "$-50.00", "$ 75")
 def no_dollar_amount(r):
     """No digit after a $ (spaces, a ( or a - between) anywhere in the day's log file."""
     raw = "".join(f.read_text() for f in (r.tmp / "auto").glob("*.jsonl"))
-    assert raw and not re.search(r"\$\s*[(\-]?\s*\d", raw), raw
+    assert raw and not re.search(r"\$\s*[(\-]?\s*\.?\d", raw), raw
 
 
 def test_the_days_log_keeps_no_dollar_amount_in_a_string_a_dict_or_a_list(frig):
@@ -2743,6 +2743,24 @@ def test_the_days_log_keeps_no_dollar_amount_in_a_string_a_dict_or_a_list(frig):
     assert (line["shares"], line["price"], line["ok"]) == (3, "42.10", True)   # a number without a $ is not masked
     assert plan_lines(frig, "note")[1]["text"] == "Schwab says below zero ($[masked])"
     assert frig.plan.notes["BBBB"]["note"] == f"Schwab says {a}"                 # the page keeps the words
+
+
+class _Says:
+    """An object whose own text names an amount, as a Schwab answer object might."""
+    def __str__(self):
+        return "balance $2,500.00 left"
+
+
+def test_the_days_log_masks_amounts_whatever_the_values_type(frig):
+    # The writer turns any value that is not JSON into its own text (json.dumps' default=str): an
+    # exception, an object, a set. The mask covers what is written, and "$.65" too (architect's
+    # review 4 of Step 7, follow-up 3, 2026-11-14 00:06 UTC). No log() call passes such a value today.
+    frig.plan.log("note", "AAAA", err=RuntimeError("below zero ($1,234.56)"), obj=_Says(), tags={"$ 75"},
+                  errs=[ValueError("$3.50")], fee="fee $.65", fees={"a": "$-.65 off"})
+    no_dollar_amount(frig)
+    (line,) = plan_lines(frig, "note")
+    assert (line["err"], line["obj"], line["tags"]) == ("below zero ($[masked])", "balance $[masked] left", "{'$[masked]'}")
+    assert line["errs"] == ["$[masked]"] and line["fee"] == "fee $[masked]" and line["fees"] == {"a": "$[masked] off"}
 
 
 def test_a_flips_4xx_with_a_dollar_amount_leaves_none_in_the_days_log(frig):
