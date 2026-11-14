@@ -216,6 +216,8 @@ function notes(r) {
       out.push(`<div class="mutline">Place: ${esc(e.place.long)}</div>`);
     // A red row's entry may still rest at Schwab: its status goes under the red text.
     if (st.order_text) out.push(`<div class="mutline">${esc(st.order_text)}</div>`);
+    // The armed plan's chase (Step 8): its limit, cap and, while it rests, until when it waits.
+    if (st.auto_text) out.push(`<div class="mutline">${esc(st.auto_text)}</div>`);
     // Brief 25 rule F: the user's own shares or working orders on the name, beside the plan's.
     if (e.manual) out.push(`<div class="mutline">${esc(e.manual)}</div>`);
     // Brief 29 part B: what the newest price Edge Trader holds says before the click. Display only.

@@ -646,8 +646,9 @@ attached. It sends one order at a time, the pick nearest its trigger first (in R
 again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
 but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
 log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
-waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never flips (unless Step 7's
-own switch is on, below), chases, exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
+waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never exits, moves a stop or
+resends, and flips or chases only with that step's own switch (below). Without the capped chase
+(below), a pick whose price is already at or past its trigger is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
 Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
@@ -870,6 +871,99 @@ stays" (or "re-level is not on") and the entry stays.
   2.25 s from the start of the cancel to Schwab's answer to the new entry; a cancel that never confirms
   gives up after about 7.3 s (`tests/test_plan_auto_flip.py`).
 
+**Capped chase by the armed plan (Step 8, off by default; not merged until Ash's go).** With
+`EDGE_TRADER_PLAN_AUTO_CHASE=1` on top of the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`,
+`EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1`, `EDGE_TRADER_PLAN_BUTTONS=1`) and only after Ash's Arm
+click, a pick that has already traded at or past its level when the plan would place gets a chase
+instead of being left to you (`companion/plan_auto/chase.py`, `companion/chase_entry.py`):
+- The order is the ticket's own limit entry with its stop attached, not a new order shape: BUY (SELL
+  SHORT) LIMIT at the level plus (minus) the cap, the stop at the other side of the 09:30 range,
+  1 share (`BREAK_MAX_SHARES`) at any size stage: Step 9's `size.stage` sizes the clicks' entries
+  only, the armed plan arms only at `"1_share"`, and `companion/chase_entry.py` refuses more than
+  `BREAK_MAX_SHARES` even inside a plan entry's size cap. The cap is 0.15 x the risk per share, at
+  least 2 cents, at most 0.15% of the price, rounded down to the cent
+  (`companion/opening_plan/playbook.json` "automatic";
+  `companion/chase_entry.py` refuses any cap above that rule). Shares come from the trigger to the
+  stop, so a fill at the cap loses up to the risk per share plus the cap: 1.15 x the Risk per pick,
+  more when the 2 cent floor decides (1.2 x at 10 cents a share of risk). A break entry has the same worst
+  case, but a chase is expected to pay most of its cap.
+- Inside the cap it should fill at once. Past the cap it rests at the cap; the plan cancels it
+  `pullback_wait_seconds` (120) after the send if it has not filled, and waits for Schwab's confirmed
+  cancel. The limit never moves. The end of the fast watch (09:35 ET) cancels it like any plan entry.
+- One chase per pick a day. A chased entry is never flipped and never chased again. After a flip,
+  the other side may be chased once when its level has already traded: Step 7 reads the tape again
+  after its confirmed cancel and hands the pick to the chase from that reading. The entry that cancel
+  ended (and its stop) is the plan's own, never yours, even while Schwab's order list (up to 5 s
+  old) still shows it working. When that reading
+  is not usable, nothing is sent and the row and the panel say nothing rests. When the chase can't go
+  on that reading for a passing reason (an old order list, old account positions, your own trades on
+  the name not showing one side, another order action running, an old quote, the price back inside
+  the level), the pick waits and the plan offers it to the chase again on each later reading, under
+  the same tries and retry wait as below, until the watch ends. Any other reason (Flat all's hold,
+  your own trade on the other side, the tries used up) and the watch end leave the pick with the
+  reason and "nothing rests".
+- Beside your own trades (brief 25, `companion/plan_side.py`, the rule above): before each chase
+  order the plan checks your own shares and working orders on the name for the chase's side. The same
+  side, or none: the chase goes. The other side: the pick is left, nothing is sent ("You are short 50
+  T by hand. The plan does not take the other side of a name you trade. Nothing was sent."). Not
+  clear (both sides, an order that is not a plain buy or sell, shares the plan cannot tell from its
+  own): the pick waits, said once on its line, with no Schwab call and no quote try, while the other
+  picks go on; it chases on a later reading once it is clear, until the watch ends. A side rule
+  that cannot be read is not clear: when unsure, the plan sends nothing and waits. Old account
+  positions wait like an old order list. The plan's log keeps the side rule's code (`side_rule`) and
+  the side in the chase's `wait`, `wait_over` and `leave` lines, never your share count or the words
+  on the page, as Step 6's armed send does.
+- An armed entry that Schwab accepts (201) and then rejects with "The stop price must be above the
+  current ask for buy stop orders and below the bid for sell stop orders." had its level passed
+  between the plan's quote and Schwab's check (seen live on 2026-11-13, 4 s after the 201). Ash's
+  answer of 2026-11-13 20:01 UTC lets the chase take that pick as already through: the same chase,
+  same cap, once a pick a day, only inside the fast watch, and only while the price is still at or
+  past the level. It is the pick's second order, so the chase switch adds one order to each pick's
+  bound (`armed.orders_per_pick` 1 + 1 = 2; with Step 7's flip switch on, 5 + 1 = 6) and, with the
+  flip switch off, takes the day's bound from `armed.orders_per_day_with_chase` (8, a start number in
+  `companion/opening_plan/playbook.json`; with the flip on the day stays
+  `armed.orders_per_day_with_flips`). The Arm dialog shows these bounds and the click confirms them.
+  When the day has no room left the pick is left, "Schwab rejected the plan's entry and nothing
+  rests", and the plan stays armed; a send that would pass a bound still disarms. Any other rejection ends
+  the pick as before, and a rejected chase is never sent again. Every rejected plan entry is one
+  `entry_rejected` line in the plan's log with the day's counts, also with the chase switch off.
+- Just before the send the plan reads the tape again: the reading must be usable, still at or past
+  the level, with the same range. Schwab's order list must be fresh and the row empty (or its plan
+  entry ended unfilled). At the send, Schwab's quote must be real-time, under 5 s old, at or past the
+  level and not through the stop. A quote that is old or back inside the level lets the plan try
+  again on a later reading, at most `armed.chase_quote_tries` (3) times a row a day, each try at
+  least `armed.chase_retry_seconds` (1.0 s) after the last refused one (both start numbers in
+  `companion/opening_plan/playbook.json`). Until then the plan reads no quote for that pick and
+  spends nothing; the panel says so once.
+- While a click holds Edge Trader's order lock ("Another submission is in progress."), or Schwab's
+  order list is too old, the chase writes nothing, reads no quote and uses neither its one chase nor
+  a quote try; the plan waits a tick and tries on its next reading, which must still be past the
+  level.
+  While Flat all runs, its hold refuses every new entry, the chase too, before any quote or record:
+  the pick is left with Flat all's reason, also after a flip's hand-over. Flat all turns its hold on
+  first and then disarms the plan (`companion/plan_flat.py`). A hold that cannot be read refuses the
+  same way. The row check uses the plan's cached Step 2 view, never a new request to Edge Scanner,
+  and is skipped for a chase exactly as for a break entry while the panel says "Row check off".
+- Schwab says no: a 4xx ends the pick for the day with Schwab's text on the row and is never retried;
+  a 429 disarms the plan for the day; no answer freezes the pick, disarms the plan and keeps the name
+  blocked until you press Resolve.
+- The row says "Chased by the armed plan: limit X, cap Y." and, while it rests, until when it waits.
+  The plan's log (`data/opening_plan/auto/`) has the level, the cap, the last trade and its age, the
+  limit sent and the times (reading, decision, send, answer). The send writes Step 6's `send_start`
+  and `send_answer` lines with `kind` "chase", so a chase sent inside the poller hold moves the hold's
+  end to 60 seconds after it, never past 09:33:30 ET (Step 6's hold above). A chase after the hold
+  ended starts no hold of its own.
+- The Arm dialog lists the chase under "It will" only while its switch is on, and then no longer says
+  that a pick past its trigger is left to you.
+- A click takes the row for the day. A click Flip on a resting chase cancels the chase, waits for
+  Schwab's confirmed cancel, then places the other side's break entry, which is then the click's: the
+  chase line goes, and the plan cancels it neither at the chase's pullback wait nor at 09:35. After a
+  click Cancel the plan does not chase that row.
+- A chase can fill on the wrong side of the level when the price comes back between Schwab's quote
+  check and the fill (about 0.4 s). Its stop is attached either way.
+- Not confirmed at Schwab: how a marketable limit entry with an attached stop behaves in the first
+  seconds after 09:31 (the first 1-share live morning answers it).
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -902,6 +996,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, or at 09:35 ET). Off by default. |
 | `EDGE_TRADER_PLAN_AUTO_FLIP` | `1`, together with the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`), lets the armed plan flip and re-level its own resting entry. Off by default. |
 | `EDGE_TRADER_PLAN_FLAT` | `1`, together with the plan buttons' switches, adds Flat all and the cover watch (Add stop) to the Opening plan. Needed for any size stage above 1 share. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO_CHASE` | `1`, together with `EDGE_TRADER_PLAN_AUTO=1` and the switches it needs, lets the armed plan chase a pick that already traded through its level: one limit entry at the capped price with its stop, once per pick a day. Off by default. |
 
 ## Good to know
 

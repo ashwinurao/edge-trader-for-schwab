@@ -63,6 +63,7 @@ from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
+from .chase import ARM_NOT_TEXT as CHASE_ARM_NOT_TEXT, armed_with_chase, offers as chase_offers
 from .flip import armed_with_flips
 from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
 
@@ -210,9 +211,14 @@ class AutoPlan:
         # Step 2's own limit for an old answer (plan.build_view marks the view stale past it).
         self.rules_feed_stale = float((playbook.get("feed") or {}).get("stale_after_seconds", 6))
         self.registry = registry or default_registry()
-        if any(self.registry.get(k, env) is not None for k in ("would_flip", "would_relevel")):
+        flips = any(self.registry.get(k, env) is not None for k in ("would_flip", "would_relevel"))
+        if flips:
             # Brief 17 item 5: a flip or a re-level is an order too (companion/plan_auto/flip.py).
             self.armed_rules = armed_with_flips(self.armed_rules, self.rules, playbook)
+        if self.registry.get(PAST_TRIGGER, env) is not None:
+            # Step 8: a chase after Schwab rejected the entry as already through is the pick's second
+            # order (architect's review 3 of PR #25, must 1; companion/plan_auto/chase.py).
+            self.armed_rules = armed_with_chase(self.armed_rules, playbook, flips)
         self.arming = Arming(self.armed_rules)
         # Guards the fields below. Never held across a call to Schwab or Edge Scanner.
         self._lock = threading.Lock()
@@ -727,6 +733,14 @@ class AutoPlan:
         picks = {p["symbol"]: p for p in er["picks"]}
         acts = [d for d in decisions if d.get("kind") in ACTION_KINDS and d.get("symbol") in picks]
         watch_over = now >= self.arming.watch_end(day)
+        # Step 8 (architect's live test notes of 2026-11-13, N1, N2 and N4): the picks the chase takes
+        # between the engine's decisions, an entry Schwab rejected as already through and a chase a
+        # flip handed over that waits; with the chase switch off it only logs each rejected plan entry.
+        with self._lock:
+            left = dict(self.left)
+        offered = [d for d in chase_offers(self, picks, left, watch_over) if d.get("symbol") in picks]
+        self._note_decisions(offered, er, timing)
+        acts += offered
         may_send = self._picks_may_send(er, watch_over)
         with self._lock:
             self._may_send = may_send
@@ -856,7 +870,9 @@ class AutoPlan:
         off = [w for w, kind in (("flip", "would_flip"), ("chase", PAST_TRIGGER)) if kind not in kinds]
         not_line = ", ".join(off + ["exit", "move a stop or resend."])
         will_not = [not_line[:1].upper() + not_line[1:],
-                    "Send when the price is already at or past the trigger: that pick is left to you.",
+                    # Step 8: with the chase on, a pick past its trigger is chased, not left to Ash.
+                    "Send when the price is already at or past the trigger: that pick is left to you."
+                    if PAST_TRIGGER not in kinds else CHASE_ARM_NOT_TEXT,
                     "Act on an old or late tape, an old order list (it waits until the list is fresh), an unclear "
                     "order, or after any disarm.",
                     "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",

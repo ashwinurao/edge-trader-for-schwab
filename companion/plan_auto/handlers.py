@@ -75,7 +75,7 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
 from .. import plan_entries
-from . import switch_on
+from . import CHASE_FLAG, switch_on
 
 Handler = Callable[["Lane"], bool]
 
@@ -334,9 +334,11 @@ def on_cancel(lane: Lane) -> bool:
 
 def default_registry() -> Registry:
     """Step 6's handlers. Steps 7 and 8 add theirs here, each behind its own switch."""
+    from .chase import ARM_TEXT as CHASE_ARM_TEXT, on_chase   # Step 8 (brief 18); here: chase.py imports this file
     reg = Registry()
     reg.register("would_place", on_place)
     reg.register("would_cancel", on_cancel)
+    reg.register(PAST_TRIGGER, on_chase, switch=CHASE_FLAG, arm_text=CHASE_ARM_TEXT)
     from . import flip                    # Step 7 (brief 17): behind EDGE_TRADER_PLAN_AUTO_FLIP
     flip.register(reg)
     return reg
