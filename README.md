@@ -686,8 +686,10 @@ cancel (read back until Schwab says CANCELED with nothing filled) and goes befor
 chase of that step. The row says "Cancelled by the armed plan, nothing filled: You are short 50 AAAA
 by hand. The plan does not take the other side of a name you trade, so it leaves AAAA for today."
 When your side is not clear (both sides, an order that is not a plain buy or sell, an old read) the
-entry rests, the pick's line says why once, and the plan looks again on the next reading. It never
-cancels an entry you clicked yourself. The plan sees your trade only through those reads (every 5 s,
+entry rests, the pick's line says why once, and the plan looks again on the next reading. Just after
+a send, while Schwab's order list does not show the plan's entry yet, the entry rests too and the
+line says "Schwab's order list does not show the plan's long entry yet. The plan checks your side of
+AAAA when it does." It never cancels an entry you clicked yourself. The plan sees your trade only through those reads (every 5 s,
 up to about 11 s when order traffic is busy), so its entry can still trigger first; then it holds 1
 share against your side with its stop, the row turns red and the plan disarms. Nothing closes that
 share automatically. What Schwab does when a 1-share plan entry triggers against a position you hold

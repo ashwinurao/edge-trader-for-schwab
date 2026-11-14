@@ -990,9 +990,10 @@ class PlanDesk:
         try:
             ps = plan_side.plan_shares(rec, orders)
             if ps.state == plan_side.UNCLEAR:
-                # Accepted, and the poller's list does not show it yet (or shows no fill count): the
-                # plan can't tell its shares from the user's, so it cancels nothing on this read.
-                return plan_side.NOT_CLEAR, ps.text, side
+                # Accepted, and the poller's list does not show it yet (its own code and calm words,
+                # review 1), or shows no fill count: the plan can't tell its shares from the user's,
+                # so it cancels nothing on this read.
+                return plan_side.NOT_CLEAR, (ps.text if ps.listed else plan_side.ENTRY_NOT_LISTED), side
             earlier = list(rec.get("auto_order_ids") or []) + list(rec.get("plan_stop_ids") or [])
             ids = set(ps.ids) | plan_side.plan_ids(rec.get("order_id"), orders, earlier)
             code, text = plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ids, ps.held)
@@ -1309,7 +1310,9 @@ class PlanDesk:
                 return done(error=f"The armed plan already tried to cancel {ticker}'s order {oid} once. "
                                   "It stays as it is; its Cancel button works.")
             # Counted from the claim, as the click's Flip: a flip that stops half-way still used one.
-            self._put(ticker, state=FLIPPING, **{count: used + 1},
+            # The id it cancels stays the plan's (auto_order_ids, brief 30 review 1): the poller's list
+            # can show it working for up to 5 s after the new entry, on the other side.
+            self._put(ticker, state=FLIPPING, **{count: used + 1}, **self._auto_ids(ticker, oid),
                       text=f"The armed plan is {'flipping to ' + side.lower() if kind == 'flip' else 're-levelling'}: "
                            f"cancelling the {old.lower()} entry.")
         _log.warning("OPENING PLAN armed %s %s: cancel %s entry %s, then %s", what, ticker, old, oid, side)

@@ -128,17 +128,21 @@ def test_no_cancel_when_ash_is_not_clearly_on_the_other_side(rig, setup):
     assert not mine(rig, "cancel_start")
 
 
-@pytest.mark.parametrize("setup,words", [
-    ("both_sides", "You are on both sides of AAAA (shares or working orders), so the plan cannot tell which "
-                   "side you trade. The plan's long entry rests; it looks again on the next reading."),
-    ("odd_order", "One of your AAAA orders is not a plain buy or sell. The plan's long entry rests; it looks "
-                  "again on the next reading."),
-    ("old_orders", "Schwab's order list is old, so the plan can't check your side of AAAA. The plan's long entry "
-                   "rests; it looks again on the next reading."),
-    ("old_positions", "Schwab's positions are old, so the plan can't check your side of AAAA. The plan's long "
-                      "entry rests; it looks again on the next reading."),
+@pytest.mark.parametrize("setup,code,words", [
+    ("both_sides", "beside_not_clear",
+     "You are on both sides of AAAA (shares or working orders), so the plan cannot tell which "
+     "side you trade. The plan's long entry rests; it looks again on the next reading."),
+    ("odd_order", "beside_not_clear",
+     "One of your AAAA orders is not a plain buy or sell. The plan's long entry rests; it looks "
+     "again on the next reading."),
+    ("old_orders", "beside_orders_old",
+     "Schwab's order list is old, so the plan can't check your side of AAAA. The plan's long entry "
+     "rests; it looks again on the next reading."),
+    ("old_positions", "beside_positions_old",
+     "Schwab's positions are old, so the plan can't check your side of AAAA. The plan's long "
+     "entry rests; it looks again on the next reading."),
 ])
-def test_a_side_that_is_not_clear_is_said_once_on_the_picks_line_and_the_log_keeps_the_code(rig, setup, words):
+def test_a_side_that_is_not_clear_is_said_once_on_the_picks_line_and_the_log_keeps_the_code(rig, setup, code, words):
     all_rest(rig)
     if setup == "both_sides":
         by_hand(rig, 7, "BUY", "AAAA")
@@ -152,8 +156,8 @@ def test_a_side_that_is_not_clear_is_said_once_on_the_picks_line_and_the_log_kee
     run(rig, et(9, 31, 9))
     assert pick_line(rig)["note"] == words
     said = [x for x in mine(rig, "note") if x["code"].startswith("beside_")]
-    assert len(said) == 1 and (said[0]["why"], said[0]["side_rule"], said[0]["side"]) == (
-        "the side rule said not_clear", "not_clear", "long")
+    assert len(said) == 1 and (said[0]["code"], said[0]["why"], said[0]["side_rule"], said[0]["side"]) == (
+        code, "the side rule said not_clear", "not_clear", "long")
     assert "text" not in said[0]
     # The reason passes: the line is cleared, and said again only when it comes back.
     rig.knobs["fresh"] = rig.knobs["pfresh"] = True
@@ -229,14 +233,21 @@ def test_a_filled_entry_is_never_cancelled_and_nothing_closes(rig):
 
 
 def test_an_entry_the_order_list_does_not_show_yet_is_not_clear_until_it_does(rig):
+    """Just accepted, not in the poller's list yet: its own code and calm words, not the doubt of an
+    unclear side (architect, review 1, 2026-11-14 04:56 UTC). The side rule is still not_clear."""
     ids = all_rest(rig)
     rig.knobs["positions"] = {"AAAA": -50.0}
     real = rig.desk._orders
     rig.desk._orders = lambda: [o for o in real() if o.get("orderId") != ids["AAAA"]]
+    assert rig.desk.beside_auto("AAAA") == (plan_side.NOT_CLEAR, plan_side.ENTRY_NOT_LISTED, "LONG")
     run(rig, et(9, 31, 6))
     assert rig.broker.cancelled == []
-    assert pick_line(rig)["note"] == (f"Schwab's order list does not show the plan's entry (order {ids['AAAA']}). "
-                                      "The plan's long entry rests; it looks again on the next reading.")
+    assert pick_line(rig)["note"] == ("Schwab's order list does not show the plan's long entry yet. "
+                                      "The plan checks your side of AAAA when it does.")
+    said = [x for x in mine(rig, "note") if x["code"].startswith("beside_")]
+    assert len(said) == 1 and (said[0]["code"], said[0]["side_rule"], said[0]["side"]) == (
+        "beside_not_listed", "not_clear", "long")
+    assert "text" not in said[0] and str(ids["AAAA"]) not in json.dumps(said[0])
     rig.desk._orders = real
     run(rig, et(9, 31, 9))
     assert rig.broker.cancelled == [ids["AAAA"]] and "AAAA" in rig.plan.left
@@ -288,6 +299,27 @@ def test_after_a_flip_the_stale_old_entry_is_the_plans_and_the_new_entry_rests(f
     ids = flipped(frig)
     got = frig.desk.records()["AAAA"]
     assert got["auto_order_ids"] == [ids["AAAA"], got["order_id"]]           # the record keeps both
+    stale(frig, ids["AAAA"])
+    run_plan(frig, et(9, 31, 9))
+    assert frig.broker.cancelled == [ids["AAAA"]] and "AAAA" not in frig.plan.left
+    assert frig.broker.orders[got["order_id"]]["status"] == "WORKING"
+
+
+def test_a_flip_keeps_the_id_it_cancels_on_the_row_when_the_row_did_not_have_it(frig):
+    """The flip's claim keeps the id it cancels (architect, review 1): an entry id the row learned
+    another way (Schwab's list matched a send whose answer was unclear, PlanDesk's reconcile) is the
+    plan's too, so its stale copy never looks like Ash's long beside the plan's new short."""
+    ids = all_four_rest(frig)
+    with frig.desk._lock:
+        recs = frig.desk._load()
+        recs["AAAA"].pop("auto_order_ids", None)
+        frig.desk._save(recs)
+    frig.tape.prices["AAAA"] = 42.14
+    frig.view.bars["AAAA"] = (42.48, 41.92, 42.14)
+    run_plan(frig, et(9, 31, 6))
+    assert frig.broker.cancelled == [ids["AAAA"]]
+    got = frig.desk.records()["AAAA"]
+    assert got["auto_order_ids"] == [ids["AAAA"], got["order_id"]]
     stale(frig, ids["AAAA"])
     run_plan(frig, et(9, 31, 9))
     assert frig.broker.cancelled == [ids["AAAA"]] and "AAAA" not in frig.plan.left

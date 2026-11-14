@@ -23,9 +23,10 @@ file checks an entry that already rests, on every step of the worker (AutoPlan.s
   are: one automatic cancel attempt per order id; a busy order lock or an old order list is a wait
   that does not use the attempt; not confirmed, a fill or a 429 turns the row red and disarms.
 - ok (the user on the same side, or not in the name): nothing. The entry rests.
-- not_clear (an old order list or account read, both sides, an order that is not a plain buy or
-  sell, a rule that raises): no cancel. The entry rests, the rule is asked again on the next step,
-  and the pick's line says why once while the reason lasts.
+- not_clear (an old order list or account read, an entry the poller's list does not show yet, both
+  sides, an order that is not a plain buy or sell, a rule that raises): no cancel. The entry rests,
+  the rule is asked again on the next step, and the pick's line says why once while the reason
+  lasts. An entry not listed yet has its own code (beside_not_listed) and calm words (review 1).
 
 The executor puts these cancels first in the step, nearest trigger first among them, before any
 send, flip, re-level or chase (a cancel removes a trade the user does not want; a send adds one),
@@ -47,7 +48,8 @@ from typing import Any, Mapping
 
 from .. import plan_side
 
-# One line of the Arm dialog's "It will" (handlers.default_registry registers it with would_cancel).
+# One line of the Arm dialog's "It will". AutoPlan.terms() adds it, not handlers.default_registry: a
+# Step 8 test pins the registry's arm texts.
 ARM_TEXT = ("Cancel its own unfilled entry on a name when you take the other side of that name by hand, and "
             "leave that pick for the day.")
 
@@ -73,6 +75,11 @@ def _wait_words(text: str, ticker: str, side: str) -> tuple[str, str]:
         return "beside_orders_old", f"Schwab's order list is old, so the plan can't check your side of {ticker}. {rests}"
     if text == plan_side.POSITIONS_OLD:
         return "beside_positions_old", f"Schwab's positions are old, so the plan can't check your side of {ticker}. {rests}"
+    if text == plan_side.ENTRY_NOT_LISTED:
+        # Just accepted and not in the poller's list yet: the usual moment after a send, not a doubt
+        # about the user's side (review 1).
+        return "beside_not_listed", (f"Schwab's order list does not show the plan's {side} entry yet. "
+                                     f"The plan checks your side of {ticker} when it does.")
     return "beside_not_clear", f"{_what(text)}. {rests}"
 
 

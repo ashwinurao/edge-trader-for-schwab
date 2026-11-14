@@ -42,6 +42,9 @@ OK, OTHER_SIDE, NOT_CLEAR = "ok", "other_side", "not_clear"
 
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
 POSITIONS_OLD = "Schwab's positions are old. Nothing is sent until they are fresh."
+# Brief 30, review 1: the armed plan's resting entry is accepted and the poller's list does not show
+# it yet. PlanDesk.beside_auto returns it and plan_auto/beside.py gives it its own calm words.
+ENTRY_NOT_LISTED = "Schwab's order list does not show the plan's entry yet."
 
 # plan_shares states
 NO_FILL = "no_fill"        # the entry filled nothing (or there is no entry)
@@ -161,6 +164,7 @@ class PlanShares:
     fill_at: Optional[datetime] = None  # the entry's last fill time
     ids: set = field(default_factory=set)
     text: str = ""
+    listed: bool = True                 # False when the poller's list does not show the entry (brief 30)
 
     @property
     def held(self) -> Optional[float]:
@@ -184,6 +188,7 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
     entry = next((o for o in _nodes(orders) if o.get("orderId") == oid), None)
     if entry is None:
         out.state, out.text = UNCLEAR, f"Schwab's order list does not show the plan's entry (order {oid})."
+        out.listed = False
         return out
     filled = _f(entry.get("filledQuantity"))
     if filled is None:
