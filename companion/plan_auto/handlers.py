@@ -72,7 +72,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
 from .. import plan_entries
 from . import switch_on
@@ -91,7 +91,9 @@ class Registration:
     kind: str
     handler: Handler
     switch: Optional[str] = None           # an env switch that must be "1" (with Step 6's), or None
-    arm_text: str = ""                     # what it may do, one sentence for the Arm dialog
+    # What it may do, one sentence for the Arm dialog: a text, or a function of the engine's rules
+    # that gives one (Step 7 names the playbook's flip and re-level counts; "" lists nothing).
+    arm_text: Union[str, Callable[[Any], str]] = ""
 
 
 class Registry:
@@ -100,7 +102,8 @@ class Registry:
     def __init__(self) -> None:
         self._by_kind: dict[str, Registration] = {}
 
-    def register(self, kind: str, handler: Handler, switch: Optional[str] = None, arm_text: str = "") -> None:
+    def register(self, kind: str, handler: Handler, switch: Optional[str] = None,
+                 arm_text: Union[str, Callable[[Any], str]] = "") -> None:
         if kind in self._by_kind:
             raise ValueError(f"a handler for {kind!r} is already registered")
         self._by_kind[kind] = Registration(kind, handler, switch, arm_text)
@@ -115,9 +118,16 @@ class Registry:
         """The kinds that have a handler on (the Arm dialog lists what the plan will do)."""
         return [k for k in self._by_kind if self.get(k, env) is not None]
 
-    def arm_texts(self, env: Mapping[str, str]) -> list[str]:
+    def arm_texts(self, env: Mapping[str, str], rules: Any = None) -> list[str]:
         """The arm_text of each handler that is on, in the order registered (the Arm dialog's "It will")."""
-        return [r.arm_text for k, r in self._by_kind.items() if r.arm_text and self.get(k, env) is not None]
+        out = []
+        for k, r in self._by_kind.items():
+            if not r.arm_text or self.get(k, env) is None:
+                continue
+            text = r.arm_text(rules) if callable(r.arm_text) else r.arm_text
+            if text:
+                out.append(text)
+        return out
 
 
 class LaneHost(Protocol):
@@ -327,4 +337,6 @@ def default_registry() -> Registry:
     reg = Registry()
     reg.register("would_place", on_place)
     reg.register("would_cancel", on_cancel)
+    from . import flip                    # Step 7 (brief 17): behind EDGE_TRADER_PLAN_AUTO_FLIP
+    flip.register(reg)
     return reg

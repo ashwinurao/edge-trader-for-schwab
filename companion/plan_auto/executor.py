@@ -37,13 +37,15 @@ The worker never holds a lock of its own across a call to Schwab or Edge Scanner
 exception (an unexpected one disarms for the day and shows why) and never blocks the ticket, the
 poller or the page. Every decision and action is one JSON line in
 data/opening_plan/auto/YYYY-MM-DD.jsonl (git-ignored) with its times; no account numbers, tokens,
-request bodies or share counts of the user's own positions (the side rule logs its code).
+request bodies or share counts of the user's own positions (the side rule logs its code), and no
+dollar amount: log() masks each one in its strings (_no_dollars; Step 8 review 5).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import threading
 import time as _time
 from collections import Counter, deque
@@ -59,8 +61,9 @@ from starlette.concurrency import run_in_threadpool
 from .. import break_entry, plan_entries, plan_flat, plan_size
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
-from . import AUTO_FLAG, BUTTONS_FLAG, enabled
+from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
+from .flip import armed_with_flips
 from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
 
 log = logging.getLogger("companion.plan_auto")
@@ -142,6 +145,29 @@ def _when(v: Any) -> Optional[datetime]:
     return None
 
 
+# A dollar amount in a string: a $, optional spaces, an optional ( or -, digits with commas and an
+# optional decimal part, an optional ). Schwab's reject words reach the plan's day log through Step 7's
+# flip and Step 8's chase answers, and it is not confirmed that they never name a balance (architect,
+# 2026-11-13 23:53 UTC, Step 8 review 5: the armed plan's day log keeps no dollar amount). The ) is
+# taken only after a (, so "below zero ($1,234.56)" keeps its own closing bracket. An amount may start
+# at the point ("$.65", review 4 follow-up 3, 2026-11-14 00:06 UTC).
+_AMOUNT = r"(?:\d+(?:,\d+)*(?:\.\d+)?|\.\d+)"
+_DOLLARS = re.compile(rf"\$\s*(?:\(\s*-?{_AMOUNT}(?:\s*\))?|-?{_AMOUNT})")
+DOLLARS_MASK = "$[masked]"
+
+
+def _no_dollars(v: Any) -> Any:
+    """v with every dollar amount in its strings, also inside a dict or a list, replaced by
+    DOLLARS_MASK. For the day log's row only: the page keeps Schwab's words."""
+    if isinstance(v, str):
+        return _DOLLARS.sub(DOLLARS_MASK, v)
+    if isinstance(v, Mapping):
+        return {k: _no_dollars(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_no_dollars(x) for x in v]
+    return v
+
+
 def _jsonable(v: Any) -> Any:
     if isinstance(v, Decimal):
         return str(v)
@@ -184,6 +210,9 @@ class AutoPlan:
         # Step 2's own limit for an old answer (plan.build_view marks the view stale past it).
         self.rules_feed_stale = float((playbook.get("feed") or {}).get("stale_after_seconds", 6))
         self.registry = registry or default_registry()
+        if any(self.registry.get(k, env) is not None for k in ("would_flip", "would_relevel")):
+            # Brief 17 item 5: a flip or a re-level is an order too (companion/plan_auto/flip.py).
+            self.armed_rules = armed_with_flips(self.armed_rules, self.rules, playbook)
         self.arming = Arming(self.armed_rules)
         # Guards the fields below. Never held across a call to Schwab or Edge Scanner.
         self._lock = threading.Lock()
@@ -303,12 +332,14 @@ class AutoPlan:
 
     def log(self, event: str, ticker: Optional[str] = None, **fields) -> None:
         now = self._now()
-        row = {"t": _iso(now), "event": event, "ticker": ticker, **_jsonable(fields)}
+        row = _no_dollars({"t": _iso(now), "event": event, "ticker": ticker, **_jsonable(fields)})
         try:
             with self._log_lock:
                 self.out_dir.mkdir(parents=True, exist_ok=True)
                 with open(self.out_dir / f"{now.astimezone(ET).date().isoformat()}.jsonl", "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(row, default=str) + "\n")
+                    # Masked again as written: json.dumps turns any other value (an exception, a set,
+                    # an object) into its own text, after the mask above (review 4 follow-up 3).
+                    fh.write(_no_dollars(json.dumps(row, default=str)) + "\n")
         except OSError:
             log.exception("armed plan: could not write its log")
         if event == "send_start":
@@ -819,7 +850,7 @@ class AutoPlan:
                 f"fetched. With none from the last {self.rules_feed_stale:g} s, send on the open tape alone and say so "
                 "on this panel.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
-                "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env)
+                "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env, self.rules)
         # Name each step that is not on (Step 8 engineer, 2026-11-13: with only the chase on, the
         # old line dropped "flip" too).
         off = [w for w, kind in (("flip", "would_flip"), ("chase", PAST_TRIGGER)) if kind not in kinds]
@@ -934,6 +965,10 @@ def fill_demo(plan: AutoPlan) -> None:
         recs = plan.desk._mem[plan.desk._key()]
         recs["AAAA"].update(origin="auto", kind="break", sent_at=_iso(armed_at + timedelta(seconds=330)))
         recs["BBBB"].update(origin="auto", kind="break")
+        if plan.registry.get("would_flip", plan.env) is not None:
+            # Step 7: AAAA's resting long reads as flipped by the armed plan from a short.
+            recs["AAAA"].update(flips=1, auto_note=f"Flipped by the armed plan (1 of {plan.rules.max_flips}).",
+                                auto_note_for=recs["AAAA"].get("order_id"))
     except Exception:
         pass
     at = lambda s: (datetime.combine(day, plan.armed_rules.act_from_et, tzinfo=ET) + timedelta(seconds=s)).strftime("%H:%M:%S")
@@ -978,6 +1013,10 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
                           and env.get(BUTTONS_FLAG) == "1")
     if desk is None or not on:
         return None
+    if demo and not enabled(env):
+        # Demo has no Edge Scanner address. A later step's own switch (Step 7's flip) still shows
+        # what it would add; every click is refused in demo and the worker never starts.
+        env = {**env, SCANNER_URL: "demo"}
     now = now or getattr(app.state, "opening_plan_now", None) or (lambda: datetime.now(timezone.utc))
     try:
         playbook = json.loads(PLAYBOOK_FILE.read_text(encoding="utf-8"))
