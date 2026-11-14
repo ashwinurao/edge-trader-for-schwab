@@ -149,8 +149,9 @@ def _when(v: Any) -> Optional[datetime]:
 # optional decimal part, an optional ). Schwab's reject words reach the plan's day log through Step 7's
 # flip and Step 8's chase answers, and it is not confirmed that they never name a balance (architect,
 # 2026-11-13 23:53 UTC, Step 8 review 5: the armed plan's day log keeps no dollar amount). The ) is
-# taken only after a (, so "below zero ($1,234.56)" keeps its own closing bracket.
-_AMOUNT = r"\d+(?:,\d+)*(?:\.\d+)?"
+# taken only after a (, so "below zero ($1,234.56)" keeps its own closing bracket. An amount may start
+# at the point ("$.65", review 4 follow-up 3, 2026-11-14 00:06 UTC).
+_AMOUNT = r"(?:\d+(?:,\d+)*(?:\.\d+)?|\.\d+)"
 _DOLLARS = re.compile(rf"\$\s*(?:\(\s*-?{_AMOUNT}(?:\s*\))?|-?{_AMOUNT})")
 DOLLARS_MASK = "$[masked]"
 
@@ -336,7 +337,9 @@ class AutoPlan:
             with self._log_lock:
                 self.out_dir.mkdir(parents=True, exist_ok=True)
                 with open(self.out_dir / f"{now.astimezone(ET).date().isoformat()}.jsonl", "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(row, default=str) + "\n")
+                    # Masked again as written: json.dumps turns any other value (an exception, a set,
+                    # an object) into its own text, after the mask above (review 4 follow-up 3).
+                    fh.write(_no_dollars(json.dumps(row, default=str)) + "\n")
         except OSError:
             log.exception("armed plan: could not write its log")
         if event == "send_start":
