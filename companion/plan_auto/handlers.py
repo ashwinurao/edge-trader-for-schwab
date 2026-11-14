@@ -65,6 +65,10 @@ The calls bound (architect's ruling, 2026-11-13 15:47 UTC, brief 14; it replaces
   calls in one minute. A 429 disarms for the day. Brief 24 changes the poller.
 tests/test_plan_auto.py pins both worst cases against break_entry.prepare and Trader.cancel_entry.
 
+Brief 30 (beside.py) hands on_cancel its other-side cancels as would_cancel decisions with the side
+rule's code: the row keeps the words, the log the code and side (log_fields), and after the
+confirmed cancel on_cancel leaves the pick for the day (leave_after).
+
 Step 6 registers would_place and would_cancel (default_registry). A decision kind with no handler
 on (would_flip until Step 7) is said once: "<kind> is not on: nothing done".
 """
@@ -310,9 +314,16 @@ def on_cancel(lane: Lane) -> bool:
     if not lane.armed():
         return False
     key = f"cancel:{oid}"
+    d = lane.decision
     if not lane.once(key):
+        if d.get("leave_tried"):
+            # Brief 30's other-side cancel of an id the plan already tried once: never repeated; the
+            # plan leaves the pick, so nothing more is sent for it.
+            lane.leave(d["leave_tried"], logged=d.get("leave_tried_logged"))
         return False                           # tried once already: never repeated
-    r = lane.desk.cancel_auto(lane.ticker, str(lane.decision.get("why") or ""), log=lane.log)
+    # Brief 30 (beside.py): the row keeps the side rule's words, the log its code and side (log_fields).
+    extra = {"log_fields": d["log_fields"]} if d.get("log_fields") else {}
+    r = lane.desk.cancel_auto(lane.ticker, str(d.get("why") or ""), log=lane.log, **extra)
     if r.get("not_sent") and (r.get("busy") or r.get("again")):
         lane.host.forget(key)                  # Trader's lock was busy, or the list old: nothing reached Schwab
         lane.busy("cancel", plan_entries.TRADER_BUSY if r.get("busy") else str(r.get("error") or ""))
@@ -323,6 +334,10 @@ def on_cancel(lane: Lane) -> bool:
         lane.leave(f"not cancelled: {r.get('error')}")
         return False
     if r.get("ok"):
+        if d.get("leave_after"):
+            # Brief 30: the user took the other side of this name; confirmed with nothing filled, the plan
+            # leaves the pick for the day, also when the user closes that trade soon after.
+            lane.leave(d["leave_after"], logged=d.get("leave_logged"))
         return True
     if "HTTP 429" in str(r.get("error") or "") or r.get("status") == "RATE_LIMITED":
         lane.disarm("Schwab throttled the plan's cancel (HTTP 429)", for_day=True)
