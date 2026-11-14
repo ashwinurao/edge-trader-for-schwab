@@ -99,7 +99,8 @@ SUBMIT_BUSY = "Another submission is in progress"      # Trader.submit's refusal
 # an automatic step wrote. A step that adds a key adds it here. The click's own counters (flips) stay,
 # and so does the chase's per-day counter (chases): a click never frees a row for another chase.
 AUTO_KEYS = ("kind", "sent", "sent_at", "wait_from", "wait_until", "range",
-             "relevels", "auto_note", "auto_note_for")    # Step 7: the re-level count and the row's flip line
+             "relevels", "auto_note", "auto_note_for",    # Step 7: the re-level count and the row's flip line
+             "auto_order_ids")                            # brief 30: every order id the armed plan placed today
 CLICK_TAKES_ROW = "Yours since your click. The armed plan leaves this row for today."
 # Trader's one order lock is held by a click, a ticket send or Flat all: nothing reached Schwab.
 # The armed plan checks it before claiming a row (architect's review 1 of fork PR #27, 2026-11-13
@@ -612,16 +613,29 @@ class PlanDesk:
                  "error": f"Error while sending ({e}). The order MAY be live: check thinkorswim."[:300]}
         with self._lock:
             if r.get("ok") and r.get("order_id"):
-                self._put(ticker, state=SENT, order_id=r["order_id"], text="")
+                self._put(ticker, state=SENT, order_id=r["order_id"], text="", **self._auto_ids(ticker, r["order_id"]))
             elif r.get("ok") or r.get("status") == UNKNOWN or r.get("duplicate"):
                 # Accepted without an order id, or no clear answer: Trader.submit keeps the name
                 # blocked until the poller finds it or the user presses Resolve.
                 self._put(ticker, state=UNKNOWN, order_id=r.get("order_id"),
-                          text=r.get("error") or "Schwab accepted it without an order id. Check thinkorswim.")
+                          text=r.get("error") or "Schwab accepted it without an order id. Check thinkorswim.",
+                          **self._auto_ids(ticker, r.get("order_id")))
             else:
                 # Refused before sending, rejected (4xx) or throttled (429): nothing is live.
                 self._put(ticker, state=NONE, order_id=None, text=f"Not sent: {r.get('error') or r.get('status')}")
         return {**r, "ticker": ticker, "side": side}
+
+    def _auto_ids(self, ticker: str, order_id: Any) -> dict:
+        """Under the lock: the armed plan's row keeps every order id it placed on the name today
+        (brief 30, "the trap"). After the plan's own flip or re-level, or a chase after a flip, the
+        poller's list (up to 5 s old) can still show the entry the plan cancelled as working, on the
+        other side of its new entry. beside_auto counts these ids as the plan's, never the user's.
+        {} for a click's row or no order id."""
+        rec = self._load().get(ticker) or {}
+        if rec.get("origin") != "auto" or not isinstance(order_id, int) or isinstance(order_id, bool):
+            return {}
+        ids = [i for i in rec.get("auto_order_ids") or [] if isinstance(i, int) and not isinstance(i, bool)]
+        return {"auto_order_ids": ids if order_id in ids else ids + [order_id]}
 
     def place(self, ticker: str, side: str, expected: Any) -> dict:
         ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
@@ -916,10 +930,14 @@ class PlanDesk:
             return {**r, "not_sent": True, "again": again, "busy": again}
         return r
 
-    def cancel_auto(self, ticker: str, why: str = "", log: Optional[Callable[..., None]] = None) -> dict:
+    def cancel_auto(self, ticker: str, why: str = "", log: Optional[Callable[..., None]] = None,
+                    log_fields: Optional[Mapping] = None) -> dict:
         """Cancel's twin for the armed plan: only the plan's own resting entry, through
         Trader.cancel_entry (which reads it back until Schwab says CANCELED with nothing filled).
-        `not_sent` when nothing reached Schwab, with `busy` when Trader's lock was the reason."""
+        `not_sent` when nothing reached Schwab, with `busy` when Trader's lock was the reason.
+        `why` goes on the row; `log_fields` (with its own `why`), when given, is what the plan's
+        cancel_start line keeps in its place (brief 30: the side rule's words can name the user's
+        own shares, so the log gets its code and the side)."""
         ticker = str(ticker or "").upper().strip()
         log = log or (lambda event, **kw: None)
         if self.demo:
@@ -937,7 +955,7 @@ class PlanDesk:
             oid = rec.get("order_id")
             if rec.get("origin") != "auto" or rec.get("state") != SENT or not oid:
                 return self._refuse(ticker, "No resting entry of the armed plan on this row.", not_sent=True)
-        log("cancel_start", order_id=oid, why=why)
+        log("cancel_start", order_id=oid, **(dict(log_fields) if log_fields else {"why": why}))
         try:
             r = self.trader.cancel_entry(int(oid))
         except Exception as e:
@@ -950,6 +968,38 @@ class PlanDesk:
                 self._put(ticker, state=NONE, order_id=None,
                           text=f"Cancelled by the armed plan, nothing filled{': ' + why if why else ''}.")
         return {**r, "ticker": ticker}
+
+    def beside_auto(self, ticker: str) -> tuple[str, str, str]:
+        """Brief 30: brief 25's side rule (plan_side.manual_refusal) for the armed plan's OWN resting
+        entry on this row, on that entry's side: (code, text, side). OK when the row is not the plan's
+        resting entry, or the user is on the same side or not in the name; OTHER_SIDE when the user
+        trades the other side of the name; NOT_CLEAR when it cannot tell (an old order list or
+        account read, both sides, an order that is not a plain buy or sell, a rule that raises: its
+        traceback goes to the server log, as _swap_side and _chase_beside). The poller's last reads
+        only: no Schwab call, no Edge Scanner call. Every order the plan placed on the name today is
+        the plan's (auto_order_ids, with the entry's tree and its Add stop stops), never the user's."""
+        ticker = str(ticker or "").upper().strip()
+        orders = self._orders()
+        fresh = self._orders_fresh()
+        with self._lock:
+            rec = dict(self._load().get(ticker) or {})
+        side = str(rec.get("side") or "")
+        if rec.get("origin") != "auto" or rec.get("state") != SENT or not rec.get("order_id"):
+            return plan_side.OK, "", side
+        positions, pfresh = self._positions_read()
+        try:
+            ps = plan_side.plan_shares(rec, orders)
+            if ps.state == plan_side.UNCLEAR:
+                # Accepted, and the poller's list does not show it yet (or shows no fill count): the
+                # plan can't tell its shares from the user's, so it cancels nothing on this read.
+                return plan_side.NOT_CLEAR, ps.text, side
+            earlier = list(rec.get("auto_order_ids") or []) + list(rec.get("plan_stop_ids") or [])
+            ids = set(ps.ids) | plan_side.plan_ids(rec.get("order_id"), orders, earlier)
+            code, text = plan_side.manual_refusal(ticker, side, positions, orders, pfresh, fresh, ids, ps.held)
+        except Exception as e:                       # when unsure, cancel nothing (CONTRIBUTING rule 4)
+            _log.exception("armed plan: the side rule failed for %s's resting entry", ticker)
+            return plan_side.NOT_CLEAR, f"Could not read your {ticker} position and orders ({e}).", side
+        return code, text, side
 
     def red_auto(self, ticker: str, text: str) -> None:
         """The armed plan turns a row red for the day (an unconfirmed cancel, the tape and the row

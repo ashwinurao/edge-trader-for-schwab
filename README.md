@@ -677,6 +677,21 @@ other side of a name you trade. Nothing was sent."). When your side is not clear
 order that is not a plain buy or sell, the plan unable to tell its shares from yours) that pick waits:
 it is looked at again on each reading until the watch ends, and the other picks go on. Schwab's
 positions old (no good account read for 15 seconds) is a wait for every pick, like an old order list.
+When you take the other side of a name after the plan's entry already rests there (your shares or a
+working order by hand, brief 30, `companion/plan_auto/beside.py`), the plan cancels its own unfilled
+entry on that name and leaves the pick for the day: no flip, re-level, chase or new entry on it, also
+when you close your trade a minute later. It checks every resting plan entry on each step (every
+0.25 s, `armed.every_seconds` in `companion/opening_plan/playbook.json`) from the poller's last account and order reads, with no Schwab call; the cancel is Step 6's
+cancel (read back until Schwab says CANCELED with nothing filled) and goes before any send, flip or
+chase of that step. The row says "Cancelled by the armed plan, nothing filled: You are short 50 AAAA
+by hand. The plan does not take the other side of a name you trade, so it leaves AAAA for today."
+When your side is not clear (both sides, an order that is not a plain buy or sell, an old read) the
+entry rests, the pick's line says why once, and the plan looks again on the next reading. It never
+cancels an entry you clicked yourself. The plan sees your trade only through those reads (every 5 s,
+up to about 11 s when order traffic is busy), so its entry can still trigger first; then it holds 1
+share against your side with its stop, the row turns red and the plan disarms. Nothing closes that
+share automatically. What Schwab does when a 1-share plan entry triggers against a position you hold
+on the other side is not confirmed.
 A **Flat all** click disarms the plan first, before Flat all builds its list ("the Flat all click").
 After it the plan sends and cancels nothing: Flat all's own list does the cancels. A send the plan had
 already started lands; its row says "A click on this row is still running" in that batch, and a second
@@ -993,7 +1008,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
-| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, or at 09:35 ET). Off by default. |
+| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, at 09:35 ET, or when you take the other side of that name by hand). Off by default. |
 | `EDGE_TRADER_PLAN_AUTO_FLIP` | `1`, together with the armed plan's switches (`EDGE_TRADER_PLAN_AUTO=1`), lets the armed plan flip and re-level its own resting entry. Off by default. |
 | `EDGE_TRADER_PLAN_FLAT` | `1`, together with the plan buttons' switches, adds Flat all and the cover watch (Add stop) to the Opening plan. Needed for any size stage above 1 share. Off by default. |
 | `EDGE_TRADER_PLAN_AUTO_CHASE` | `1`, together with `EDGE_TRADER_PLAN_AUTO=1` and the switches it needs, lets the armed plan chase a pick that already traded through its level: one limit entry at the capped price with its stop, once per pick a day. Off by default. |
