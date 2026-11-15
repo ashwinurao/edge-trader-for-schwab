@@ -203,9 +203,21 @@
       "value": 0.25,
       "note": "start number, not approved by Ash; data stamped more than this after our clock makes the reading unusable (the clock looks behind)"
     },
+    "chase_quote_tries": {
+      "value": 3,
+      "note": "start number, not approved by Ash (Step 8, brief 18; architect, 2026-11-13 16:02 UTC); a chase refused at the send after Schwab's quote (an old quote, the price back inside the level) may try again on a later reading at most this many times a pick a day, one quote call each (companion/plan_entries.py PlanDesk.chase_auto)"
+    },
+    "chase_retry_seconds": {
+      "value": 1.0,
+      "note": "start number, not approved by Ash (Step 8, brief 18; architect's review 1 of PR #25, 2026-11-13 17:08 UTC); after a chase refused at the send after Schwab's quote for a passing reason, the same pick reads no new quote before this many seconds have passed, so the armed.chase_quote_tries tries are not used up in about a second (companion/plan_auto/chase.py on_chase, PlanDesk.chase_retry_left)"
+    },
     "orders_per_day_with_flips": {
       "value": 8,
       "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_FLIP=1 (Step 7, companion/plan_auto/flip.py): the day's 4 entries and 4 flips or re-levels in all. Orders per pick then becomes orders_per_pick + automatic.max_flips + relevels_per_pick (brief 17 item 5)"
+    },
+    "orders_per_day_with_chase": {
+      "value": 8,
+      "note": "start number, not approved by Ash; only with EDGE_TRADER_PLAN_AUTO_CHASE=1 and the flip switch off (Step 8, companion/plan_auto/chase.py armed_with_chase; architect's review 3 of PR #25, 2026-11-13 20:44 UTC): the day's 4 entries and at most 4 chases after Schwab rejected an entry as already through (Ash, 2026-11-13 20:01:19 UTC, \"4 - yes\"). With the chase switch on, orders per pick becomes orders_per_pick + CHASES_PER_ROW (1 + 1 = 2), or with the flip switch on as well Step 7's bound + 1 (5 + 1 = 6), and the day then keeps orders_per_day_with_flips"
     },
     "swap_recheck_seconds": {
       "value": 1.5,

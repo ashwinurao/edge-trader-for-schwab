@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from . import break_entry, netlog, read_retry, schwab
+from . import break_entry, chase_entry, netlog, read_retry, schwab
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -686,6 +686,9 @@ class Trader:
     def _submit_locked(self, req: dict, ticket_id: str, state: dict) -> dict:
         if req.get("entry") == "break":     # Step 3: its own checks (break_entry.py), same send
             p, order = break_entry.prepare(self, req)
+            return self._place(p, order, ticket_id, state) if p else order
+        if req.get("entry") == "chase":     # Step 8: the armed plan's capped chase (chase_entry.py), same send
+            p, order = chase_entry.prepare(self, req)
             return self._place(p, order, ticket_id, state) if p else order
         try:
             exp_limit = Decimal(str(req.get("expected_limit") or 0))
