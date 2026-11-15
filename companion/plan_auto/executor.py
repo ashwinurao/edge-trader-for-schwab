@@ -19,7 +19,9 @@ Each step, from armed.act_from_et (09:31:00 ET) while armed:
    (Trader's lock busy: a click, a ticket send or Flat all; or Schwab's order list old) is not an
    action: the step ends, no other pick tries on that reading, and the next step comes one tick
    later. When a pick that waited acts, one `wait_over` line says how long it waited. A side that
-   is not clear on one name (brief 25) is that pick's own wait: the other picks go on.
+   is not clear on one name (brief 25) is that pick's own wait: the other picks go on. First in
+   the step, before any send, flip, re-level or chase: a plan entry resting on the other side of
+   the user's own trades on its name is cancelled and the pick left (brief 30, beside.py).
 5. At the watch end the engine says would_cancel for each unfilled plan entry; once none is left
    the plan disarms ("the fast watch ended"). The arm ends at the latest end_grace_seconds later;
    if the cancels were still waiting on an old order list, the disarm says how many entries were
@@ -63,6 +65,7 @@ from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
 from .arming import Arming, Facts, armed_rules_from, refusals
+from .beside import ARM_TEXT as BESIDE_ARM_TEXT, Beside
 from .chase import ARM_NOT_TEXT as CHASE_ARM_NOT_TEXT, armed_with_chase, offers as chase_offers
 from .flip import armed_with_flips
 from .handlers import PAST_TRIGGER, Lane, Registry, default_registry
@@ -236,6 +239,7 @@ class AutoPlan:
         self.onces: set = set()
         self.last_reading: dict = {}
         self.busy_picks: dict[str, tuple] = {}  # ticker -> (what, why, since mono, logged) while it waits
+        self.beside = Beside()                  # brief 30: the other-side cancels of the plan's resting entries
         # The poller's hold (review 6): the arm (armed_at) the next three belong to, whether that arm's one
         # hold has ended, when the plan's last send started (its send_start line) and whether a pick may
         # still send (from the last reading; True before the first).
@@ -361,13 +365,21 @@ class AutoPlan:
                                    **{k: fields[k] for k in ("ok", "status", "why", "side", "trigger", "stop")
                                       if k in fields}}
 
-    def say(self, ticker: str, code: str, text: str) -> None:
+    def say(self, ticker: str, code: str, text: str, logged: Optional[Mapping] = None) -> None:
+        """`logged`: the log's fields in place of `text` (brief 30: the side rule's words)."""
         with self._lock:
             n = self.notes.setdefault(ticker, {})
             if n.get("said") == code:
                 return
             n["said"], n["note"] = code, text
-        self.log("note", ticker, code=code, text=text)
+        self.log("note", ticker, code=code, **(dict(logged) if logged else {"text": text}))
+
+    def unsay(self, ticker: str, code: str) -> None:
+        """The reason `code` said on the pick's line has passed: the line is cleared, when it still says it."""
+        with self._lock:
+            n = self.notes.get(ticker)
+            if n is not None and n.get("said") == code:
+                n["said"], n["note"] = None, ""
 
     def leave(self, ticker: str, reason: str, logged: Optional[Mapping] = None) -> None:
         """The plan leaves this pick for today. `logged`: the log's fields (with `why`) when the
@@ -749,6 +761,16 @@ class AutoPlan:
             # re-level or chase (architect's review, 2026-11-13 16:21 UTC).
             acts = [d for d in acts if d.get("kind") == "would_cancel"]
         acts.sort(key=lambda d: self._distance(d, picks[d["symbol"]]))
+        # Brief 30 (Ash's card pick, 2026-11-14 04:15:56 UTC): a plan entry that rests on the other side
+        # of the user's own trades on its name is cancelled, and the pick left, before any send, flip,
+        # re-level or chase of this step (beside.py); nearest trigger first among them. The engine's own
+        # decisions for those picks wait for a later step, which finds the pick left.
+        with self._lock:
+            left = dict(self.left)
+        first = sorted(self.beside.cancels(self, picks, left), key=lambda d: self._distance(d, picks[d["symbol"]]))
+        if first:
+            gone = {d["symbol"] for d in first}
+            acts = first + [d for d in acts if d["symbol"] not in gone]
         for d in acts:
             sym = d["symbol"]
             with self._lock:
@@ -864,7 +886,9 @@ class AutoPlan:
                 f"fetched. With none from the last {self.rules_feed_stale:g} s, send on the open tape alone and say so "
                 "on this panel.",
                 f"At {self.armed_rules.watch_until_et:%H:%M} ET (or after the pullback wait): cancel a plan entry "
-                "that has not filled, and wait for Schwab to confirm."] + self.registry.arm_texts(self.env, self.rules)
+                "that has not filled, and wait for Schwab to confirm.",
+                # Brief 30: part of the armed plan, no switch of its own; the Arm click confirms it.
+                BESIDE_ARM_TEXT] + self.registry.arm_texts(self.env, self.rules)
         # Name each step that is not on (Step 8 engineer, 2026-11-13: with only the chase on, the
         # old line dropped "flip" too).
         off = [w for w, kind in (("flip", "would_flip"), ("chase", PAST_TRIGGER)) if kind not in kinds]

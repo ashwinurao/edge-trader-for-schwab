@@ -32,7 +32,11 @@ These decide most review questions:
    capped chase (Step 8, `EDGE_TRADER_PLAN_AUTO_CHASE=1`) sends, for a pick already at or past its
    trigger, one 1-share limit entry at the trigger plus the cap with its stop attached, once per
    pick a day; the plan cancels it like its other entries. Like Place, they never take the other
-   side of a name the user trades by hand (brief 25, `companion/plan_side.py`). Ash's go for this exception
+   side of a name the user trades by hand (brief 25, `companion/plan_side.py`). When the user takes
+   the other side of a name after the plan's own entry already rests there, the plan cancels that
+   unfilled entry (Step 6's cancel, once per order) and leaves the pick for the day; it never cancels
+   an entry the user clicked (brief 30, `companion/plan_auto/beside.py`; Ash's card pick
+   2026-11-14 04:15:56 UTC). Ash's go for this exception
    is quoted in the pull request that adds it. Any other change that would act without a click will
    not be merged. No order request (place, replace, cancel, preview) is ever tried again. Only two
    reads of the order path are: the click's quote and a read of one order are sent once more, at
@@ -104,7 +108,8 @@ What to add:
 - `companion/plan_auto/`: the armed plan (OV entries Step 6, rule 1's third exception): `arming.py`
   (the Arm window, refusals and bounds), `executor.py` (the worker thread, the panel and its routes),
   `handlers.py` (one handler per decision kind; Steps 7 and 8 add theirs), `flip.py` (Step 7: the
-  automatic flip and re-level, behind `EDGE_TRADER_PLAN_AUTO_FLIP=1`). It sends and cancels only
+  automatic flip and re-level, behind `EDGE_TRADER_PLAN_AUTO_FLIP=1`), `beside.py` (brief 30: it
+  cancels its own resting entry when the user takes the other side of that name). It sends and cancels only
   through `companion/plan_entries.py` and so through `Trader.submit` and `Trader.cancel_entry`.
 - `companion/plan_side.py`, `companion/plan_close.py`: the Opening plan beside your own trades on the
   same name (brief 25): which side you are on, which shares are the plan's (told apart by the plan's

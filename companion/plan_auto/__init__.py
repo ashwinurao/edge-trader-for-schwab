@@ -14,6 +14,8 @@ A switch alone sends nothing: Ash arms the named playbook for today by a click (
 - executor.py: one daemon thread; reads the open tape, runs the engine, gives each decision to its handler.
 - handlers.py: the registry from decision kind to handler, and the Lane a handler gets (the seam
   Steps 7 and 8 build on).
+- beside.py (brief 30): each step, a plan entry resting on the other side of the user's own trades on
+  its name is cancelled through Step 6's cancel, first in the step, and the pick left for the day.
 Every send and cancel goes through companion/plan_entries.py (PlanDesk) and so through
 Trader.submit and Trader.cancel_entry: the same refusals, tickets, row records and recover() as a click.
 """
