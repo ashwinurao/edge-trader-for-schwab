@@ -95,6 +95,12 @@ class Source:
         self._reading = Reading()
         self.asks = 0                      # how many requests went out (tests and the log)
 
+    def peek(self) -> Reading:
+        """The last reading, never asking (the armed plan's row check, architect's review 1 of
+        fork PR #27, 2026-11-13 16:45 UTC: the armed worker never waits on Edge Scanner)."""
+        with self._lock:
+            return Reading(self._reading.body, self._reading.ok_at, self._reading.error)
+
     def read(self) -> Reading:
         """The last reading, after asking first when the spacing allows and no ask is out."""
         with self._lock:
@@ -137,3 +143,7 @@ class Feed:
 
     def read(self) -> tuple[Reading, Reading]:
         return self.picks.read(), self.clock.read()
+
+    def peek(self) -> tuple[Reading, Reading]:
+        """The last answers, never asking: what the page or the shadow fetched last."""
+        return self.picks.peek(), self.clock.peek()

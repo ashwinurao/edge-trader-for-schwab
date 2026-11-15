@@ -90,7 +90,12 @@ name are refused). It needs no account and sends no telemetry.
   0.25 seconds with a 0.5 second time limit, from 09:29 to 09:36 ET only; Edge Scanner answers from
   memory and asks Alpaca for nothing more).
   Each read carries `X-Edge-App: edge-trader` and the call's id in `X-Edge-Req`, so Edge Scanner's own
-  record can name it.
+  record can name it. The armed plan (`EDGE_TRADER_PLAN_AUTO=1`, below) reads the same open tape through
+  the same reader, so with the shadow log on as well it is still at most one read every 0.25 seconds:
+  once when its Arm dialog opens and once at the Arm click, then, only while armed, from 09:31:00 ET to
+  the end of the watch (at the latest 09:35:45 ET). Before each send it also checks the pick's row against the
+  last OV picks answer that the Opening plan screen or the shadow log fetched. It never asks Edge Scanner's
+  picks route itself.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews Break orders, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -579,7 +584,8 @@ by the clock: every order is your click.
   Place and Flip still need ARM.
 - While a batch runs, no new plan entry goes: Place and Flip refuse with "Flat all is running: no new
   entries until it ends. Nothing was sent." Cancel still works. So Flat all never says "done" while a
-  new order rests. A batch first calls the hook Step 6 wires to its Disarm.
+  new order rests. A batch first disarms the armed plan (Step 6, below), before it builds its list,
+  and its hold refuses the armed plan's sends as well.
 - From 2 minutes before the playbook's flat time (`exit.flat_et`, 10:00 ET) the button turns red and
   says the flat time.
 - **Cover watch:** for each plan row that holds shares, the plan's own shares against the plan's own
@@ -613,6 +619,132 @@ reviews 1 and 2 of Step 9, 2026-11-13):
    it is a sizing rule. For example, a one-cent 09:30 minute at the 10,000 share cap is 2,500 shares
    at 25%, where ten cents of slippage is ten times the planned risk.
 
+**The armed plan (OV entries Step 6, off by default).** This is the one place Edge Trader sends and
+cancels orders without a click on each order (CONTRIBUTING rule 1, third exception). It needs
+`EDGE_TRADER_PLAN_AUTO=1` together with `EDGE_SCANNER_URL`, `EDGE_TRADER_BREAK_ENTRY=1` and
+`EDGE_TRADER_PLAN_BUTTONS=1`. Without all four there is no thread, no route and no panel
+(`companion/plan_auto/`).
+
+The switch alone sends nothing. You arm it for the day with **Arm…** on the Opening plan page, from
+09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, 1 share each, the risk per pick and
+the calm flag, what the plan will and will not do, and its bounds. **Arm with these bounds** is refused,
+with every reason listed, when: it is not a market day or outside that window; ARM is off on the
+dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
+or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
+answer; the bounds or the playbook changed since the dialog showed them; the plan was disarmed for
+the day; the size stage (`size.stage`, above) is not 1 share or cannot be read; or Flat all is on
+(`EDGE_TRADER_PLAN_FLAT=1`) but the armed plan found no Flat all to wire its Disarm to, so a Flat all
+click would not disarm it (Edge Trader's log says so at start). The armed plan sends 1 share whatever
+the stage: the stage is for your clicks only, so Arm is refused at any other stage ("The size stage is
+25%. The armed plan sends 1 share only, so it arms only at the 1-share stage").
+
+Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
+plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
+`Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
+attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
+again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
+but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
+log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
+waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never flips, chases,
+exits, moves a stop or resends. A pick whose price is already at or past its trigger is left to you.
+When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
+stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
+Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
+waits on Edge Scanner's picks route, which is at its slowest just after 09:31:00. With the screen closed
+and the shadow log off, or an answer older than 6 seconds (`feed.stale_after_seconds` in the playbook),
+the check is skipped and the sends go on the tape alone. While armed, the Armed plan panel then says
+"Row check off: …" until the check runs again, and the log says so once (`row_check_skipped`).
+Keep the Opening plan screen open, or the shadow log on, while armed.
+When a click, a ticket send or Flat all is using Edge Trader's one order lock, the plan sends and
+cancels nothing: it waits 0.25 s, reads the tape again and tries then. The pick's line says so once.
+An old order list is a wait in the same way: one failed read of Schwab's order list, or no good read
+for 15 seconds (3 times the 5 second poll: `INTERVALS["orders_today"]` and `Poller._fresh` in
+`companion/poller.py`). The plan sends and cancels nothing on it, the pick's line says "Schwab's order
+list is old. Nothing is sent until it is fresh." (or "…cancels nothing…" for a cancel), and it tries
+again on each reading until the list is fresh or the watch ends. If the 09:35 cancels are still
+waiting when the arm ends (45 seconds after 09:35), the plan disarms with "the end of the fast watch
+passed; N entries were not cancelled because Schwab's order list was old", and the red banner lists
+them. On 2026-11-13, while order calls ran, the poller read the order list only every 12 to 19 seconds.
+A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
+that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
+your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
+On a name you also trade by hand, the plan follows the side rule above (brief 25): it sends beside
+your shares and working orders on the same side. On the other side it sends nothing and leaves that
+pick to you for the day, with Place's words ("You are short 50 T by hand. The plan does not take the
+other side of a name you trade. Nothing was sent."). When your side is not clear (both sides, an
+order that is not a plain buy or sell, the plan unable to tell its shares from yours) that pick waits:
+it is looked at again on each reading until the watch ends, and the other picks go on. Schwab's
+positions old (no good account read for 15 seconds) is a wait for every pick, like an old order list.
+A **Flat all** click disarms the plan first, before Flat all builds its list ("the Flat all click").
+After it the plan sends and cancels nothing: Flat all's own list does the cancels. A send the plan had
+already started lands; its row says "A click on this row is still running" in that batch, and a second
+Flat all click cancels it. While a batch runs, a plan send is refused like Place ("Flat all is
+running: …"): nothing reaches Schwab, nothing is spent from the bounds, and that pick is left for the
+day. A hold that cannot be read refuses too.
+
+It does nothing price-based on an old or late tape reading, on a range that is not the 09:30 ET bar of
+today, or when the tape is stamped ahead of Edge Trader's clock. It stops and disarms on: your
+**Disarm** click (one click, checked before every send and cancel); a **Flat all** click; an unclear
+Schwab answer (that pick is left and the row follows its ticket, as after a click); a cancel Schwab does
+not confirm (the row turns red); a reached bound; ARM turned off on the dashboard; or an unexpected
+error. A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
+pick and is never retried, and so does an entry Schwab rejects after accepting it (on 2026-11-13 a
+REJECTED came 4.0 s after the 201: "The stop price must be above the current ask…"); the row shows
+Schwab's reason. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
+up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
+at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
+Cancel. A restart never restores "armed".
+
+Its bounds are in `companion/opening_plan/playbook.json` under `armed`, each a start number Ash has not
+approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pick, 4 orders a day, and
+40 Schwab calls a minute by the plan. The calls bound counts and refuses sends only, each at its worst
+case of 5 calls (usually 4: the quote, the POST and two status reads; 5 when an earlier close on the
+name still has an open status), so at most 8 sends in any 60 s. A cancel is never refused by it: it can
+take up to 12 calls (`Trader.cancel_entry` reads, cancels and reads back up to ten times) and is tried
+once per order. With four picks the plan makes at most 4 sends and 4 cancels a day: 16 to 20 calls for
+the sends, 12 to 48 for the cancels, at most 68 in one minute (sends held back by an old list until just
+before 09:35, then the four 09:35 cancels, each at its worst). The limit that binds is not Schwab's 120
+but the poller's own 70 a minute (`MAX_PER_MIN`, `Poller._throttle` in `companion/poller.py`): every
+Schwab call of Edge Trader counts there, the ticket's and the plan's never wait, so the poller's reads
+wait. That is why the order list could go old while the plan works, and why the plan holds the
+poller's later reads during its opening burst (next paragraph).
+Since brief 26 (`companion/read_retry.py`) a quote or order read whose connection Schwab dropped before
+any answer is sent once more, so each such drop adds one call to a send or a cancel (on 2026-11-13,
+1 in 31 ticket quotes dropped). `calls_per_send` stays 5 and does not count them.
+
+For its opening burst only, the plan holds the poller's later reads (brief 24: `Poller.hold_later` in
+`companion/poller.py`, the rules in `companion/poll_budget.py`; reviews 6 and 7 of fork PR #27). The
+hold starts 30 seconds before the plan may act (09:30:30 ET) and ends 60 seconds after the plan's
+last send. With no send yet it ends at once when no pick is left to send. It never runs past 150
+seconds after the plan may act (09:33:30 ET), with or without a send, so at most 3 minutes: sends
+less than 60 seconds apart do not keep it going. On a normal morning that is 09:30:30 to about
+09:32:05 ET. The
+account and the order list keep their 5 second pace. Fills still come about every 15 seconds
+(`HELD_FILLS_EVERY_S`). Position marks (quotes), corrections and market hours pause, and the
+dashboard shows the marks, open P&L and live R as old. A stop the app moves itself keeps its reads:
+an Auto B/E that has not fired and a spread stop with Send still get their quotes. The plan asks for
+30 second holds and renews them every 10 seconds, each cut so it ends at that second and never past
+the plan's own end (`POLL_HOLD_LEAD_SECONDS`, `POLL_HOLD_AFTER_SEND_SECONDS`,
+`POLL_HOLD_LATEST_SECONDS`, `POLL_HOLD_SECONDS` and `POLL_HOLD_RENEW_SECONDS` in
+`companion/plan_auto/executor.py`; start numbers, not approved by Ash). One hold per arm: entries that
+only rest keep no hold, and later sends and the 09:35 cancels start none (one action is 5 to 10 calls,
+and below 30 order calls a minute the poller keeps marks at 6 seconds by itself). On a disarm or at
+the plan's end it stops renewing, and the last hold lapses within 30 seconds. The hold is the poller's
+own memory, not a Schwab call. Before 09:30:30 ET, or without an Arm click, nothing is held.
+
+Every decision and action is one JSON line in `data/opening_plan/auto/YYYY-MM-DD.jsonl`: the reading's
+time, the decision with how long the step's view and tape reads took (`view_ms`, `tape_ms`), the send's
+start and its answer with their times. A step that took over 100 ms before its action adds a
+`slow_step` line. A busy order lock adds one `busy` line per pick; an old order list or account read,
+or a side that is not clear, one `wait` line; and the pick's action after either a `wait_over` line
+with how long it waited (`waited_s`). A side rule line keeps the rule's code and the pick's side
+(`side_rule`, `side`), never the words on the page, which can name your own shares. The poller hold
+adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
+row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
+request body or share count of your own positions. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
+`refusal` line, and the plan's Schwab calls their usual `call` lines.
+
 ## Updating to a new release
 
 Your data (`data/`), your keys (`.env`) and your Schwab tokens are not part of a release, so an update
@@ -642,6 +774,7 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
+| `EDGE_TRADER_PLAN_AUTO` | `1`, together with the three switches above, adds the armed plan: after your Arm click it sends the day's break entries at 1 share and cancels the unfilled ones (after the pullback wait, or at 09:35 ET). Off by default. |
 | `EDGE_TRADER_PLAN_FLAT` | `1`, together with the plan buttons' switches, adds Flat all and the cover watch (Add stop) to the Opening plan. Needed for any size stage above 1 share. Off by default. |
 
 ## Good to know

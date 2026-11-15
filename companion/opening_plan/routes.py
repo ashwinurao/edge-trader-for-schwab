@@ -104,7 +104,9 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     def opening_plan_page():
         return FileResponse(STATIC / "opening_plan.html", headers={"Cache-Control": "no-store"})
 
-    def current_view() -> dict:
+    def current_view(ask: bool = True) -> dict:
+        """Step 2's view. ask=False builds it from the feed's last answers and never asks Edge
+        Scanner (the armed plan's row check: architect's review 1 of fork PR #27, 2026-11-13)."""
         at = now()
         # The demo shows invented balances (demo_feed.demo_account); never the account's own.
         account = demo_account(at) if demo and not url else account_reading(snapshot, private)
@@ -112,7 +114,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
             view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb, account=account)
             view.update(state=NOT_SET_UP, message=f"The Opening plan is off: {bad_url}")
         else:
-            picks, clock = feed.read()
+            picks, clock = feed.read() if ask else feed.peek()
             view = build_view(picks.body, picks.ok_at, picks.error, clock.body, clock.ok_at, clock.error,
                               stored_risk(store), at, pb, account=account)
         view["demo"] = demo and not url
@@ -127,6 +129,9 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     # The row buttons (companion/plan_entries.py, Step 4) read the same view the screen shows,
     # so a click is checked against the server's own latest row, never the page's numbers.
     app.state.opening_plan_view = current_view
+    # The same view from the last answers the page or the shadow fetched, never asking: the armed
+    # plan's worker reads this one, so it never waits on Edge Scanner (companion/plan_auto).
+    app.state.opening_plan_view_cached = lambda: current_view(ask=False)
     app.state.opening_plan_now = now
     app.state.preview_rates = rates
 
