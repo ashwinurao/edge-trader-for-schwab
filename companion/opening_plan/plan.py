@@ -517,13 +517,16 @@ def balances_counted(bp: Optional[Mapping]) -> dict:
 
     A number counts when it is known and above 0. On 2026-11-16 at 09:18 ET Schwab's day-trading
     buying power read 0 while buying power was above 0, which made every estimate 0. Why Schwab
-    reports that 0 is not confirmed, so the plan does not guess: a number at 0 (or below) beside
-    one that counts is left out and the text says so.
+    reports that 0 is not confirmed (it may be a field Schwab does not fill), so the plan does not
+    guess: a 0 beside a number that counts is left out and the text says so.
+    - a known number below 0: state NONE, a true 0, and the text names it. Below 0 is Schwab saying
+      the account is past a limit, so it is never left out (architect's review 1 of ET PR #41);
     - both count: both, each with its own rate; the smaller share count decides (bp_max);
-    - one counts: that one alone, and `left_out` names the other;
-    - both known and neither counts: state NONE, a true 0;
+    - one counts and the other is 0 or missing: that one alone, and `left_out` names the other;
+    - both 0: state NONE, a true 0;
     - nothing to stand on otherwise (both missing, or one 0 and the other missing): NOT_KNOWN,
-      never 0 for a missing number (CONTRIBUTING.md rule 3); HIDDEN with --private."""
+      never 0 for a missing number (CONTRIBUTING.md rule 3); HIDDEN with --private.
+    State NONE's text is the whole sentence the row shows."""
     out = {"state": "NOT_KNOWN", "use": {}, "left_out": None, "text": ""}
     state = bp.get("state") if isinstance(bp, Mapping) else None
     if state == "HIDDEN":
@@ -533,6 +536,10 @@ def balances_counted(bp: Optional[Mapping]) -> dict:
         out["text"] = "Buying power maximum not known: buying power is not known."
         return out
     nums = {k: to_dec(bp.get(k)) for k, _, _ in BALANCES}
+    below = [_NAME[k] for k, v in nums.items() if v is not None and v < 0]
+    if below:
+        out.update(state="NONE", text=f"Schwab reports {' and '.join(below)} as below 0, so buying power allows 0.")
+        return out
     use = {k: v for k, v in nums.items() if v is not None and v > 0}
     if not use:
         known = [k for k, v in nums.items() if v is not None]
@@ -540,23 +547,19 @@ def balances_counted(bp: Optional[Mapping]) -> dict:
             out["text"] = "Buying power maximum not known: Schwab's account answer has no buying power number."
         elif len(known) == 1:
             other = next(k for k in nums if k not in known)
-            out["text"] = (f"Buying power maximum not known: Schwab reports {_NAME[known[0]]} as "
-                           f"{_zero_word(nums[known[0]])} and sends no {_NAME[other]}.")
+            out["text"] = (f"Buying power maximum not known: Schwab reports {_NAME[known[0]]} as 0 and sends "
+                           f"no {_NAME[other]}.")
         else:
-            out.update(state="NONE", text="Schwab reports no buying power: buying power and day-trading "
-                                          "buying power are both 0 or below.")
+            out.update(state="NONE", text="Schwab reports buying power and day-trading buying power as 0, so "
+                                          "buying power allows 0.")
         return out
     out.update(state="OK", use=use)
     if len(use) == 1:
         other = next(k for k in nums if k not in use)
         out["left_out"] = other
-        out["text"] = (f"Schwab reports {_NAME[other]} as {_zero_word(nums[other])}, so it is left out."
-                       if nums[other] is not None else f"Schwab sends no {_NAME[other]}, so it is left out.")
+        out["text"] = (f"Schwab reports {_NAME[other]} as 0, so it is left out." if nums[other] is not None
+                       else f"Schwab sends no {_NAME[other]}, so it is left out.")
     return out
-
-
-def _zero_word(v: Decimal) -> str:
-    return "0" if v == 0 else "below 0"
 
 
 def _rate_of(side_info: Any, pair: str) -> Optional[tuple[Decimal, Optional[str]]]:
@@ -612,7 +615,7 @@ def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook,
         out["text"] = "Buying power maximum not known: no price for this row."
         return out
     if which["state"] == "NONE":
-        out.update(state="OK", shares=0, text=f"Buying power allows 0. {which['text']}")
+        out.update(state="OK", shares=0, text=which["text"])
         return out
     per = []
     for key, pair, name in BALANCES:
@@ -632,7 +635,10 @@ def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook,
         text = f"Buying power allows {win['shares']:,} at full margin: this name's own rate is not known yet ({of})."
     for other in per:
         if other is not win:
-            text += (f" {other['name'][0].upper()}{other['name'][1:]} allows {other['shares']:,}, "
+            # A balance worked without a rate says so even when it does not decide (architect's
+            # review 1 of ET PR #41): at its own rate it might have been the smaller.
+            how = "" if other["rate"] else " at full margin, its rate not known yet"
+            text += (f" {other['name'][0].upper()}{other['name'][1:]} alone would allow {other['shares']:,}{how}, "
                      f"so {win['name']} decides.")
     if which["left_out"]:
         text += f" {which['text']}"

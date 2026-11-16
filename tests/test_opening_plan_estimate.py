@@ -206,7 +206,8 @@ def test_the_buying_power_maximum_is_a_quarter_of_the_smaller_buying_power_over_
     assert mx == {"state": "OK", "shares": 621, "decided_by": "buying_power", "rate": None, "rate_at_et": None,
                   "rate_known": False, "left_out": None,
                   "text": "Buying power allows 621 at full margin: this name's own rate is not known yet (a quarter "
-                          "of buying power at 42.10). Day-trading buying power allows 1,243, so buying power decides."}
+                          "of buying power at 42.10). Day-trading buying power alone would allow 1,243 at full margin, "
+                          "its rate not known yet, so buying power decides."}
 
 
 def test_the_buying_power_maximum_not_known_or_hidden_is_never_a_number():
@@ -336,7 +337,7 @@ def test_no_balance_or_maximum_reaches_a_log_or_the_network_record(tmp_path, mon
     # note's 615 and 624 at the entries (brief 31; were 1,243, 1,231 and 1,248).
     assert all("209360.72" in s for s in shown)
     assert '"shares": 621' in shown[0].replace('":', '": ') and '"shares": 621' in shown[1].replace('":', '": ')
-    assert "allows 1,243" in shown[0]
+    assert "would allow 1,243" in shown[0]
     assert '"long": 615' in shown[2].replace('":', '": ') and '"short": 624' in shown[2].replace('":', '": ')
     assert any(x["kind"] == "route" for x in lines)                  # the middleware did write its line
     written = json.dumps(lines) + "\n".join(r.getMessage() for r in caplog.records)
@@ -427,15 +428,15 @@ def test_both_balances_count_each_with_its_own_rate_and_the_smaller_decides():
     assert mx["shares"] == 500 and mx["decided_by"] == "day_trading" and mx["rate"] == 2.0
     assert mx["left_out"] is None and mx["rate_known"] is True
     assert mx["text"] == ("Buying power allows 500: a quarter of day-trading buying power at 50.00, at Schwab's "
-                          "rate of 2 for this name (preview 09:16 ET). Buying power allows 1,250, so day-trading "
-                          "buying power decides.")
+                          "rate of 2 for this name (preview 09:16 ET). Buying power alone would allow 1,250, so "
+                          "day-trading buying power decides.")
 
 
 def test_both_at_0_is_a_true_0_and_both_missing_is_not_known():
     mx = P.bp_max(bal31(0, 0), Decimal("50"), PB, name_rates(1.6, 1.6))
     assert mx["state"] == "OK" and mx["shares"] == 0
-    assert mx["text"] == ("Buying power allows 0. Schwab reports no buying power: buying power and day-trading "
-                          "buying power are both 0 or below.")
+    assert mx["text"] == ("Schwab reports buying power and day-trading buying power as 0, so buying power "
+                          "allows 0.")
     mx = P.bp_max(bal31(None, None), Decimal("50"), PB, name_rates(1.6, 1.6))
     assert mx["state"] == "NOT_KNOWN" and mx["shares"] is None
     assert mx["text"] == "Buying power maximum not known: Schwab's account answer has no buying power number."
@@ -576,3 +577,46 @@ def test_the_demo_shows_day_trading_0_with_and_without_rates(tmp_path):
         # 26,170.09 / (42.10 x 1.6) = 388.5 -> 388 with the demo's rate; 26,170.09 / 42.10 = 621 without.
         assert aaaa["estimate"]["bp_max"]["shares"] == want and aaaa["estimate"]["bp_max"]["left_out"] == "day_trading"
         assert aaaa["estimate"]["bp_max"]["rate_known"] is (no_rates == "0")
+
+
+# ---- architect's review 1 of ET PR #41 (2026-11-16 16:28 UTC) ------------------------------------------
+
+@pytest.mark.parametrize("buying_power, day_trading, named", [
+    (-1000, 200000, "buying power"),
+    (400000, -1, "day-trading buying power"),
+    (-1000, -1, "buying power and day-trading buying power"),
+    (-1000, None, "buying power"),
+])
+def test_a_balance_below_0_is_a_true_0_never_left_out(buying_power, day_trading, named):
+    # Below 0 is Schwab saying the account is past a limit, not a field it does not fill.
+    mx = P.bp_max(bal31(buying_power, day_trading), Decimal("50"), PB, name_rates(1.6, 1.6, 1.6, 1.6))
+    assert mx["state"] == "OK" and mx["shares"] == 0 and mx["left_out"] is None
+    assert mx["text"] == f"Schwab reports {named} as below 0, so buying power allows 0."
+    # A 0 beside 400,000 is still left out: the 1,250 of the 2026-11-16 case.
+    assert P.bp_max(bal31(400000, 0), Decimal("50"), PB, name_rates(1.6, 1.6))["shares"] == 1250
+
+
+def test_a_balance_without_a_rate_says_full_margin_also_when_it_does_not_decide():
+    # Buying power 400,000 at bp 1.6: 1,250. Day-trading 300,000 with no dt rate: 75,000 / 50 = 1,500 at
+    # full margin. Buying power decides, but the day-trading number is said to stand on full margin.
+    mx = P.bp_max(bal31(400000, 300000), Decimal("50"), PB, name_rates(1.6, 1.6))
+    assert mx["shares"] == 1250 and mx["decided_by"] == "buying_power" and mx["rate"] == 1.6
+    assert mx["rate_known"] is False
+    assert mx["text"] == ("Buying power allows 1,250: a quarter of buying power at 50.00, at Schwab's rate of 1.6 "
+                          "for this name (preview 09:16 ET). Day-trading buying power alone would allow 1,500 at "
+                          "full margin, its rate not known yet, so buying power decides.")
+    # The reverse: a dt rate of 2.0 and no bp rate. Day-trading 300,000 / 4 / 100 = 750; buying power
+    # 400,000 / 4 / 50 = 2,000 at full margin.
+    mx = P.bp_max(bal31(400000, 300000), Decimal("50"), PB, name_rates(long_dt=2.0, short_dt=2.0))
+    assert mx["shares"] == 750 and mx["decided_by"] == "day_trading" and mx["rate"] == 2.0
+    assert mx["rate_known"] is False
+    assert mx["text"].endswith("Buying power alone would allow 2,000 at full margin, its rate not known yet, so "
+                               "day-trading buying power decides.")
+
+
+def test_the_page_shows_the_rate_not_known_mark_whenever_rate_known_is_false():
+    html = (Path(R.__file__).parent / "static" / "opening_plan.html").read_text(encoding="utf-8")
+    cell = html[html.index("function estimateCell"):html.index("function previewRow")]
+    # The mark hangs on rate_known alone, so it shows beside the deciding balance's rate too.
+    assert '(m.rate_known === false ? ` <span class="tag sofar">rate not known yet</span>` : "")' in cell
+    assert "m.rate != null ?" in cell

@@ -435,9 +435,10 @@ function estimateCell(e) {
   const m = e.bp_max || {};
   const bp = m.state === "OK" ? `buying power allows ${sh(m.shares)}` : m.state === "HIDDEN" ? "buying power hidden" : "buying power not known";
   // Brief 31: each name's own rate from the morning's previews, or full margin marked "rate not known yet".
+  // The mark shows whenever a balance was worked at full margin, also beside the deciding one's rate.
   const rate = m.state !== "OK" || m.decided_by == null ? ""
-    : m.rate != null ? ` · rate ${m.rate}${m.rate_at_et ? ` (${esc(m.rate_at_et.slice(0, 5))} ET)` : ""}`
-    : ` <span class="tag sofar">rate not known yet</span>`;
+    : (m.rate != null ? ` · rate ${m.rate}${m.rate_at_et ? ` (${esc(m.rate_at_et.slice(0, 5))} ET)` : ""}` : "")
+      + (m.rate_known === false ? ` <span class="tag sofar">rate not known yet</span>` : "");
   const bpLine = `<span class="sub" title="${esc(m.text)}">${bp}${rate}</span>`
     + (m.state === "OK" && m.text ? `<span class="sub mut">${esc(m.text)}</span>` : "");
   if (e.state === "OFF") return `<span class="mut">–</span>${bpLine}`;
