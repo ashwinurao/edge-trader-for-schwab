@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import time as _time
 from datetime import datetime, time, timedelta, timezone
-from typing import Callable
+from typing import Callable, Mapping
 
 from .feed import Reading
 from .plan import ET
@@ -28,6 +28,10 @@ from .plan import ET
 DEMO_START_ET = time(9, 31, 5)
 DEMO_ET_ENV = "EDGE_TRADER_PLAN_DEMO_ET"     # demo only: the time of day the demo clock starts at
 DEMO_RV20_ENV = "EDGE_TRADER_PLAN_DEMO_RV20"  # demo only: the SPY RV20 the demo's clock answer gives
+# Brief 31, demo only: "1" makes the demo's day-trading buying power read 0 (as Schwab's did on
+# 2026-11-16 at 09:18 ET), and "1" here gives no margin rates yet (before the probe's first window).
+DEMO_DT_ZERO_ENV = "EDGE_TRADER_PLAN_DEMO_DT_ZERO"
+DEMO_NO_RATES_ENV = "EDGE_TRADER_PLAN_DEMO_NO_RATES"
 DEMO_RV20 = 9.8
 FREEZE_ET = time(9, 25)
 PREVIEW_FROM_ET = time(9, 0)
@@ -104,10 +108,35 @@ def preview_answer(now: datetime) -> dict:
             "is_today": True, "day": day, "preview": preview, "warnings": []}
 
 
-def demo_account(now: datetime) -> dict:
-    """Invented balances for the demo's buying power line, read 1.2 s ago."""
-    return {"balances": {"equity": 52340.18, "buyingPower": 104680.36, "dayTradingBuyingPower": 209360.72},
+def demo_account(now: datetime, env: Mapping[str, str] | None = None) -> dict:
+    """Invented balances for the demo's buying power line, read 1.2 s ago. With DEMO_DT_ZERO_ENV
+    set to "1", day-trading buying power reads 0 (brief 31)."""
+    dt_zero = (env or {}).get(DEMO_DT_ZERO_ENV) == "1"
+    return {"balances": {"equity": 52340.18, "buyingPower": 104680.36,
+                         "dayTradingBuyingPower": 0.0 if dt_zero else 209360.72},
             "ok_at": now - timedelta(seconds=1.2), "private": False}
+
+
+# Invented margin rates (Schwab's requirement over the order's value) in the shape of
+# preview_rates.PreviewRates.today(). AAAA the same both sides, BBBB short dearer than long, CCCC
+# dear; DDDD and EEEE have no preview yet, so they show full margin and "rate not known yet".
+DEMO_RATES = {"AAAA": (1.6, 1.6), "BBBB": (1.2, 2.0), "CCCC": (2.0, 2.0)}
+
+
+def _demo_side(rate: float) -> dict:
+    at = "09:05:31"
+    pair = lambda r, bal: {"rate": r, "at_et": at, "balance": bal}
+    return {"previews": 1, "dropped": 0,
+            "rates": {"af": pair(round(rate / 4, 4), "availableFunds"), "bp": pair(rate, "buyingPower"),
+                      "dt": pair(rate, "dayTradingBuyingPower")},
+            "last": {"at_et": at, "http": 201, "ok": True, "status": None, "rejects": [], "warns": [], "alerts": []}}
+
+
+def demo_rates(now: datetime, none: bool = False) -> dict:
+    """The demo's rates for today, or {} with `none` (no probe preview yet). Ratios only."""
+    if none:
+        return {}
+    return {sym: {"LONG": _demo_side(lo), "SHORT": _demo_side(sh)} for sym, (lo, sh) in DEMO_RATES.items()}
 
 
 def demo_rv20(text: str | None) -> float:
