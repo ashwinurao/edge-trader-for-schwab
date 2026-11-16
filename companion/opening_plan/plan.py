@@ -35,10 +35,16 @@ Before the 09:30 minute there is no range, so no exact share count (brief 22, As
 2026-11-13 17:18 UTC: "what would be the shares that would be purchased, including accounting
 for margin"). Preview rows, and frozen rows still waiting for the minute, carry an estimate in
 row["estimate"]: the risk used over a typical first minute (playbook size.estimate, from the 2026
-study), its usual range, and the most an equal share of day-trading buying power buys at the
+study), its usual range, and the most an equal share of buying power buys at the
 row's price. It is never a size: row["long"], row["short"] and row["shares"] stay empty until the
 minute gives levels, so no button, send, shadow or probe can read an estimate. A frozen row with
 levels keeps its shares; it only gets a note when they are above the buying power maximum.
+
+Brief 31 (Ash's pick "Buying power with each name's rate", 2026-11-16 15:58:21 UTC, after
+day-trading buying power read 0 at 09:18 ET and every estimate showed 0): the maximum stands on
+Schwab's buying power and day-trading buying power, each with this name's own rate from the
+morning's probe previews (preview_rates.PreviewRates.today(), handed in as a plain mapping), and a
+number at 0 beside one above 0 is left out and said. Still display only.
 """
 from __future__ import annotations
 
@@ -302,9 +308,12 @@ def _f(d: Optional[Decimal]) -> Optional[float]:
 
 
 def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[Decimal],
-              calm: Optional[bool], pb: Playbook, bp: Optional[Mapping] = None) -> dict:
+              calm: Optional[bool], pb: Playbook, bp: Optional[Mapping] = None,
+              rates: Optional[Mapping] = None) -> dict:
     """One plan row from one row of Edge Scanner's ranked list. `bp` is view["buying_power"], for
-    the estimate (brief 22) and the buying power note; None makes both "not known"."""
+    the estimate (brief 22) and the buying power note; None makes both "not known". `rates` is
+    PreviewRates.today() (brief 31); None or a name without previews is full margin."""
+    name_rates = _name_rates(rates, row.get("ticker"))
     levels = row.get("levels") if isinstance(row.get("levels"), Mapping) else {}
     atr = to_dec(levels.get("atr"))
     if atr is not None and atr <= 0:
@@ -356,7 +365,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         out["shares"].update(state="NO_LEVELS", text="No levels yet, so no shares.")
         if bar["state"] in ESTIMATE_ROW_STATES:
             # Brief 22: an estimate in its own key; the row's shares stay empty.
-            out["estimate"] = estimate_row(risk, calm, atr, to_dec(levels.get("last")), bp, pb)
+            out["estimate"] = estimate_row(risk, calm, atr, to_dec(levels.get("last")), bp, pb, name_rates)
         return out
 
     high, low = Decimal(str(bar["high"])), Decimal(str(bar["low"]))
@@ -383,7 +392,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                        "shown side by side.")
         for k in ("long", "short"):
             out[k]["capped"] = full[k]["capped"] or half[k]["capped"]
-        out["buying_power_note"] = buying_power_note(out, bp, pb)
+        out["buying_power_note"] = buying_power_note(out, bp, pb, name_rates)
         return out
     used = risk * pb.calm_multiplier if calm else risk
     got = {k: size(used, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
@@ -394,8 +403,16 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         else f"${used:,.2f} at risk."))
     if all(got[k]["shares"] == 0 for k in ("long", "short")):
         sh["text"] = f"${used:,.2f} is less than one share's risk (${lv['long']['rps']}): 0 shares."
-    out["buying_power_note"] = buying_power_note(out, bp, pb)
+    out["buying_power_note"] = buying_power_note(out, bp, pb, name_rates)
     return out
+
+
+def _name_rates(rates: Optional[Mapping], ticker: Any) -> Optional[Mapping]:
+    """One name's {"LONG", "SHORT"} entry of PreviewRates.today(), or None."""
+    if not isinstance(rates, Mapping) or not ticker:
+        return None
+    got = rates.get(str(ticker).upper())
+    return got if isinstance(got, Mapping) else None
 
 
 def _pair(got: Mapping[str, Mapping]) -> dict:
@@ -474,6 +491,9 @@ def buying_power(account: Optional[Mapping], now: datetime) -> dict:
         out["text"] = "Buying power not known: Schwab's account answer has none of the three numbers."
         return out
     out.update(state="OK", **nums)
+    # Brief 31: on 2026-11-16 Schwab's day-trading number read 0 beside a buying power above 0.
+    if nums["day_trading"] == 0 and (nums["buying_power"] or 0) > 0:
+        out["text"] = "Schwab reports day-trading buying power as 0, so the plan's numbers use buying power."
     return out
 
 
@@ -481,33 +501,151 @@ def buying_power(account: Optional[Mapping], now: datetime) -> dict:
 
 _SHARE_WORDS = {1: "all", 2: "half", 3: "third", 4: "quarter"}
 
+# Brief 31 (Ash's pick "Buying power with each name's rate", 2026-11-16 15:58:21 UTC): Schwab's two
+# buying power numbers, each with the probe's rate pair measured against it (preview_rates.BALANCE).
+# The order is the tie-break: on equal share counts, buying power is named as the one that decided.
+BALANCES = (("buying_power", "bp", "buying power"), ("day_trading", "dt", "day-trading buying power"))
+_NAME = {k: name for k, _, name in BALANCES}
+
 
 def _share_word(n: int) -> str:
     return _SHARE_WORDS.get(n, f"1/{n} share")
 
 
-def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook) -> dict:
-    """The most shares an equal share of day-trading buying power buys at `price`:
-    floor(day-trading buying power / the playbook's rank count / price). It assumes Schwab's full
-    margin for every name; each name's own rate is brief 23. Not known (never 0, never a guess)
-    when the buying power line is not OK or the row has no price; hidden with --private, because
-    the number gives the balance away. On screen only, like the balance it comes from."""
-    ranks = pb.rank_to - pb.rank_from + 1
-    out = {"state": "NOT_KNOWN", "shares": None, "text": ""}
+def balances_counted(bp: Optional[Mapping]) -> dict:
+    """Which of Schwab's two buying power numbers the maximum stands on (brief 31). Pure.
+
+    A number counts when it is known and above 0. On 2026-11-16 at 09:18 ET Schwab's day-trading
+    buying power read 0 while buying power was above 0, which made every estimate 0. Why Schwab
+    reports that 0 is not confirmed (it may be a field Schwab does not fill), so the plan does not
+    guess: a 0 beside a number that counts is left out and the text says so.
+    - a known number below 0: state NONE, a true 0, and the text names it. Below 0 is Schwab saying
+      the account is past a limit, so it is never left out (architect's review 1 of ET PR #41);
+    - both count: both, each with its own rate; the smaller share count decides (bp_max);
+    - one counts and the other is 0 or missing: that one alone, and `left_out` names the other;
+    - both 0: state NONE, a true 0;
+    - nothing to stand on otherwise (both missing, or one 0 and the other missing): NOT_KNOWN,
+      never 0 for a missing number (CONTRIBUTING.md rule 3); HIDDEN with --private.
+    State NONE's text is the whole sentence the row shows."""
+    out = {"state": "NOT_KNOWN", "use": {}, "left_out": None, "text": ""}
     state = bp.get("state") if isinstance(bp, Mapping) else None
     if state == "HIDDEN":
         out.update(state="HIDDEN", text="Buying power maximum hidden: Edge Trader runs with --private.")
         return out
-    dtbp = to_dec(bp.get("day_trading")) if state == "OK" else None
-    if dtbp is None:
-        out["text"] = "Buying power maximum not known: day-trading buying power is not known."
+    if state != "OK":
+        out["text"] = "Buying power maximum not known: buying power is not known."
+        return out
+    nums = {k: to_dec(bp.get(k)) for k, _, _ in BALANCES}
+    below = [_NAME[k] for k, v in nums.items() if v is not None and v < 0]
+    if below:
+        out.update(state="NONE", text=f"Schwab reports {' and '.join(below)} as below 0, so buying power allows 0.")
+        return out
+    use = {k: v for k, v in nums.items() if v is not None and v > 0}
+    if not use:
+        known = [k for k, v in nums.items() if v is not None]
+        if not known:
+            out["text"] = "Buying power maximum not known: Schwab's account answer has no buying power number."
+        elif len(known) == 1:
+            other = next(k for k in nums if k not in known)
+            out["text"] = (f"Buying power maximum not known: Schwab reports {_NAME[known[0]]} as 0 and sends "
+                           f"no {_NAME[other]}.")
+        else:
+            out.update(state="NONE", text="Schwab reports buying power and day-trading buying power as 0, so "
+                                          "buying power allows 0.")
+        return out
+    out.update(state="OK", use=use)
+    if len(use) == 1:
+        other = next(k for k in nums if k not in use)
+        out["left_out"] = other
+        out["text"] = (f"Schwab reports {_NAME[other]} as 0, so it is left out." if nums[other] is not None
+                       else f"Schwab sends no {_NAME[other]}, so it is left out.")
+    return out
+
+
+def _rate_of(side_info: Any, pair: str) -> Optional[tuple[Decimal, Optional[str]]]:
+    """(rate, preview time ET) of one side's counted rate of `pair`, as PreviewRates.side() gives it,
+    or None. Only a finite number above 0 counts (brief 31 item 2); anything else is "no rate"."""
+    try:
+        got = side_info["rates"][pair]
+        rate = got["rate"]
+    except (KeyError, TypeError):
+        return None
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or rate != rate \
+            or rate in (float("inf"), float("-inf")) or rate <= 0:
+        return None
+    at = got.get("at_et") if isinstance(got, Mapping) else None
+    return Decimal(str(rate)), (str(at) if at else None)
+
+
+def name_rate(name_rates: Optional[Mapping], pair: str, side: Optional[str] = None
+              ) -> Optional[tuple[Decimal, Optional[str]]]:
+    """A name's counted rate of `pair` today. `name_rates` is {"LONG": side(), "SHORT": side()}
+    from PreviewRates.today() for that name. A side ("LONG" or "SHORT") uses its own rate. No side
+    (a row before the open): the HIGHER of the long and short rates, which sizes smaller (brief 31)."""
+    if not isinstance(name_rates, Mapping):
+        return None
+    if side is not None:
+        return _rate_of(name_rates.get(side), pair)
+    got = [r for r in (_rate_of(name_rates.get(s), pair) for s in ("LONG", "SHORT")) if r is not None]
+    return max(got, key=lambda r: r[0]) if got else None
+
+
+def _rate_text(rate: Decimal) -> str:
+    return f"{float(rate):.4g}"
+
+
+def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook,
+           name_rates: Optional[Mapping] = None, side: Optional[str] = None) -> dict:
+    """The most shares an equal share of buying power buys at `price` (briefs 22 and 31).
+
+    Per balance that counts (balances_counted): floor(balance / the playbook's rank count /
+    (price x this name's rate)), the rate from this morning's probe previews against that same
+    balance (pair `bp` for buying power, `dt` for day-trading). No rate for the name yet: rate 1,
+    full margin, and `rate_known` is False. Both balances count: the smaller number decides and
+    `decided_by` names it. Not known (never 0, never a guess) without a balance to stand on or a
+    price; hidden with --private, because the number gives the balance away. On screen only."""
+    ranks = pb.rank_to - pb.rank_from + 1
+    out = {"state": "NOT_KNOWN", "shares": None, "decided_by": None, "rate": None, "rate_at_et": None,
+           "rate_known": None, "left_out": None, "text": ""}
+    which = balances_counted(bp)
+    if which["state"] in ("HIDDEN", "NOT_KNOWN"):
+        out.update(state=which["state"], text=which["text"])
         return out
     if price is None or price <= 0:
         out["text"] = "Buying power maximum not known: no price for this row."
         return out
-    n = int((max(dtbp, Decimal(0)) / ranks / price).to_integral_value(rounding=ROUND_FLOOR))
-    out.update(state="OK", shares=n, text=(f"Buying power allows {n:,} at full margin: a {_share_word(ranks)} "
-                                           f"of day-trading buying power at {price:,.2f}."))
+    if which["state"] == "NONE":
+        out.update(state="OK", shares=0, text=which["text"])
+        return out
+    per = []
+    for key, pair, name in BALANCES:
+        if key not in which["use"]:
+            continue
+        got = name_rate(name_rates, pair, side)
+        rate = got[0] if got else Decimal(1)
+        n = int((which["use"][key] / ranks / (price * rate)).to_integral_value(rounding=ROUND_FLOOR))
+        per.append({"key": key, "name": name, "shares": n, "rate": got})
+    win = min(per, key=lambda x: x["shares"])
+    of = f"a {_share_word(ranks)} of {win['name']} at {price:,.2f}"
+    if win["rate"]:
+        rate, at = win["rate"]
+        when = f" (preview {at[:5]} ET)" if at else ""
+        text = f"Buying power allows {win['shares']:,}: {of}, at Schwab's rate of {_rate_text(rate)} for this name{when}."
+    else:
+        text = f"Buying power allows {win['shares']:,} at full margin: this name's own rate is not known yet ({of})."
+    for other in per:
+        if other is not win:
+            # A balance worked without a rate says so even when it does not decide (architect's
+            # review 1 of ET PR #41): at its own rate it might have been the smaller.
+            how = "" if other["rate"] else " at full margin, its rate not known yet"
+            text += (f" {other['name'][0].upper()}{other['name'][1:]} alone would allow {other['shares']:,}{how}, "
+                     f"so {win['name']} decides.")
+    if which["left_out"]:
+        text += f" {which['text']}"
+    out.update(state="OK", shares=win["shares"], decided_by=win["key"],
+               rate=_f(win["rate"][0]) if win["rate"] else None,
+               rate_at_et=win["rate"][1] if win["rate"] else None,
+               rate_known=all(x["rate"] is not None for x in per), left_out=which["left_out"], text=text)
     return out
 
 
@@ -529,14 +667,16 @@ def _estimate_at(risk: Decimal, atr: Decimal, price: Decimal, bp_shares: Optiona
 
 
 def estimate_row(risk: Optional[Decimal], calm: Optional[bool], atr: Optional[Decimal],
-                 price: Optional[Decimal], bp: Optional[Mapping], pb: Playbook) -> dict:
+                 price: Optional[Decimal], bp: Optional[Mapping], pb: Playbook,
+                 name_rates: Optional[Mapping] = None) -> dict:
     """A row's estimated shares before the 09:30 minute (brief 22). Its own key, row["estimate"],
     never a size: `kind` says "estimate" and nothing that sends reads it.
 
     State FULL or CALM: `used` holds the estimate at the risk used (calm_multiplier of it on a calm
     day). CALM_UNKNOWN: `full` and `half` side by side, as the rows do. MISSING: no ATR, no price or
-    no risk, said in `text`, never 0. OFF: size.estimate.show is "none". `bp_max` is bp_max()."""
-    mx = bp_max(bp, price, pb)
+    no risk, said in `text`, never 0. OFF: size.estimate.show is "none". `bp_max` is bp_max() with
+    the name's rates and no side (brief 31)."""
+    mx = bp_max(bp, price, pb, name_rates)
     out = {"kind": "estimate", "show": pb.estimate_show, "state": None, "calm": calm,
            "used": None, "full": None, "half": None, "bp_max": mx, "text": ""}
     if pb.estimate_show == "none":
@@ -566,10 +706,10 @@ def estimate_row(risk: Optional[Decimal], calm: Optional[bool], atr: Optional[De
 def estimate_header(pb: Playbook) -> dict:
     """What every estimate on the screen assumes, said once in the header."""
     ranks = pb.rank_to - pb.rank_from + 1
-    bp = (f"Schwab's full margin for every name, and an equal {_share_word(ranks)} of day-trading buying "
-          "power per pick")
+    bp = ("each name's own margin rate from this morning's Schwab previews (full margin until a name has "
+          f"one), and an equal {_share_word(ranks)} of buying power per pick")
     if pb.estimate_show == "none":
-        text = f"No share estimates before the 09:30 minute. The buying power maximum assumes {bp}."
+        text = f"No share estimates before the 09:30 minute. The buying power maximum uses {bp}."
     elif pb.estimate_show == "cautious":
         text = (f"Estimated shares before the 09:30 minute assume a wide first minute of "
                 f"{pb.estimate_wide_atr:g} x ATR (OV's 2026 top 4: three picks in four had a narrower one), {bp}.")
@@ -582,10 +722,12 @@ def estimate_header(pb: Playbook) -> dict:
             "per_pick_of": ranks, "text": text}
 
 
-def buying_power_note(row: Mapping, bp: Optional[Mapping], pb: Playbook) -> Optional[dict]:
+def buying_power_note(row: Mapping, bp: Optional[Mapping], pb: Playbook,
+                      name_rates: Optional[Mapping] = None) -> Optional[dict]:
     """A note on a row with levels whose shares are above the buying power maximum at that side's
-    entry, or None. Display only: the row's shares are NOT changed (capping real sizes is brief 23,
-    with Ash's own go). Calm flag not known: the full-size shares are checked."""
+    entry, each side with its own rate (brief 31), or None. Display only: the row's shares are NOT
+    changed (capping real sizes is ET #38, with Ash's own go). Calm flag not known: the full-size
+    shares are checked."""
     sh = row.get("shares") or {}
     shown = sh.get("used") or sh.get("full")
     if not isinstance(shown, Mapping):
@@ -593,27 +735,42 @@ def buying_power_note(row: Mapping, bp: Optional[Mapping], pb: Playbook) -> Opti
     over = {}
     for k in ("long", "short"):
         side = row.get(k) or {}
-        mx = bp_max(bp, to_dec(side.get("entry")), pb)
+        mx = bp_max(bp, to_dec(side.get("entry")), pb, name_rates, k.upper())
         if mx["state"] == "OK" and isinstance(shown.get(k), int) and shown[k] > mx["shares"]:
-            over[k] = mx["shares"]
+            over[k] = mx
     if not over:
         return None
-    if len(over) == 2 and over["long"] == over["short"]:
-        what = f"{over['long']:,}"
+    if len(over) == 2 and over["long"]["shares"] == over["short"]["shares"]:
+        what = f"{over['long']['shares']:,}"
     else:
-        what = " and ".join(f"{n:,} {k}" for k, n in over.items())
-    return {"long": over.get("long"), "short": over.get("short"),
-            "text": f"Buying power allows at most {what} at full margin."}
+        what = " and ".join(f"{m['shares']:,} {k}" for k, m in over.items())
+    rate_known = all(m["rate_known"] for m in over.values())
+    rates = {k: m["rate"] for k, m in over.items()}
+    if any(r is None for r in rates.values()):
+        how = "at full margin: this name's own rate is not known yet"
+    elif len(set(rates.values())) == 1:
+        how = f"at Schwab's rate of {_rate_text(Decimal(str(next(iter(rates.values())))))} for this name"
+    else:
+        how = "at Schwab's rates of " + " and ".join(f"{_rate_text(Decimal(str(r)))} {k}" for k, r in rates.items())
+    text = f"Buying power allows at most {what} {how}."
+    left = next((m for m in over.values() if m["left_out"]), None)
+    if left:
+        text += f" {balances_counted(bp)['text']}"
+    return {"long": over["long"]["shares"] if "long" in over else None,
+            "short": over["short"]["shares"] if "short" in over else None,
+            "rate_known": rate_known, "text": text}
 
 
 def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_error: str,
                clock: Optional[Mapping], clock_ok_at: Optional[datetime], clock_error: str,
-               risk: Optional[Decimal], now: datetime, pb: Playbook, account: Optional[Mapping] = None) -> dict:
+               risk: Optional[Decimal], now: datetime, pb: Playbook, account: Optional[Mapping] = None,
+               rates: Optional[Mapping] = None) -> dict:
     """The whole screen: header facts, the calm flag and one row per pick of the playbook.
 
     `picks` is Edge Scanner's last good answer from GET /api/v2/ov-picks (scanner/ov_picks_route.py),
     `picks_ok_at` when it came, `picks_error` the last failure ("" when the last ask worked).
     `account` feeds the buying power line (buying_power()); None shows it as not known.
+    `rates` is the probe's PreviewRates.today() (brief 31): ratios only, never a dollar amount.
     """
     now_et = now.astimezone(ET)
     view = {
@@ -659,7 +816,7 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
             view.update(state=PREVIEW, message=PREVIEW_TEXT, preview=pv)
             for r in pv["rows"]:
                 r["estimate"] = estimate_row(risk, view["calm"]["calm"], to_dec(r["atr"]), to_dec(r["last"]),
-                                             view["buying_power"], pb)
+                                             view["buying_power"], pb, _name_rates(rates, r["ticker"]))
             if not pv["rows"]:
                 view["notes"].append(f"No name ranked {pb.rank_from} to {pb.rank_to} in the preview as of "
                                      f"{pv['as_of_et'][:5]} ET.")
@@ -695,6 +852,6 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         return view
     if view["stale"]:
         view["state"] = STALE
-    view["rows"] = [build_row(r, trading_date, now, risk, view["calm"]["calm"], pb, view["buying_power"])
+    view["rows"] = [build_row(r, trading_date, now, risk, view["calm"]["calm"], pb, view["buying_power"], rates)
                     for r in rows]
     return view
