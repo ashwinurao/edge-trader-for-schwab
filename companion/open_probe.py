@@ -53,13 +53,14 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   poll_budget.probe_pairs_fit): it goes only if, at each of those times, the window still has room
   for the pair and the pair's own fresh quote, counting the probe's own sends that will have left
   the window by then. With no pair due within 60 s it asks for itself alone. A time lost as
-  `no_quote` because the last quotes call gave way for the budget keeps its pick's turn; a pick
-  missing from a fresh answer still uses its turn. With no position and a ticket window in focus
+  `no_quote` because the last quotes call gave way for the budget, with no quotes answer in the
+  last 10 s, keeps its pick's turn; a pick missing from a fresh answer still uses its turn. With no position and a ticket window in focus
   it sends a whole preview pair at 7 of the 8 preview times before the freeze (each of four picks
   gets one), 9 of 10 in the open window from 09:26:00 and 5 of 6 from 09:29:00, and 40 to 60
   percent of its quotes calls; with neither, all (tests/test_probe_budget.py). Each call it sends is counted in the poller's
   window (Poller.note_probe_request), never as order traffic. A call that gave way writes one
-  netlog `skip` line (purpose probe, reason `probe_minute_tight`, `probe_held` or `pause_429`),
+  netlog `skip` line (purpose probe, reason `probe_minute_tight`, `probe_pair_ahead`, `probe_held`,
+  `pause_429` or `budget_error`),
   at most one per quote interval, and is counted in the
   window's `quotes_skipped` / `previews_skipped`; a preview that gave way still writes its
   `probe: "preview"` line with `skipped: "budget"`. Each call sent has a netlog `call` line
@@ -664,6 +665,7 @@ class OpenProbe:
         self._shared_at: Optional[float] = None       # brief 34: when lines last came from a shared answer
         self._own_sent: deque = deque()               # review 4 of PR #44: the probe's own sends
         self._quote_gave_way = False                  # review 4: the last quotes tick gave way
+        self._answer_at: Optional[float] = None       # review 5: when the last good quotes answer came
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
                        "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0,
                        "quotes_skipped": 0, "previews_skipped": 0, "quotes_shared": 0}
@@ -947,6 +949,13 @@ class OpenProbe:
         with netlog.call("schwab", "quotes", "probe", clients=(self.client,)) as call:
             self._quotes_call(call)
 
+    def _lost_to_budget(self) -> bool:
+        """A preview time had no quote because the budget held the probe's quote back: the last
+        quotes tick gave way and no quotes answer came in the last QUOTE_FRESH_S (review 5 of PR
+        #44). With a fresh answer that lacks the pick, the pick is missing, not held back."""
+        fresh = self._answer_at is not None and self._mono() - self._answer_at <= QUOTE_FRESH_S
+        return self._quote_gave_way and not fresh
+
     def _pairs_in(self) -> tuple[float, ...]:
         """Seconds to each preview time of the open window due within the next 60 s (the budget's
         window), not done yet, while the window's preview cap still leaves a pair (reviews 3 and 4
@@ -986,6 +995,7 @@ class OpenProbe:
             return
         body = r.json()
         recv_ms = recv.timestamp() * 1000
+        self._answer_at = self._mono()
         for line in quote_lines(body, syms, recv_ms, wire, total):
             line["via"] = "probe"
             self._line(**line)
@@ -1001,10 +1011,10 @@ class OpenProbe:
         hit = self._last_quote.get(sym)
         if hit is None or self._mono() - hit[0] > QUOTE_FRESH_S or not hit[1].get("ask") or not hit[1].get("bid"):
             self._line(probe="preview", symbol=sym, at=at, skipped="no_quote")
-            if self._quote_gave_way:
-                # Review 4 of PR #44: the time was lost because the probe's own quote gave way for
-                # the budget, so the pick keeps its turn, as a pair that gives way does. A pick
-                # missing from a fresh answer still uses its turn.
+            if self._lost_to_budget():
+                # Reviews 4 and 5 of PR #44: the time was lost because the probe's own quote gave
+                # way for the budget, so the pick keeps its turn, as a pair that gives way does. A
+                # pick missing from a fresh answer still uses its turn.
                 self._turn -= 1
             return
         acct = self._hash()
