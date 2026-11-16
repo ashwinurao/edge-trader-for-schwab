@@ -79,6 +79,9 @@ async def lifespan(_app: FastAPI):
     trader.arm(False, reason="startup")   # arming never survives a restart
     # The network record (netlog.py): its threads, a start note and the event-loop lag task.
     lag_task = netlog.start(f"Edge Trader {__version__} started{' in DEMO mode' if DEMO else ''}")
+    if _plan_routes is not None:      # brief 32: the shadow's start line, now that main() set up logging
+        from .opening_plan import shadow as _plan_shadow
+        _plan_shadow.log_start(os.environ)
     poller.start()
     open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add)  # briefs 09, 21, 23, off by default
     if not DEMO:
