@@ -160,6 +160,88 @@ def test_a_shared_call_that_goes_wrong_leaves_the_guest_out_for_the_backoff(rig,
     assert g.got
 
 
+def _with_unknown(symbols, unknown=("ZZZZ",)):
+    """Schwab's 200 with a top-level errors entry naming the symbols it does not know (the shape as
+    the architect remembers Schwab's reference; not confirmed in this repo)."""
+    body = {s: {"quote": {"lastPrice": 10.5, "bidPrice": 10.4, "askPrice": 10.6}}
+            for s in symbols if s not in unknown}
+    bad = [s for s in symbols if s in unknown]
+    if bad:
+        body["errors"] = {"invalidSymbols": bad}
+    return Resp(200, body)
+
+
+def test_a_guest_symbol_schwab_does_not_know_never_reaches_the_poller_state(rig):
+    """Review 1 of PR #46: guest-only symbols are taken out of a top-level errors entry, and the
+    entry is dropped when nothing of the poller's is left. poller.quotes and save_quotes then equal
+    the run without a guest. A symbol of the poller's own in that entry stays."""
+    p, clock, saved, notes = rig
+    p.client.script = [_with_unknown(["BRVO", "XLE"])]
+    assert p._poll("quotes")
+    without, saved_without = p.quotes, list(saved)
+    saved.clear()
+    g = Guest(("NVDA", "ZZZZ"))
+    p.set_quote_guest(g.ask, g.take)
+    p.client.script = [_with_unknown(["BRVO", "XLE", "NVDA", "ZZZZ"])]
+    clock.advance(3)
+    assert p._poll("quotes")
+    assert p.client.asks[-1] == ("BRVO", "XLE", "NVDA", "ZZZZ")
+    assert p.quotes == without and saved == saved_without and "errors" not in p.quotes
+    assert set(g.got[0][0]) == {"NVDA"}                      # the guest gets what Schwab knew
+    # The poller's own unknown symbol: the entry stays, with the poller's symbol only.
+    body = {"BRVO": {"quote": {}}, "errors": {"invalidSymbols": ["XLE", "ZZZZ"], "other": ["ZZZZ"]}}
+    assert quote_guests.split(body, ("ZZZZ",)) == {"BRVO": {"quote": {}}, "errors": {"invalidSymbols": ["XLE"]}}
+    assert quote_guests.split({"BRVO": {}, "errors": ["zzzz"]}, ("ZZZZ",)) == {"BRVO": {}}
+
+
+def test_a_guest_that_breaks_every_shared_call_costs_at_most_two_marks_reads_a_window(rig):
+    """Review 1 of PR #46: after two shared calls in a row that go wrong the guest stays out until
+    its window ends (its symbols turn empty); the next window starts clean. A good shared answer
+    resets the count."""
+    p, clock, saved, notes = rig
+    g = Guest()
+
+    class Breaks(QuotesClient):
+        def quotes(self, symbols):
+            self.asks.append(tuple(symbols))
+            if set(symbols) & set(GUEST):
+                return Resp(400, None, text="bad symbol")
+            return Resp(200, {s: {"quote": {"lastPrice": 10.5}} for s in symbols})
+    p.client = Breaks(clock)
+    p.set_quote_guest(g.ask, g.take)
+    good = 0
+    for _ in range(int(13 * 60 / 3)):                        # a 13 min window, a read every 3 s
+        if p._poll("quotes") and set(p.quotes) == {"BRVO", "XLE"}:
+            good += 1
+        clock.advance(3)
+    lost = int(13 * 60 / 3) - good
+    assert lost <= 2 and p.guests.out_for_window
+    assert sum(1 for a in p.client.asks if set(a) & set(GUEST)) == 2
+    # The window ends: the guest's symbols turn empty, and the next window starts clean.
+    g.wants = ()
+    p._poll("quotes")
+    clock.advance(3)
+    assert not p.guests.out_for_window and p.guests.bad_in_row == 0
+    g.wants = GUEST
+    p._poll("quotes")
+    assert p.client.asks[-1] == ("BRVO", "XLE") + GUEST
+
+
+def test_a_good_shared_answer_resets_the_count_of_bad_ones(rig):
+    p, clock, saved, notes = rig
+    g = Guest()
+    p.set_quote_guest(g.ask, g.take)
+    p.client.script = [Resp(500, None, text="boom")]
+    p._poll("quotes")
+    assert p.guests.bad_in_row == 1
+    clock.advance(quote_guests.GUEST_BACKOFF_S + 1)
+    assert p._poll("quotes") and g.got and p.guests.bad_in_row == 0      # a good shared answer
+    p.client.script = [Resp(500, None, text="boom")]
+    clock.advance(3)
+    p._poll("quotes")
+    assert p.guests.bad_in_row == 1 and not p.guests.out_for_window   # one, not two in a row
+
+
 def test_an_answer_without_an_own_symbol_keeps_what_the_poller_would_keep(rig):
     p, clock, saved, notes = rig
     g = Guest()
@@ -282,6 +364,28 @@ def test_a_tick_after_a_preview_took_the_shared_answer_is_served():
     clock.go(1)
     probe.step()                                            # 09:29:30: preview, tick at 09:29:30
     assert len(client.quote_calls) == 1 and probe.counts["quotes_shared"] == 1
+
+
+def test_a_shared_answer_counts_as_a_fresh_answer_for_the_turn_rule():
+    """Review 5 of PR #44, carried here: a shared answer sets the same answer time as the probe's
+    own. A shared answer without the pick serves a tick, the next tick gives way, then the preview
+    time: the pick is missing, not held back, so it uses its turn."""
+    clock = ProbeClock(et(9, 29, 19))
+    probe, sink, client, guest, asked = _probe(clock, budget=(lambda need=1, ahead=None: "probe_minute_tight",
+                                                              lambda: None))
+    probe.step()                                            # 09:29:19: opens; the tick gives way
+    clock.go(3)
+    _hand_over(clock, guest, symbols=("SPY",))              # 09:29:22: an answer without NVDA
+    clock.go(2)
+    probe.step()                                            # 09:29:24: the tick is served by it
+    assert probe.counts["quotes_shared"] == 1
+    clock.go(5)
+    probe.step()                                            # 09:29:29: the tick gives way
+    assert probe._quote_gave_way
+    clock.go(1)
+    probe.step()                                            # 09:29:30: NVDA has no quote
+    assert [x.get("skipped") for x in sink.probes("preview")] == ["no_quote"]
+    assert probe._turn == 1 and client.quote_calls == []
 
 
 def test_the_hand_over_only_stores():

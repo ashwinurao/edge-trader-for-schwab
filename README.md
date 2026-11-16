@@ -143,7 +143,10 @@ name are refused). It needs no account and sends no telemetry.
   because the probe's quote gave way keeps its pick's turn. **While the poller reads your position marks
   anyway, the probe's symbols ride in that same quotes call** (brief 34, `companion/quote_guests.py`): it
   costs no call, the marks keep their own pace and never depend on it, and a shared call that fails or misses
-  one of your own symbols leaves the probe out of it for 60 seconds. The probe then writes its quote lines
+  one of your own symbols leaves the probe out of it for 60 seconds, and two such calls in a row leave it out
+  until its window ends, so a probe symbol that breaks every shared call costs your marks at most two reads a
+  window. A symbol only the probe asked never reaches your marks, also when Schwab names it as unknown in an
+  `errors` entry of its answer. The probe then writes its quote lines
   from that answer with `via: "poller"` (its own calls say `via: "probe"`) and makes no quotes call of its
   own. Those lines have no wire time, and an answer can be up to one marks interval (3 to 6 seconds) old when
   the probe reads it. So with a position open in a quiet minute the probe gets quote lines at every 5 s tick.

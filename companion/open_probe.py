@@ -871,6 +871,7 @@ class OpenProbe:
         if not syms or self._mono() - recv_mono > QUOTE_FRESH_S:
             return False
         self._shared_at = self._mono()
+        self._answer_at = recv_mono    # review 5 of PR #44: a fresh answer, whoever made the call
         for line in quote_lines(entries, syms, recv_wall.timestamp() * 1000, None, None):
             line["via"] = "poller"
             self._line(**line)
