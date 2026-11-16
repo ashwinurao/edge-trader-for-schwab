@@ -279,12 +279,14 @@ def _through(d: Mapping, bid: Any, ask: Any) -> tuple[bool, str]:
     refused and Schwab rejects it; only the chase gets it. By the click path's own rule
     (companion/break_entry.py): a long when the ASK is at or above the trigger, a short when the
     BID is at or below it, here from the reading's quote ("quote"). Only when the reading has no
-    quote for that side (the picks feed) the last trade is compared ("last"; review 1 of brief 32)."""
+    quote for that side (the picks feed, or a 0 from the tape) the last trade is compared ("last"; review 1 of brief 32)."""
     trigger = engine._dec(d.get("trigger"))
     side = d.get("side")
     if trigger is None or side not in ("long", "short"):
         return False, "last"
     quote = engine._dec(ask if side == "long" else bid)
+    if quote is not None and quote <= 0:
+        quote = None            # the tape sends 0 for a side with no quote (tape._num keeps it): no quote
     by, price = ("quote", quote) if quote is not None else ("last", engine._dec(d.get("price")))
     if price is None:
         return False, by

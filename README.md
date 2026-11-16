@@ -412,7 +412,7 @@ What the shadow log also says (brief 32):
   re-levelled, `chase` (Step 8) once an entry was placed with the market at or past its trigger, which a
   click refuses (`companion/break_entry.py`) and Schwab rejects. The mark uses the tape's quote as the
   click path uses Schwab's: the ask at or above a long trigger, the bid at or below a short one. Only a
-  reading with no quote (the picks route) compares the last trade. The `would_place`, `would_flip` and
+  reading with no quote (the picks route, or a bid or ask of 0) compares the last trade. The `would_place`, `would_flip` and
   `would_relevel` lines say what was compared: `bid`, `ask` and `through_by` (`quote` or `last`). So
   `needs: ["send"]` is what the armed plan with Step 6 alone would have done. `needs` lists what is
   necessary, not what is enough: whether Step 8 would chase an entry past its cap is not checked.

@@ -255,6 +255,18 @@ def test_without_a_quote_the_last_trade_is_compared_and_said(tmp_path):
     assert (place_line(rows)["needs"], place_line(rows)["through_by"]) == (["send"], "last")
 
 
+def test_a_zero_quote_is_no_quote(tmp_path):
+    # Review 2 of brief 32: the tape sends 0 for a side with no bid or ask. A short (trigger 48.99,
+    # last 49.10) with bid 0 is not through by the quote: the last trade decides, and it is not.
+    rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 49.10, "bid": 0.0, "ask": 49.12})))
+    p = place_line(rows)
+    assert (p["side"], p["needs"], p["through_by"], p["bid"], p["ask"]) == ("short", ["send"], "last", 0.0, 49.12)
+    # A long (trigger 50.01) with ask 0 and the last trade 50.03 past its trigger: through by the last.
+    rows = run(tmp_path / "long", steps_of(("09:31:00.200", {"price": 50.03, "bid": 50.02, "ask": 0.0}),))
+    p = place_line(rows)
+    assert (p["side"], p["needs"], p["through_by"], p["ask"]) == ("long", ["send", "chase"], "last", 0.0)
+
+
 def test_quote_fields_only_on_place_flip_and_relevel(tmp_path):
     rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 49.80}), ("09:31:01.000", {"price": 49.40}),
                                   ("09:31:02.000", {"price": 48.95})))
