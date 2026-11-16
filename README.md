@@ -226,7 +226,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   (e.g. `09:10:00`) to start the demo clock at that time of day and see the preview,
   `EDGE_TRADER_PLAN_DEMO_RV20` (e.g. `12.3`) for a day that is not calm,
   `EDGE_TRADER_PLAN_DEMO_DT_ZERO=1` for day-trading buying power at 0 and
-  `EDGE_TRADER_PLAN_DEMO_NO_RATES=1` for no margin rates yet (the demo's invented rates are in
+  `EDGE_TRADER_PLAN_DEMO_NO_RATES=1` for no margin rates yet, `EDGE_TRADER_PLAN_DEMO_ONE_SIDE=1` for
+  long rates only (the demo's invented rates are in
   `companion/opening_plan/demo_feed.py`).
   Before the 09:30 minute there is no range, so each preview row, and each frozen row still waiting for
   the minute, shows **estimated shares**, marked "estimate": the risk per pick you set (half on a calm
@@ -235,8 +236,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   buying power and day-trading buying power, a quarter of it over (the row's last price times this
   name's own margin rate), and the smaller of the two. The rate is Schwab's requirement over the
   order's value from this morning's opening probe previews (`companion/preview_rates.py`; before the
-  open the higher of the long and short rate); a name without a preview yet counts at full margin
-  (rate 1) and is marked "rate not known yet". A number Schwab reports as 0 (or does not send) beside
+  open the higher of the long and short rate, and a side without a rate counts at full margin, so one
+  side's rate alone never sizes the row); a name or side without a preview yet counts at full margin
+  (rate 1) and is marked "rate not known yet", naming the missing side. A number Schwab reports as 0 (or does not send) beside
   one above 0 is left out and the row says so: on 2026-11-16 day-trading buying power read 0 before
   the open and every estimate showed 0 (brief 31; Ash picked "Buying power with each name's rate").
   The header's Buying power line then says the plan's numbers use buying power. Both at 0, or either
