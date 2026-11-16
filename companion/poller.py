@@ -19,7 +19,8 @@ using the same Schwab login):
                           limiter, sent only while the last 60 s hold fewer than 70 - PROBE_ROOM
                           (54) sends and no hold_later holds (brief 33): with a position open it
                           sends almost nothing; with no position and a ticket window in focus
-                          about six in ten quotes calls and half its previews.
+                          about two in three quotes calls and a preview pair at
+                          about one preview time in six.
 Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN, 70 calls in
 any 60 s, order traffic and the opening probe included), schwabdev's internal retries are disabled (companion/schwab.py),
 and a 429 pauses ALL companion requests. Each endpoint keeps its own last-success time.
@@ -205,14 +206,15 @@ class Poller:
         call of their own (companion/quote_guests.py). The poller's state never sees them."""
         self.guests.set(wants, take)
 
-    def probe_gives_way(self) -> str | None:
-        """None when the opening probe may send one call now, else why not (brief 33,
-        poll_budget.probe_gives_way). The probe asks before each call and gives way first. If the
-        budget cannot be read, the probe gives way: it is a measurement, never needed."""
+    def probe_gives_way(self, need: int = 1) -> str | None:
+        """None when the opening probe may send `need` calls now, else why not (brief 33,
+        poll_budget.probe_gives_way). The probe asks before each call, a preview pair for both of
+        its calls at once (review 2 of PR #44), and gives way first. If the budget cannot be read,
+        the probe gives way: it is a measurement, never needed."""
         try:
             # tuple(): the same safe copy as _give_way (review 1 of PR #33).
             return poll_budget.probe_gives_way(time.monotonic(), tuple(self._sent), MAX_PER_MIN,
-                                               self.cooldown_left(), self._hold_until)
+                                               self.cooldown_left(), self._hold_until, need)
         except Exception:
             log.exception("poll budget failed for the probe; the probe gives way")
             return "budget_error"
