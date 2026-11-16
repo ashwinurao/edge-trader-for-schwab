@@ -32,13 +32,20 @@ def at(hms: str) -> datetime:
     return datetime(2026, 11, 13, int(h) + 5, int(m), int(sec), int(round((sec % 1) * 1e6)), tzinfo=timezone.utc)
 
 
-def tape_reading(hms, price=49.80, age=0.1, high=50.00, low=49.00, final=True, feed_age=0.05, symbol="AAA"):
+QUOTE = object()      # the default quote: one cent either side of the last trade
+
+
+def tape_reading(hms, price=49.80, age=0.1, high=50.00, low=49.00, final=True, feed_age=0.05, symbol="AAA",
+                 bid=QUOTE, ask=QUOTE):
     """An open-tape reading received and read at `hms`, whose AAA price is `age` s old."""
+    bid = round(price - 0.01, 2) if bid is QUOTE else bid
+    ask = round(price + 0.01, 2) if ask is QUOTE else ask
     r = tape.empty(at(hms))
     received = at(hms)
     fresh = received - timedelta(seconds=age)
     r.update(seq=7, day=DAY, snapshot_at=received, tape_age_s=0.0, reference="SPY", feed_age=feed_age,
              picks=[{"symbol": symbol, "rank": 1, "last": price, "last_at": fresh, "fresh_at": fresh,
+                     "bid": bid, "ask": ask, "quote_at": fresh if bid is not None or ask is not None else None,
                      "high": high, "low": low, "final": final, "from": tape.FROM_SNAPSHOT}])
     return r
 
@@ -142,14 +149,15 @@ def test_a_summary_line_never_changes_a_decision(tmp_path):
     tp = FakeTape()
     plain = shadow.Shadow(NoFeed(), PLAYBOOK, risk=lambda: Decimal("101"), calm=lambda c, n: False,
                           out_dir=plain_dir, now=lambda: clock["t"], tape=tp, count=False)
-    plain.needs.tag = lambda now, ds: ds
+    plain.needs.tag = lambda now, ds, reading=None: ds
     for hms, reading in steps:
         clock["t"], tp.next = at(hms), reading
         plain.step()
     before = [json.loads(x) for x in (plain_dir / f"{DAY}.jsonl").read_text(encoding="utf-8").splitlines()]
     after = run(said_dir, steps)
     assert any(r["kind"] == shadow.SUMMARY for r in after)
-    assert [{k: v for k, v in r.items() if k != "needs"} for r in decisions(after)] == before
+    added = ("needs", "bid", "ask", "through_by")
+    assert [{k: v for k, v in r.items() if k not in added} for r in decisions(after)] == before
     assert [r["kind"] for r in before] == ["would_place", "no_action", "would_fill"]
 
 
@@ -213,6 +221,106 @@ def test_a_relevel_needs_the_relevel(tmp_path):
                               ("would_fill", ["send", "relevel"])]
 
 
+def place_line(rows):
+    return next(r for r in rows if r["kind"] == "would_place")
+
+
+def test_a_long_with_the_ask_through_its_trigger_needs_the_chase(tmp_path):
+    # Review 1 of brief 32: last 49.99 is under the long trigger 50.01, but the ask 50.02 is at or
+    # above it, so break_entry.py refuses the click and Schwab rejects the stop.
+    rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 49.99, "bid": 49.98, "ask": 50.02})))
+    p = place_line(rows)
+    assert (p["side"], p["needs"], p["through_by"], p["bid"], p["ask"]) == ("long", ["send", "chase"], "quote",
+                                                                             49.98, 50.02)
+
+
+def test_a_short_with_the_bid_through_its_trigger_needs_the_chase(tmp_path):
+    # Short trigger 48.99: last 49.01 is above it, the bid 48.99 is at it.
+    rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 49.01, "bid": 48.99, "ask": 49.02})))
+    p = place_line(rows)
+    assert (p["side"], p["needs"], p["through_by"]) == ("short", ["send", "chase"], "quote")
+
+
+def test_an_ask_below_the_trigger_needs_the_send_only(tmp_path):
+    rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 49.99, "bid": 49.98, "ask": 50.00})))
+    p = place_line(rows)
+    assert (p["needs"], p["through_by"], p["ask"]) == (["send"], "quote", 50.00)
+
+
+def test_without_a_quote_the_last_trade_is_compared_and_said(tmp_path):
+    rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 50.05, "bid": None, "ask": None}),))
+    p = place_line(rows)
+    assert (p["needs"], p["through_by"], p["bid"], p["ask"]) == (["send", "chase"], "last", None, None)
+    rows = run(tmp_path / "below", steps_of(("09:31:00.200", {"price": 49.99, "bid": None, "ask": None}),))
+    assert (place_line(rows)["needs"], place_line(rows)["through_by"]) == (["send"], "last")
+
+
+def test_quote_fields_only_on_place_flip_and_relevel(tmp_path):
+    rows = run(tmp_path, steps_of(("09:31:00.200", {"price": 49.80}), ("09:31:01.000", {"price": 49.40}),
+                                  ("09:31:02.000", {"price": 48.95})))
+    by_kind = {r["kind"]: r for r in decisions(rows)}
+    assert by_kind["would_flip"]["through_by"] == "quote" and by_kind["would_flip"]["bid"] == 49.39
+    assert "through_by" not in by_kind["would_fill"] and "bid" not in by_kind["would_fill"]
+
+
+# ---------------------------------------------------------------- review 1: the decision lines come first
+
+FILL_STEPS = AGES + steps_of(("09:31:12.000", {"price": 50.03}), ("09:32:00.000", {"price": 50.04}),
+                             ("09:36:00.000", {}))
+
+
+def plain_decisions(tmp_path):
+    """The decision lines of FILL_STEPS with no counting, needs and quote fields left out."""
+    rows = run(tmp_path / "plain", FILL_STEPS, count=False)
+    drop = ("needs", "bid", "ask", "through_by")
+    return [{k: v for k, v in r.items() if k not in drop} for r in rows]
+
+
+def test_a_failing_count_never_costs_a_decision_line(tmp_path, monkeypatch, caplog):
+    def boom(self, *a, **k):
+        raise RuntimeError("count boom")
+    monkeypatch.setattr(shadow.Counts, "add", boom)
+    with caplog.at_level(logging.ERROR, logger="companion.opening_plan.shadow"):
+        rows = run(tmp_path / "said", FILL_STEPS)
+    assert [{k: v for k, v in r.items() if k not in ("needs", "bid", "ask", "through_by")} for r in rows] == \
+        plain_decisions(tmp_path)
+    assert all("needs" in r for r in rows if r["kind"] != "no_action")
+    assert sum("count boom" in r.getMessage() for r in caplog.records) == 1       # logged once
+
+
+def test_a_failing_count_write_never_costs_a_decision_line(tmp_path, monkeypatch):
+    def boom(self, done):
+        if done:
+            raise OSError("disk boom")
+    monkeypatch.setattr(shadow.Shadow, "_write_counts", boom)
+    rows = run(tmp_path / "said", FILL_STEPS)
+    assert not [r for r in rows if r["kind"] in (shadow.SUMMARY, shadow.TAPE_SUMMARY)]
+    assert [{k: v for k, v in r.items() if k not in ("needs", "bid", "ask", "through_by")} for r in rows] == \
+        plain_decisions(tmp_path)
+
+
+def test_a_failing_tag_writes_the_lines_without_needs(tmp_path, monkeypatch):
+    def boom(self, *a, **k):
+        raise RuntimeError("tag boom")
+    monkeypatch.setattr(shadow.Needs, "tag", boom)
+    rows = decisions(run(tmp_path / "said", FILL_STEPS))
+    assert rows == plain_decisions(tmp_path)
+    assert not any("needs" in r or "through_by" in r for r in rows)
+
+
+def test_the_0931_decision_line_comes_before_the_0930_count_lines(tmp_path):
+    rows = run(tmp_path, [("09:30:59.500", tape_reading("09:30:59.500", final=False)),
+                          ("09:31:00.200", tape_reading("09:31:00.200"))])
+    kinds = [(r["kind"], r.get("minute")) for r in rows]
+    assert kinds.index(("would_place", None)) < kinds.index((shadow.SUMMARY, "09:30"))
+
+
+def test_a_long_tape_reason_is_cut_to_200_characters(tmp_path):
+    b = shadow._tape_bucket()
+    shadow.Counts._count_tape(b, {"source": "tape", "tape_usable": False, "tape_why": "x" * 500})
+    assert list(b["reasons"]) == ["x" * 200]
+
+
 def test_no_action_lines_carry_no_needs_and_a_new_day_starts_clean():
     n = shadow.Needs()
     day1 = n.tag(at("09:31:00"), [{"kind": "would_place", "symbol": "AAA", "side": "long", "trigger": 50.01,
@@ -244,7 +352,8 @@ def test_the_line_says_off(no_start_line):
     assert shadow.start_lines({})[0] == "opening plan shadow: off (EDGE_TRADER_SHADOW is not 1)"
     # Asked for, but routes.register never started it: the Opening plan is off.
     assert shadow.start_lines({"EDGE_TRADER_SHADOW": "1"})[0] == (
-        "opening plan shadow: off, EDGE_TRADER_SHADOW is 1 but the Opening plan is off (EDGE_SCANNER_URL is not set)")
+        "opening plan shadow: off, EDGE_TRADER_SHADOW is 1 but the Opening plan is off (EDGE_SCANNER_URL is not set "
+        "or not usable)")
     shadow.maybe_start({"EDGE_TRADER_SHADOW": "0"}, NoFeed(), PLAYBOOK, lambda: None, lambda c, n: None)
     assert shadow.start_lines({"EDGE_TRADER_SHADOW": "0"})[0] == "opening plan shadow: off (EDGE_TRADER_SHADOW is not 1)"
 

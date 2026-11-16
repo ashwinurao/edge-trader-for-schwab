@@ -399,9 +399,16 @@ What the shadow log also says (brief 32):
 - **The armed steps a decision needs.** Each `would_place`, `would_flip`, `would_relevel`,
   `would_cancel` and `would_fill` line has `needs`, from the pick's history that day: `send` (Step 6)
   always, `flip` (Step 7) once the pick has flipped, `relevel` (Step 7, the same switch) once it has
-  re-levelled, `chase` (Step 8) once an entry was placed with the price at or past its trigger, which a
-  click refuses (`companion/break_entry.py`) and Schwab rejects. So `needs: ["send"]` is what the armed
-  plan with Step 6 alone would have done.
+  re-levelled, `chase` (Step 8) once an entry was placed with the market at or past its trigger, which a
+  click refuses (`companion/break_entry.py`) and Schwab rejects. The mark uses the tape's quote as the
+  click path uses Schwab's: the ask at or above a long trigger, the bid at or below a short one. Only a
+  reading with no quote (the picks route) compares the last trade. The `would_place`, `would_flip` and
+  `would_relevel` lines say what was compared: `bid`, `ask` and `through_by` (`quote` or `last`). So
+  `needs: ["send"]` is what the armed plan with Step 6 alone would have done. `needs` lists what is
+  necessary, not what is enough: whether Step 8 would chase an entry past its cap is not checked.
+- **The decision lines come first.** Each reading is decided and its lines written before it is
+  counted. A failure in the counting, in its lines or in `needs` is logged once and never stops a
+  decision line; a failed `needs` leaves the line without it.
 
 To run the plan over a whole morning again, replay Edge Scanner's opening-recorder file
 (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):

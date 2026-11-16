@@ -40,7 +40,9 @@ Brief 32 (the shadow says more): maybe_start keeps its on/off line and lifespan 
 logs it with the plan's switches (log_start), because at import time no log is set up yet. Counts
 writes `summary` lines per pick and `tape_summary` lines per ET minute and for the whole window: how
 many readings the engine could not act on a price. Needs adds `needs` to each would_* line: the
-armed steps (send, flip, relevel, chase) without which the armed plan would not have got there.
+armed steps (send, flip, relevel, chase) without which the armed plan would not have got there;
+the chase mark uses the reading's ask (long) or bid (short), as break_entry.py does. Both run after
+the decision lines are written, each contained on its own (review 1 of brief 32).
 
 Its own daemon thread. Any exception is contained and logged once per kind; nothing here can
 reach the ticket, the poller or the screen. The risk per pick is read from the settings at most
@@ -82,6 +84,7 @@ PLAN_SWITCHES = ("EDGE_TRADER_PLAN_BUTTONS", "EDGE_TRADER_PLAN_FLAT", "EDGE_TRAD
 # Brief 32 item 2: the count lines. "window" is the minute of the line that covers the whole window.
 SUMMARY, TAPE_SUMMARY, WINDOW = "summary", "tape_summary", "window"
 MAX_REASONS = 10                # distinct tape reasons kept per line; the rest count as "other"
+MAX_REASON_CHARS = 200          # an error text can be long (review 1 of brief 32)
 # Brief 32 item 3: the armed steps a decision needs, in step order. "relevel" is Step 7 too
 # (engine.py would_relevel), under the same switch as "flip".
 NEEDS_ORDER = ("send", "flip", "relevel", "chase")
@@ -236,6 +239,7 @@ class Counts:
         b["not_usable"] += 1
         # Numbers out, so "1.40 s old" and "1.52 s old" are one reason.
         why = re.sub(r"\d+(?:\.\d+)?", "N", str(head.get("tape_problem") or head.get("tape_why") or "not said"))
+        why = why[:MAX_REASON_CHARS]
         reasons = b["reasons"]
         if why not in reasons and len(reasons) >= MAX_REASONS:
             why = "other"
@@ -270,29 +274,41 @@ class Counts:
                 "not_usable": b["not_usable"], "fell_back": b["fell_back"], "reasons": dict(b["reasons"])}
 
 
-def _through(d: Mapping) -> bool:
-    """The entry was placed with the price at or past its trigger (engine: "already past the
-    trigger"): break_entry.py refuses that by click and Schwab rejects it, so only the chase gets it."""
-    price, trigger = engine._dec(d.get("price")), engine._dec(d.get("trigger"))
-    if price is None or trigger is None or d.get("side") not in ("long", "short"):
-        return False
-    return price >= trigger if d["side"] == "long" else price <= trigger
+def _through(d: Mapping, bid: Any, ask: Any) -> tuple[bool, str]:
+    """(through, by): the entry was placed with the market at or past its trigger, so a click is
+    refused and Schwab rejects it; only the chase gets it. By the click path's own rule
+    (companion/break_entry.py): a long when the ASK is at or above the trigger, a short when the
+    BID is at or below it, here from the reading's quote ("quote"). Only when the reading has no
+    quote for that side (the picks feed) the last trade is compared ("last"; review 1 of brief 32)."""
+    trigger = engine._dec(d.get("trigger"))
+    side = d.get("side")
+    if trigger is None or side not in ("long", "short"):
+        return False, "last"
+    quote = engine._dec(ask if side == "long" else bid)
+    by, price = ("quote", quote) if quote is not None else ("last", engine._dec(d.get("price")))
+    if price is None:
+        return False, by
+    return (price >= trigger if side == "long" else price <= trigger), by
 
 
 class Needs:
     """Brief 32 item 3: the armed steps each decision needs, from the pick's history today, kept
     here and never in the engine's state. "send" (Step 6) always; "flip" (Step 7) once the pick has
     flipped; "relevel" (Step 7) once it has re-levelled; "chase" (Step 8) once an entry was placed
-    with the price at or past its trigger. So needs ["send"] is what Step 6 alone would do."""
+    with the market at or past its trigger (_through). So needs ["send"] is what Step 6 alone would
+    do. It lists what is necessary, not what is enough."""
 
     def __init__(self) -> None:
         self.day: Optional[date] = None
         self.seen: dict[str, set] = {}
 
-    def tag(self, now: datetime, decisions: list[dict]) -> list[dict]:
+    def tag(self, now: datetime, decisions: list[dict], reading: Optional[Mapping] = None) -> list[dict]:
+        """`reading` is the one the engine decided on: its picks' bid and ask mark the chase."""
         day = now.astimezone(engine.ET).date()
         if day != self.day:
             self.day, self.seen = day, {}
+        quotes = {str(p.get("symbol")): (p.get("bid"), p.get("ask"))
+                  for p in (reading or {}).get("picks") or [] if isinstance(p, Mapping)}
         out = []
         for d in decisions:
             kind = d.get("kind")
@@ -304,9 +320,14 @@ class Needs:
                 seen.add("flip")
             elif kind == "would_relevel":
                 seen.add("relevel")
-            if kind in ("would_place", "would_flip", "would_relevel") and _through(d):
-                seen.add("chase")
-            out.append(dict(d, needs=[s for s in NEEDS_ORDER if s in seen]))
+            extra = {}
+            if kind in ("would_place", "would_flip", "would_relevel"):
+                bid, ask = quotes.get(str(d.get("symbol")), (None, None))
+                through, by = _through(d, bid, ask)
+                if through:
+                    seen.add("chase")
+                extra = {"bid": bid, "ask": ask, "through_by": by}
+            out.append(dict(d, **extra, needs=[s for s in NEEDS_ORDER if s in seen]))
         return out
 
 
@@ -338,6 +359,7 @@ class Shadow:
         self._tape_last: Optional[dict] = None
         self._tape_day: Optional[date] = None
         self._last_problem = ""
+        self._part_problems: dict[str, str] = {}
         self._stop = threading.Event()
         self.thread: Optional[threading.Thread] = None
 
@@ -351,7 +373,7 @@ class Shadow:
         if not self._inside(now):
             self._risk_at = None
             if self.counts is not None:
-                self._write_counts(self.counts.close(now))
+                self._contained("counting", lambda: self._write_counts(self.counts.close(now)))
             return False
         if self._risk_at is None or (now - self._risk_at).total_seconds() >= RISK_EVERY_SECONDS:
             self._risk_value, self._risk_at = self._risk(), now
@@ -362,13 +384,33 @@ class Shadow:
             reading, ranges = es_reading(picks, now, self._risk_value, calm)
             es_age = None if picks.ok_at is None else round((now - picks.ok_at).total_seconds(), 3)
             head.update(source="picks feed", es_ok_at=_iso(picks.ok_at), es_age_s=es_age, es_error=picks.error or None)
-        if self.counts is not None:
-            self._write_counts(self.counts.add(now, reading, head, self.tape is not None))
         self.state, decisions = engine.decide(self.state, reading, self.rules)
         if decisions:
-            decisions = self.needs.tag(now, decisions)
-            self._write(now, [{"t": _iso(now), **head, **d, "range": ranges.get(d.get("symbol"))} for d in decisions])
+            # A failed tag writes the lines without `needs`: the decision lines come first (review 1
+            # of brief 32), exactly as before brief 32.
+            tagged = self._contained("needs", lambda: self.needs.tag(now, decisions, reading))
+            self._write(now, [{"t": _iso(now), **head, **d, "range": ranges.get(d.get("symbol"))}
+                              for d in (tagged if tagged is not None else decisions)])
+        if self.counts is not None:
+            # Only after the decision lines are written, and never able to stop them (review 1 of brief 32).
+            done = self._contained("counting", lambda: self.counts.add(now, reading, head, self.tape is not None))
+            if done:
+                self._contained("count lines", lambda: self._write_counts(done))
         return True
+
+    def _contained(self, part: str, fn: Callable[[], Any]) -> Any:
+        """Run one of brief 32's added parts; on an exception log it once per part and kind, carry on, and
+        return None. The decision lines never depend on them."""
+        try:
+            out = fn()
+            self._part_problems.pop(part, None)
+            return out
+        except Exception as e:
+            problem = f"{type(e).__name__}: {e}"
+            if self._part_problems.get(part) != problem:
+                log.exception("opening plan shadow: the %s failed (%s); the decision lines carry on", part, problem)
+            self._part_problems[part] = problem
+            return None
 
     def _write_counts(self, done: list[tuple[datetime, list]]) -> None:
         # Into the file of the minute they count, so a window's last lines never land in the next day's.
@@ -497,7 +539,7 @@ def start_lines(env: Mapping[str, str]) -> list[str]:
     other env value). Each switch as set: the later ones still need the ones before them."""
     line = _start_line
     if line is None:            # routes.register never called maybe_start: the Opening plan is off
-        line = (f"opening plan shadow: off, {ENV_VAR} is 1 but the Opening plan is off ({URL_VAR} is not set)"
+        line = (f"opening plan shadow: off, {ENV_VAR} is 1 but the Opening plan is off ({URL_VAR} is not set or not usable)"
                 if (env.get(ENV_VAR) or "").strip() == "1" else f"opening plan shadow: off ({ENV_VAR} is not 1)")
     switches = ", ".join(f"{name} {'on' if env.get(name) == '1' else 'off'}" for name in PLAN_SWITCHES)
     return [line, f"opening plan switches: {switches}"]
