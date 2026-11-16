@@ -44,8 +44,9 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   poller (Poller.probe_gives_way, companion/poll_budget.py PROBE_ROOM): while the last 60 s hold
   54 sends or more, while the armed plan's hold_later holds, or in the 429 pause, it sends
   nothing, does not try again and does not catch up. So with a position open (the poller alone
-  then sends about 54 calls a minute) or a ticket window in focus it measures almost nothing, and
-  a preview needs its own quote under 10 s old. Each call it sends is counted in the poller's
+  then sends about 54 calls a minute) it measures almost nothing, and a preview needs its own
+  quote under 10 s old. With no position and a ticket window in focus it still sends about six in
+  ten quotes calls and half its previews; with neither, all (tests/test_probe_budget.py). Each call it sends is counted in the poller's
   window (Poller.note_probe_request), never as order traffic. A call that gave way writes one
   netlog `skip` line (purpose probe, reason `probe_minute_tight`, `probe_held` or `pause_429`),
   at most one per quote interval, and is counted in the

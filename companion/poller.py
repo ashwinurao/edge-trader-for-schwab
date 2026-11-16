@@ -18,7 +18,8 @@ using the same Schwab login):
                           up to 12 quotes calls and 2 to 4 previews a minute, counted in the
                           limiter, sent only while the last 60 s hold fewer than 70 - PROBE_ROOM
                           (54) sends and no hold_later holds (brief 33): with a position open it
-                          sends almost nothing.
+                          sends almost nothing; with no position and a ticket window in focus
+                          about six in ten quotes calls and half its previews.
 Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN, 70 calls in
 any 60 s, order traffic and the opening probe included), schwabdev's internal retries are disabled (companion/schwab.py),
 and a 429 pauses ALL companion requests. Each endpoint keeps its own last-success time.

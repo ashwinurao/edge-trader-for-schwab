@@ -74,10 +74,11 @@ HELD_FILLS_EVERY_S = 15.0
 # Brief 33: the opening probe (companion/open_probe.py) sends a call only while the last 60 s hold
 # fewer than MAX_PER_MIN - PROBE_ROOM sends (70 - 16 = 54), and never while hold_later holds.
 # Set by the simulation in tests/test_probe_budget.py (32 cases, the probe off and on). The brief's
-# start number 10 failed 21 of them: a quiet minute with a position open is already 54 poller calls,
+# start number 10 failed 20 of them: a quiet minute with a position open is already 54 poller calls,
 # so a probe that fills the window to 60 leaves too little room for clicks (three quick clicks read
 # the order list 15 s apart instead of 12). 16 is the lowest value at which every case holds. The
-# cost: with a position open or a ticket window in focus the probe sends almost nothing.
+# cost: with a position open the probe sends almost nothing; with no position and a ticket window in
+# focus it still sends about six in ten quotes calls and half its previews (review 1 of PR #44).
 PROBE_ROOM = 16
 
 
