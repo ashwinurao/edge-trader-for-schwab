@@ -318,7 +318,10 @@ CASES = {
     "40 calls in 3 s under hold_later": (lambda r: burst(r, 150), (None, 20.0, 10.0, 10.0)),
     "40 calls in 3 s, cold": (lambda r: burst(r, None), (None, None, 30.0, None)),
     "quiet, positions open": (quiet, (3.5, 10.5, 5.5, 5.5)),
-    "quiet, no position": (None, (None, 10.5, 5.5, 5.5)),     # built in the test (positions=False)
+    "quiet, no position": (quiet, (None, 10.5, 5.5, 5.5)),
+    # Review 1 of PR #44: without a position a focused ticket leaves the probe some room.
+    "focused ticket alone, no position": (ticket_alone, (None, 10.5, 5.5, 5.5)),
+    "ticket, one click, no position": (lambda r: manual(r, [30]), (None, 10.5, 5.5, 5.5)),
     "focused ticket alone": (ticket_alone, (6.5, 10.5, 5.5, 5.5)),
     "ticket, hold_later(90), 20 calls in 3 s": (held_ticket, (None, 30.0, 8.0, 8.0)),
     "five order calls": (five_calls, (3.5, None, None, None)),
@@ -340,9 +343,8 @@ CASES = {
 
 def run_case(monkeypatch, tmp_path, name: str, probe_on: bool):
     fn, _ = CASES[name]
-    no_position = name == "quiet, no position"
-    rig = build(monkeypatch, tmp_path, probe_on, positions=not no_position)
-    start, end = (quiet if no_position else fn)(rig)
+    rig = build(monkeypatch, tmp_path, probe_on, positions="no position" not in name)
+    start, end = fn(rig)
     out = {"worst": worst(rig, start, end), "poller_max_window": max(rig.window_at_send),
            "poller_skips": sorted({why for _, _, why in rig.skips}), "orders_on_time": rig.clock.sent == [t for t in getattr(rig.clock, "scheduled", [])
                                                  if t <= rig.clock.mono]}
@@ -392,6 +394,10 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
     # Order traffic never waits, probe or not.
     assert on["orders_on_time"] and off["orders_on_time"]
     assert not on["probe_halted"]
+    # Review 1 of PR #44: a focused ticket without a position still leaves room for some probe
+    # quotes and some previews (the docs say so).
+    if name in ("focused ticket alone, no position", "ticket, one click, no position"):
+        assert on["probe_quotes"] > 0 and on["probe_previews"] > 0, on
     # d. In a quiet minute without a position every probe call goes.
     if name == "quiet, no position":
         assert on["probe_quotes_gave_way"] == 0 and on["probe_previews_gave_way"] == 0, on

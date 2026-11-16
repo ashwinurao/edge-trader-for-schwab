@@ -136,9 +136,11 @@ name are refused). It needs no account and sends no telemetry.
   writes one `skip` line (purpose probe) per 5 seconds and counts in the window's `quotes_skipped` or
   `previews_skipped`, and a preview that gives way writes its line with `skipped: "budget"`. So **the
   probe measures almost nothing while a position is open** (the poller alone then makes about 54 calls a
-  minute), **while a ticket window has focus, or while the armed plan's hold runs**. A preview also needs
-  the probe's own quote from the last 10 seconds, so on such a morning the Opening plan gets **no preview
-  rates** before the freeze. Each call it does send has a netlog `call` line with purpose probe. Each preview's rates also go to the Opening plan's rate store (`companion/preview_rates.py`, in
+  minute) **or while the armed plan's hold runs**, and a preview also needs the probe's own quote from the
+  last 10 seconds, so on such a morning the Opening plan gets **no preview rates** before the freeze. With
+  **no position open and a ticket window in focus** it still sends about six in ten of its quotes calls and
+  about half its previews (simulated, `tests/test_probe_budget.py`); with no position and no ticket
+  window, all of them. Each call it does send has a netlog `call` line with purpose probe. Each preview's rates also go to the Opening plan's rate store (`companion/preview_rates.py`, in
   memory, for today only): per name and side, the highest rate whose `af_rate` on the same preview is from
   0.24 to 1.10 (a trade of yours between the balance read and the preview bends a rate; a bent one is
   dropped, and the highest of the rest sizes smaller, never larger), with its ET time, Schwab's status word
