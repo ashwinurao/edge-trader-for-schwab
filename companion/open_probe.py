@@ -61,10 +61,24 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   (purpose probe) with its wait, wire and total times.
 - Brief 23: each preview line also goes to the plan's rate store (companion/preview_rates.py,
   in memory, rates and Schwab's texts only), so the Opening plan can size by each name's rate.
+- Brief 34: its symbols ride in the poller's own quotes call (companion/quote_guests.py), which
+  the poller makes anyway every 3 to 6 s while it has positions or working orders. Inside a
+  window and not halted, `quote_wants` hands the poller a ready tuple of the probe's symbols;
+  the poller's thread hands the answer back through `quote_take`, which only stores it. At each
+  quote tick, and just before a preview, the probe takes the newest shared answer it has not
+  used: it writes its quote lines from it with `via: "poller"` (its own calls' lines say
+  `via: "probe"`), prices previews off it with the answer's own receive time, counts
+  `quotes_shared`, and makes no call and asks no budget. A tick is also served when a preview
+  took a shared answer since the last tick. Without one it does what brief 33 says. The shared
+  lines have no wire or total time (the poller's call helper does not hand them over), and a
+  shared answer can be up to one marks interval old when the tick reads it. With a position
+  open in a quiet minute the probe so gets quote lines at every tick and sends no quotes call of
+  its own; a preview is still two calls of its own, so with a position open it still sends
+  almost none, and the plan gets almost no preview rates then (Part B of brief 34).
 
 It never touches the trading client, Trader._send_lock, the poller's client or the store. It
 does not import the order code: from the poller it gets only callables (the pause, the balances,
-and brief 33's budget pair). Every failure is contained here and said once in a note.
+brief 33's budget pair and brief 34's quote guest). Every failure is contained here and said once in a note.
 """
 from __future__ import annotations
 

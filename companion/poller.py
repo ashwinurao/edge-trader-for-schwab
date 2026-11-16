@@ -7,7 +7,10 @@ using the same Schwab login):
     orders, 59-day sweep  every 30 s   4   (status WORKING + PENDING_ACTIVATION: older
                                             GTC orders; an unfiltered 59-day query times out)
     transactions today    every 10 s   6
-    quotes (batched)      every 3 s   20   (open positions and working orders, one request)
+    quotes (batched)      every 3 s   20   (open positions and working orders, one request;
+                                            in the opening probe's windows the probe's symbols
+                                            ride in it, brief 34, companion/quote_guests.py:
+                                            no call more, and the marks never wait for them)
     transactions, 3 days  every 10 min     (late corrections to earlier sessions)
     order_details         as needed        (orders that drop out of the working set)
                                      ----
@@ -17,8 +20,9 @@ using the same Schwab login):
     opening probe (companion/open_probe.py, only with EDGE_TRADER_OPEN_PROBE=1, in its ET windows):
                           up to 12 quotes calls and 2 to 4 previews a minute, counted in the
                           limiter, sent only while the last 60 s hold fewer than 70 - PROBE_ROOM
-                          (54) sends and no hold_later holds (brief 33): with a position open it
-                          sends almost nothing; with no position and a ticket window in focus
+                          (54) sends and no hold_later holds (brief 33). With a position open
+                          its quotes come from the marks call above (brief 34) and it sends
+                          almost no previews; with no position and a ticket window in focus
                           about half its quotes calls and a whole preview pair
                           at about five preview times in six (previews first).
 Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN, 70 calls in
