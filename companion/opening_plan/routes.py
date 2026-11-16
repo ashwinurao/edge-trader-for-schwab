@@ -12,6 +12,7 @@ with --private as the dashboard hides the account value.
 
 `rates` is the opening probe's store of today's margin rates (companion/preview_rates.py, brief
 23): view["preview_rates"] carries them, ratios and Schwab's texts only, never a dollar amount.
+build_view gets the same mapping, so each name's buying power maximum uses its own rate (brief 31).
 """
 from __future__ import annotations
 
@@ -76,7 +77,8 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     pb = load_playbook()
     bad_url = ""
     if demo:
-        from .demo_feed import DEMO_ET_ENV, DEMO_RV20_ENV, DemoFeed, demo_account, demo_clock, demo_rv20
+        from .demo_feed import (DEMO_ET_ENV, DEMO_NO_RATES_ENV, DEMO_RV20_ENV, DemoFeed, demo_account,
+                                demo_clock, demo_rates, demo_rv20)
         now = now or demo_clock(env.get(DEMO_ET_ENV) or None)
     now = now or (lambda: datetime.now(timezone.utc))
     feed = None
@@ -109,16 +111,22 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
         Scanner (the armed plan's row check: architect's review 1 of fork PR #27, 2026-11-13)."""
         at = now()
         # The demo shows invented balances (demo_feed.demo_account); never the account's own.
-        account = demo_account(at) if demo and not url else account_reading(snapshot, private)
+        account = demo_account(at, env) if demo and not url else account_reading(snapshot, private)
+        # Ratios only, no dollar amount (preview_rates.py). The demo shows invented ones
+        # (demo_feed.demo_rates) only while the probe's store has none for today.
+        today = rates.today(at) if rates is not None else {}
+        if demo and not url and not today:
+            today = demo_rates(at, env.get(DEMO_NO_RATES_ENV) == "1")
         if feed is None:
-            view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb, account=account)
+            view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb, account=account,
+                              rates=today)
             view.update(state=NOT_SET_UP, message=f"The Opening plan is off: {bad_url}")
         else:
             picks, clock = feed.read() if ask else feed.peek()
             view = build_view(picks.body, picks.ok_at, picks.error, clock.body, clock.ok_at, clock.error,
-                              stored_risk(store), at, pb, account=account)
+                              stored_risk(store), at, pb, account=account, rates=today)
         view["demo"] = demo and not url
-        view["preview_rates"] = rates.today(at) if rates is not None else {}
+        view["preview_rates"] = today
         return view
 
     # A plain def: FastAPI runs it in a worker thread, so a slow Edge Scanner never blocks the server.
