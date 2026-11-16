@@ -203,7 +203,7 @@ def _probe(clock, budget=None, share=True):
     def set_guest(wants, take):
         guest.update(wants=wants, take=take)
 
-    def gives_way(need=1):
+    def gives_way(need=1, ahead=None):
         asked.append(need)
         return None
     probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=CFG, make_client=lambda: client,

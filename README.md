@@ -138,20 +138,22 @@ name are refused). It needs no account and sends no telemetry.
   pair (the long and the short side of one pick) asks for both its calls at once and goes whole or not at
   all, and a pair that gives way keeps its pick's turn for the next preview time. **Previews come before the
   probe's own quotes**: the margin rates are what the Opening plan needs from the probe, and its quotes are a
-  timing measurement, so while a preview time is due within 60 seconds a quotes call goes only if the window
-  also leaves room for that pair. **While the poller reads your position marks anyway, the probe's symbols
-  ride in that same quotes call** (brief 34, `companion/quote_guests.py`): it costs no call, the marks keep
-  their own pace and never depend on it, and a shared call that fails or misses one of your own symbols
-  leaves the probe out of it for 60 seconds. The probe then writes its quote lines from that answer with
-  `via: "poller"` (its own calls say `via: "probe"`) and makes no quotes call of its own. Those lines have
-  no wire time, and an answer can be up to one marks interval (3 to 6 seconds) old when the probe reads it.
-  So with a position open in a quiet minute the probe gets quote lines at every 5 s tick. **What it still
-  does not measure with a position open:** a preview is two calls of its own, and the poller alone then
-  makes about 54 calls a minute, so it sends almost no previews, and the Opening plan gets **almost no
-  preview rates** before the freeze on such a morning. **While the armed plan's hold runs** it measures
-  nothing (the marks give way too). With
-  **no position open and a ticket window in focus** it still sends about half of its quotes calls and
-  a whole preview pair at about five preview times in six (simulated, `tests/test_probe_budget.py`); with no position and no ticket
+  timing measurement, so while preview times are due within 60 seconds a quotes call goes only if the window
+  will still have room, at each of those times, for the pair and its own fresh quote. A preview time lost
+  because the probe's quote gave way keeps its pick's turn. **While the poller reads your position marks
+  anyway, the probe's symbols ride in that same quotes call** (brief 34, `companion/quote_guests.py`): it
+  costs no call, the marks keep their own pace and never depend on it, and a shared call that fails or misses
+  one of your own symbols leaves the probe out of it for 60 seconds. The probe then writes its quote lines
+  from that answer with `via: "poller"` (its own calls say `via: "probe"`) and makes no quotes call of its
+  own. Those lines have no wire time, and an answer can be up to one marks interval (3 to 6 seconds) old when
+  the probe reads it. So with a position open in a quiet minute the probe gets quote lines at every 5 s tick.
+  **What it still does not measure with a position open:** a preview is two calls of its own, and the poller
+  alone then makes about 54 calls a minute, so it sends almost no previews, and the Opening plan gets
+  **almost no preview rates** before the freeze on such a morning (Ash chose to leave it so, 2026-11-16).
+  **While the armed plan's hold runs** it measures nothing (the marks give way too). With
+  **no position open and a ticket window in focus** it still sends 40 to 60 percent of its quotes calls and
+  a whole preview pair at 7 of the 8 preview times before the freeze (each of four picks gets one) and 9 of
+  10 in the open window (simulated, `tests/test_probe_budget.py`); with no position and no ticket
   window, all of them. Each call it does send has a netlog `call` line with purpose probe. Each preview's rates also go to the Opening plan's rate store (`companion/preview_rates.py`, in
   memory, for today only): per name and side, the highest rate whose `af_rate` on the same preview is from
   0.24 to 1.10 (a trade of yours between the balance read and the preview bends a rate; a bent one is
