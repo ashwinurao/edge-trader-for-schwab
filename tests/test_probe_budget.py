@@ -144,7 +144,7 @@ def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dti
     p._stop, p._wake = FakeEvent(clock), FakeEvent(clock)
     clock.poller = p
     rig = SimpleNamespace(p=p, clock=clock, schwab=fake, window_at_send=[], skips=[], probe=None,
-                          probe_client=None)
+                          probe_client=None, probe_lines=[])
     real_throttle = Poller._throttle
 
     def throttle(self, may_wait=True):
@@ -168,7 +168,8 @@ def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dti
         client = ProbeSchwab(clock, p)
         probe = op.OpenProbe(lambda: PROBE_HASH, p.cooldown_left, cfg=shifted_config(clock, at),
                              make_client=lambda: client, symbols=lambda: (list(PICKS), ""),
-                             emit=lambda *a, **k: None, wall=lambda: clock.wall, mono=lambda: clock.mono,
+                             emit=lambda kind, **f: rig.probe_lines.append((kind, f)),
+                             wall=lambda: clock.wall, mono=lambda: clock.mono,
                              budget=(p.probe_gives_way, p.note_probe_request))
         rig.probe, rig.probe_client = probe, client
         clock.probe, clock.next_tick = probe, clock.mono
@@ -357,6 +358,15 @@ def run_case(monkeypatch, tmp_path, name: str, probe_on: bool):
                    probe_max_window=max((c[2] for c in calls), default=0),
                    probe_halted=rig.probe.halted,
                    probe_calls_in_hold=sum(1 for c in calls for a, b in rig.holds if a <= c[0] < b))
+        # Review 2 of PR #44: preview times at which one side went and the other gave way for the budget.
+        times: dict = {}
+        for kind, f in rig.probe_lines:
+            if kind == "probe" and f.get("probe") == "preview" and f.get("side"):
+                times.setdefault((f["at"], f["symbol"]), []).append(f.get("skipped"))
+        out["probe_preview_times_one_side"] = sum(1 for v in times.values()
+                                                  if "budget" in v and any(x is None for x in v))
+        out["probe_preview_times_went"] = sum(1 for v in times.values() if all(x is None for x in v))
+        out["probe_preview_times_gave_way"] = sum(1 for v in times.values() if all(x == "budget" for x in v))
         # The probe's quotes calls inside the case's own part, for the quiet-minute question.
         inside = [c for c in calls if start <= c[0] <= end and c[1] == "quotes"]
         out["probe_quotes_in_part"] = len(inside)
@@ -379,6 +389,7 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
     #    hold_later holds (the probe_held rule).
     assert on["probe_max_window"] <= MAX_PER_MIN - poll_budget.PROBE_ROOM, on
     assert on["probe_calls_in_hold"] == 0, on
+    assert on["probe_preview_times_one_side"] == 0, on       # review 2: a pair goes whole or not
     assert on["poller_max_window"] <= MAX_PER_MIN, on
     # b. Brief 24's goals, as its tests assert them.
     _, limits = CASES[name]
@@ -457,6 +468,25 @@ def test_the_poller_answers_the_probe_from_its_own_window_pause_and_hold(tmp_pat
     assert p.probe_gives_way() == "pause_429"
 
 
+def test_a_pair_needs_room_for_both_calls():
+    """Review 2 of PR #44: 52 sends let a preview pair go whole (its last call makes 54), 53 make
+    it give way whole. A single call still goes at 53."""
+    gw = poll_budget.probe_gives_way
+    assert gw(100.0, [99.0] * 52, MAX_PER_MIN, need=2) is None
+    assert gw(100.0, [99.0] * 53, MAX_PER_MIN, need=2) == "probe_minute_tight"
+    assert gw(100.0, [99.0] * 53, MAX_PER_MIN, need=1) is None
+
+
+def test_the_poller_passes_the_need_on(tmp_path):
+    p = Poller(Store(tmp_path / "p.db"))
+    now = poller_mod.time.monotonic()
+    p._sent.extend([now] * 53)
+    assert p.probe_gives_way() is None
+    assert p.probe_gives_way(2) == "probe_minute_tight"
+    p._sent.pop()
+    assert p.probe_gives_way(2) is None
+
+
 def test_a_poller_whose_budget_breaks_makes_the_probe_give_way(tmp_path, monkeypatch):
     p = Poller(Store(tmp_path / "p.db"))
 
@@ -478,7 +508,7 @@ def _probe(clock, budget, client=None):
 def test_a_quotes_call_that_gives_way_sends_nothing_and_says_so_once_an_interval(lines):
     clock = ProbeClock(et(9, 28, 0))
     counted = []
-    probe, sink, client = _probe(clock, (lambda: "probe_minute_tight", lambda: counted.append(1)))
+    probe, sink, client = _probe(clock, (lambda need=1: "probe_minute_tight", lambda: counted.append(1)))
     for _ in range(int(6 / 0.5)):                       # 6 s: two quote times, 0 and 5 s
         probe.step()
         clock.go(0.5)
@@ -492,7 +522,7 @@ def test_a_quotes_call_that_gives_way_sends_nothing_and_says_so_once_an_interval
 def test_skip_lines_are_at_most_one_per_quote_interval_across_quotes_and_previews(lines):
     clock = ProbeClock(et(9, 29, 29))
     answers = iter([None] + ["probe_held"] * 100)        # the first quote goes, then all give way
-    probe, sink, client = _probe(clock, (lambda: next(answers), lambda: None))
+    probe, sink, client = _probe(clock, (lambda need=1: next(answers), lambda: None))
     probe.step()                                         # 09:29:29: the quote goes
     clock.go(1.0)
     probe.step()                                         # 09:29:30: a preview time, both sides
@@ -506,7 +536,7 @@ def test_a_preview_that_gives_way_writes_its_line_and_sends_nothing(lines):
     clock = ProbeClock(et(9, 29, 25))
     answers = {"n": 0}
 
-    def gives_way():
+    def gives_way(need=1):
         answers["n"] += 1
         return None if answers["n"] == 1 else "probe_minute_tight"
     probe, sink, client = _probe(clock, (gives_way, lambda: None))
@@ -531,20 +561,66 @@ def test_each_probe_call_is_counted_just_before_it_goes_and_has_a_call_line(line
         def preview_order(self, account, o):
             order.append("preview")
             return super().preview_order(account, o)
-    probe, sink, client = _probe(clock, (lambda: None, lambda: order.append("count")), Client(clock))
+    probe, sink, client = _probe(clock, (lambda need=1: None, lambda: order.append("count")), Client(clock))
     probe.step()                                          # the quote
     clock.go(1.0)
     probe.step()                                          # 09:29:30: two previews
-    assert order == ["count", "quotes", "count", "preview", "count", "preview"]
+    # Review 2 of PR #44: the pair is counted whole just before its first call.
+    assert order == ["count", "quotes", "count", "count", "preview", "preview"]
     calls = [f for k, f in lines if k == "call"]
     assert [(f["endpoint"], f["purpose"]) for f in calls] == [
         ("quotes", "probe"), ("preview_order", "probe"), ("preview_order", "probe")]
 
 
+def test_a_preview_pair_goes_whole_or_not_at_all(lines):
+    """Review 2 of PR #44: one budget question for both sides. Room for one call only (the budget
+    says no to a need of 2): both sides give way, nothing is sent, and the pick keeps its turn."""
+    clock = ProbeClock(et(9, 29, 29))
+    asked, counted = [], []
+
+    def gives_way(need=1):
+        asked.append(need)
+        return None if need == 1 else "probe_minute_tight"
+    probe, sink, client = _probe(clock, (gives_way, lambda: counted.append(1)))
+    probe.step()                                          # 09:29:29: the quote (need 1)
+    clock.go(1.0)
+    probe.step()                                          # 09:29:30: the pair (need 2)
+    assert asked == [1, 2] and len(counted) == 1
+    assert client.previews == []
+    assert [(x["side"], x["skipped"]) for x in sink.probes("preview")] == [("LONG", "budget"), ("SHORT", "budget")]
+    assert probe.counts["previews_skipped"] == 2 and probe._turn == 0
+
+
+def test_a_pair_that_gives_way_keeps_its_picks_turn():
+    """Review 2 of PR #44 (was brief 34 item A7): with every second preview time giving way, each
+    pick still gets its turn in rank order."""
+    clock = ProbeClock(et(9, 29, 20))
+    n = {"pair": 0}
+
+    def gives_way(need=1):
+        if need == 1:
+            return None
+        n["pair"] += 1
+        return None if n["pair"] % 2 == 0 else "probe_minute_tight"
+    sink = Sink()
+    client = FakeClient(clock)
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=CFG, make_client=lambda: client,
+                         symbols=lambda: (["NVDA", "AMD"], ""), emit=sink, wall=clock.wall, mono=clock.mono,
+                         budget=(gives_way, lambda: None))
+    while clock.wall() < et(9, 35, 1):
+        probe.step()
+        clock.go(0.5)
+    went = [x["symbol"] for x in sink.probes("preview") if not x.get("skipped") and x["side"] == "LONG"]
+    gave = [x["symbol"] for x in sink.probes("preview") if x.get("skipped") == "budget" and x["side"] == "LONG"]
+    assert went and gave
+    # The pick that gave way is the next to go: the picks go in rank order, none passed over.
+    assert went == (["NVDA", "AMD"] * 5)[:len(went)]
+
+
 def test_a_budget_that_raises_makes_the_probe_give_way_and_keep_running(lines):
     clock = ProbeClock(et(9, 28, 0))
 
-    def boom():
+    def boom(need=1):
         raise RuntimeError("no budget")
     probe, sink, client = _probe(clock, (boom, lambda: None))
     probe.step()
@@ -555,7 +631,7 @@ def test_a_budget_that_raises_makes_the_probe_give_way_and_keep_running(lines):
 
 def test_the_429_pause_seen_by_the_budget_stops_the_window_as_before(lines):
     clock = ProbeClock(et(9, 28, 0))
-    probe, sink, client = _probe(clock, (lambda: "pause_429", lambda: None))
+    probe, sink, client = _probe(clock, (lambda need=1: "pause_429", lambda: None))
     probe.step()
     assert client.quote_calls == [] and probe.halted
 
@@ -565,4 +641,4 @@ def test_app_hands_the_probe_the_poller_budget_and_the_demo_poller_has_it():
     src = (Path(op.__file__).parent / "app.py").read_text(encoding="utf-8")
     line = next(x for x in src.splitlines() if "open_probe.start(" in x)
     assert "budget=(poller.probe_gives_way, poller.note_probe_request)" in line
-    assert "def note_probe_request(self): pass" in src and "def probe_gives_way(self): return None" in src
+    assert "def note_probe_request(self): pass" in src and "def probe_gives_way(self, need=1): return None" in src

@@ -134,12 +134,14 @@ name are refused). It needs no account and sends no telemetry.
   last 60 seconds hold fewer than 54 calls of the app, never while the armed plan holds the poller for its
   opening burst, and never in the 429 pause. A call that gives way is not tried again or caught up; it
   writes one `skip` line (purpose probe) per 5 seconds and counts in the window's `quotes_skipped` or
-  `previews_skipped`, and a preview that gives way writes its line with `skipped: "budget"`. So **the
+  `previews_skipped`, and a preview that gives way writes its line with `skipped: "budget"`. A preview
+  pair (the long and the short side of one pick) asks for both its calls at once and goes whole or not at
+  all, and a pair that gives way keeps its pick's turn for the next preview time. So **the
   probe measures almost nothing while a position is open** (the poller alone then makes about 54 calls a
   minute) **or while the armed plan's hold runs**, and a preview also needs the probe's own quote from the
   last 10 seconds, so on such a morning the Opening plan gets **no preview rates** before the freeze. With
-  **no position open and a ticket window in focus** it still sends about six in ten of its quotes calls and
-  about half its previews (simulated, `tests/test_probe_budget.py`); with no position and no ticket
+  **no position open and a ticket window in focus** it still sends about two in three of its quotes calls but
+  a preview pair at only about one preview time in six (simulated, `tests/test_probe_budget.py`); with no position and no ticket
   window, all of them. Each call it does send has a netlog `call` line with purpose probe. Each preview's rates also go to the Opening plan's rate store (`companion/preview_rates.py`, in
   memory, for today only): per name and side, the highest rate whose `af_rate` on the same preview is from
   0.24 to 1.10 (a trade of yours between the balance read and the preview bends a rate; a bent one is

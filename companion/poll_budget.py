@@ -27,7 +27,8 @@ so the polls that decide protection and refusals keep their pace.
 - While `hold_later` holds, LATER polls give way, except transactions once HELD_FILLS_EVERY_S old.
 
 - The opening probe (brief 33, `probe_gives_way`) gives way before any poll: it sends only while the
-  last 60 s hold fewer than the limit minus PROBE_ROOM sends and no hold_later holds.
+  last 60 s hold fewer than the limit minus PROBE_ROOM sends and no hold_later holds. A preview
+  pair asks for both its calls at once and goes whole or not at all (review 2 of PR #44).
 
 A poll that gives way is not sent: its data keeps its old time and shows as old (poller.py writes a
 netlog `skip` line). It is asked again on a later pass. Nothing here changes MAX_PER_MIN, and order
@@ -73,12 +74,13 @@ SWEEP_YIELD_S = 60.0
 HELD_FILLS_EVERY_S = 15.0
 # Brief 33: the opening probe (companion/open_probe.py) sends a call only while the last 60 s hold
 # fewer than MAX_PER_MIN - PROBE_ROOM sends (70 - 16 = 54), and never while hold_later holds.
-# Set by the simulation in tests/test_probe_budget.py (32 cases, the probe off and on). The brief's
-# start number 10 failed 20 of them: a quiet minute with a position open is already 54 poller calls,
-# so a probe that fills the window to 60 leaves too little room for clicks (three quick clicks read
-# the order list 15 s apart instead of 12). 16 is the lowest value at which every case holds. The
-# cost: with a position open the probe sends almost nothing; with no position and a ticket window in
-# focus it still sends about six in ten quotes calls and half its previews (review 1 of PR #44).
+# Set by the simulation in tests/test_probe_budget.py (32 cases, 34 since review 1 of PR #44, the
+# probe off and on). The brief's start number 10 failed 20 of the 32: a quiet minute with a position
+# open is already 54 poller calls, so a probe that fills the window to 60 leaves too little room for
+# clicks (three quick clicks read the order list 15 s apart instead of 12). 16 is the lowest value
+# at which every case holds. The cost: with a position open the probe sends almost nothing; with no
+# position and a ticket window in focus it still sends about two in three quotes calls, and a
+# preview pair (both calls asked at once, review 2 of PR #44) at about one preview time in six.
 PROBE_ROOM = 16
 
 
@@ -136,20 +138,22 @@ def goes_first(name: str, now: float, order_sends, hold_until: float = 0.0, age_
 
 
 def probe_gives_way(now: float, sends, limit: int, pause_left: float = 0.0,
-                    hold_until: float = 0.0) -> str | None:
-    """None when the opening probe may send one call now, else why not (its netlog `skip` reason).
+                    hold_until: float = 0.0, need: int = 1) -> str | None:
+    """None when the opening probe may send `need` calls now, else why not (its netlog `skip` reason).
 
     Brief 33: the probe's calls count in the same 60 s window as every other Schwab call of the app,
     and the probe gives way first. `sends`: every send of the window (Poller._sent). The probe's
     calls are never order traffic, so they never switch give_way to its busy rules.
     `hold_until`: Poller.hold_later's end. While it holds the probe sends nothing: the poller drops
     its marks to make room for the armed plan's burst, and a probe that took that room read the
-    order list 30 s late instead of 10 in the simulation, at any PROBE_ROOM from 10 to 30."""
+    order list 30 s late instead of 10 in the simulation, at any PROBE_ROOM from 10 to 30.
+    `need`: a preview pair asks for its two calls at once (review 2 of PR #44), so that it goes
+    whole or not at all and its last call still leaves the window at most limit - PROBE_ROOM."""
     if pause_left > 0:
         return "pause_429"
     if now < hold_until:
         return "probe_held"
-    if len(in_window(sends, now)) >= limit - PROBE_ROOM:
+    if len(in_window(sends, now)) >= limit - PROBE_ROOM - (max(1, int(need)) - 1):
         return "probe_minute_tight"
     return None
 
