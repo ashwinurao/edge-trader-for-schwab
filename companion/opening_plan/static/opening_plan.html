@@ -111,6 +111,7 @@
   .ovl .dlg .row { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
   .bp { font: 500 12.5px var(--sans); color: var(--muted); }
   .bp b { font: 600 13px var(--mono); color: var(--text); }
+  .bp .warn { color: var(--amber); font-weight: 600; }
   table.preview td { background: repeating-linear-gradient(135deg, transparent 0 10px, rgba(214,165,43,.05) 10px 20px); }
   .tag.est { background: var(--blue-bg); color: var(--blue); margin-right: 4px; }
   td.est { min-width: 190px; }
@@ -410,8 +411,9 @@ const usd = v => v == null ? "not known" : "$" + Number(v).toLocaleString("en-US
 function buyingPower(b) {
   if (!b || b.state === "NOT_KNOWN") return `Buying power <b>not known</b>`;
   if (b.state === "HIDDEN") return `Buying power <b>hidden</b>`;
+  // Brief 31: when day-trading reads 0 beside buying power above 0, the line says the plan uses buying power.
   return `Buying power · day trading <b>${usd(b.day_trading)}</b> · buying power <b>${usd(b.buying_power)}</b>
-    · equity <b>${usd(b.equity)}</b> · read ${esc(b.read_at_et)} ET, ${ago(b.age_s)}`;
+    · equity <b>${usd(b.equity)}</b> · read ${esc(b.read_at_et)} ET, ${ago(b.age_s)}${b.text ? ` · <span class="warn">${esc(b.text)}</span>` : ""}`;
 }
 
 // Estimated shares before the 09:30 minute (brief 22): never a size and always marked "estimate".
@@ -432,7 +434,13 @@ function estimateCell(e) {
   if (!e) return `<span class="mut">–</span>`;
   const m = e.bp_max || {};
   const bp = m.state === "OK" ? `buying power allows ${sh(m.shares)}` : m.state === "HIDDEN" ? "buying power hidden" : "buying power not known";
-  const bpLine = `<span class="sub" title="${esc(m.text)}">${bp}</span>`;
+  // Brief 31: each name's own rate from the morning's previews, or full margin marked "rate not known yet".
+  // The mark shows whenever a balance was worked at full margin, also beside the deciding one's rate.
+  const rate = m.state !== "OK" || m.decided_by == null ? ""
+    : (m.rate != null ? ` · rate ${m.rate}${m.rate_at_et ? ` (${esc(m.rate_at_et.slice(0, 5))} ET)` : ""}` : "")
+      + (m.rate_known === false ? ` <span class="tag sofar">rate not known yet</span>` : "");
+  const bpLine = `<span class="sub" title="${esc(m.text)}">${bp}${rate}</span>`
+    + (m.state === "OK" && m.text ? `<span class="sub mut">${esc(m.text)}</span>` : "");
   if (e.state === "OFF") return `<span class="mut">–</span>${bpLine}`;
   if (e.state === "MISSING") return `<span class="tag est">estimate</span><span class="mut">none</span><span class="sub">${esc(e.text)}</span>${bpLine}`;
   const body = e.state === "CALM_UNKNOWN"
