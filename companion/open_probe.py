@@ -48,11 +48,16 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   quote under 10 s old. A preview pair (long and short of one pick) asks for both its calls at
   once and goes whole or not at all, and a pair that gives way keeps its pick's turn (review 2 of
   PR #44). Previews come before its own quotes (review 3 of PR #44): the margin rates are what
-  the plan needs from the probe, its quotes are a timing measurement. So while a preview time is
-  due within the next 60 s (PAIR_AHEAD_S), a quotes call goes only if the window also leaves room
-  for that pair: it asks for three calls and counts one. With no position and a ticket window in
-  focus it still sends about half its quotes calls and a whole preview pair at about five
-  preview times in six; with neither, all (tests/test_probe_budget.py). Each call it sends is counted in the poller's
+  the plan needs from the probe, its quotes are a timing measurement. So while preview times are
+  due within the next 60 s (PAIR_AHEAD_S), a quotes call looks ahead (review 4 of PR #44,
+  poll_budget.probe_pairs_fit): it goes only if, at each of those times, the window still has room
+  for the pair and the pair's own fresh quote, counting the probe's own sends that will have left
+  the window by then. With no pair due within 60 s it asks for itself alone. A time lost as
+  `no_quote` because the last quotes call gave way for the budget keeps its pick's turn; a pick
+  missing from a fresh answer still uses its turn. With no position and a ticket window in focus
+  it sends a whole preview pair at 7 of the 8 preview times before the freeze (each of four picks
+  gets one), 9 of 10 in the open window from 09:26:00 and 5 of 6 from 09:29:00, and 40 to 60
+  percent of its quotes calls; with neither, all (tests/test_probe_budget.py). Each call it sends is counted in the poller's
   window (Poller.note_probe_request), never as order traffic. A call that gave way writes one
   netlog `skip` line (purpose probe, reason `probe_minute_tight`, `probe_held` or `pause_429`),
   at most one per quote interval, and is counted in the
@@ -75,6 +80,7 @@ import os
 import re
 import threading
 import time as _time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -101,7 +107,7 @@ MAX_PICKS = 6                                       # brief 09: at most 6 plan s
 PREVIEW_GRACE_S = 10    # a preview time missed by more than this (the probe was busy) is skipped
 QUOTE_FRESH_S = 10      # the preview prices off the probe's own last quote, at most this old
 TICK_S = 0.2            # how often the thread looks at the clock
-# Review 3 of PR #44: while a preview time is this close, a quotes call also asks room for the pair.
+# Reviews 3 and 4 of PR #44: a quotes call looks ahead at the preview times due this close.
 # The budget's window (companion/poll_budget.py WINDOW_S): a quote sent now still counts then.
 PAIR_AHEAD_S = 60
 # Break shape of the probe preview (brief 09): trigger = ask + the larger of 5 cents and 0.2%,
@@ -629,6 +635,8 @@ class OpenProbe:
         self._reread_at: Optional[datetime] = None     # review 1 of PR #29: the next picks read
         self._reads = 0
         self._skip_said_at: Optional[float] = None    # brief 33: one skip line per quote interval
+        self._own_sent: deque = deque()               # review 4 of PR #44: the probe's own sends
+        self._quote_gave_way = False                  # review 4: the last quotes tick gave way
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
                        "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0,
                        "quotes_skipped": 0, "previews_skipped": 0}
@@ -811,7 +819,8 @@ class OpenProbe:
             self._note(f"open probe: stopped for the rest of the window: {why}", window=self._win_text())
 
     # the budget (brief 33)
-    def _gives_way(self, endpoint: str, need: int = 1, sends: Optional[int] = None) -> Optional[str]:
+    def _gives_way(self, endpoint: str, need: int = 1, sends: Optional[int] = None,
+                   ahead: Optional[tuple] = None) -> Optional[str]:
         """Ask the poller's budget just before `need` calls (a preview pair asks for both at once,
         review 2 of PR #44). None: they go, and the `sends` of them that go now (default all) are
         counted in the poller's 60 s window now.
@@ -822,10 +831,11 @@ class OpenProbe:
             return None
         gives_way, count = self._budget
         try:
-            why = gives_way(need)
+            why = gives_way(need) if ahead is None else gives_way(need, ahead)
             if why is None:
                 for _ in range(need if sends is None else sends):
                     count()
+                    self._own_sent.append(self._mono())     # review 4: for the look-ahead
                 return None
         except Exception as e:
             self._contain("budget", e)
@@ -847,25 +857,33 @@ class OpenProbe:
         if self._pause_left() > 0:
             self._halt("the app is in its 429 pause")
             return
-        # Review 3 of PR #44: previews come before the probe's own quotes. The margin rates are what
-        # the plan needs from the probe; its quotes are a timing measurement. While a preview pair
-        # is due within the next 60 s, a quotes call goes only if the window also leaves room for
-        # that pair (need 3, one counted now): a quote sent now still counts when the pair asks.
-        need = 1 + len(SIDES) if self._pair_due() else 1
-        if self._gives_way("quotes", need=need, sends=1):
+        # Reviews 3 and 4 of PR #44: previews come before the probe's own quotes. The margin rates
+        # are what the plan needs from the probe; its quotes are a timing measurement. While preview
+        # pairs are due within the next 60 s, a quotes call goes only if each of them still finds
+        # room for itself and for its own fresh quote when its time comes (poll_budget.
+        # probe_pairs_fit): a quote sent now still counts then, and before the freeze the preview
+        # times are 30 s apart.
+        pairs = self._pairs_in()
+        ahead = (tuple(self._own_sent), pairs, QUOTE_FRESH_S - TICK_S) if pairs else None
+        if self._gives_way("quotes", sends=1, ahead=ahead):
             self.counts["quotes_skipped"] += 1
+            self._quote_gave_way = True
             return
+        self._quote_gave_way = False
         with netlog.call("schwab", "quotes", "probe", clients=(self.client,)) as call:
             self._quotes_call(call)
 
-    def _pair_due(self) -> bool:
-        """A preview time of the open window is due within the next 60 s (the budget's window), not
-        done yet, and the window's preview cap still leaves a pair (review 3 of PR #44)."""
+    def _pairs_in(self) -> tuple[float, ...]:
+        """Seconds to each preview time of the open window due within the next 60 s (the budget's
+        window), not done yet, while the window's preview cap still leaves a pair (reviews 3 and 4
+        of PR #44)."""
         if self._win is None or self.counts["previews"] >= self.cfg.max_previews_per_window:
-            return False
+            return ()
         now = self._wall()
-        return any(t not in self._done and now <= t < now + timedelta(seconds=PAIR_AHEAD_S)
-                   for t in self._previews_in(self._win))
+        while self._own_sent and self._mono() - self._own_sent[0] >= PAIR_AHEAD_S:
+            self._own_sent.popleft()
+        return tuple(sorted((t - now).total_seconds() for t in self._previews_in(self._win)
+                            if t not in self._done and now <= t < now + timedelta(seconds=PAIR_AHEAD_S)))
 
     def _quotes_call(self, call) -> None:
         syms = list(self.symbols)
@@ -908,6 +926,11 @@ class OpenProbe:
         hit = self._last_quote.get(sym)
         if hit is None or self._mono() - hit[0] > QUOTE_FRESH_S or not hit[1].get("ask") or not hit[1].get("bid"):
             self._line(probe="preview", symbol=sym, at=at, skipped="no_quote")
+            if self._quote_gave_way:
+                # Review 4 of PR #44: the time was lost because the probe's own quote gave way for
+                # the budget, so the pick keeps its turn, as a pair that gives way does. A pick
+                # missing from a fresh answer still uses its turn.
+                self._turn -= 1
             return
         acct = self._hash()
         if not acct:

@@ -61,7 +61,7 @@ class DemoPoller:
     def note_external_request(self, retry_after=None): pass
     def cooldown_left(self): return 0.0
     def note_probe_request(self): pass
-    def probe_gives_way(self, need=1): return None
+    def probe_gives_way(self, need=1, ahead=None): return None
 
 
 poller = DemoPoller() if DEMO else Poller()
