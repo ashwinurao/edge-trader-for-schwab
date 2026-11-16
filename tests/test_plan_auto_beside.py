@@ -9,6 +9,7 @@ long (trigger 42.49, stop 41.92), BBBB short (19.99, 20.50), CCCC long (71.85, 7
 """
 import json
 import logging
+import re
 from datetime import timedelta
 
 import pytest
@@ -496,6 +497,22 @@ def test_an_id_the_plan_already_tried_once_is_not_tried_again(rig):
 
 # ---- 8. the log keeps the code and the side, the page the words ---------------------------------------
 
+def holds_count(text, n):
+    """Does `text` hold the share count `n` as a whole number? A digit run inside a longer run of
+    letters or digits (a random ticket id such as "4d181776-250b-...") is not that number. The
+    plain substring check failed about once in 30 runs on such an id (architect's review 1 of
+    ET PR #41, 2026-11-16); the rule it stands for is the same: the day's log never holds Ash's
+    share count."""
+    return re.search(rf"(?<![0-9A-Za-z]){n}(?![0-9A-Za-z])", text) is not None
+
+
+def test_the_share_count_check_finds_the_count_and_skips_an_id_that_holds_its_digits():
+    for line in ('{"why": "250 shares by hand"}', '{"qty": 250}', "bought 250", "250", '{"n": "250"}', "x 250, y"):
+        assert holds_count(line, 250), line
+    for line in ('{"ticket_id": "4d181776-250b-4418-af99-0b1828d38235"}', "a250", "2501", "1250", "0x250f"):
+        assert not holds_count(line, 250), line
+
+
 def test_the_days_log_keeps_the_code_and_the_side_never_ashs_words(rig):
     ids = all_rest(rig)
     by_hand(rig, 7, "BUY", "AAAA", qty=250)
@@ -506,9 +523,10 @@ def test_the_days_log_keeps_the_code_and_the_side_never_ashs_words(rig):
     run(rig, et(9, 31, 12))
     assert sorted(rig.broker.cancelled) == sorted([ids["AAAA"], ids["BBBB"]])
     text = day_log(rig)
-    for words in ("by hand", "50 AAAA", "30 BBBB", "250", "both sides", "working short order", RULE.strip(),
+    for words in ("by hand", "50 AAAA", "30 BBBB", "both sides", "working short order", RULE.strip(),
                   "so it leaves"):
         assert words not in text, words
+    assert not holds_count(text, 250)                        # Ash's share count, as a whole number
     for sym, side in (("AAAA", "long"), ("BBBB", "short")):
         (start,) = mine(rig, "cancel_start", sym)
         assert (start["why"], start["side_rule"], start["side"]) == ("the side rule said other_side", "other_side", side)
