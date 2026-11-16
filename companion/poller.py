@@ -14,8 +14,13 @@ using the same Schwab login):
                                      ~54
     ticket quotes (outside this limiter) every 5 s while a ticket window has focus, else every
     30 s: up to ~12 more. Order actions are on top, at most one at a time.
+    opening probe (companion/open_probe.py, only with EDGE_TRADER_OPEN_PROBE=1, in its ET windows):
+                          up to 12 quotes calls and 2 to 4 previews a minute, counted in the
+                          limiter, sent only while the last 60 s hold fewer than 70 - PROBE_ROOM
+                          (54) sends and no hold_later holds (brief 33): with a position open it
+                          sends almost nothing.
 Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN, 70 calls in
-any 60 s, order traffic included), schwabdev's internal retries are disabled (companion/schwab.py),
+any 60 s, order traffic and the opening probe included), schwabdev's internal retries are disabled (companion/schwab.py),
 and a 429 pauses ALL companion requests. Each endpoint keeps its own last-success time.
 
 When order traffic is busy (brief 24, companion/poll_budget.py), the account and order reads go
@@ -200,7 +205,7 @@ class Poller:
         try:
             # tuple(): the same safe copy as _give_way (review 1 of PR #33).
             return poll_budget.probe_gives_way(time.monotonic(), tuple(self._sent), MAX_PER_MIN,
-                                               self.cooldown_left())
+                                               self.cooldown_left(), self._hold_until)
         except Exception:
             log.exception("poll budget failed for the probe; the probe gives way")
             return "budget_error"

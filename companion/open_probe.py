@@ -42,10 +42,13 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
 - Brief 33: its Schwab calls count in the app's limit of 70 calls a minute (companion/poller.py
   MAX_PER_MIN) and it gives way first. Before every quotes call and every preview it asks the
   poller (Poller.probe_gives_way, companion/poll_budget.py PROBE_ROOM): while the last 60 s hold
-  60 sends or more, or in the 429 pause, it sends nothing, does not try again and does not catch
-  up. Each call it sends is counted in the poller's window (Poller.note_probe_request), never as
-  order traffic. A call that gave way writes one netlog `skip` line (purpose probe, reason
-  `probe_minute_tight` or `pause_429`), at most one per quote interval, and is counted in the
+  54 sends or more, while the armed plan's hold_later holds, or in the 429 pause, it sends
+  nothing, does not try again and does not catch up. So with a position open (the poller alone
+  then sends about 54 calls a minute) or a ticket window in focus it measures almost nothing, and
+  a preview needs its own quote under 10 s old. Each call it sends is counted in the poller's
+  window (Poller.note_probe_request), never as order traffic. A call that gave way writes one
+  netlog `skip` line (purpose probe, reason `probe_minute_tight`, `probe_held` or `pause_429`),
+  at most one per quote interval, and is counted in the
   window's `quotes_skipped` / `previews_skipped`; a preview that gave way still writes its
   `probe: "preview"` line with `skipped: "budget"`. Each call sent has a netlog `call` line
   (purpose probe) with its wait, wire and total times.

@@ -154,6 +154,13 @@ def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dti
         return went
     monkeypatch.setattr(Poller, "_throttle", throttle)
     monkeypatch.setattr(Poller, "_skip", staticmethod(lambda name, why: rig.skips.append((clock.mono, name, why))))
+    rig.holds = []
+    real_hold = Poller.hold_later
+
+    def hold_later(self, seconds, why):
+        rig.holds.append((clock.mono, clock.mono + seconds))
+        real_hold(self, seconds, why)
+    monkeypatch.setattr(Poller, "hold_later", hold_later)
     # The app has run for a while when the probe's window opens (09:26:30 ET): the poller's first
     # pass (sign-in, 60 days of fills) is out of the window before any case starts, probe or not.
     run(rig, WARM_UP_S)
@@ -337,7 +344,8 @@ def run_case(monkeypatch, tmp_path, name: str, probe_on: bool):
     rig = build(monkeypatch, tmp_path, probe_on, positions=not no_position)
     start, end = (quiet if no_position else fn)(rig)
     out = {"worst": worst(rig, start, end), "poller_max_window": max(rig.window_at_send),
-           "poller_skips": sorted({why for _, _, why in rig.skips}), "orders_on_time": rig.clock.sent == getattr(rig.clock, "scheduled", [])}
+           "poller_skips": sorted({why for _, _, why in rig.skips}), "orders_on_time": rig.clock.sent == [t for t in getattr(rig.clock, "scheduled", [])
+                                                 if t <= rig.clock.mono]}
     if probe_on:
         calls = rig.probe_client.calls
         out.update(probe_quotes=sum(1 for c in calls if c[1] == "quotes"),
@@ -345,7 +353,8 @@ def run_case(monkeypatch, tmp_path, name: str, probe_on: bool):
                    probe_quotes_gave_way=rig.probe.counts["quotes_skipped"],
                    probe_previews_gave_way=rig.probe.counts["previews_skipped"],
                    probe_max_window=max((c[2] for c in calls), default=0),
-                   probe_halted=rig.probe.halted)
+                   probe_halted=rig.probe.halted,
+                   probe_calls_in_hold=sum(1 for c in calls for a, b in rig.holds if a <= c[0] < b))
         # The probe's quotes calls inside the case's own part, for the quiet-minute question.
         inside = [c for c in calls if start <= c[0] <= end and c[1] == "quotes"]
         out["probe_quotes_in_part"] = len(inside)
@@ -364,8 +373,10 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
             f.write(json.dumps({"case": name, "off": off["worst"], "on": on["worst"],
                                 **{k: v for k, v in on.items() if k.startswith("probe_")}}) + "\n")
     # a. A probe call is never sent when the window already holds 70 - PROBE_ROOM sends: with the
-    #    call itself counted, the window at its send is at most 60.
+    #    call itself counted, the window at its send is at most 70 - PROBE_ROOM (54). Nor while
+    #    hold_later holds (the probe_held rule).
     assert on["probe_max_window"] <= MAX_PER_MIN - poll_budget.PROBE_ROOM, on
+    assert on["probe_calls_in_hold"] == 0, on
     assert on["poller_max_window"] <= MAX_PER_MIN, on
     # b. Brief 24's goals, as its tests assert them.
     _, limits = CASES[name]
@@ -381,3 +392,171 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
     # Order traffic never waits, probe or not.
     assert on["orders_on_time"] and off["orders_on_time"]
     assert not on["probe_halted"]
+    # d. In a quiet minute without a position every probe call goes.
+    if name == "quiet, no position":
+        assert on["probe_quotes_gave_way"] == 0 and on["probe_previews_gave_way"] == 0, on
+        assert on["probe_quotes_in_part"] >= on["probe_quotes_due_in_part"] and on["probe_previews"] > 0, on
+
+
+# ---- the parts, one by one (each fails on main before brief 33) ---------------------------------
+
+from test_open_probe import CFG, HASH, Clock as ProbeClock, FakeClient, Sink, et  # noqa: E402
+
+
+@pytest.fixture
+def lines(monkeypatch):
+    """The netlog lines written through _emit_rolled (call and skip lines)."""
+    from companion import netlog
+    got = []
+    monkeypatch.setattr(netlog, "_emit_rolled", lambda kind, **f: got.append((kind, f)))
+    monkeypatch.setattr(netlog, "enabled", lambda env=None: True)
+    monkeypatch.setattr(netlog, "_ensure_watcher", lambda: None)
+    return got
+
+
+def test_a_probe_call_counts_in_the_window_but_never_as_order_traffic(tmp_path):
+    p = Poller(Store(tmp_path / "p.db"))
+    for _ in range(14):
+        p.note_probe_request()
+    assert len(p._sent) == 14 and len(p._order_sent) == 0
+    # Fourteen probe calls in a minute leave the budget in its quiet rules: quotes go at 3 s.
+    now = poller_mod.time.monotonic()
+    assert poll_budget.give_way("quotes", now, tuple(p._sent), tuple(p._order_sent), MAX_PER_MIN,
+                                age_s=3.0, every=3.0) is None
+
+
+def test_the_probe_may_send_below_54_sends_and_not_at_54():
+    gw, room = poll_budget.probe_gives_way, poll_budget.PROBE_ROOM
+    assert room == 16
+    assert gw(100.0, [99.0] * (MAX_PER_MIN - room - 1), MAX_PER_MIN) is None             # 53
+    assert gw(100.0, [99.0] * (MAX_PER_MIN - room), MAX_PER_MIN) == "probe_minute_tight"  # 54
+    assert gw(100.0, [40.0] * 80, MAX_PER_MIN) is None                 # exactly 60 s old: gone
+    assert gw(100.0, [], MAX_PER_MIN, pause_left=3.0) == "pause_429"
+    assert gw(100.0, [], MAX_PER_MIN, hold_until=100.5) == "probe_held"
+    assert gw(100.0, [], MAX_PER_MIN, hold_until=100.0) is None        # the hold has ended
+
+
+def test_the_poller_answers_the_probe_from_its_own_window_pause_and_hold(tmp_path):
+    p = Poller(Store(tmp_path / "p.db"))
+    now = poller_mod.time.monotonic()
+    p._sent.extend([now] * 53)
+    assert p.probe_gives_way() is None
+    p.note_external_request()                                           # one order call: 54
+    assert p.probe_gives_way() == "probe_minute_tight"
+    p._sent.clear()
+    p.hold_later(60, "test")
+    assert p.probe_gives_way() == "probe_held"
+    p._hold_until = 0.0
+    p._cooldown_until = now + 30
+    assert p.probe_gives_way() == "pause_429"
+
+
+def test_a_poller_whose_budget_breaks_makes_the_probe_give_way(tmp_path, monkeypatch):
+    p = Poller(Store(tmp_path / "p.db"))
+
+    def boom(*a, **k):
+        raise RuntimeError("deque mutated during iteration")
+    monkeypatch.setattr(poll_budget, "probe_gives_way", boom)
+    assert p.probe_gives_way() == "budget_error"
+
+
+def _probe(clock, budget, client=None):
+    sink = Sink()
+    client = client or FakeClient(clock)
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=CFG, make_client=lambda: client,
+                         symbols=lambda: (["NVDA"], ""), emit=sink, wall=clock.wall, mono=clock.mono,
+                         budget=budget)
+    return probe, sink, client
+
+
+def test_a_quotes_call_that_gives_way_sends_nothing_and_says_so_once_an_interval(lines):
+    clock = ProbeClock(et(9, 28, 0))
+    counted = []
+    probe, sink, client = _probe(clock, (lambda: "probe_minute_tight", lambda: counted.append(1)))
+    for _ in range(int(6 / 0.5)):                       # 6 s: two quote times, 0 and 5 s
+        probe.step()
+        clock.go(0.5)
+    assert client.quote_calls == [] and counted == []
+    assert probe.counts["quotes_skipped"] == 2 and probe.counts["quote_calls"] == 0
+    skips = [f for k, f in lines if k == "skip"]
+    assert len(skips) == 2                              # one per 5 s quote interval
+    assert {(f["endpoint"], f["purpose"], f["reason"]) for f in skips} == {("quotes", "probe", "probe_minute_tight")}
+
+
+def test_skip_lines_are_at_most_one_per_quote_interval_across_quotes_and_previews(lines):
+    clock = ProbeClock(et(9, 29, 29))
+    answers = iter([None] + ["probe_held"] * 100)        # the first quote goes, then all give way
+    probe, sink, client = _probe(clock, (lambda: next(answers), lambda: None))
+    probe.step()                                         # 09:29:29: the quote goes
+    clock.go(1.0)
+    probe.step()                                         # 09:29:30: a preview time, both sides
+    assert len(client.quote_calls) == 1 and client.previews == []
+    assert probe.counts["previews_skipped"] == 2
+    assert [x.get("skipped") for x in sink.probes("preview")] == ["budget", "budget"]
+    assert len([f for k, f in lines if k == "skip"]) == 1
+
+
+def test_a_preview_that_gives_way_writes_its_line_and_sends_nothing(lines):
+    clock = ProbeClock(et(9, 29, 25))
+    answers = {"n": 0}
+
+    def gives_way():
+        answers["n"] += 1
+        return None if answers["n"] == 1 else "probe_minute_tight"
+    probe, sink, client = _probe(clock, (gives_way, lambda: None))
+    while clock.wall() < et(9, 29, 31):
+        probe.step()
+        clock.go(0.5)
+    assert client.previews == []
+    lines_ = sink.probes("preview")
+    assert lines_ and all(x["skipped"] == "budget" for x in lines_)
+    assert probe.counts["previews"] == 0 and probe.counts["previews_skipped"] == 2
+
+
+def test_each_probe_call_is_counted_just_before_it_goes_and_has_a_call_line(lines):
+    clock = ProbeClock(et(9, 29, 29))
+    order = []
+
+    class Client(FakeClient):
+        def quotes(self, symbols):
+            order.append("quotes")
+            return super().quotes(symbols)
+
+        def preview_order(self, account, o):
+            order.append("preview")
+            return super().preview_order(account, o)
+    probe, sink, client = _probe(clock, (lambda: None, lambda: order.append("count")), Client(clock))
+    probe.step()                                          # the quote
+    clock.go(1.0)
+    probe.step()                                          # 09:29:30: two previews
+    assert order == ["count", "quotes", "count", "preview", "count", "preview"]
+    calls = [f for k, f in lines if k == "call"]
+    assert [(f["endpoint"], f["purpose"]) for f in calls] == [
+        ("quotes", "probe"), ("preview_order", "probe"), ("preview_order", "probe")]
+
+
+def test_a_budget_that_raises_makes_the_probe_give_way_and_keep_running(lines):
+    clock = ProbeClock(et(9, 28, 0))
+
+    def boom():
+        raise RuntimeError("no budget")
+    probe, sink, client = _probe(clock, (boom, lambda: None))
+    probe.step()
+    assert client.quote_calls == [] and probe.counts["quotes_skipped"] == 1
+    assert [f["reason"] for k, f in lines if k == "skip"] == ["budget_error"]
+    assert not probe.halted
+
+
+def test_the_429_pause_seen_by_the_budget_stops_the_window_as_before(lines):
+    clock = ProbeClock(et(9, 28, 0))
+    probe, sink, client = _probe(clock, (lambda: "pause_429", lambda: None))
+    probe.step()
+    assert client.quote_calls == [] and probe.halted
+
+
+def test_app_hands_the_probe_the_poller_budget_and_the_demo_poller_has_it():
+    from pathlib import Path
+    src = (Path(op.__file__).parent / "app.py").read_text(encoding="utf-8")
+    line = next(x for x in src.splitlines() if "open_probe.start(" in x)
+    assert "budget=(poller.probe_gives_way, poller.note_probe_request)" in line
+    assert "def note_probe_request(self): pass" in src and "def probe_gives_way(self): return None" in src
