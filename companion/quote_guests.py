@@ -101,13 +101,17 @@ class Guests:
             return own, None
         return ask, (tuple(own), only, asked)
 
-    def answer(self, data, plan: Optional[tuple], now: float, wall: datetime):
+    def answer(self, data, plan: Optional[tuple], now: float, wall: datetime, went: bool = True):
         """What the poller keeps (guest-only entries removed), after handing the guest its entries.
         A failed or incomplete answer leaves the guests out for the backoff; the poller keeps
-        whatever it would have kept without a guest."""
+        whatever it would have kept without a guest. `went` False: the limiter held the call back
+        (a full minute, a 429 pause), nothing was sent, so nothing failed and the guest gets
+        nothing."""
         if plan is None:
             return data
         own, only, asked = plan
+        if not went:
+            return data
         if not isinstance(data, dict):
             self._off(now, "the shared quotes call failed")
             return data

@@ -408,9 +408,12 @@ class Poller:
         elif name == "quotes":
             syms = self._quote_symbols()
             if syms:
-                ask, plan = self.guests.ask(syms, time.monotonic())        # brief 34
-                data = self._call(name, lambda: self.client.quotes(ask))
-                data = self.guests.answer(data, plan, time.monotonic(), datetime.now(timezone.utc))
+                # Brief 34: guest symbols ride in this one call (companion/quote_guests.py). `went`
+                # tells a call that failed from one the limiter held back (not sent: no backoff).
+                ask, plan = self.guests.ask(syms, time.monotonic())
+                went = []
+                data = self._call(name, lambda: went.append(1) or self.client.quotes(ask))
+                data = self.guests.answer(data, plan, time.monotonic(), datetime.now(timezone.utc), bool(went))
                 if not isinstance(data, dict):
                     return False
                 self.quotes = data

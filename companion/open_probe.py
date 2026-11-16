@@ -632,6 +632,7 @@ class OpenProbe:
         self._reread_at: Optional[datetime] = None     # review 1 of PR #29: the next picks read
         self._reads = 0
         self._skip_said_at: Optional[float] = None    # brief 33: one skip line per quote interval
+        self._shared_at: Optional[float] = None       # brief 34: when lines last came from a shared answer
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
                        "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0,
                        "quotes_skipped": 0, "previews_skipped": 0, "quotes_shared": 0}
@@ -722,9 +723,14 @@ class OpenProbe:
                 self._wants = ()
                 return
         if self._mono() >= self._next_quote:
+            last_tick = self._next_quote - self.cfg.quote_every_s
             self._next_quote = self._mono() + self.cfg.quote_every_s
             try:
-                if not self._use_shared():
+                # Brief 34: a tick is served by the poller's call when a shared answer came since
+                # the last tick (a preview may have taken it a moment ago). Else brief 33's way.
+                if self._use_shared() or (self._shared_at is not None and self._shared_at > last_tick):
+                    self.counts["quotes_shared"] += 1
+                else:
                     self._quotes()
             except Exception as e:
                 self._contain("quotes", e)
@@ -830,7 +836,7 @@ class OpenProbe:
         syms = [s for s in self.symbols if s in asked]
         if not syms or self._mono() - recv_mono > QUOTE_FRESH_S:
             return False
-        self.counts["quotes_shared"] += 1
+        self._shared_at = self._mono()
         for line in quote_lines(entries, syms, recv_wall.timestamp() * 1000, None, None):
             line["via"] = "poller"
             self._line(**line)
