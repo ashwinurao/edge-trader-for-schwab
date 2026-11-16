@@ -203,8 +203,9 @@ def test_the_buying_power_maximum_is_a_quarter_of_the_smaller_buying_power_over_
     # Brief 31: was 1,243 from day-trading buying power alone; now both count and buying power's 621
     # is the smaller. No rate for the name: full margin, said.
     mx = P.bp_max(bp_ok(), Decimal("42.10"), PB)
+    # Brief 35 adds the key rate_missing (no rate at all: both sides); no value changed.
     assert mx == {"state": "OK", "shares": 621, "decided_by": "buying_power", "rate": None, "rate_at_et": None,
-                  "rate_known": False, "left_out": None,
+                  "rate_known": False, "rate_missing": ["LONG", "SHORT"], "left_out": None,
                   "text": "Buying power allows 621 at full margin: this name's own rate is not known yet (a quarter "
                           "of buying power at 42.10). Day-trading buying power alone would allow 1,243 at full margin, "
                           "its rate not known yet, so buying power decides."}
@@ -620,3 +621,96 @@ def test_the_page_shows_the_rate_not_known_mark_whenever_rate_known_is_false():
     # The mark hangs on rate_known alone, so it shows beside the deciding balance's rate too.
     assert '(m.rate_known === false ? ` <span class="tag sofar">rate not known yet</span>` : "")' in cell
     assert "m.rate != null ?" in cell
+
+
+# ---- brief 35: one side's rate alone never sizes the row (architect, 2026-11-16 17:15 UTC) --------------
+# Display only, a gap in Ash's pick of 2026-11-16 15:58:21 UTC. Buying power 400,000 beside day-trading
+# 0: a quarter is 100,000. At price 50: rate 1 gives 2,000; 0.30 would give 6,666 (main's answer).
+
+def one_side(long=None, short=None, pair="bp", at="09:16:02"):
+    side = lambda r: None if r is None else side_rates(**{pair: r}, at=at)
+    return {"LONG": side(long), "SHORT": side(short)}
+
+
+@pytest.mark.parametrize("rates, known, missing", [
+    (one_side(long=0.30), "long", "short"),
+    (one_side(short=0.30), "short", "long"),
+])
+def test_one_sides_rate_below_full_margin_works_at_full_margin_and_names_the_missing_side(rates, known, missing):
+    mx = P.bp_max(bal31(400000, 0), Decimal("50"), PB, rates)
+    assert mx["shares"] == 2000 and mx["rate"] is None and mx["rate_known"] is False
+    assert mx["rate_missing"] == [missing.upper()]
+    assert mx["text"] == (f"Buying power allows 2,000 at full margin: this name's {missing} rate is not known yet "
+                          f"(its {known} rate is 0.3, preview 09:16 ET; a quarter of buying power at 50.00). {LEFT_OUT}")
+    assert P.name_rate(rates, "bp") is None                       # no side: both are needed
+
+
+def test_both_sides_known_the_higher_decides_as_before():
+    mx = P.bp_max(bal31(400000, 0), Decimal("50"), PB, one_side(long=0.30, short=1.00))
+    assert mx["shares"] == 2000 and mx["rate"] == 1.0 and mx["rate_known"] is True and mx["rate_missing"] == []
+
+
+def test_a_side_asked_uses_its_own_rate_as_before_even_with_the_other_missing():
+    rates = one_side(long=0.30)
+    mx = P.bp_max(bal31(400000, 0), Decimal("50"), PB, rates, "LONG")
+    # 100,000 / (50 x 0.3 = 15) = 6,666.7 -> 6,666.
+    assert mx["shares"] == 6666 and mx["rate"] == 0.3 and mx["rate_known"] is True and mx["rate_missing"] == []
+    mx = P.bp_max(bal31(400000, 0), Decimal("50"), PB, rates, "SHORT")
+    assert mx["shares"] == 2000 and mx["rate_known"] is False and mx["rate_missing"] == ["SHORT"]
+    assert mx["text"].startswith("Buying power allows 2,000 at full margin: this name's own rate is not known yet")
+
+
+def test_no_rate_at_all_is_unchanged():
+    mx = P.bp_max(bal31(400000, 0), Decimal("50"), PB, {})
+    assert mx["shares"] == 2000 and mx["rate_missing"] == ["LONG", "SHORT"]
+    assert mx["text"] == ("Buying power allows 2,000 at full margin: this name's own rate is not known yet "
+                          f"(a quarter of buying power at 50.00). {LEFT_OUT}")
+
+
+def test_a_known_rate_above_full_margin_decides_and_the_other_side_is_said_not_known():
+    # 100,000 / (50 x 1.6 = 80) = 1,250.
+    mx = P.bp_max(bal31(400000, 0), Decimal("50"), PB, one_side(long=1.6))
+    assert mx["shares"] == 1250 and mx["rate"] == 1.6 and mx["rate_known"] is False and mx["rate_missing"] == ["SHORT"]
+    assert mx["text"] == ("Buying power allows 1,250: a quarter of buying power at 50.00, at Schwab's long rate of 1.6 "
+                          f"for this name (preview 09:16 ET). Its short rate is not known yet. {LEFT_OUT}")
+
+
+def test_one_side_missing_is_never_larger_than_both_known_at_full_margin_or_below():
+    one = P.bp_max(bal31(400000, 0), Decimal("50"), PB, one_side(long=0.30))["shares"]
+    assert one == 2000                                            # main gave 6,666
+    for short in (0.30, 0.50, 1.00):
+        # Short known at 0.30, 0.50, 1.00: the higher decides, 6,666, 4,000 and 2,000 shares.
+        both = P.bp_max(bal31(400000, 0), Decimal("50"), PB, one_side(long=0.30, short=short))["shares"]
+        assert one <= both, short
+    e1 = P.estimate_row(Decimal("1000"), False, Decimal("2.00"), Decimal("50"), bal31(400000, 0), PB, one_side(long=0.30))
+    # $1,000 / 0.54 = 1,851 is under 2,000: the estimate decides, never the one-sided 6,666.
+    assert e1["used"]["headline"] == 1851 and e1["bp_max"]["shares"] == 2000
+
+
+def test_the_rule_holds_for_each_pair():
+    # dt: long 2.0 only. Day-trading 200,000 / 4 / (50 x 2) = 500; buying power both sides 1.6: 1,250.
+    rates = {"LONG": side_rates(bp=1.6, dt=2.0), "SHORT": side_rates(bp=1.6)}
+    mx = P.bp_max(bal31(400000, 200000), Decimal("50"), PB, rates)
+    assert mx["shares"] == 500 and mx["decided_by"] == "day_trading" and mx["rate_missing"] == ["SHORT"]
+    assert mx["text"] == ("Buying power allows 500: a quarter of day-trading buying power at 50.00, at Schwab's long "
+                          "rate of 2 for this name (preview 09:16 ET). Its short rate is not known yet. Buying power "
+                          "alone would allow 1,250, so day-trading buying power decides.")
+    # bp: long 0.30 only, at full margin 2,000; dt both sides 2.0: 500 decides, and bp's gap is said.
+    rates = {"LONG": side_rates(bp=0.30, dt=2.0), "SHORT": side_rates(dt=2.0)}
+    mx = P.bp_max(bal31(400000, 200000), Decimal("50"), PB, rates)
+    assert mx["shares"] == 500 and mx["rate_known"] is False and mx["rate_missing"] == ["SHORT"]
+    assert mx["text"].endswith("Buying power alone would allow 2,000 at full margin, its short rate not known yet, "
+                               "so day-trading buying power decides.")
+
+
+def test_the_demo_shows_a_one_sided_rate(tmp_path):
+    from companion.opening_plan.demo_feed import DEMO_DT_ZERO_ENV, DEMO_ET_ENV, DEMO_ONE_SIDE_ENV
+    app = FastAPI()
+    R.register(app, Store(tmp_path / "d35.db"), _guard, demo=True, get=lambda u, t: None,
+               env={DEMO_ET_ENV: "09:10:00", DEMO_DT_ZERO_ENV: "1", DEMO_ONE_SIDE_ENV: "1"})
+    v = TestClient(app).get("/api/opening-plan").json()
+    aaaa = next(r for r in v["preview"]["rows"] if r["ticker"] == "AAAA")
+    mx = aaaa["estimate"]["bp_max"]
+    # AAAA long 1.6 only: 26,170.09 / (42.10 x 1.6) = 388, and the short side is said not known.
+    assert mx["shares"] == 388 and mx["rate_known"] is False and mx["rate_missing"] == ["SHORT"]
+    assert "Its short rate is not known yet." in mx["text"]
