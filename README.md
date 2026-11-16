@@ -386,8 +386,41 @@ says why; that route has no price after 09:31, so the fallback mostly shows the 
 old prices. Its range says `minute so far`, `snapshot 09:30 bar, not confirmed` (Edge Scanner's early
 bar, not final until its bar request confirms it) or `09:30 bar`. Once the tape has given picks today, a tape problem is a hold instead, as the armed plan
 would do: `source` stays `tape`, `tape_problem` says why, every pick keeps the tape's last picks with
-no price action, and time-based cancels (the watch end, the pullback wait) still run. To run the plan
-over a whole morning again, replay Edge Scanner's opening-recorder file
+no price action, and time-based cancels (the watch end, the pullback wait) still run.
+
+What the shadow log also says (brief 32):
+
+- **Its start.** At each start `data/companion.log` gets `opening plan shadow: on, weekdays 09:29:00 to
+  09:36:00 ET, writing to ..., reading ...`, or `off` and why, then `opening plan switches:` with
+  `EDGE_TRADER_PLAN_BUTTONS`, `EDGE_TRADER_PLAN_FLAT`, `EDGE_TRADER_PLAN_AUTO`,
+  `EDGE_TRADER_PLAN_AUTO_FLIP` and `EDGE_TRADER_PLAN_AUTO_CHASE` each `on` or `off` as set (a later
+  switch still needs the ones before it). No other setting is printed. The lines come from `lifespan`
+  in `companion/app.py`, after logging is set up; before brief 32 the shadow's line was written while
+  the app was imported and reached no log. The shadow folder itself appears only at its first line,
+  09:29 ET.
+- **Counts of its readings.** When an ET minute of the window ends, one `kind: "summary"` line per
+  pick: `minute` (`HH:MM`), `symbol`, `readings`, `too_old` (older than `automatic.stale_after_seconds`
+  by the engine's rule: from the newest trade or quote time, else the trade's), `held` (the tape was not
+  usable), `no_price`, `age_max_s` and `age_p50_s` (largest and middle age of the readings that have
+  one, held or not). One `kind: "tape_summary"` line per minute for the tape: `readings`, `not_usable`,
+  `fell_back` (read from the picks route instead) and `reasons` (each reason with its numbers taken out,
+  and how often). After the window, the same lines once more with `minute: "window"` for the whole
+  window. They hold no price, dollar amount or share count, and change no decision.
+- **The armed steps a decision needs.** Each `would_place`, `would_flip`, `would_relevel`,
+  `would_cancel` and `would_fill` line has `needs`, from the pick's history that day: `send` (Step 6)
+  always, `flip` (Step 7) once the pick has flipped, `relevel` (Step 7, the same switch) once it has
+  re-levelled, `chase` (Step 8) once an entry was placed with the market at or past its trigger, which a
+  click refuses (`companion/break_entry.py`) and Schwab rejects. The mark uses the tape's quote as the
+  click path uses Schwab's: the ask at or above a long trigger, the bid at or below a short one. Only a
+  reading with no quote (the picks route, or a bid or ask of 0) compares the last trade. The `would_place`, `would_flip` and
+  `would_relevel` lines say what was compared: `bid`, `ask` and `through_by` (`quote` or `last`). So
+  `needs: ["send"]` is what the armed plan with Step 6 alone would have done. `needs` lists what is
+  necessary, not what is enough: whether Step 8 would chase an entry past its cap is not checked.
+- **The decision lines come first.** Each reading is decided and its lines written before it is
+  counted. A failure in the counting, in its lines or in `needs` is logged once and never stops a
+  decision line; a failed `needs` leaves the line without it.
+
+To run the plan over a whole morning again, replay Edge Scanner's opening-recorder file
 (`data/open_recorder/YYYY-MM-DD.jsonl` in Edge Scanner):
 
     python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
