@@ -79,8 +79,9 @@ HELD_FILLS_EVERY_S = 15.0
 # open is already 54 poller calls, so a probe that fills the window to 60 leaves too little room for
 # clicks (three quick clicks read the order list 15 s apart instead of 12). 16 is the lowest value
 # at which every case holds. The cost: with a position open the probe sends almost nothing; with no
-# position and a ticket window in focus it still sends about two in three quotes calls, and a
-# preview pair (both calls asked at once, review 2 of PR #44) at about one preview time in six.
+# position and a ticket window in focus it still sends about half its quotes calls, and a whole
+# preview pair (both calls asked at once, review 2 of PR #44) at about five preview times in six:
+# while a pair is due within 60 s a quotes call asks room for the pair too (review 3 of PR #44).
 PROBE_ROOM = 16
 
 
@@ -148,7 +149,8 @@ def probe_gives_way(now: float, sends, limit: int, pause_left: float = 0.0,
     its marks to make room for the armed plan's burst, and a probe that took that room read the
     order list 30 s late instead of 10 in the simulation, at any PROBE_ROOM from 10 to 30.
     `need`: a preview pair asks for its two calls at once (review 2 of PR #44), so that it goes
-    whole or not at all and its last call still leaves the window at most limit - PROBE_ROOM."""
+    whole or not at all and its last call still leaves the window at most limit - PROBE_ROOM. A
+    quotes call asks for 3 while a pair is due within 60 s (review 3 of PR #44: previews first)."""
     if pause_left > 0:
         return "pause_429"
     if now < hold_until:

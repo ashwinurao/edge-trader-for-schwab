@@ -521,6 +521,9 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
     # quotes and some previews (the docs say so).
     if name in ("focused ticket alone, no position", "ticket, one click, no position"):
         assert on["probe_quotes"] > 0 and on["probe_previews"] > 0, on
+    # Review 3 of PR #44: previews come before the probe's own quotes.
+    if name == "focused ticket alone, no position":
+        assert on["probe_preview_times_went"] >= 4, on
     # d. In a quiet minute without a position every probe call goes.
     if name == "quiet, no position":
         assert on["probe_quotes_gave_way"] == 0 and on["probe_previews_gave_way"] == 0, on
@@ -724,12 +727,12 @@ def test_a_preview_pair_goes_whole_or_not_at_all(lines):
 
     def gives_way(need=1):
         asked.append(need)
-        return None if need == 1 else "probe_minute_tight"
+        return None if need != 2 else "probe_minute_tight"
     probe, sink, client = _probe(clock, (gives_way, lambda: counted.append(1)))
-    probe.step()                                          # 09:29:29: the quote (need 1)
+    probe.step()                                          # 09:29:29: the quote (need 3, review 3)
     clock.go(1.0)
     probe.step()                                          # 09:29:30: the pair (need 2)
-    assert asked == [1, 2] and len(counted) == 1
+    assert asked == [3, 2] and len(counted) == 1
     assert client.previews == []
     assert [(x["side"], x["skipped"]) for x in sink.probes("preview")] == [("LONG", "budget"), ("SHORT", "budget")]
     assert probe.counts["previews_skipped"] == 2 and probe._turn == 0
@@ -742,7 +745,7 @@ def test_a_pair_that_gives_way_keeps_its_picks_turn():
     n = {"pair": 0}
 
     def gives_way(need=1):
-        if need == 1:
+        if need != 2:                                      # the quotes calls (need 1 or 3)
             return None
         n["pair"] += 1
         return None if n["pair"] % 2 == 0 else "probe_minute_tight"
@@ -759,6 +762,30 @@ def test_a_pair_that_gives_way_keeps_its_picks_turn():
     assert went and gave
     # The pick that gave way is the next to go: the picks go in rank order, none passed over.
     assert went == (["NVDA", "AMD"] * 5)[:len(went)]
+
+
+def test_a_quotes_call_leaves_room_for_a_pair_due_within_60_s(lines):
+    """Review 3 of PR #44: while a preview time is due within 60 s, a quotes call asks the budget
+    for itself and the pair (need 3) and counts one call. Otherwise it asks for itself alone."""
+    clock = ProbeClock(et(9, 28, 0))                     # the first preview time is 09:29:30
+    asked, counted = [], []
+
+    def gives_way(need=1):
+        asked.append(need)
+        return None
+    probe, sink, client = _probe(clock, (gives_way, lambda: counted.append(1)))
+    probe.step()                                         # 09:28:00: 90 s before the pair
+    assert asked == [1] and len(counted) == 1
+    clock.go(35)
+    probe.step()                                         # 09:28:35: 55 s before the pair
+    assert asked == [1, 3] and len(counted) == 2 and len(client.quote_calls) == 2
+
+
+def test_a_quotes_call_gives_way_when_the_window_has_no_room_for_the_pair_too():
+    """Review 3 of PR #44: 51 sends let a quote go before a pair is due (51 + 3 = 54), 52 do not."""
+    gw = poll_budget.probe_gives_way
+    assert gw(100.0, [99.0] * 51, MAX_PER_MIN, need=3) is None
+    assert gw(100.0, [99.0] * 52, MAX_PER_MIN, need=3) == "probe_minute_tight"
 
 
 def test_a_budget_that_raises_makes_the_probe_give_way_and_keep_running(lines):
