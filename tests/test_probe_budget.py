@@ -741,6 +741,31 @@ def test_a_time_lost_because_the_quote_gave_way_keeps_its_picks_turn():
     assert [x.get("skipped") for x in sink2.probes("preview")] == ["no_quote"] and probe2._turn == 1
 
 
+def test_a_pick_missing_from_a_fresh_answer_uses_its_turn_even_when_the_next_tick_gave_way():
+    """Review 5 of PR #44: the turn is kept only when the budget held the quote back AND no quotes
+    answer came in the last 10 s. A fresh answer that lacks the pick, then a tick that gives way,
+    then the preview time: the pick is missing, not held back, so it uses its turn."""
+    class Missing(FakeClient):                             # AMD missing from every answer
+        def quotes(self, symbols):
+            return super().quotes([s for s in symbols if s != "AMD"])
+    clock = ProbeClock(et(9, 29, 24))
+    asked = []
+
+    def gives_way(need=1, ahead=None):
+        asked.append(need)
+        return None if len(asked) == 1 else "probe_minute_tight"   # 09:29:24 goes, 09:29:29 not
+    sink = Sink()
+    probe = op.OpenProbe(lambda: HASH, lambda: 0.0, cfg=CFG, make_client=lambda: Missing(clock),
+                         symbols=lambda: (["AMD", "NVDA"], ""), emit=sink, wall=clock.wall, mono=clock.mono,
+                         budget=(gives_way, lambda: None))
+    while clock.wall() < et(9, 29, 31):
+        probe.step()
+        clock.go(0.5)
+    assert probe._quote_gave_way and probe.counts["quote_calls"] == 1
+    assert [(x["symbol"], x.get("skipped")) for x in sink.probes("preview")] == [("AMD", "no_quote")]
+    assert probe._turn == 1                                # AMD used its turn: NVDA is next
+
+
 def test_a_budget_that_raises_makes_the_probe_give_way_and_keep_running(lines):
     clock = ProbeClock(et(9, 28, 0))
 
