@@ -239,8 +239,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   (rate 1) and is marked "rate not known yet". A number Schwab reports as 0 (or does not send) beside
   one above 0 is left out and the row says so: on 2026-11-16 day-trading buying power read 0 before
   the open and every estimate showed 0 (brief 31; Ash picked "Buying power with each name's rate").
-  The header's Buying power line then says the plan's numbers use buying power. Both at 0 is a true
-  0. The headline is the smaller of the estimate and that maximum, and says "limited by buying power"
+  The header's Buying power line then says the plan's numbers use buying power. Both at 0, or either
+  one below 0 (Schwab saying the account is past a limit), is a true 0. The headline is the smaller of the estimate and that maximum, and says "limited by buying power"
   when buying power decides. The header says once what the estimate assumes. The numbers are in `playbook.json` under `size.estimate` (from a 2026
   study of OV's top 4; Ash picked "About N, usually L to H" on 2026-11-13): `show` is `range`,
   `cautious` (one number at 0.37 x ATR) or `none`. An estimate is never a size: rows with levels size
