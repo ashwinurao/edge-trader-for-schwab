@@ -60,6 +60,8 @@ class DemoPoller:
     def _merged_orders(self): return []
     def note_external_request(self, retry_after=None): pass
     def cooldown_left(self): return 0.0
+    def note_probe_request(self): pass
+    def probe_gives_way(self): return None
 
 
 poller = DemoPoller() if DEMO else Poller()
@@ -80,7 +82,7 @@ async def lifespan(_app: FastAPI):
     # The network record (netlog.py): its threads, a start note and the event-loop lag task.
     lag_task = netlog.start(f"Edge Trader {__version__} started{' in DEMO mode' if DEMO else ''}")
     poller.start()
-    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add)  # briefs 09, 21, 23, off by default
+    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add, budget=(poller.probe_gives_way, poller.note_probe_request))  # briefs 09, 21, 23, 33, off by default
     if not DEMO:
         import threading
         from . import update_check

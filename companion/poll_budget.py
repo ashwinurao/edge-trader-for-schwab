@@ -68,6 +68,11 @@ SWEEP_ROOM = 2
 SWEEP_YIELD_S = 60.0
 # Review 1, must 2: while hold_later holds, transactions still go once they are this old.
 HELD_FILLS_EVERY_S = 15.0
+# Brief 33: the opening probe (companion/open_probe.py) sends a call only while the last 60 s hold
+# fewer than MAX_PER_MIN - PROBE_ROOM sends (70 - 10 = 60), so a probe call is never the one that
+# takes a minute past 70 and two clicks (about 5 calls each) still fit. Start number, set by the
+# simulation in tests/test_poll_budget.py (brief 33). Change it only with a new simulation.
+PROBE_ROOM = 10
 
 
 def in_window(times, now: float) -> list[float]:
@@ -121,6 +126,19 @@ def goes_first(name: str, now: float, order_sends, hold_until: float = 0.0, age_
     if name in OWN_PACE:
         return True          # asked only when due: it goes at its interval
     return age_s is not None and every is not None and age_s >= LATE_INTERVALS * every
+
+
+def probe_gives_way(now: float, sends, limit: int, pause_left: float = 0.0) -> str | None:
+    """None when the opening probe may send one call now, else why not (its netlog `skip` reason).
+
+    Brief 33: the probe's calls count in the same 60 s window as every other Schwab call of the app,
+    and the probe gives way first. `sends`: every send of the window (Poller._sent). The probe's
+    calls are never order traffic, so they never switch give_way to its busy rules."""
+    if pause_left > 0:
+        return "pause_429"
+    if len(in_window(sends, now)) >= limit - PROBE_ROOM:
+        return "probe_minute_tight"
+    return None
 
 
 def give_way(name: str, now: float, sends, order_sends, limit: int, hold_until: float = 0.0,

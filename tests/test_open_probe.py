@@ -386,7 +386,9 @@ def test_the_written_file_holds_no_account_number(tmp_path, monkeypatch):
     text = "".join(f.read_text() for f in tmp_path.glob("*.jsonl"))
     lines = [json.loads(x) for x in text.splitlines()]
     assert any(x.get("probe") == "preview" for x in lines)
-    assert all(x["app"] == "edge-trader" and x["kind"] in ("probe", "note") for x in lines)
+    # Brief 33 item 3 adds a netlog `call` line (purpose probe) for each probe call: the third kind.
+    assert all(x["app"] == "edge-trader" and x["kind"] in ("probe", "note", "call") for x in lines)
+    assert {x["purpose"] for x in lines if x["kind"] == "call"} == {"probe"}
     assert ACCOUNT_NUMBER not in text and HASH not in text
 
 

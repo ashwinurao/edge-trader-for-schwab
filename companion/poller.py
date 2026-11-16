@@ -187,6 +187,24 @@ class Poller:
     def cooldown_left(self) -> float:
         return max(0.0, self._cooldown_until - time.monotonic())
 
+    def note_probe_request(self) -> None:
+        """One Schwab call of the opening probe (companion/open_probe.py, brief 33): counted in the
+        60 s window like every other call, never as order traffic, so the budget keeps its quiet
+        rules. It never waits."""
+        self._sent.append(time.monotonic())
+
+    def probe_gives_way(self) -> str | None:
+        """None when the opening probe may send one call now, else why not (brief 33,
+        poll_budget.probe_gives_way). The probe asks before each call and gives way first. If the
+        budget cannot be read, the probe gives way: it is a measurement, never needed."""
+        try:
+            # tuple(): the same safe copy as _give_way (review 1 of PR #33).
+            return poll_budget.probe_gives_way(time.monotonic(), tuple(self._sent), MAX_PER_MIN,
+                                               self.cooldown_left())
+        except Exception:
+            log.exception("poll budget failed for the probe; the probe gives way")
+            return "budget_error"
+
     def hold_later(self, seconds: float, why: str) -> None:
         """Hold the LATER polls (transactions, quotes, corrections, hours) for this long, for a
         caller that knows a burst of order calls is coming (brief 24; the armed plan, in its own

@@ -39,11 +39,22 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   or buying power in dollars is ever written, and nothing else from the answer: it holds the
   account number.
 - No retries. Any 429, or the app's own 429 pause, stops the probe for the rest of the window.
+- Brief 33: its Schwab calls count in the app's limit of 70 calls a minute (companion/poller.py
+  MAX_PER_MIN) and it gives way first. Before every quotes call and every preview it asks the
+  poller (Poller.probe_gives_way, companion/poll_budget.py PROBE_ROOM): while the last 60 s hold
+  60 sends or more, or in the 429 pause, it sends nothing, does not try again and does not catch
+  up. Each call it sends is counted in the poller's window (Poller.note_probe_request), never as
+  order traffic. A call that gave way writes one netlog `skip` line (purpose probe, reason
+  `probe_minute_tight` or `pause_429`), at most one per quote interval, and is counted in the
+  window's `quotes_skipped` / `previews_skipped`; a preview that gave way still writes its
+  `probe: "preview"` line with `skipped: "budget"`. Each call sent has a netlog `call` line
+  (purpose probe) with its wait, wire and total times.
 - Brief 23: each preview line also goes to the plan's rate store (companion/preview_rates.py,
   in memory, rates and Schwab's texts only), so the Opening plan can size by each name's rate.
 
 It never touches the trading client, Trader._send_lock, the poller's client or the store. It
-does not import the order code. Every failure is contained here and said once in a note.
+does not import the order code: from the poller it gets only callables (the pause, the balances,
+and brief 33's budget pair). Every failure is contained here and said once in a note.
 """
 from __future__ import annotations
 
@@ -577,8 +588,12 @@ class OpenProbe:
                  wall: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  mono: Callable[[], float] = _time.monotonic,
                  balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
-                 rates: Optional[Callable[[Mapping, datetime], object]] = None) -> None:
+                 rates: Optional[Callable[[Mapping, datetime], object]] = None,
+                 budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None) -> None:
         self.cfg = cfg if cfg is not None else load_config()
+        # Brief 33: (Poller.probe_gives_way, Poller.note_probe_request). None (a test without a
+        # poller): every call goes and nothing is counted, as before brief 33.
+        self._budget = budget
         self._hash, self._paused, self._make_client = account_hash, paused, make_client
         self._balances = balances
         self._rates = rates     # brief 23 PR A: preview_rates.PreviewRates.add, the plan's store
@@ -600,8 +615,10 @@ class OpenProbe:
         self._turn = 0          # brief 21: the next pick in rank order at each preview time
         self._reread_at: Optional[datetime] = None     # review 1 of PR #29: the next picks read
         self._reads = 0
+        self._skip_said_at: Optional[float] = None    # brief 33: one skip line per quote interval
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
-                       "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0}
+                       "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0,
+                       "quotes_skipped": 0, "previews_skipped": 0}
 
     # thread plumbing
     def start(self) -> threading.Thread:
@@ -780,21 +797,60 @@ class OpenProbe:
             self.halted = why
             self._note(f"open probe: stopped for the rest of the window: {why}", window=self._win_text())
 
+    # the budget (brief 33)
+    def _gives_way(self, endpoint: str) -> Optional[str]:
+        """Ask the poller's budget just before one call. None: the call goes, and it is counted in
+        the poller's 60 s window now. Else the reason it gives way, with one netlog `skip` line at
+        most once per quote interval. If the budget cannot be asked, the call gives way: the probe
+        is a measurement and never needed."""
+        if self._budget is None:
+            return None
+        gives_way, count = self._budget
+        try:
+            why = gives_way()
+            if why is None:
+                count()
+                return None
+        except Exception as e:
+            self._contain("budget", e)
+            why = "budget_error"
+        now = self._mono()
+        if self._skip_said_at is None or now - self._skip_said_at >= self.cfg.quote_every_s:
+            self._skip_said_at = now
+            try:
+                with netlog.call("schwab", endpoint, "probe") as call:
+                    call.skip(why)
+            except Exception:
+                pass
+        if why == "pause_429":
+            self._halt("the app is in its 429 pause")
+        return why
+
     # the two probes
     def _quotes(self) -> None:
         if self._pause_left() > 0:
             self._halt("the app is in its 429 pause")
             return
+        if self._gives_way("quotes"):
+            self.counts["quotes_skipped"] += 1
+            return
+        with netlog.call("schwab", "quotes", "probe", clients=(self.client,)) as call:
+            self._quotes_call(call)
+
+    def _quotes_call(self, call) -> None:
         syms = list(self.symbols)
         self.counts["quote_calls"] += 1
         t0 = self._mono()
+        call.sending()
         try:
             r = self.client.quotes(syms)
         except Exception as e:
+            call.failed(e)
             self.counts["quote_errors"] += 1
             self._line(probe="quote", ok=False, symbols=syms, error=error_class(e),
                        total_ms=round((self._mono() - t0) * 1000, 1))
             return
+        call.returned(r)
         recv = self._wall()
         total = round((self._mono() - t0) * 1000, 1)
         wire = _wire_ms(r)
@@ -869,15 +925,26 @@ class OpenProbe:
             self._line(probe="preview", symbol=sym, at=at, side=side, skipped="plan_refused", reason=_text(str(e)))
             return False
         numbers = order_numbers(order)
+        if self._gives_way("preview_order"):
+            self.counts["previews_skipped"] += 1
+            self._line(probe="preview", symbol=sym, at=at, side=side, skipped="budget")
+            return False
+        with netlog.call("schwab", "preview_order", "probe", clients=(self.client,)) as call:
+            return self._preview_call(call, sym, at, order, numbers, acct)
+
+    def _preview_call(self, call, sym: str, at: str, order: dict, numbers: dict, acct: str) -> bool:
         self.counts["previews"] += 1
         t0 = self._mono()
+        call.sending()
         try:
             r = self.client.preview_order(acct, order)
         except Exception as e:
+            call.failed(e)
             self.counts["preview_errors"] += 1
             self._line(probe="preview", symbol=sym, at=at, ok=False, error=error_class(e),
                        total_ms=round((self._mono() - t0) * 1000, 1), **numbers)
             return True
+        call.returned(r)
         total = round((self._mono() - t0) * 1000, 1)
         err = http_class(r.status_code)
         try:
@@ -910,12 +977,13 @@ class OpenProbe:
 def start(account_hash: Callable[[], Optional[str]], paused: Callable[[], float], demo: bool = False,
           env: Mapping[str, str] = os.environ,
           balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
-          rates: Optional[Callable[[Mapping, datetime], object]] = None) -> Optional[OpenProbe]:
+          rates: Optional[Callable[[Mapping, datetime], object]] = None,
+          budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None) -> Optional[OpenProbe]:
     """app.py's one start line. Off unless EDGE_TRADER_OPEN_PROBE=1, never in --demo. Never raises."""
     try:
         if demo or not enabled(env):
             return None
-        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates)
+        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates, budget=budget)
         probe.start()
         log.info("open probe on: windows %s ET", [f"{a:%H:%M:%S}-{b:%H:%M:%S}" for a, b in probe.cfg.windows])
         return probe
