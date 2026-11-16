@@ -47,7 +47,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from . import netlog, poll_budget, schwab
+from . import netlog, poll_budget, quote_guests, schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, fills_from_transactions, session_day
 from .store import Store, now_iso
@@ -110,6 +110,7 @@ class Poller:
         self._skip_logged: dict[str, float] = {}   # one skip line per poll per interval
         self._urgent: frozenset[str] = frozenset() # LATER polls a stop-moving reader needs now
         self._later = False                        # a LATER poll is running: its calls never wait
+        self.guests = quote_guests.Guests()        # brief 34: symbols that ride in the quotes call
         self._cooldown_until = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()       # set by a sign-in from the dashboard
@@ -197,6 +198,11 @@ class Poller:
         60 s window like every other call, never as order traffic, so the budget keeps its quiet
         rules. It never waits."""
         self._sent.append(time.monotonic())
+
+    def set_quote_guest(self, wants, take) -> None:
+        """Brief 34: a guest's symbols ride in the marks call the poller makes anyway, never in a
+        call of their own (companion/quote_guests.py). The poller's state never sees them."""
+        self.guests.set(wants, take)
 
     def probe_gives_way(self) -> str | None:
         """None when the opening probe may send one call now, else why not (brief 33,
@@ -401,7 +407,9 @@ class Poller:
         elif name == "quotes":
             syms = self._quote_symbols()
             if syms:
-                data = self._call(name, lambda: self.client.quotes(syms))
+                ask, plan = self.guests.ask(syms, time.monotonic())        # brief 34
+                data = self._call(name, lambda: self.client.quotes(ask))
+                data = self.guests.answer(data, plan, time.monotonic(), datetime.now(timezone.utc))
                 if not isinstance(data, dict):
                     return False
                 self.quotes = data

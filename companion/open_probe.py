@@ -592,8 +592,20 @@ class OpenProbe:
                  mono: Callable[[], float] = _time.monotonic,
                  balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
                  rates: Optional[Callable[[Mapping, datetime], object]] = None,
-                 budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None) -> None:
+                 budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None,
+                 share: Optional[Callable[[Callable, Callable], object]] = None) -> None:
         self.cfg = cfg if cfg is not None else load_config()
+        # Brief 34: the poller's quotes call carries this probe's symbols when it goes anyway
+        # (companion/quote_guests.py). `_wants` is the ready answer the poller's thread reads;
+        # `_shared` the newest answer it handed over, taken by the probe's own thread.
+        self._wants: tuple[str, ...] = ()
+        self._shared: Optional[tuple[dict, tuple, datetime, float]] = None
+        self._share_lock = threading.Lock()
+        if share is not None:
+            try:
+                share(self.quote_wants, self.quote_take)
+            except Exception as e:
+                log.warning("open probe: quote sharing not set up: %r", e)
         # Brief 33: (Poller.probe_gives_way, Poller.note_probe_request). None (a test without a
         # poller): every call goes and nothing is counted, as before brief 33.
         self._budget = budget
@@ -621,7 +633,7 @@ class OpenProbe:
         self._skip_said_at: Optional[float] = None    # brief 33: one skip line per quote interval
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
                        "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0,
-                       "quotes_skipped": 0, "previews_skipped": 0}
+                       "quotes_skipped": 0, "previews_skipped": 0, "quotes_shared": 0}
 
     # thread plumbing
     def start(self) -> threading.Thread:
@@ -686,10 +698,13 @@ class OpenProbe:
         if self._reread_at is not None and now >= self._reread_at and not self.halted:
             self._reread(now)
         if self.halted or self.client is None or now < win[0]:
+            self._wants = ()
             return
         if self._pause_left() > 0:
             self._halt("the app is in its 429 pause")
+            self._wants = ()
             return
+        self._wants = tuple(self.symbols)          # brief 34: only inside a window, not halted
         for t in self._previews_in(win):
             if t in self._done or now < t:
                 continue
@@ -698,17 +713,22 @@ class OpenProbe:
                 self.counts["previews_missed"] += 1
                 continue
             try:
+                self._use_shared()             # brief 34: price off the freshest shared quote
                 self._preview(t)
             except Exception as e:
                 self._contain("preview", e)
             if self.halted:
+                self._wants = ()
                 return
         if self._mono() >= self._next_quote:
             self._next_quote = self._mono() + self.cfg.quote_every_s
             try:
-                self._quotes()
+                if not self._use_shared():
+                    self._quotes()
             except Exception as e:
                 self._contain("quotes", e)
+        if self.halted:
+            self._wants = ()
 
     def _previews_in(self, win: tuple[datetime, datetime]) -> list[datetime]:
         day = win[0].date()
@@ -785,10 +805,43 @@ class OpenProbe:
         else:
             self._reread_at = nxt
 
+    # sharing the poller's quotes call (brief 34)
+    def quote_wants(self) -> tuple[str, ...]:
+        """The symbols this probe wants in the poller's quotes call now: a ready tuple, empty
+        outside a window or when halted. Runs on the poller's thread; never waits."""
+        return self._wants
+
+    def quote_take(self, entries: dict, asked: tuple, recv_wall: datetime, recv_mono: float) -> None:
+        """The poller's thread hands over its answer for this probe's symbols. Only stored: no
+        file, no netlog line, no Schwab call on the poller's thread."""
+        with self._share_lock:
+            self._shared = (entries, tuple(asked), recv_wall, recv_mono)
+
+    def _use_shared(self) -> bool:
+        """Write quote lines from the newest shared answer not used yet (`via: "poller"`), feed
+        `_last_quote` with its own receive time, and count it. False when there is none fresh
+        enough: then the probe asks the budget and calls itself, as brief 33 says."""
+        with self._share_lock:
+            got, self._shared = self._shared, None
+        if got is None:
+            return False
+        entries, asked, recv_wall, recv_mono = got
+        syms = [s for s in self.symbols if s in asked]
+        if not syms or self._mono() - recv_mono > QUOTE_FRESH_S:
+            return False
+        self.counts["quotes_shared"] += 1
+        for line in quote_lines(entries, syms, recv_wall.timestamp() * 1000, None, None):
+            line["via"] = "poller"
+            self._line(**line)
+            if not line.get("missing"):
+                self._last_quote[line["symbol"]] = (recv_mono, line)
+        return True
+
     def _close(self) -> None:
         self._note("open probe: window stop", window=self._win_text(), halted=self.halted or None, **self.counts)
         self.client = None      # dropped: the next window builds a new one
         self._win = None
+        self._wants = ()
 
     def _win_text(self) -> Optional[str]:
         if self._win is None:
@@ -868,6 +921,7 @@ class OpenProbe:
         body = r.json()
         recv_ms = recv.timestamp() * 1000
         for line in quote_lines(body, syms, recv_ms, wire, total):
+            line["via"] = "probe"
             self._line(**line)
             if not line.get("missing"):
                 self._last_quote[line["symbol"]] = (self._mono(), line)
@@ -886,7 +940,7 @@ class OpenProbe:
         if not acct:
             self._line(probe="preview", symbol=sym, at=at, skipped="no_account")
             return
-        sent = 0
+        sent, gave_way = 0, False
         for side in SIDES:
             if self.halted:
                 return
@@ -897,8 +951,13 @@ class OpenProbe:
             if self._pause_left() > 0:
                 self._halt("the app is in its 429 pause")
                 return
-            if self._preview_one(sym, side, at, hit[1], acct):
-                sent += 1
+            went = self._preview_one(sym, side, at, hit[1], acct)
+            sent += went is True
+            gave_way |= went == "budget"
+        if gave_way and not sent:
+            # Brief 34 item 7: a preview that gave way for the budget keeps its pick's turn, so
+            # the same picks are not skipped at every second preview time.
+            self._turn -= 1
 
     def _keep(self, line: dict) -> None:
         """Hand the preview line to the plan's rate store (brief 23 PR A item 3). The line holds
@@ -920,8 +979,9 @@ class OpenProbe:
         except Exception:
             return None, None
 
-    def _preview_one(self, sym: str, side: str, at: str, q: dict, acct: str) -> bool:
-        """One preview of one side. True when a preview_order call went out."""
+    def _preview_one(self, sym: str, side: str, at: str, q: dict, acct: str):
+        """One preview of one side. True when a preview_order call went out, "budget" when it gave
+        way for the budget (brief 34), else False."""
         try:
             order = with_quantity(preview_body(sym, q["bid"], q["ask"], side), self.cfg.preview_shares)
         except ValueError as e:     # e.g. a wide spread puts the 1% stop past the other side
@@ -931,7 +991,7 @@ class OpenProbe:
         if self._gives_way("preview_order"):
             self.counts["previews_skipped"] += 1
             self._line(probe="preview", symbol=sym, at=at, side=side, skipped="budget")
-            return False
+            return "budget"
         with netlog.call("schwab", "preview_order", "probe", clients=(self.client,)) as call:
             return self._preview_call(call, sym, at, order, numbers, acct)
 
@@ -981,12 +1041,13 @@ def start(account_hash: Callable[[], Optional[str]], paused: Callable[[], float]
           env: Mapping[str, str] = os.environ,
           balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
           rates: Optional[Callable[[Mapping, datetime], object]] = None,
-          budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None) -> Optional[OpenProbe]:
+          budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None,
+          share: Optional[Callable[[Callable, Callable], object]] = None) -> Optional[OpenProbe]:
     """app.py's one start line. Off unless EDGE_TRADER_OPEN_PROBE=1, never in --demo. Never raises."""
     try:
         if demo or not enabled(env):
             return None
-        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates, budget=budget)
+        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates, budget=budget, share=share)
         probe.start()
         log.info("open probe on: windows %s ET", [f"{a:%H:%M:%S}-{b:%H:%M:%S}" for a, b in probe.cfg.windows])
         return probe
