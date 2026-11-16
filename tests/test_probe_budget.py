@@ -1,11 +1,12 @@
 """Brief 33: the opening probe's Schwab calls count in the app's 70 a minute, and the probe gives way first.
+Brief 34: the probe's symbols ride in the poller's own quotes call (companion/quote_guests.py).
 
 Every case of brief 24 and its reviews (tests/test_poll_budget.py) runs twice: once with the probe
 off, once with the real OpenProbe (companion/open_probe.py) stepping on the same fake clock as the
 real Poller._run loop, at its real pace: one quotes call every 5 s and two previews at each preview
 time of the shipped third window (companion/open_probe.json, 09:26:30-09:40:00 ET). The probe gets
-the poller's two budget callables, as app.py hands them. Nothing reaches the network and nothing
-sleeps.
+the poller's two budget callables and its quote guest, as app.py hands them (brief 34: sharing
+on, unless a case says otherwise). Nothing reaches the network and nothing sleeps.
 
 Run with EDGE_TRADER_PROBE_TABLE=<file> to write one JSON row per case (the PR's table).
 """
@@ -25,6 +26,7 @@ from companion.poller import INTERVALS, MAX_PER_MIN, Poller
 from companion.store import Store
 
 from test_poller_loop import START, Clock, FakeEvent, FakeSchwab, Resp
+from companion import quote_guests
 from test_poll_budget import MINUTE_1906, MINUTE_1937, click, spread, ticket
 
 ET = op.ET
@@ -70,6 +72,26 @@ class ProbeSchwab:
         return ProbeAnswer({"orderStrategy": {"status": "ACCEPTED"}, "orderValidationResult": {}}, 201)
 
 
+class SimSchwab(FakeSchwab):
+    """The poller's fake Schwab, with a bid and an ask in each quote (the probe prices previews off
+    a shared quote, brief 34). Each quotes call notes the symbols it asked."""
+
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.asks = []
+
+    def quotes(self, symbols):
+        self.asks.append((self.clock.mono, tuple(symbols)))
+        ms = self.clock.wall.timestamp() * 1000
+        body = {s: {"realtime": True, "quote": {"lastPrice": 10.5, "mark": 10.5, "bidPrice": 100.00,
+                                                 "askPrice": 100.02, "quoteTime": ms - 200,
+                                                 "tradeTime": ms - 500}} for s in symbols}
+        return self._answer("quotes", Resp(200, body))
+
+
+OWN = ("BRVO",)                    # the poller's own marks in the rig: its one position
+
+
 # ---- one rig: the real poller loop, order traffic, and the probe (or not) -----------------------
 
 class SimClock(Clock):
@@ -106,25 +128,28 @@ class SimClock(Clock):
             self.on_advance()
 
 
-def shifted_config(clock: SimClock, at: dtime) -> op.Config:
-    """The shipped third window and its preview times, moved so that the fake clock's now reads `at`
-    ET. Only the probe sees this time; the poller keeps the rig's own wall clock."""
+def shifted_config(clock: SimClock, at: dtime, window: int = -1) -> op.Config:
+    """One shipped window (the third by default) and its preview times, moved so that the fake
+    clock's now reads `at` ET. Only the probe sees this time; the poller keeps the rig's own wall
+    clock."""
     now_et = clock.wall.astimezone(ET)
     delta = now_et - datetime.combine(now_et.date(), at, ET)
 
     def move(t: dtime) -> dtime:
         return (datetime.combine(now_et.date(), t, ET) + delta).time()
 
-    a, b = SHIPPED.windows[-1]
+    a, b = SHIPPED.windows[window]
     previews = tuple(move(t) for t in SHIPPED.previews if a <= t < b)
     return op.Config(((move(a), move(b)),), SHIPPED.quote_every_s, previews, SHIPPED.preview_shares,
                      SHIPPED.max_previews_per_time, SHIPPED.max_previews_per_window)
 
 
-def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dtime = dtime(9, 29, 0)):
+def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dtime = dtime(9, 29, 0),
+          share: bool = True, window: int = -1, budget=None):
     """The rig of tests/test_poller_loop.py and the traffic fixture of tests/test_poll_budget.py in
     one, so one test can run a case twice. With probe_on, the real OpenProbe on the same clock, its
-    window open, the clock at `at` ET in the probe's day."""
+    window open, the clock at `at` ET in the probe's day. `share`: the probe is the poller's quote
+    guest (brief 34). `budget`: the probe's budget question in place of the poller's."""
     clock = SimClock()
 
     class FakeDatetime(poller_mod.datetime):
@@ -136,7 +161,7 @@ def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dti
     monkeypatch.setattr(poller_mod, "datetime", FakeDatetime)
     monkeypatch.setattr(poller_mod, "now_iso", lambda: clock.wall.isoformat(timespec="milliseconds"))
     monkeypatch.setattr(schwab, "auth_hours_left", lambda: 100.0)
-    fake = FakeSchwab(clock)
+    fake = SimSchwab(clock)
     if not positions:
         fake.positions = []
     monkeypatch.setattr(schwab, "make_client", lambda *a, **k: fake)
@@ -144,7 +169,7 @@ def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dti
     p._stop, p._wake = FakeEvent(clock), FakeEvent(clock)
     clock.poller = p
     rig = SimpleNamespace(p=p, clock=clock, schwab=fake, window_at_send=[], skips=[], probe=None,
-                          probe_client=None, probe_lines=[])
+                          probe_client=None, probe_lines=[], ticks=[], preview_times=[])
     real_throttle = Poller._throttle
 
     def throttle(self, may_wait=True):
@@ -166,12 +191,29 @@ def build(monkeypatch, tmp_path, probe_on: bool, positions: bool = True, at: dti
     run(rig, WARM_UP_S)
     if probe_on:
         client = ProbeSchwab(clock, p)
-        probe = op.OpenProbe(lambda: PROBE_HASH, p.cooldown_left, cfg=shifted_config(clock, at),
+        probe = op.OpenProbe(lambda: PROBE_HASH, p.cooldown_left, cfg=shifted_config(clock, at, window),
                              make_client=lambda: client, symbols=lambda: (list(PICKS), ""),
                              emit=lambda kind, **f: rig.probe_lines.append((kind, f)),
                              wall=lambda: clock.wall, mono=lambda: clock.mono,
-                             budget=(p.probe_gives_way, p.note_probe_request))
+                             budget=(budget or p.probe_gives_way, p.note_probe_request),
+                             share=p.set_quote_guest if share else None)
         rig.probe, rig.probe_client = probe, client
+        real_step = probe.step
+
+        def step():
+            # Each quote tick: served by the poller's call, by the probe's own call, or not at all.
+            before = dict(probe.counts)
+            real_step()
+            d = {k: v - before.get(k, 0) for k, v in probe.counts.items()}
+            if d["quotes_shared"]:
+                rig.ticks.append((clock.mono, "poller"))
+            elif d["quote_calls"] or d["quote_errors"]:
+                rig.ticks.append((clock.mono, "own"))
+            elif d["quotes_skipped"]:
+                rig.ticks.append((clock.mono, "none"))
+            if d["previews"] or d["previews_skipped"]:
+                rig.preview_times.append((clock.mono, "went" if d["previews"] else "gave_way"))
+        probe.step = step
         clock.probe, clock.next_tick = probe, clock.mono
     return rig
 
@@ -305,6 +347,38 @@ def armed(rig):
     return s, s + 120
 
 
+def quiet_window(rig, seconds):
+    """Brief 34: a quiet stretch from the start of one probe window to its end."""
+    t0 = rig.clock.mono
+    run(rig, seconds)
+    return t0, t0 + seconds
+
+
+def shared_call_fails(rig, answer):
+    """Brief 34: one quotes call gets `answer` (an HTTP error, or an answer that lacks the poller's
+    own symbol), in a quiet stretch with a position open."""
+    run(rig, 30)
+    rig.schwab.script["quotes"] = [answer]
+    t0 = rig.clock.mono
+    run(rig, 120)
+    return t0, t0 + 120
+
+
+def pause_429(rig):
+    """Brief 34: the app's 429 pause for 30 s in a quiet stretch with a position open."""
+    run(rig, 30)
+    t0 = rig.clock.mono
+    rig.p._cooldown_until = t0 + 30
+    rig.pauses = [(t0, t0 + 30)]
+    run(rig, 90)
+    return t0, t0 + 90
+
+
+def _guest_only_answer():
+    body = {s: {"quote": {"lastPrice": 10.5, "bidPrice": 100.0, "askPrice": 100.02}} for s in PICKS + ["SPY"]}
+    return Resp(200, body)
+
+
 ONE_TWO = (9, 30, 10, 10)          # brief 33 goal b: one or two clicks, a ticket in focus
 THREE = (15, 30, 12, 12)           # three clicks, back to back included
 SPACINGS = (0, 2, 5, 10, 20, 40)
@@ -339,12 +413,29 @@ CASES = {
     **{f"ticket, three clicks {s} s apart": ((lambda r, s=s: manual(r, [30, 30 + s, 30 + 2 * s])),
                                              (9, 30, 10, 10) if s >= 20 else THREE) for s in SPACINGS},
     "armed burst, a click, a flip": (armed, (None, None, None, None)),
+    # brief 34: the three probe windows, quiet, a position open; a shared call that goes wrong; a pause
+    "quiet window 09:05, position open": (lambda r: quiet_window(r, 150), (3.5, 10.5, 5.5, 5.5)),
+    "quiet window 09:15, position open": (lambda r: quiet_window(r, 150), (3.5, 10.5, 5.5, 5.5)),
+    "quiet window 09:26:30, position open": (lambda r: quiet_window(r, 810), (3.5, 10.5, 5.5, 5.5)),
+    "a shared call fails once (HTTP 500)": (lambda r: shared_call_fails(r, Resp(500, None, text="boom")),
+                                            (3.5, 10.5, 5.5, 5.5)),
+    "a shared answer lacks the poller's symbol": (lambda r: shared_call_fails(r, _guest_only_answer()),
+                                                  (3.5, 10.5, 5.5, 5.5)),
+    "a 429 pause of 30 s, position open": (pause_429, (None, None, None, None)),
 }
+# Brief 34: the rig of a case when it is not the third window from 09:29:00 ET.
+RIGS = {
+    "quiet window 09:05, position open": {"window": 0, "at": dtime(9, 5, 0)},
+    "quiet window 09:15, position open": {"window": 1, "at": dtime(9, 15, 0)},
+    "quiet window 09:26:30, position open": {"window": 2, "at": dtime(9, 26, 30)},
+}
+QUIET_WITH_POSITION = ("quiet, positions open", *RIGS)
 
 
-def run_case(monkeypatch, tmp_path, name: str, probe_on: bool):
+def run_case(monkeypatch, tmp_path, name: str, probe_on: bool, **kw):
     fn, _ = CASES[name]
-    rig = build(monkeypatch, tmp_path, probe_on, positions="no position" not in name)
+    rig = build(monkeypatch, tmp_path, probe_on, positions="no position" not in name, **RIGS.get(name, {}), **kw)
+    rig.pauses = []
     start, end = fn(rig)
     out = {"worst": worst(rig, start, end), "poller_max_window": max(rig.window_at_send),
            "poller_skips": sorted({why for _, _, why in rig.skips}), "orders_on_time": rig.clock.sent == [t for t in getattr(rig.clock, "scheduled", [])
@@ -367,10 +458,29 @@ def run_case(monkeypatch, tmp_path, name: str, probe_on: bool):
                                                   if "budget" in v and any(x is None for x in v))
         out["probe_preview_times_went"] = sum(1 for v in times.values() if all(x is None for x in v))
         out["probe_preview_times_gave_way"] = sum(1 for v in times.values() if all(x == "budget" for x in v))
+        # Brief 34: the quote ticks, by who served them; per full minute of the case's part too.
+        for how in ("poller", "own", "none"):
+            out[f"probe_ticks_{how}"] = sum(1 for _, h in rig.ticks if h == how)
+        minutes = int((end - start) // 60)
+        out["probe_ticks_poller_per_minute"] = [
+            sum(1 for t, h in rig.ticks if h == "poller" and start + 60 * m <= t < start + 60 * (m + 1))
+            for m in range(minutes)]
+        out["probe_own_quotes_in_part"] = sum(1 for t, h in rig.ticks if h == "own" and start <= t <= end)
+        # Brief 34 item 4: a guest symbol never rides while hold_later holds or in the 429 pause,
+        # and the probe sends nothing then.
+        stops = rig.holds + rig.pauses
+        out["guest_rides_held"] = sum(1 for t, syms in rig.schwab.asks
+                                      if set(syms) - set(OWN) and any(a <= t < b for a, b in stops))
+        out["probe_calls_in_pause"] = sum(1 for c in calls for a, b in rig.pauses if a <= c[0] < b)
+        out["guest_rides"] = sum(1 for _, syms in rig.schwab.asks if set(syms) - set(OWN))
         # The probe's quotes calls inside the case's own part, for the quiet-minute question.
         inside = [c for c in calls if start <= c[0] <= end and c[1] == "quotes"]
         out["probe_quotes_in_part"] = len(inside)
         out["probe_quotes_due_in_part"] = int((end - start) // SHIPPED.quote_every_s)
+    # Brief 34 item 6: after a failed shared call, the next quotes call and its symbols.
+    asks = [(t, syms) for t, syms in rig.schwab.asks if t >= start]
+    if len(asks) > 1:
+        out["after_first_ask"] = (round(asks[1][0] - asks[0][0], 1), asks[1][1])
     return out
 
 
@@ -383,13 +493,15 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
     if path:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"case": name, "off": off["worst"], "on": on["worst"],
-                                **{k: v for k, v in on.items() if k.startswith("probe_")}}) + "\n")
+                                **{k: v for k, v in on.items() if k.startswith(("probe_", "guest_", "after_"))}},
+                               default=list) + "\n")
     # a. A probe call is never sent when the window already holds 70 - PROBE_ROOM sends: with the
     #    call itself counted, the window at its send is at most 70 - PROBE_ROOM (54). Nor while
     #    hold_later holds (the probe_held rule).
     assert on["probe_max_window"] <= MAX_PER_MIN - poll_budget.PROBE_ROOM, on
     assert on["probe_calls_in_hold"] == 0, on
     assert on["probe_preview_times_one_side"] == 0, on       # review 2: a pair goes whole or not
+    assert on["probe_calls_in_pause"] == 0 and on["guest_rides_held"] == 0, on   # brief 34 item 4
     assert on["poller_max_window"] <= MAX_PER_MIN, on
     # b. Brief 24's goals, as its tests assert them.
     _, limits = CASES[name]
@@ -404,7 +516,7 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
         assert on["worst"][poll] <= off["worst"][poll] + 1.0, (poll, on["worst"], off["worst"])
     # Order traffic never waits, probe or not.
     assert on["orders_on_time"] and off["orders_on_time"]
-    assert not on["probe_halted"]
+    assert not on["probe_halted"] or name == "a 429 pause of 30 s, position open"
     # Review 1 of PR #44: a focused ticket without a position still leaves room for some probe
     # quotes and some previews (the docs say so).
     if name in ("focused ticket alone, no position", "ticket, one click, no position"):
@@ -413,6 +525,38 @@ def test_every_case_with_the_probe_on(monkeypatch, tmp_path, name):
     if name == "quiet, no position":
         assert on["probe_quotes_gave_way"] == 0 and on["probe_previews_gave_way"] == 0, on
         assert on["probe_quotes_in_part"] >= on["probe_quotes_due_in_part"] and on["probe_previews"] > 0, on
+    # Brief 34 requirement 2: with a position open in a quiet minute the probe's quotes come from the
+    # poller's call: no call of its own, quote lines from at least 10 of the 12 ticks a minute.
+    if name in QUIET_WITH_POSITION:
+        assert on["probe_own_quotes_in_part"] == 0, on
+        assert on["probe_ticks_poller_per_minute"] and min(on["probe_ticks_poller_per_minute"]) >= 10, on
+    # Brief 34 requirement 6: after a shared call that failed or lacked the poller's symbol, the next
+    # quotes call goes at its own time (as with the probe off) and asks the poller's symbols only.
+    if name.startswith("a shared"):
+        assert on["after_first_ask"][1] == OWN and on["after_first_ask"][0] <= off["after_first_ask"][0] + 0.5, on
+
+
+@pytest.mark.parametrize("name", list(CASES))
+def test_a_guest_adds_no_send(monkeypatch, tmp_path, name):
+    """Brief 34 requirement 3: the poller makes the same calls at the same times with the probe's
+    symbols riding in its quotes call as with no probe at all. The probe here makes no call of its
+    own (its budget always says no), so any difference would be the guest's."""
+    def calls(**kw):
+        rig = build(monkeypatch, tmp_path, positions="no position" not in name, **RIGS.get(name, {}), **kw)
+        rig.pauses = []
+        CASES[name][0](rig)
+        return rig
+    off = calls(probe_on=False)
+    monkeypatch.undo()
+    guest = calls(probe_on=True, budget=lambda need=1: "probe_minute_tight")
+    assert guest.schwab.calls == off.schwab.calls
+    assert guest.window_at_send == off.window_at_send
+    assert guest.probe_client.calls == []
+    rides = [syms for _, syms in guest.schwab.asks if set(syms) - set(OWN)]
+    if "no position" in name:
+        assert not guest.schwab.asks
+    elif name != "a 429 pause of 30 s, position open":
+        assert rides and all(syms[:len(OWN)] == OWN for syms in rides)     # own symbols first
 
 
 # ---- the parts, one by one (each fails on main before brief 33) ---------------------------------
