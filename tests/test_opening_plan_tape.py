@@ -673,7 +673,8 @@ def placed_then(tmp_path, problem, feed_body, steps):
         clock.t = at(hms)
         tp.readings = [reading if reading is not None else problem(hms)]
         sh.step()
-    return [x for x in shadow_rows(tmp_path) if x["symbol"] == "AAA"]
+    # Decision lines only: brief 32's count lines (kind summary) also name AAA once a minute ends.
+    return [x for x in shadow_rows(tmp_path) if x["symbol"] == "AAA" and x["kind"] != shadow.SUMMARY]
 
 
 def feed_with_a_fill_price():

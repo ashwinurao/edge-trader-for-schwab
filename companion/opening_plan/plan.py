@@ -581,13 +581,34 @@ def name_rate(name_rates: Optional[Mapping], pair: str, side: Optional[str] = No
               ) -> Optional[tuple[Decimal, Optional[str]]]:
     """A name's counted rate of `pair` today. `name_rates` is {"LONG": side(), "SHORT": side()}
     from PreviewRates.today() for that name. A side ("LONG" or "SHORT") uses its own rate. No side
-    (a row before the open): the HIGHER of the long and short rates, which sizes smaller (brief 31)."""
-    if not isinstance(name_rates, Mapping):
-        return None
-    if side is not None:
-        return _rate_of(name_rates.get(side), pair)
-    got = [r for r in (_rate_of(name_rates.get(s), pair) for s in ("LONG", "SHORT")) if r is not None]
-    return max(got, key=lambda r: r[0]) if got else None
+    (a row before the open): the HIGHER of the long and short rates, which sizes smaller (brief 31),
+    and only when BOTH sides have one (brief 35); otherwise None. rate_need() says which is missing."""
+    need = rate_need(name_rates, pair, side)
+    return None if need["missing"] else need["known"][0][:2]
+
+
+def rate_need(name_rates: Optional[Mapping], pair: str, side: Optional[str] = None) -> dict:
+    """The rate a balance is worked at for one name and pair (briefs 31 and 35). Pure.
+
+    A side asked ("LONG" or "SHORT") needs that side's counted rate. No side (a row before the
+    open) needs BOTH: the higher decides, which sizes smaller. A needed side without a counted rate
+    (its preview failed, was rejected, was dropped as bent, or did not go) counts as full margin,
+    rate 1, so one side's rate alone never sizes the row: long 0.30 with no short rate works at 1,
+    not 0.30 (architect, brief 35, 2026-11-16).
+
+    Returns {"rate": the rate used, "known": [(rate, preview time ET, side), ...] of the needed
+    sides that have one, "missing": the needed sides without one}."""
+    sides = (side,) if side is not None else ("LONG", "SHORT")
+    known, missing = [], []
+    for sd in sides:
+        got = _rate_of(name_rates.get(sd), pair) if isinstance(name_rates, Mapping) else None
+        if got is None:
+            missing.append(sd)
+        else:
+            known.append((got[0], got[1], sd))
+    known.sort(key=lambda k: k[0], reverse=True)
+    rate = max([k[0] for k in known] + ([Decimal(1)] if missing else []))
+    return {"rate": rate, "known": known, "missing": missing}
 
 
 def _rate_text(rate: Decimal) -> str:
@@ -600,13 +621,14 @@ def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook,
 
     Per balance that counts (balances_counted): floor(balance / the playbook's rank count /
     (price x this name's rate)), the rate from this morning's probe previews against that same
-    balance (pair `bp` for buying power, `dt` for day-trading). No rate for the name yet: rate 1,
-    full margin, and `rate_known` is False. Both balances count: the smaller number decides and
+    balance (pair `bp` for buying power, `dt` for day-trading), through rate_need(). A needed side
+    without a rate counts at rate 1, full margin; `rate_missing` names it and `rate_known` is False
+    (brief 35: before the open both sides are needed). Both balances count: the smaller number decides and
     `decided_by` names it. Not known (never 0, never a guess) without a balance to stand on or a
     price; hidden with --private, because the number gives the balance away. On screen only."""
     ranks = pb.rank_to - pb.rank_from + 1
     out = {"state": "NOT_KNOWN", "shares": None, "decided_by": None, "rate": None, "rate_at_et": None,
-           "rate_known": None, "left_out": None, "text": ""}
+           "rate_known": None, "rate_missing": None, "left_out": None, "text": ""}
     which = balances_counted(bp)
     if which["state"] in ("HIDDEN", "NOT_KNOWN"):
         out.update(state=which["state"], text=which["text"])
@@ -621,32 +643,63 @@ def bp_max(bp: Optional[Mapping], price: Optional[Decimal], pb: Playbook,
     for key, pair, name in BALANCES:
         if key not in which["use"]:
             continue
-        got = name_rate(name_rates, pair, side)
-        rate = got[0] if got else Decimal(1)
-        n = int((which["use"][key] / ranks / (price * rate)).to_integral_value(rounding=ROUND_FLOOR))
-        per.append({"key": key, "name": name, "shares": n, "rate": got})
+        need = rate_need(name_rates, pair, side)
+        n = int((which["use"][key] / ranks / (price * need["rate"])).to_integral_value(rounding=ROUND_FLOOR))
+        # `rate` is the counted rate the number stands on, None when it stands on full margin.
+        on = need["known"][0] if need["known"] and need["known"][0][0] == need["rate"] else None
+        per.append({"key": key, "name": name, "shares": n, "need": need, "on": on})
     win = min(per, key=lambda x: x["shares"])
     of = f"a {_share_word(ranks)} of {win['name']} at {price:,.2f}"
-    if win["rate"]:
-        rate, at = win["rate"]
-        when = f" (preview {at[:5]} ET)" if at else ""
-        text = f"Buying power allows {win['shares']:,}: {of}, at Schwab's rate of {_rate_text(rate)} for this name{when}."
-    else:
-        text = f"Buying power allows {win['shares']:,} at full margin: this name's own rate is not known yet ({of})."
+    text = f"Buying power allows {win['shares']:,}" + _rate_words(win["need"], win["on"], of)
     for other in per:
         if other is not win:
             # A balance worked without a rate says so even when it does not decide (architect's
             # review 1 of ET PR #41): at its own rate it might have been the smaller.
-            how = "" if other["rate"] else " at full margin, its rate not known yet"
-            text += (f" {other['name'][0].upper()}{other['name'][1:]} alone would allow {other['shares']:,}{how}, "
-                     f"so {win['name']} decides.")
+            text += (f" {other['name'][0].upper()}{other['name'][1:]} alone would allow {other['shares']:,}"
+                     f"{_other_words(other['need'], other['on'])}, so {win['name']} decides.")
     if which["left_out"]:
         text += f" {which['text']}"
+    missing = sorted({sd for x in per for sd in x["need"]["missing"]})
     out.update(state="OK", shares=win["shares"], decided_by=win["key"],
-               rate=_f(win["rate"][0]) if win["rate"] else None,
-               rate_at_et=win["rate"][1] if win["rate"] else None,
-               rate_known=all(x["rate"] is not None for x in per), left_out=which["left_out"], text=text)
+               rate=_f(win["on"][0]) if win["on"] else None,
+               rate_at_et=win["on"][1] if win["on"] else None,
+               rate_known=not missing, rate_missing=missing, left_out=which["left_out"], text=text)
     return out
+
+
+def _when(at: Optional[str]) -> str:
+    return f"preview {at[:5]} ET" if at else ""
+
+
+def _rate_words(need: Mapping, on: Optional[tuple], of: str) -> str:
+    """The deciding balance's words after "Buying power allows N" (briefs 31 and 35)."""
+    known, missing = need["known"], need["missing"]
+    if not missing:
+        rate, at, _ = on
+        when = f" ({_when(at)})" if at else ""
+        return f": {of}, at Schwab's rate of {_rate_text(rate)} for this name{when}."
+    if not known:
+        return f" at full margin: this name's own rate is not known yet ({of})."
+    rate, at, sd = known[0]
+    miss = " and ".join(m.lower() for m in missing)
+    if on is None:
+        # The known side's rate is below full margin: the missing side may need more (brief 35).
+        when = f", {_when(at)}" if at else ""
+        return (f" at full margin: this name's {miss} rate is not known yet (its {sd.lower()} rate is "
+                f"{_rate_text(rate)}{when}; {of}).")
+    when = f" ({_when(at)})" if at else ""
+    return (f": {of}, at Schwab's {sd.lower()} rate of {_rate_text(rate)} for this name{when}. "
+            f"Its {miss} rate is not known yet.")
+
+
+def _other_words(need: Mapping, on: Optional[tuple]) -> str:
+    """What the balance that does not decide stands on, when it is not a full set of rates."""
+    if not need["missing"]:
+        return ""
+    if not need["known"]:
+        return " at full margin, its rate not known yet"
+    miss = " and ".join(m.lower() for m in need["missing"])
+    return f"{' at full margin' if on is None else ''}, its {miss} rate not known yet"
 
 
 def _estimate_at(risk: Decimal, atr: Decimal, price: Decimal, bp_shares: Optional[int], pb: Playbook) -> dict:

@@ -77,8 +77,8 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
     pb = load_playbook()
     bad_url = ""
     if demo:
-        from .demo_feed import (DEMO_ET_ENV, DEMO_NO_RATES_ENV, DEMO_RV20_ENV, DemoFeed, demo_account,
-                                demo_clock, demo_rates, demo_rv20)
+        from .demo_feed import (DEMO_ET_ENV, DEMO_NO_RATES_ENV, DEMO_ONE_SIDE_ENV, DEMO_RV20_ENV, DemoFeed,
+                                demo_account, demo_clock, demo_rates, demo_rv20)
         now = now or demo_clock(env.get(DEMO_ET_ENV) or None)
     now = now or (lambda: datetime.now(timezone.utc))
     feed = None
@@ -116,7 +116,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
         # (demo_feed.demo_rates) only while the probe's store has none for today.
         today = rates.today(at) if rates is not None else {}
         if demo and not url and not today:
-            today = demo_rates(at, env.get(DEMO_NO_RATES_ENV) == "1")
+            today = demo_rates(at, env.get(DEMO_NO_RATES_ENV) == "1", env.get(DEMO_ONE_SIDE_ENV) == "1")
         if feed is None:
             view = build_view(None, None, "", None, None, "", stored_risk(store), at, pb, account=account,
                               rates=today)

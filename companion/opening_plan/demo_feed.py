@@ -32,6 +32,9 @@ DEMO_RV20_ENV = "EDGE_TRADER_PLAN_DEMO_RV20"  # demo only: the SPY RV20 the demo
 # 2026-11-16 at 09:18 ET), and "1" here gives no margin rates yet (before the probe's first window).
 DEMO_DT_ZERO_ENV = "EDGE_TRADER_PLAN_DEMO_DT_ZERO"
 DEMO_NO_RATES_ENV = "EDGE_TRADER_PLAN_DEMO_NO_RATES"
+# Brief 35, demo only: "1" gives each demo name a long rate and no short rate (its short preview
+# failed or did not go), so the estimate shows full margin and names the missing side.
+DEMO_ONE_SIDE_ENV = "EDGE_TRADER_PLAN_DEMO_ONE_SIDE"
 DEMO_RV20 = 9.8
 FREEZE_ET = time(9, 25)
 PREVIEW_FROM_ET = time(9, 0)
@@ -132,11 +135,13 @@ def _demo_side(rate: float) -> dict:
             "last": {"at_et": at, "http": 201, "ok": True, "status": None, "rejects": [], "warns": [], "alerts": []}}
 
 
-def demo_rates(now: datetime, none: bool = False) -> dict:
-    """The demo's rates for today, or {} with `none` (no probe preview yet). Ratios only."""
+def demo_rates(now: datetime, none: bool = False, one_side: bool = False) -> dict:
+    """The demo's rates for today, or {} with `none` (no probe preview yet). With `one_side`, long
+    rates only (brief 35). Ratios only."""
     if none:
         return {}
-    return {sym: {"LONG": _demo_side(lo), "SHORT": _demo_side(sh)} for sym, (lo, sh) in DEMO_RATES.items()}
+    return {sym: {"LONG": _demo_side(lo), "SHORT": None if one_side else _demo_side(sh)}
+            for sym, (lo, sh) in DEMO_RATES.items()}
 
 
 def demo_rv20(text: str | None) -> float:
