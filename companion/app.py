@@ -62,6 +62,7 @@ class DemoPoller:
     def cooldown_left(self): return 0.0
     def note_probe_request(self): pass
     def probe_gives_way(self, need=1, ahead=None): return None
+    def set_quote_guest(self, wants, take): pass
 
 
 poller = DemoPoller() if DEMO else Poller()
@@ -85,7 +86,7 @@ async def lifespan(_app: FastAPI):
         from .opening_plan import shadow as _plan_shadow
         _plan_shadow.log_start(os.environ)
     poller.start()
-    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add, budget=(poller.probe_gives_way, poller.note_probe_request))  # briefs 09, 21, 23, 33, off by default
+    open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add, budget=(poller.probe_gives_way, poller.note_probe_request), share=poller.set_quote_guest)  # briefs 09, 21, 23, 33, 34, off by default
     if not DEMO:
         import threading
         from . import update_check

@@ -7,7 +7,10 @@ using the same Schwab login):
     orders, 59-day sweep  every 30 s   4   (status WORKING + PENDING_ACTIVATION: older
                                             GTC orders; an unfiltered 59-day query times out)
     transactions today    every 10 s   6
-    quotes (batched)      every 3 s   20   (open positions and working orders, one request)
+    quotes (batched)      every 3 s   20   (open positions and working orders, one request;
+                                            in the opening probe's windows the probe's symbols
+                                            ride in it, brief 34, companion/quote_guests.py:
+                                            no call more, and the marks never wait for them)
     transactions, 3 days  every 10 min     (late corrections to earlier sessions)
     order_details         as needed        (orders that drop out of the working set)
                                      ----
@@ -17,8 +20,9 @@ using the same Schwab login):
     opening probe (companion/open_probe.py, only with EDGE_TRADER_OPEN_PROBE=1, in its ET windows):
                           up to 12 quotes calls and 2 to 4 previews a minute, counted in the
                           limiter, sent only while the last 60 s hold fewer than 70 - PROBE_ROOM
-                          (54) sends and no hold_later holds (brief 33): with a position open it
-                          sends almost nothing; with no position and a ticket window in focus
+                          (54) sends and no hold_later holds (brief 33). With a position open
+                          its quotes come from the marks call above (brief 34) and it sends
+                          almost no previews; with no position and a ticket window in focus
                           40 to 60 percent of its quotes calls and a whole
                           preview pair at 7 of 8 preview times before the
                           freeze, 9 of 10 after 09:26 (previews first).
@@ -50,7 +54,7 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
-from . import netlog, poll_budget, schwab
+from . import netlog, poll_budget, quote_guests, schwab
 from .orders import TERMINAL, pending_orders, terminal_ids
 from .pnl import ET, fills_from_transactions, session_day
 from .store import Store, now_iso
@@ -113,6 +117,7 @@ class Poller:
         self._skip_logged: dict[str, float] = {}   # one skip line per poll per interval
         self._urgent: frozenset[str] = frozenset() # LATER polls a stop-moving reader needs now
         self._later = False                        # a LATER poll is running: its calls never wait
+        self.guests = quote_guests.Guests()        # brief 34: symbols that ride in the quotes call
         self._cooldown_until = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()       # set by a sign-in from the dashboard
@@ -200,6 +205,11 @@ class Poller:
         60 s window like every other call, never as order traffic, so the budget keeps its quiet
         rules. It never waits."""
         self._sent.append(time.monotonic())
+
+    def set_quote_guest(self, wants, take) -> None:
+        """Brief 34: a guest's symbols ride in the marks call the poller makes anyway, never in a
+        call of their own (companion/quote_guests.py). The poller's state never sees them."""
+        self.guests.set(wants, take)
 
     def probe_gives_way(self, need: int = 1, ahead=None) -> str | None:
         """None when the opening probe may send `need` calls now, else why not (brief 33,
@@ -405,7 +415,12 @@ class Poller:
         elif name == "quotes":
             syms = self._quote_symbols()
             if syms:
-                data = self._call(name, lambda: self.client.quotes(syms))
+                # Brief 34: guest symbols ride in this one call (companion/quote_guests.py). `went`
+                # tells a call that failed from one the limiter held back (not sent: no backoff).
+                ask, plan = self.guests.ask(syms, time.monotonic())
+                went = []
+                data = self._call(name, lambda: went.append(1) or self.client.quotes(ask))
+                data = self.guests.answer(data, plan, time.monotonic(), datetime.now(timezone.utc), bool(went))
                 if not isinstance(data, dict):
                     return False
                 self.quotes = data

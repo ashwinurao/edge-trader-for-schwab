@@ -140,10 +140,20 @@ name are refused). It needs no account and sends no telemetry.
   probe's own quotes**: the margin rates are what the Opening plan needs from the probe, and its quotes are a
   timing measurement, so while preview times are due within 60 seconds a quotes call goes only if the window
   will still have room, at each of those times, for the pair and its own fresh quote. A preview time lost
-  because the probe's quote gave way keeps its pick's turn. So **the
-  probe measures almost nothing while a position is open** (the poller alone then makes about 54 calls a
-  minute) **or while the armed plan's hold runs**, and a preview also needs the probe's own quote from the
-  last 10 seconds, so on such a morning the Opening plan gets **no preview rates** before the freeze. With
+  because the probe's quote gave way keeps its pick's turn. **While the poller reads your position marks
+  anyway, the probe's symbols ride in that same quotes call** (brief 34, `companion/quote_guests.py`): it
+  costs no call, the marks keep their own pace and never depend on it, and a shared call that fails or misses
+  one of your own symbols leaves the probe out of it for 60 seconds, and two such calls in a row leave it out
+  until its window ends, so a probe symbol that breaks every shared call costs your marks at most two reads a
+  window. A symbol only the probe asked never reaches your marks, also when Schwab names it as unknown in an
+  `errors` entry of its answer. The probe then writes its quote lines
+  from that answer with `via: "poller"` (its own calls say `via: "probe"`) and makes no quotes call of its
+  own. Those lines have no wire time, and an answer can be up to one marks interval (3 to 6 seconds) old when
+  the probe reads it. So with a position open in a quiet minute the probe gets quote lines at every 5 s tick.
+  **What it still does not measure with a position open:** a preview is two calls of its own, and the poller
+  alone then makes about 54 calls a minute, so it sends almost no previews, and the Opening plan gets
+  **almost no preview rates** before the freeze on such a morning (Ash chose to leave it so, 2026-11-16).
+  **While the armed plan's hold runs** it measures nothing (the marks give way too). With
   **no position open and a ticket window in focus** it still sends 40 to 60 percent of its quotes calls and
   a whole preview pair at 7 of the 8 preview times before the freeze (each of four picks gets one) and 9 of
   10 in the open window (simulated, `tests/test_probe_budget.py`); with no position and no ticket
@@ -172,8 +182,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   order list are read every 5 s, marks every 3 s and fills every 10 s. While a ticket window has
   focus or after a click, marks come every 6 s instead of 3, so the account and order list keep
   their pace within the app's limit of 70 Schwab calls a minute (`MAX_PER_MIN`,
-  `companion/poller.py`). The opening probe's calls count in that limit and give way first (see
-  Opening probe above). With up to two clicks a minute marks and fills never show as old; with
+  `companion/poller.py`). The opening probe's calls count in that limit and give way first, and in its
+  windows its symbols ride in the marks call (see Opening probe above). With up to two clicks a minute marks and fills never show as old; with
   three clicks close together marks can be up to 15 s old for a moment and show as old (after 9 s).
   In heavier order traffic (30 or more order calls a minute) marks, fills and realized P&L can show
   as old until it eases (`companion/poll_budget.py`). Right after a
