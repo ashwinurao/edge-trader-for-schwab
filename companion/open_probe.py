@@ -39,11 +39,38 @@ What it does, off unless EDGE_TRADER_OPEN_PROBE=1 (never in --demo):
   or buying power in dollars is ever written, and nothing else from the answer: it holds the
   account number.
 - No retries. Any 429, or the app's own 429 pause, stops the probe for the rest of the window.
+- Brief 33: its Schwab calls count in the app's limit of 70 calls a minute (companion/poller.py
+  MAX_PER_MIN) and it gives way first. Before every quotes call and every preview pair it asks the
+  poller (Poller.probe_gives_way, companion/poll_budget.py PROBE_ROOM): while the last 60 s hold
+  54 sends or more, while the armed plan's hold_later holds, or in the 429 pause, it sends
+  nothing, does not try again and does not catch up. So with a position open (the poller alone
+  then sends about 54 calls a minute) it measures almost nothing, and a preview needs its own
+  quote under 10 s old. A preview pair (long and short of one pick) asks for both its calls at
+  once and goes whole or not at all, and a pair that gives way keeps its pick's turn (review 2 of
+  PR #44). Previews come before its own quotes (review 3 of PR #44): the margin rates are what
+  the plan needs from the probe, its quotes are a timing measurement. So while preview times are
+  due within the next 60 s (PAIR_AHEAD_S), a quotes call looks ahead (review 4 of PR #44,
+  poll_budget.probe_pairs_fit): it goes only if, at each of those times, the window still has room
+  for the pair and the pair's own fresh quote, counting the probe's own sends that will have left
+  the window by then. With no pair due within 60 s it asks for itself alone. A time lost as
+  `no_quote` because the last quotes call gave way for the budget, with no quotes answer in the
+  last 10 s, keeps its pick's turn; a pick missing from a fresh answer still uses its turn. With no position and a ticket window in focus
+  it sends a whole preview pair at 7 of the 8 preview times before the freeze (each of four picks
+  gets one), 9 of 10 in the open window from 09:26:00 and 5 of 6 from 09:29:00, and 40 to 60
+  percent of its quotes calls; with neither, all (tests/test_probe_budget.py). Each call it sends is counted in the poller's
+  window (Poller.note_probe_request), never as order traffic. A call that gave way writes one
+  netlog `skip` line (purpose probe, reason `probe_minute_tight`, `probe_pair_ahead`, `probe_held`,
+  `pause_429` or `budget_error`),
+  at most one per quote interval, and is counted in the
+  window's `quotes_skipped` / `previews_skipped`; a preview that gave way still writes its
+  `probe: "preview"` line with `skipped: "budget"`. Each call sent has a netlog `call` line
+  (purpose probe) with its wait, wire and total times.
 - Brief 23: each preview line also goes to the plan's rate store (companion/preview_rates.py,
   in memory, rates and Schwab's texts only), so the Opening plan can size by each name's rate.
 
 It never touches the trading client, Trader._send_lock, the poller's client or the store. It
-does not import the order code. Every failure is contained here and said once in a note.
+does not import the order code: from the poller it gets only callables (the pause, the balances,
+and brief 33's budget pair). Every failure is contained here and said once in a note.
 """
 from __future__ import annotations
 
@@ -54,6 +81,7 @@ import os
 import re
 import threading
 import time as _time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -80,6 +108,9 @@ MAX_PICKS = 6                                       # brief 09: at most 6 plan s
 PREVIEW_GRACE_S = 10    # a preview time missed by more than this (the probe was busy) is skipped
 QUOTE_FRESH_S = 10      # the preview prices off the probe's own last quote, at most this old
 TICK_S = 0.2            # how often the thread looks at the clock
+# Reviews 3 and 4 of PR #44: a quotes call looks ahead at the preview times due this close.
+# The budget's window (companion/poll_budget.py WINDOW_S): a quote sent now still counts then.
+PAIR_AHEAD_S = 60
 # Break shape of the probe preview (brief 09): trigger = ask + the larger of 5 cents and 0.2%,
 # stop = trigger - 1% of the price. Far enough from the ask that make_plan accepts it.
 TRIGGER_MIN = Decimal("0.05")
@@ -577,8 +608,12 @@ class OpenProbe:
                  wall: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  mono: Callable[[], float] = _time.monotonic,
                  balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
-                 rates: Optional[Callable[[Mapping, datetime], object]] = None) -> None:
+                 rates: Optional[Callable[[Mapping, datetime], object]] = None,
+                 budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None) -> None:
         self.cfg = cfg if cfg is not None else load_config()
+        # Brief 33: (Poller.probe_gives_way, Poller.note_probe_request). None (a test without a
+        # poller): every call goes and nothing is counted, as before brief 33.
+        self._budget = budget
         self._hash, self._paused, self._make_client = account_hash, paused, make_client
         self._balances = balances
         self._rates = rates     # brief 23 PR A: preview_rates.PreviewRates.add, the plan's store
@@ -600,8 +635,13 @@ class OpenProbe:
         self._turn = 0          # brief 21: the next pick in rank order at each preview time
         self._reread_at: Optional[datetime] = None     # review 1 of PR #29: the next picks read
         self._reads = 0
+        self._skip_said_at: Optional[float] = None    # brief 33: one skip line per quote interval
+        self._own_sent: deque = deque()               # review 4 of PR #44: the probe's own sends
+        self._quote_gave_way = False                  # review 4: the last quotes tick gave way
+        self._answer_at: Optional[float] = None       # review 5: when the last good quotes answer came
         self.counts = {"quote_calls": 0, "quote_errors": 0, "previews": 0, "preview_errors": 0,
-                       "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0}
+                       "previews_missed": 0, "previews_capped": 0, "picks_reads": 0, "cycle_errors": 0,
+                       "quotes_skipped": 0, "previews_skipped": 0}
 
     # thread plumbing
     def start(self) -> threading.Thread:
@@ -780,21 +820,94 @@ class OpenProbe:
             self.halted = why
             self._note(f"open probe: stopped for the rest of the window: {why}", window=self._win_text())
 
+    # the budget (brief 33)
+    def _gives_way(self, endpoint: str, need: int = 1, sends: Optional[int] = None,
+                   ahead: Optional[tuple] = None) -> Optional[str]:
+        """Ask the poller's budget just before `need` calls (a preview pair asks for both at once,
+        review 2 of PR #44). None: they go, and the `sends` of them that go now (default all) are
+        counted in the poller's 60 s window now.
+        Else the reason they give way, with one netlog `skip` line at most once per quote
+        interval. If the budget cannot be asked, they give way: the probe is a measurement and
+        never needed."""
+        if self._budget is None:
+            return None
+        gives_way, count = self._budget
+        try:
+            why = gives_way(need) if ahead is None else gives_way(need, ahead)
+            if why is None:
+                for _ in range(need if sends is None else sends):
+                    count()
+                    self._own_sent.append(self._mono())     # review 4: for the look-ahead
+                return None
+        except Exception as e:
+            self._contain("budget", e)
+            why = "budget_error"
+        now = self._mono()
+        if self._skip_said_at is None or now - self._skip_said_at >= self.cfg.quote_every_s:
+            self._skip_said_at = now
+            try:
+                with netlog.call("schwab", endpoint, "probe") as call:
+                    call.skip(why)
+            except Exception:
+                pass
+        if why == "pause_429":
+            self._halt("the app is in its 429 pause")
+        return why
+
     # the two probes
     def _quotes(self) -> None:
         if self._pause_left() > 0:
             self._halt("the app is in its 429 pause")
             return
+        # Reviews 3 and 4 of PR #44: previews come before the probe's own quotes. The margin rates
+        # are what the plan needs from the probe; its quotes are a timing measurement. While preview
+        # pairs are due within the next 60 s, a quotes call goes only if each of them still finds
+        # room for itself and for its own fresh quote when its time comes (poll_budget.
+        # probe_pairs_fit): a quote sent now still counts then, and before the freeze the preview
+        # times are 30 s apart.
+        pairs = self._pairs_in()
+        ahead = (tuple(self._own_sent), pairs, QUOTE_FRESH_S - TICK_S) if pairs else None
+        if self._gives_way("quotes", sends=1, ahead=ahead):
+            self.counts["quotes_skipped"] += 1
+            self._quote_gave_way = True
+            return
+        self._quote_gave_way = False
+        with netlog.call("schwab", "quotes", "probe", clients=(self.client,)) as call:
+            self._quotes_call(call)
+
+    def _lost_to_budget(self) -> bool:
+        """A preview time had no quote because the budget held the probe's quote back: the last
+        quotes tick gave way and no quotes answer came in the last QUOTE_FRESH_S (review 5 of PR
+        #44). With a fresh answer that lacks the pick, the pick is missing, not held back."""
+        fresh = self._answer_at is not None and self._mono() - self._answer_at <= QUOTE_FRESH_S
+        return self._quote_gave_way and not fresh
+
+    def _pairs_in(self) -> tuple[float, ...]:
+        """Seconds to each preview time of the open window due within the next 60 s (the budget's
+        window), not done yet, while the window's preview cap still leaves a pair (reviews 3 and 4
+        of PR #44)."""
+        if self._win is None or self.counts["previews"] >= self.cfg.max_previews_per_window:
+            return ()
+        now = self._wall()
+        while self._own_sent and self._mono() - self._own_sent[0] >= PAIR_AHEAD_S:
+            self._own_sent.popleft()
+        return tuple(sorted((t - now).total_seconds() for t in self._previews_in(self._win)
+                            if t not in self._done and now <= t < now + timedelta(seconds=PAIR_AHEAD_S)))
+
+    def _quotes_call(self, call) -> None:
         syms = list(self.symbols)
         self.counts["quote_calls"] += 1
         t0 = self._mono()
+        call.sending()
         try:
             r = self.client.quotes(syms)
         except Exception as e:
+            call.failed(e)
             self.counts["quote_errors"] += 1
             self._line(probe="quote", ok=False, symbols=syms, error=error_class(e),
                        total_ms=round((self._mono() - t0) * 1000, 1))
             return
+        call.returned(r)
         recv = self._wall()
         total = round((self._mono() - t0) * 1000, 1)
         wire = _wire_ms(r)
@@ -808,6 +921,7 @@ class OpenProbe:
             return
         body = r.json()
         recv_ms = recv.timestamp() * 1000
+        self._answer_at = self._mono()
         for line in quote_lines(body, syms, recv_ms, wire, total):
             self._line(**line)
             if not line.get("missing"):
@@ -822,24 +936,49 @@ class OpenProbe:
         hit = self._last_quote.get(sym)
         if hit is None or self._mono() - hit[0] > QUOTE_FRESH_S or not hit[1].get("ask") or not hit[1].get("bid"):
             self._line(probe="preview", symbol=sym, at=at, skipped="no_quote")
+            if self._lost_to_budget():
+                # Reviews 4 and 5 of PR #44: the time was lost because the probe's own quote gave
+                # way for the budget, so the pick keeps its turn, as a pair that gives way does. A
+                # pick missing from a fresh answer still uses its turn.
+                self._turn -= 1
             return
         acct = self._hash()
         if not acct:
             self._line(probe="preview", symbol=sym, at=at, skipped="no_account")
             return
-        sent = 0
+        sides = []
         for side in SIDES:
-            if self.halted:
-                return
-            if sent >= self.cfg.max_previews_per_time or self.counts["previews"] >= self.cfg.max_previews_per_window:
+            if len(sides) >= self.cfg.max_previews_per_time or \
+                    self.counts["previews"] + len(sides) >= self.cfg.max_previews_per_window:
                 self.counts["previews_capped"] += 1
                 self._line(probe="preview", symbol=sym, at=at, side=side, skipped="cap")
                 continue
+            order = self._preview_body(sym, side, at, hit[1])
+            if order is not None:
+                sides.append((side, order))
+        if not sides:
+            return
+        if self._pause_left() > 0:
+            self._halt("the app is in its 429 pause")
+            return
+        # Review 2 of PR #44: the pair goes whole or not at all. With one side only the plan would
+        # hold one rate, and the estimate before the open takes the higher of the two it has.
+        if self._gives_way("preview_order", need=len(sides)):
+            for side, _ in sides:
+                self.counts["previews_skipped"] += 1
+                self._line(probe="preview", symbol=sym, at=at, side=side, skipped="budget")
+            # A pair that gave way for the budget keeps its pick's turn, so the same picks are not
+            # passed over at every time that gives way (review 2 of PR #44).
+            self._turn -= 1
+            return
+        for side, order in sides:
+            if self.halted:
+                return
             if self._pause_left() > 0:
                 self._halt("the app is in its 429 pause")
                 return
-            if self._preview_one(sym, side, at, hit[1], acct):
-                sent += 1
+            with netlog.call("schwab", "preview_order", "probe", clients=(self.client,)) as call:
+                self._preview_call(call, sym, at, order, order_numbers(order), acct)
 
     def _keep(self, line: dict) -> None:
         """Hand the preview line to the plan's rate store (brief 23 PR A item 3). The line holds
@@ -861,23 +1000,27 @@ class OpenProbe:
         except Exception:
             return None, None
 
-    def _preview_one(self, sym: str, side: str, at: str, q: dict, acct: str) -> bool:
-        """One preview of one side. True when a preview_order call went out."""
+    def _preview_body(self, sym: str, side: str, at: str, q: dict) -> Optional[dict]:
+        """The preview order of one side, or None (its line says why)."""
         try:
-            order = with_quantity(preview_body(sym, q["bid"], q["ask"], side), self.cfg.preview_shares)
+            return with_quantity(preview_body(sym, q["bid"], q["ask"], side), self.cfg.preview_shares)
         except ValueError as e:     # e.g. a wide spread puts the 1% stop past the other side
             self._line(probe="preview", symbol=sym, at=at, side=side, skipped="plan_refused", reason=_text(str(e)))
-            return False
-        numbers = order_numbers(order)
+            return None
+
+    def _preview_call(self, call, sym: str, at: str, order: dict, numbers: dict, acct: str) -> bool:
         self.counts["previews"] += 1
         t0 = self._mono()
+        call.sending()
         try:
             r = self.client.preview_order(acct, order)
         except Exception as e:
+            call.failed(e)
             self.counts["preview_errors"] += 1
             self._line(probe="preview", symbol=sym, at=at, ok=False, error=error_class(e),
                        total_ms=round((self._mono() - t0) * 1000, 1), **numbers)
             return True
+        call.returned(r)
         total = round((self._mono() - t0) * 1000, 1)
         err = http_class(r.status_code)
         try:
@@ -910,12 +1053,13 @@ class OpenProbe:
 def start(account_hash: Callable[[], Optional[str]], paused: Callable[[], float], demo: bool = False,
           env: Mapping[str, str] = os.environ,
           balances: Callable[[], tuple[Optional[Mapping], Optional[datetime]]] = lambda: (None, None),
-          rates: Optional[Callable[[Mapping, datetime], object]] = None) -> Optional[OpenProbe]:
+          rates: Optional[Callable[[Mapping, datetime], object]] = None,
+          budget: Optional[tuple[Callable[[], Optional[str]], Callable[[], None]]] = None) -> Optional[OpenProbe]:
     """app.py's one start line. Off unless EDGE_TRADER_OPEN_PROBE=1, never in --demo. Never raises."""
     try:
         if demo or not enabled(env):
             return None
-        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates)
+        probe = OpenProbe(account_hash, paused, balances=balances, rates=rates, budget=budget)
         probe.start()
         log.info("open probe on: windows %s ET", [f"{a:%H:%M:%S}-{b:%H:%M:%S}" for a, b in probe.cfg.windows])
         return probe

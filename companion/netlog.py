@@ -29,7 +29,10 @@ every line has ts (UTC, milliseconds), kind and app. Kinds written here:
 - inflight: a call still open after 2, 5, 10, 30 and 60 s (the only trace of a call that hangs).
 - skip: a call our code chose not to send, with its `reason`: a read during a 429 pause
   (`pause_429`), or a poller read that gave way to order traffic (`light`, `after_burst`,
-  `reserve`, `held`, `minute_full`: companion/poll_budget.py), one line per poll interval.
+  `reserve`, `held`, `minute_full`: companion/poll_budget.py), one line per poll interval, or an
+  opening probe call that gave way (purpose probe: `probe_minute_tight`, `probe_pair_ahead`,
+  `probe_held`, `pause_429`, `budget_error`; brief 33 and review 4 of PR #44), one line per quote
+  interval.
 - pause: start and end of the 429 pause. token: an access token renewal seen by a call.
 - route and refusal: a request to a named route of ours (a polled GET only when it took 100 ms
   or more or did not answer 200), and an order action that answered without sending anything.

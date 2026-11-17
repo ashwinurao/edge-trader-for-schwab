@@ -14,8 +14,16 @@ using the same Schwab login):
                                      ~54
     ticket quotes (outside this limiter) every 5 s while a ticket window has focus, else every
     30 s: up to ~12 more. Order actions are on top, at most one at a time.
+    opening probe (companion/open_probe.py, only with EDGE_TRADER_OPEN_PROBE=1, in its ET windows):
+                          up to 12 quotes calls and 2 to 4 previews a minute, counted in the
+                          limiter, sent only while the last 60 s hold fewer than 70 - PROBE_ROOM
+                          (54) sends and no hold_later holds (brief 33): with a position open it
+                          sends almost nothing; with no position and a ticket window in focus
+                          40 to 60 percent of its quotes calls and a whole
+                          preview pair at 7 of 8 preview times before the
+                          freeze, 9 of 10 after 09:26 (previews first).
 Enforced, not just scheduled: every request goes through one limiter (MAX_PER_MIN, 70 calls in
-any 60 s, order traffic included), schwabdev's internal retries are disabled (companion/schwab.py),
+any 60 s, order traffic and the opening probe included), schwabdev's internal retries are disabled (companion/schwab.py),
 and a 429 pauses ALL companion requests. Each endpoint keeps its own last-success time.
 
 When order traffic is busy (brief 24, companion/poll_budget.py), the account and order reads go
@@ -186,6 +194,25 @@ class Poller:
 
     def cooldown_left(self) -> float:
         return max(0.0, self._cooldown_until - time.monotonic())
+
+    def note_probe_request(self) -> None:
+        """One Schwab call of the opening probe (companion/open_probe.py, brief 33): counted in the
+        60 s window like every other call, never as order traffic, so the budget keeps its quiet
+        rules. It never waits."""
+        self._sent.append(time.monotonic())
+
+    def probe_gives_way(self, need: int = 1, ahead=None) -> str | None:
+        """None when the opening probe may send `need` calls now, else why not (brief 33,
+        poll_budget.probe_gives_way). The probe asks before each call, a preview pair for both of
+        its calls at once (review 2 of PR #44), and gives way first. If the budget cannot be read,
+        the probe gives way: it is a measurement, never needed."""
+        try:
+            # tuple(): the same safe copy as _give_way (review 1 of PR #33).
+            return poll_budget.probe_gives_way(time.monotonic(), tuple(self._sent), MAX_PER_MIN,
+                                               self.cooldown_left(), self._hold_until, need, ahead)
+        except Exception:
+            log.exception("poll budget failed for the probe; the probe gives way")
+            return "budget_error"
 
     def hold_later(self, seconds: float, why: str) -> None:
         """Hold the LATER polls (transactions, quotes, corrections, hours) for this long, for a
