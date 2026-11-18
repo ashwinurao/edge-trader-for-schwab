@@ -24,6 +24,7 @@ was), the engine's `price_age_s` (and `fresh_age_s` from the tape), and from the
 `tape_age_s`, `feed_age`, `tape_usable`, `tape_why`.
 
 What Step 2's feed (the fallback) can and cannot say (Edge Scanner scanner/ov_picks_live.py, main 5d0b606):
+- Before 09:30 ET a row has no `first_minute`: no range, and it says `no first minute yet` (brief 36).
 - Before the 09:30 bar is in, `first_minute` is the minute so far and `first_minute_as_of` is the
   last trade's time, whole seconds ("HH:MM:SS" ET). The shadow takes that time as the trade's,
   so a price age can read up to 1 s too old.
@@ -75,6 +76,9 @@ RISK_EVERY_SECONDS = 30.0
 IDLE_SECONDS = 20.0            # the longest sleep outside the window
 BAR_END_ET = time(9, 31)
 UNCONFIRMED = "snapshot 09:30 bar, not confirmed"     # Edge Scanner PR #45's early bar
+# Brief 36: a row with no first_minute (every row before 09:30 ET) gets its own words, never the
+# row before's label. Read by people only.
+NO_FIRST_MINUTE = "no first minute yet"
 
 # Brief 32 item 1: the plan's other switches, said on or off in the start lines. Names only, so the
 # shadow imports no order code (plan_entries.BUTTONS_FLAG, plan_flat.FLAT_FLAG, plan_auto's
@@ -129,6 +133,7 @@ def es_reading(picks: Reading, now: datetime, risk: Optional[Decimal], calm: Opt
             continue
         p = {"symbol": str(row.get("ticker")), "rank": row["rank"], "last": None, "last_at": None,
              "high": None, "low": None, "final": False}
+        label = NO_FIRST_MINUTE
         fm = row.get("first_minute")
         if isinstance(fm, Mapping):
             p.update(high=fm.get("high"), low=fm.get("low"), last=fm.get("close"))

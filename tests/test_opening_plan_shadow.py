@@ -412,6 +412,57 @@ def test_the_feeds_early_0930_bar_is_labelled_not_confirmed_and_is_not_final(as_
     assert reading["picks"][0]["final"] is False
 
 
+def two_rows(*rows, day="2026-11-13"):
+    return {"set_up": True, "reason_code": "", "day": {"has_picks": True, "trading_date": day, "picks": list(rows)}}
+
+
+def test_a_pick_with_no_first_minute_reads_with_no_range():
+    # Brief 36: before 09:30 ET the feed's rows have no first_minute. On 2026-11-18 09:29:00 ET
+    # the first such row raised UnboundLocalError ('label') and the shadow lost the reading.
+    reading, ranges = shadow.es_reading(Reading(two_rows({"ticker": "AAAA", "rank": 1}), at("09:29:00.000"), ""),
+                                        at("09:29:00.010"), Decimal("100"), False)
+    assert [(p["symbol"], p["high"], p["low"], p["last"], p["final"]) for p in reading["picks"]] == \
+        [("AAAA", None, None, None, False)]
+    assert ranges["AAAA"] == {"high": None, "low": None, "final": False, "from": shadow.NO_FIRST_MINUTE}
+    assert shadow.NO_FIRST_MINUTE == "no first minute yet"
+
+
+def test_a_pick_with_no_first_minute_does_not_take_the_row_befores_label():
+    # Brief 36, fault 2: the second row has no bar, so it must not say the first row's "not confirmed".
+    body = two_rows({"ticker": "AAAA", "rank": 1, "first_minute_as_of": "09:31:00",
+                     "first_minute": {"open": 49.5, "high": 50.0, "low": 49.0, "close": 49.8}},
+                    {"ticker": "BBBB", "rank": 2})
+    _, ranges = shadow.es_reading(Reading(body, at("09:31:00.300"), ""), at("09:31:00.400"), Decimal("100"), False)
+    assert ranges["AAAA"]["from"] == shadow.UNCONFIRMED
+    assert ranges["BBBB"] == {"high": None, "low": None, "final": False, "from": "no first minute yet"}
+
+
+def test_shadow_falls_back_at_0929_on_picks_with_no_first_minute_and_logs_no_error(tmp_path, caplog):
+    # Brief 36: the tape's first read of the day has a problem, so the shadow falls back to the
+    # picks feed, whose picks have no first minute before 09:30 ET.
+    class ProblemTape:
+        url = "http://192.168.1.10:8772/api/v2/ov-picks/open-tape"
+
+        def read(self):
+            from companion.opening_plan import tape as tape_mod
+            return tape_mod.empty(at("09:29:00.005"), problem="no answer yet")
+
+    feed = FakeFeed()
+    feed.answers = [(two_rows({"ticker": "AAAA", "rank": 1}, {"ticker": "BBBB", "rank": 2}), at("09:28:59.000"))]
+    sh = shadow.Shadow(feed, PLAYBOOK, risk=lambda: Decimal("101"), calm=lambda clock_reading, now: False,
+                       out_dir=tmp_path, now=lambda: at("09:29:00.010"), tape=ProblemTape())
+    with caplog.at_level(logging.ERROR, logger="companion.opening_plan.shadow"):
+        assert sh.step() is True
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    rows = [json.loads(x) for x in (tmp_path / "2026-11-13.jsonl").read_text(encoding="utf-8").splitlines()]
+    decided = [r for r in rows if r["kind"] not in (shadow.SUMMARY, shadow.TAPE_SUMMARY)]
+    assert [(r["kind"], r["code"], r["symbol"]) for r in decided] == \
+        [("no_action", "no_range", "AAAA"), ("no_action", "no_range", "BBBB")]
+    assert {r["source"] for r in decided} == {"picks feed"}
+    assert {r["tape_problem"] for r in decided} == {"no answer yet"}
+    assert [r["range"]["from"] for r in decided] == ["no first minute yet"] * 2
+
+
 def test_shadow_writes_each_decision_with_times_and_ages(tmp_path):
     feed = FakeFeed()
     feed.answers = [(es_answer({"open": 49.5, "high": 50.0, "low": 49.0, "close": 49.8}, as_of="09:30:59"),
