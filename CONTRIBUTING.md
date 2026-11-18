@@ -111,6 +111,12 @@ What to add:
   automatic flip and re-level, behind `EDGE_TRADER_PLAN_AUTO_FLIP=1`), `beside.py` (brief 30: it
   cancels its own resting entry when the user takes the other side of that name). It sends and cancels only
   through `companion/plan_entries.py` and so through `Trader.submit` and `Trader.cancel_entry`.
+- `companion/opening_plan/`: the Opening plan. `plan.py` builds the view, `fit.py` fits each row's
+  shares to the account, `bars.py` reads the charts' 1-minute bars inside the call budget, `routes.py`
+  serves the A1 page (`static/opening_plan_a1.html`), the table (`static/opening_plan.html`) and the
+  vendored chart library (`static/vendor/`, see its `VENDORED.md`). It imports no order code.
+- `companion/plan_entries.py`, `companion/plan_flat.py`: the plan's clicks (Place, Place all 4, Cancel,
+  Flip, Chase, Take; Flat all, Flatten, Cancel stop), each through `Trader.submit` or `Trader.cancel_entry`.
 - `companion/plan_side.py`, `companion/plan_close.py`: the Opening plan beside your own trades on the
   same name (brief 25): which side you are on, which shares are the plan's (told apart by the plan's
   own stop), and Flat all's close of only the plan's shares, inside Trader's one-at-a-time lock.

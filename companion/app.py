@@ -424,13 +424,16 @@ try:
     from .spreads import routes as _feature_routes
 except ImportError:
     _feature_routes = None
-# The Opening plan (display only, off unless EDGE_SCANNER_URL is set) registers first: its fixed
+# The Opening plan (off unless EDGE_SCANNER_URL is set) registers first: its fixed
 # /features/openingplan.js must come before the spreads' /features/{name}.js.
 try:
     from .opening_plan import routes as _plan_routes
 except ImportError:
     _plan_routes = None
-FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO, snapshot=poller.snapshot, private=PRIVATE, rates=PREVIEW_RATES) if _plan_routes else []
+# The A1 charts' 1-minute bars (companion/opening_plan/bars.py): budgeted like the opening probe.
+# poller.client is the read-only client (schwab._ALLOWED); the order client has no price_history.
+_plan_bars = None if (DEMO or _plan_routes is None) else _plan_routes.bars_source(poller)
+FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO, snapshot=poller.snapshot, private=PRIVATE, bars=_plan_bars, rates=PREVIEW_RATES) if _plan_routes else []
 FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
 # Place / Cancel / Flip on the plan rows (Step 4): only with EDGE_TRADER_PLAN_BUTTONS=1,
 # EDGE_TRADER_BREAK_ENTRY=1 and the plan on.

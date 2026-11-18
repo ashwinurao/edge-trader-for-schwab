@@ -1,6 +1,7 @@
 // Opening plan (companion/opening_plan): adds one header link that opens the plan screen in its own
 // window. Loaded by the dashboard only when the server lists "openingplan" in its features, which it
-// does only when EDGE_SCANNER_URL is set (or in --demo). The screen is display only: no orders.
+// does only when EDGE_SCANNER_URL is set (or in --demo). Its buttons send only on a click, each
+// behind its own switch (companion/plan_entries.py, plan_flat.py).
 (() => {
   const slot = document.querySelector("header span.only-main");
   if (!slot || document.getElementById("op-open")) return;
@@ -11,7 +12,7 @@
   a.target = "opening-plan";
   a.rel = "noopener";
   a.textContent = "Opening plan ⧉";
-  a.title = "OV picks opening plan: break levels, stops and shares from Edge Scanner. Display only, no orders.";
+  a.title = "OV picks opening plan: four charts, shares sized to the account, one button per pick.";
   a.style.textDecoration = "none";
   a.style.display = "inline-flex";
   a.style.alignItems = "center";

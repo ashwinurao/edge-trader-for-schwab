@@ -301,6 +301,10 @@ class PlanFlat:
         def refuse(text: str) -> dict:
             it.update(action=REFUSE, text=text)
             return it
+        if rec.get("taken"):
+            # Take control (the A1 page, 2026-11-18): the plan, Flat all included, leaves the pick.
+            it["text"] = "Yours: you took this pick, so Flat all leaves it."
+            return it
         state = rec.get("state") or plan_entries.NONE
         if state in plan_entries.BUSY:
             return refuse("A click on this row is still running. Look again in a moment.")
@@ -538,6 +542,52 @@ class PlanFlat:
             return REFUSED, err, False                     # 201 and then rejected: the position is still open
         return UNCLEAR, err, False
 
+    # ---- one pick: Flatten and Cancel stop on the A1 page ------------------------------------
+
+    def one(self, ticker: Any, expected: Any, actions: tuple) -> dict:
+        """Flat all for one pick (the A1 page's Flatten and Cancel stop, Ash's ask of 2026-11-18
+        14:07:45 UTC: "once it is filled i need buttons to cancel and flatten"). The same list, checks
+        and paths as Flat all (_item, _refusal, _one), for one row, and only when its action is one of
+        `actions`: Flatten is CLOSE_PLAN (close the plan's shares, which takes the place of its stop),
+        Cancel stop is CANCEL_STOP (only when the account holds none of the name: a stop is never
+        removed from shares that are held, CONTRIBUTING rule 2). `expected` is the row's item as the
+        page showed it; any difference refuses. It holds new entries while it runs, like a batch."""
+        ticker = str(ticker or "").upper().strip()
+        if self.demo:
+            return {"ok": False, "ticker": ticker, "error": "Demo mode: no orders and no Schwab calls."}
+        with self._lock:
+            if self._running:
+                return {"ok": False, "ticker": ticker, "error": "Flat all is running. Wait for its result."}
+            self._running = True
+        try:
+            why = self._refusal()
+            if why:
+                return {"ok": False, "ticker": ticker, "error": why}
+            try:
+                items = [it for it in self.items() if it["ticker"] == ticker]
+            except Exception as e:
+                return {"ok": False, "ticker": ticker, "error": f"Not sent: the plan's records could not be read ({e})."[:300]}
+            if not items:
+                return {"ok": False, "ticker": ticker, "error": f"{ticker} is not on the plan."}
+            it = items[0]
+            if it["action"] not in actions:
+                return {"ok": False, "ticker": ticker, "item": it,
+                        "error": it["text"] if it["action"] == REFUSE else "Nothing to do there now. Look again."}
+            if not self._same([expected], [it]):
+                return {"ok": False, "ticker": ticker, "item": it,
+                        "error": "The pick changed since the page showed it. Nothing was sent. Look again."}
+            log.warning("OPENING PLAN %s %s (order %s)", it["action"], ticker, it["order_id"])
+            try:
+                result, text, _ = self._one(it)
+            except Exception as e:
+                log.exception("opening plan one pick: %s", ticker)
+                result, text = UNCLEAR, f"Error while sending ({e}). Check thinkorswim."[:300]
+            return {"ok": result == DONE, "ticker": ticker, "result": result, "text": text,
+                    **({} if result == DONE else {"error": text})}
+        finally:
+            with self._lock:
+                self._running = False
+
     # ---- cover watch ------------------------------------------------------------------------
 
     def cover(self) -> dict[str, dict]:
@@ -720,6 +770,16 @@ def register(app, trader, poller, guard, desk: plan_entries.PlanDesk, demo: bool
     async def opening_plan_add_stop(request: Request):
         b = await body(request)
         return await run_in_threadpool(flat.add_stop, b.get("ticker"), b.get("expected"))
+
+    @app.post("/api/opening-plan/flatten")
+    async def opening_plan_flatten(request: Request):
+        b = await body(request)
+        return await run_in_threadpool(flat.one, b.get("ticker"), b.get("expected"), (CLOSE_PLAN,))
+
+    @app.post("/api/opening-plan/cancel-stop")
+    async def opening_plan_cancel_stop(request: Request):
+        b = await body(request)
+        return await run_in_threadpool(flat.one, b.get("ticker"), b.get("expected"), (CANCEL_STOP,))
 
     app.state.opening_plan_flat = flat
     return True

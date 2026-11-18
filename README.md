@@ -96,6 +96,15 @@ name are refused). It needs no account and sends no telemetry.
   the end of the watch (at the latest 09:35:45 ET). Before each send it also checks the pick's row against the
   last OV picks answer that the Opening plan screen or the shadow log fetched. It never asks Edge Scanner's
   picks route itself.
+- **The Opening plan's charts, only while its screen is open** (with `EDGE_SCANNER_URL` set, never in
+  `--demo`): Schwab's price history (`price_history`, 1-minute bars of today from 08:30 ET, on the
+  read-only client) for the four picks, at most one call per pick a minute, and only when the page
+  asks. The calls count in the app's limit of 70 a minute and give way like the opening probe: none
+  while the last 60 seconds hold 54 calls or more, while the armed plan's hold runs, in the 429 pause,
+  or from 09:29:30 to 09:33:00 ET, when the page draws the live minutes from the prices Edge Trader
+  already holds (`companion/opening_plan/bars.py`). A 429 answer starts the app's pause. Each call writes
+  a netlog `call` line (purpose `plan_bars`). The chart library (TradingView's lightweight-charts 4.2.3,
+  Apache-2.0) is in the repo and served by Edge Trader; the page loads nothing from the internet.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews Break orders, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -229,8 +238,11 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   target, partials at the mid, market, ask or bid (the stop and target are rebuilt on the rest), cancel
   orders and close.
 - **Floating windows:** small always-on-top Entry and Manage windows to keep next to your charts.
-- **Opening plan (optional, display only):** with `EDGE_SCANNER_URL` set, an "Opening plan" button
-  opens a screen with one row per OV pick of the day (ranks 1 to 4) from Edge Scanner: the 09:30 ET
+- **Opening plan (optional):** with `EDGE_SCANNER_URL` set, an "Opening plan" button opens the A1
+  screen (2026-11-18, below: "The A1 screen"): four chart cards, one per OV pick, each with its shares
+  sized to the account and one big button for the action that matters now, and a **Place all 4**
+  button on top. Its **Details** link opens the table below, which keeps every number and reason.
+  The table shows one row per OV pick of the day (ranks 1 to 4) from Edge Scanner: the 09:30 ET
   minute's high and low (marked "so far" until the bar is final, or "not confirmed" while it is Edge
   Scanner's early 09:30 bar from Alpaca's snapshot), the long entry one cent above the
   high and the short entry one cent below the low, each with its stop at the other side, the risk per
@@ -522,6 +534,60 @@ cap is 0.15 x 1.01 = 0.15, but at most 0.15% of 50.01 = 0.075, rounded down to 0
 50.08. $101 at risk on a day that is not calm buys 101 / 1.01 = 100 shares. A trade at or below 49.40
 before a fill (60% of the way to the low) would flip it to the short side. 50.04 is already inside
 50.01 to 50.08, so the next line is `would_fill` at 50.04.
+
+**The A1 screen (2026-11-18, Ash's go 20:00:20 UTC in the project thread).** `/opening-plan` shows
+the day's four picks as cards in rank order (`companion/opening_plan/static/opening_plan_a1.html`):
+- **Top line:** the clock, the risk per pick (a slider, saved like before), a meter of how much of the
+  account's room the four picks use if all fill, the gear (the room share and the margin for a name with
+  no preview), "sends 1 share" while the size stage is the test stage, a count of filled, working, flip
+  and chase picks, **Place all 4**, **Flat all**, and **Details** (the table).
+- **Each card:** the ticker, its live price, ATR, the margin Schwab charges for the side ("2.5x", or
+  "1.4x?" when no preview gave the name's rate), the shares, and a chart of 1-minute bars fixed from
+  08:30 to 11:00 ET with the BUY and SELL levels (the side shown is solid, the other dashed), the STOP
+  once filled and the CHASE limit while a chase rests. Before 09:30 ET the card says "sizes at 09:31".
+- **One big button per card**, for what the pick needs now: **Flip** to the other side when the price
+  crossed it while the entry rests; **Chase** when the price is past the entry with nothing filled;
+  **Flatten** once filled. **Cancel** and **Take** are small beside it. Before any entry exists today
+  only Place all 4 acts; after it, a pick with no entry gets its own **Place**.
+
+All buttons are behind the switches of "Place, Cancel and Flip" below (and Flat all's for Flatten), each
+sends only on its click, and every click is checked on the server against its latest row (the page
+sends what it showed; a difference refuses). Nothing is automatic.
+- **Place all 4** places each pick through Place's own checks, one at a time in rank order. A pick that
+  is refused does not stop the others; a 429 from Schwab stops the rest
+  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`).
+- **Chase** (`PlanDesk.chase`, `POST /api/opening-plan/chase`): reads one Schwab quote; when the price is
+  still past the entry it cancels the resting entry (if one rests) and waits until Schwab confirms it
+  CANCELED with nothing filled, then sends a break entry with its trigger at the ask (long) or bid (short)
+  and its limit 0.1% past that, at least one cent (`break_entry.chase_levels`). The stop stays at the
+  09:30 minute's other side. The plan's shares for the side are made smaller so the dollar risk does not
+  grow (the stop is farther), never larger; then the size stage applies (1 share at the test stage). If
+  the price is back inside, nothing is sent ("Use Place"). If by the send the price ran past the limit,
+  the send is refused. A failed cancel turns the row red and sends nothing, like Flip. Only this click
+  lets a break entry go with the price through its level (`break_entry.click_chase`, set by the server
+  around the one send); the ticket's own Break entry still refuses it. **Not confirmed yet:** that Schwab
+  accepts a buy stop-limit whose stop is at the ask; the first 1-share chase answers it.
+- **Take** (`POST /api/opening-plan/take`) hands a pick to you for the day: the plan's Place, Flip, Chase
+  and Cancel refuse it and Flat all leaves it. Nothing is sent and its orders stay as they are. **Give
+  back** undoes it.
+- **Flatten** (`POST /api/opening-plan/flatten`) is Flat all for one pick: the same list, checks and
+  path (close the plan's shares, which replaces its stop). **Cancel stop** (`POST
+  /api/opening-plan/cancel-stop`) shows only when Flat all's list says the plan's stop rests with no
+  shares held: a stop is never cancelled under shares you hold (CONTRIBUTING.md rule 2). For held shares
+  without the plan, use Take and thinkorswim.
+
+**Fit the account (`companion/opening_plan/fit.py`).** Each side's shares are the smaller of what the
+risk per pick gives and what the account's room gives:
+`floor((4 x equity x room share / 4 picks) / (entry x the name's rate))`. The rate is Schwab's for that
+name and side from this morning's previews (day-trading buying power first, then buying power); a name
+with no preview counts at the gear's margin (2.8 by default, the most Schwab charged 2026-11-16 to
+11-18). Then the rows without an entry today are scaled down together, rounded down, so their cost
+stays inside each buying power number Schwab reports. A number below 0 gives 0 shares. When the account
+or its buying power is not known, the row has no shares and says why: nothing is sent on a guess. The
+page shows shares and percents only, never a dollar amount, also with `--private`. Example with equity
+10,000 and the room at 100%: 10,000 a pick; AAAA long at 42.49 and Schwab's 1.6 gives 147 shares where
+risk alone gives 175 (`tests/test_opening_plan_a1.py`). The size stage still decides what is sent: 1
+share at the test stage.
 
 **Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
 and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
@@ -1077,8 +1143,9 @@ folder across, run `setup.bat` once, then `launch.bat`.
 | `COMPANION_PORT` | The local port. Default `8770`. |
 | `EDGE_TRADER_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
 | `EDGE_TRADER_BREAK_ENTRY` | `1` shows the Break entry on the ticket (a stop-limit entry with its stop, 1 share). Off by default. |
-| `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the display-only Opening plan. Unset: off. |
+| `EDGE_SCANNER_URL` | Edge Scanner's LAN address (e.g. `http://192.168.1.10:8772`). Turns on the Opening plan (its buttons need their own switches). Unset: off. |
 | `EDGE_TRADER_PLAN_DEMO_ET` | `--demo` only: the time of day (ET, e.g. `09:10:00`) the demo clock starts at, so the Opening plan shows the 09:00 to 09:25 preview. Default: 09:31:05. |
+| `EDGE_TRADER_PLAN_DEMO_NO_ENTRIES` | `--demo` only: `1` shows the plan with no invented entries, as before Place all 4. |
 | `EDGE_TRADER_PLAN_DEMO_RV20` | `--demo` only: the SPY RV20 the demo's Opening plan reads (e.g. `12.3` for a day that is not calm). Default: 9.80, a calm day. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 | `EDGE_TRADER_NETLOG` | `0` turns off the network record in `data/netlog/` (answers, calls, waits, routes, refusals, lag) and its threads. On by default. |
