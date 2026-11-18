@@ -117,12 +117,40 @@ class FlatBroker(PlanBroker):
                  filledQuantity=n, orderActivityCollection=[
                      {"executionType": "FILL", "executionLegs": [{"quantity": n, "price": 42.50, "time": when}]}])
         self._move({**leg, "quantity": n})
-        for ch in o.get("childOrderStrategies") or []:
+
+        # Every exit under the entry, also inside an OCO (the plan's 5% target with its stop).
+        def start(ch):
             ch["status"] = "WORKING" if stop_live else "CANCELED"
-            if stop_live:
+            if stop_live and ch.get("orderLegCollection"):
                 ch["quantity"] = n
                 for lg in ch.get("orderLegCollection") or []:
                     lg["quantity"] = n
+            for k in ch.get("childOrderStrategies") or []:
+                start(k)
+        for ch in o.get("childOrderStrategies") or []:
+            start(ch)
+
+
+def plan_stop(order):
+    """The STOP under a plan entry, also inside the OCO with its 5% target (2026-11-18)."""
+    stack = list(order.get("childOrderStrategies") or [])
+    while stack:
+        o = stack.pop(0)
+        if o.get("orderType") == "STOP":
+            return o
+        stack.extend(o.get("childOrderStrategies") or [])
+    raise AssertionError("no stop under the entry")
+
+
+def plan_target(order):
+    """The LIMIT target under a plan entry (its OCO with the stop), or None."""
+    stack = list(order.get("childOrderStrategies") or [])
+    while stack:
+        o = stack.pop(0)
+        if o.get("orderType") == "LIMIT" and o.get("orderLegCollection"):
+            return o
+        stack.extend(o.get("childOrderStrategies") or [])
+    return None
 
 
 def four_rows():
@@ -201,13 +229,13 @@ def test_the_list_for_each_kind_of_row(fr):
     got = {it["ticker"]: (it["action"], it["order_id"], it["shares"]) for it in items}
     # Brief 25 rule D: a filled row closes the plan's own shares by its stop (order id: the stop), and
     # a row whose account holds none while the plan's stop works cancels that stop.
-    stop_a, stop_c = (fr.broker.orders[x]["childOrderStrategies"][0]["orderId"] for x in (a, c))
+    stop_a, stop_c = (plan_stop(fr.broker.orders[x])["orderId"] for x in (a, c))
     assert got == {"AAAA": ("close_plan", stop_a, 1.0), "BBBB": ("cancel", b_, None),
                    "CCCC": ("cancel_stop", stop_c, None), "DDDD": ("nothing", d, None)}
     t = by_ticker(items)
     assert t["AAAA"]["text"] == "Close the plan's 1 share at the market."
     assert t["BBBB"]["text"] == f"Cancel the unfilled long entry (order {b_})."
-    assert t["CCCC"]["text"] == f"The account holds no CCCC: cancel the plan's stop (order {stop_c})."
+    assert t["CCCC"]["text"] == f"The account holds no CCCC: cancel the plan's stop (order {stop_c}) and target."
     assert "ended CANCELED" in t["DDDD"]["text"]
 
 
@@ -283,8 +311,8 @@ def test_cancels_first_then_closes_in_rank_order(fr):
     items = fr.flat.items()
     r = fr.flat.run(expected(items))
     assert r["ok"], r
-    stop_a = fr.broker.orders[a]["childOrderStrategies"][0]["orderId"]
-    stop_c = fr.broker.orders[c]["childOrderStrategies"][0]["orderId"]
+    stop_a = plan_stop(fr.broker.orders[a])["orderId"]
+    stop_c = plan_stop(fr.broker.orders[c])["orderId"]
     assert mutating(fr) == [("cancel", b_), ("cancel", d), ("replace", stop_a), ("replace", stop_c)]
     assert fr.broker.pos == {"AAAA": 0.0, "CCCC": 0.0}
     res = {x["ticker"]: x["result"] for x in r["batch"]["rows"]}
@@ -358,7 +386,7 @@ def test_a_refused_row_and_an_unclear_row_do_not_stop_the_rest(fr):
     # AAAA: an earlier close is still unclear, so the Close path refuses it (nothing sent).
     fr.trader.store.log_action("close", "AAAA", None, "UNKNOWN", "no answer")
     # BBBB: Schwab does not answer the close (its stop's replace): unclear.
-    fr.broker.no_answer_replace.add(fr.broker.orders[b_]["childOrderStrategies"][0]["orderId"])
+    fr.broker.no_answer_replace.add(plan_stop(fr.broker.orders[b_])["orderId"])
     fr.broker.calls.clear()
     r = fr.flat.run(expected(fr.flat.items()))
     res = {x["ticker"]: (x["result"], x["text"]) for x in r["batch"]["rows"]}
@@ -453,7 +481,7 @@ def test_a_place_and_a_flip_during_a_batch_are_refused_and_send_nothing(fr):
     assert not p["ok"] and p["error"] == plan_flat.HOLD
     assert not f["ok"] and f["error"] == plan_flat.HOLD
     assert out["batch"]["ok"], out["batch"]
-    stop_a = fr.broker.orders[a]["childOrderStrategies"][0]["orderId"]
+    stop_a = plan_stop(fr.broker.orders[a])["orderId"]
     assert mutating(fr)[-3:] == [("cancel", b_), ("cancel", c), ("replace", stop_a)]   # the batch's own
     assert len(fr.broker.placed) == n_placed                                           # no new entry
     assert int(fr.desk._load()["CCCC"].get("flips") or 0) == 0                         # the flip used none
@@ -707,10 +735,10 @@ def test_covered_again_resets_the_timer(fr):
     a = place(fr, "AAAA")
     fr.broker.fill_entry(a, stop_live=False)
     fr.flat.cover()
-    fr.broker.orders[a]["childOrderStrategies"][0]["status"] = "WORKING"
+    plan_stop(fr.broker.orders[a])["status"] = "WORKING"
     fr.mono[0] = 10.0
     assert fr.flat.cover()["AAAA"]["state"] == "covered"
-    fr.broker.orders[a]["childOrderStrategies"][0]["status"] = "CANCELED"
+    plan_stop(fr.broker.orders[a])["status"] = "CANCELED"
     assert not fr.flat.cover()["AAAA"]["red"]                      # a new grace starts
 
 

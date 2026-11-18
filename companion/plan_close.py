@@ -17,6 +17,12 @@ cancel the user's orders. These two actions touch only the plan's own stop:
   It is the one action here that removes a stop, so it reads Schwab's position again under Trader's
   lock first and sends nothing unless that read shows none (architect's review 1 of PR #35).
 
+The plan's 5% target (Ash, 2026-11-18 23:46:05 UTC) rests in one OCO with the plan's stop. Schwab
+cancels it when the stop is replaced by the close (seen live on a ticket bracket, 2026-11-06). After a
+close that filled, and after the plan's stop is cancelled, `_drop_target` reads the target and cancels
+it if it still works, because a target left alone could open a new position. It touches only the
+plan's own target.
+
 Both run inside Trader, never around it (architect, 2026-11-13 20:30 UTC): Trader's one-at-a-time
 lock (_send_lock), its client (_ensure), its block on a name with an unclear close (_blocked), its
 request log (_logged) and its action log. An unclear answer is logged as a "close" with status
@@ -65,14 +71,50 @@ def _locked(trader, symbol: str, fn) -> dict:
         trader._send_lock.release()
 
 
-def close_plan_shares(trader, symbol: str, side: str, stop_id: int, qty: float) -> dict:
+def _drop_target(trader, client, symbol: str, target_id) -> str:
+    """The plan's target after its shares are gone: "" when it is not working (the OCO took it), or
+    after it is cancelled and Schwab says CANCELED; else a WARNING note. Never raises."""
+    if not isinstance(target_id, int) or isinstance(target_id, bool):
+        return ""
+    try:
+        d = trader._logged("order_details", lambda: client.order_details(trader._hash, target_id))
+        st = (d.json() or {}).get("status") if d.status_code == 200 else None
+        if st in TERMINAL:
+            if st == "FILLED":
+                return (f"WARNING: the plan's target {target_id} filled too. Check the {symbol} position in "
+                        "thinkorswim now.")
+            return ""
+        trader.store.log_action("close", symbol, target_id, "SENDING", f"cancel the plan's target {target_id}")
+        c = trader._logged("cancel_order", lambda: client.cancel_order(trader._hash, target_id))
+        if c.status_code in (200, 201):
+            for _ in range(3):
+                time.sleep(0.35)
+                d = trader._logged("order_details", lambda: client.order_details(trader._hash, target_id))
+                st = (d.json() or {}).get("status") if d.status_code == 200 else None
+                if st in TERMINAL:
+                    break
+        if st == "CANCELED":
+            trader.store.log_action("close", symbol, target_id, "DONE", "the plan's target cancelled")
+            return ""
+        if st == "FILLED":
+            return (f"WARNING: the plan's target {target_id} filled too. Check the {symbol} position in "
+                    "thinkorswim now.")
+        trader.store.log_action("close", symbol, target_id, "CHECK", f"the plan's target not confirmed gone: {st}")
+    except Exception as e:
+        log.warning("plan target %s %s: %r", symbol, target_id, e)
+    return (f"WARNING: the plan's target {target_id} may still work: cancel it in thinkorswim now, or it could "
+            f"open a new {symbol} position.")
+
+
+def close_plan_shares(trader, symbol: str, side: str, stop_id: int, qty: float, target_id=None) -> dict:
     """Replace the plan's stop `stop_id` with a market order for the plan's `qty` (one PUT). The
-    answer has close_position's keys (ok, order_id, filled, unresolved_close, message, error)."""
+    answer has close_position's keys (ok, order_id, filled, unresolved_close, message, error).
+    `target_id`: the plan's target in the stop's OCO, cancelled after the close fills if Schwab left it."""
     symbol = str(symbol or "").upper().strip()
-    return _locked(trader, symbol, lambda: _close(trader, symbol, side, int(stop_id), float(qty)))
+    return _locked(trader, symbol, lambda: _close(trader, symbol, side, int(stop_id), float(qty), target_id))
 
 
-def _close(trader, symbol: str, side: str, stop_id: int, qty: float) -> dict:
+def _close(trader, symbol: str, side: str, stop_id: int, qty: float, target_id=None) -> dict:
     client = trader._ensure()
     blocked = trader._blocked(symbol, client)
     if blocked:
@@ -139,6 +181,10 @@ def _close(trader, symbol: str, side: str, stop_id: int, qty: float) -> dict:
                 "unresolved_close": False, "message": text, "error": text}
     done = filled >= qty - 1e-9
     notes = []
+    if done:
+        gone = _drop_target(trader, client, symbol, target_id)
+        if gone:
+            notes.append(gone)
     if done and rest > 1e-9:
         notes.append(f"Your other {rest:g} stay, with your own orders untouched.")
     try:
@@ -158,15 +204,16 @@ def _close(trader, symbol: str, side: str, stop_id: int, qty: float) -> dict:
             "unresolved_close": not done and status not in TERMINAL, "message": text, "error": None if ok else text}
 
 
-def cancel_plan_stop(trader, symbol: str, stop_id: int) -> dict:
+def cancel_plan_stop(trader, symbol: str, stop_id: int, target_id=None) -> dict:
     """Cancel the plan's stop (the account holds none of the name) and read it back until Schwab
     says CANCELED (at most 3 reads, as Trader.cancel_entry). Filled meanwhile: said, nothing more
-    sent. No clear answer: a "close" logged UNKNOWN, so the name stays blocked until Resolve."""
+    sent. No clear answer: a "close" logged UNKNOWN, so the name stays blocked until Resolve.
+    `target_id`: the plan's target, cancelled too once the stop is."""
     symbol = str(symbol or "").upper().strip()
-    return _locked(trader, symbol, lambda: _cancel(trader, symbol, int(stop_id)))
+    return _locked(trader, symbol, lambda: _cancel(trader, symbol, int(stop_id), target_id))
 
 
-def _cancel(trader, symbol: str, stop_id: int) -> dict:
+def _cancel(trader, symbol: str, stop_id: int, target_id=None) -> dict:
     client = trader._ensure()
     blocked = trader._blocked(symbol, client)
     if blocked:
@@ -214,8 +261,13 @@ def _cancel(trader, symbol: str, stop_id: int) -> dict:
                 break
     if st == "CANCELED":
         trader.store.log_action("close", symbol, stop_id, "DONE", "the plan's stop cancelled")
+        gone = _drop_target(trader, client, symbol, target_id)
+        if gone:
+            return {"ok": False, "symbol": symbol, "order_id": stop_id, "status": st, "unresolved_close": False,
+                    "message": "Cancelled the plan's stop. " + gone, "error": "Cancelled the plan's stop. " + gone}
         return {"ok": True, "symbol": symbol, "order_id": stop_id, "status": st,
-                "message": "Cancelled the plan's stop: the account held none of the plan's shares."}
+                "message": "Cancelled the plan's stop" + (" and target" if target_id else "")
+                           + ": the account held none of the plan's shares."}
     if st == "FILLED":
         trader.store.log_action("close", symbol, stop_id, "CHECK", "the plan's stop filled before the cancel")
         text = (f"The plan's stop filled before the cancel: check the {symbol} position in thinkorswim. "

@@ -326,7 +326,8 @@ function drawChart(row, side, k, day) {
   c.candles.setData(grid);
   c.vol.setData(data.map(b => ({ time: b.time, value: b.volume || 0, color: b.close >= b.open ? "#1d3528" : "#3a2427" })));
   const e = entryOf(row.ticker), ent = (e || {}).entry || {};
-  const key = JSON.stringify([row.long && row.long.entry, row.short && row.short.entry, side, k, e && e.click_chase, ent.filled]);
+  const tgt = e && e.target && e.target.sent && (ent.state === "SENT") ? Number(e.target.sent) : null;
+  const key = JSON.stringify([row.long && row.long.entry, row.short && row.short.entry, side, k, e && e.click_chase, ent.filled, tgt]);
   if (key !== c.key) {
     c.lines.forEach(l => c.candles.removePriceLine(l)); c.lines = [];
     const line = (price, color, title, style, w = 1) => c.lines.push(c.candles.createPriceLine({ price, color, lineWidth: w, lineStyle: style, axisLabelVisible: true, title }));
@@ -336,6 +337,8 @@ function drawChart(row, side, k, day) {
       line(row.long.entry, L ? "#4caf50" : "#4caf5066", L ? "BUY" : "", L ? LC.LineStyle.Solid : LC.LineStyle.Dashed, L ? 2 : 1);
       line(row.short.entry, Sh ? "#ef5350" : "#ef535066", Sh ? "SELL" : "", Sh ? LC.LineStyle.Solid : LC.LineStyle.Dashed, Sh ? 2 : 1);
       if (k === "FILLED" && side) line(row[side.toLowerCase()].stop, "#8597ad", "STOP", LC.LineStyle.Dotted);
+      // Ash's 5% target (2026-11-18 23:46:05 UTC): the target the plan's order carries, once sent.
+      if (tgt) line(tgt, "#26a69a", "TARGET", LC.LineStyle.Dotted);
       if (e && e.click_chase && ent.state === "SENT" && ent.resting) line(Number(e.click_chase.limit), "#ffa726", "CHASE", LC.LineStyle.Solid, 2);
     }
     c.key = key;
@@ -384,7 +387,7 @@ function placeAllPicks(v) {
     const sl = side.toLowerCase();
     if ((e.place || {})[sl] || !(e.send || {})[sl]) continue;
     const n = e.send[sl];
-    out.push({ ticker: row.ticker, side, expected: { trigger: n.trigger, stop: n.stop, shares: n.shares } });
+    out.push({ ticker: row.ticker, side, target: (e.target || {})[sl], expected: { trigger: n.trigger, stop: n.stop, shares: n.shares } });
   }
   return out;
 }
@@ -432,7 +435,7 @@ function render() {
   btn.textContent = picks.length && picks.length !== 4 ? `Place ${picks.length}` : "Place all 4";
   btn.disabled = !S.entries || !picks.length || S.busy.has("*");
   btn.title = !S.entries ? "The plan buttons are off (EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1)." :
-    picks.length ? picks.map(p => `${p.ticker} ${p.side.toLowerCase()} ${p.expected.trigger}, stop ${p.expected.stop}, ${p.expected.shares} sh`).join("\n") :
+    picks.length ? picks.map(p => `${p.ticker} ${p.side.toLowerCase()} ${p.expected.trigger}, stop ${p.expected.stop}, target ${p.target || "?"}, ${p.expected.shares} sh`).join("\n") :
     "Nothing to place: the 09:30 bar is not final, or every pick already has an entry or is refused.";
   btn.style.display = anyEntryToday() && !picks.length ? "none" : "";
   $("flatAll").style.display = S.flat ? "" : "none";

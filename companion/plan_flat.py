@@ -360,7 +360,8 @@ class PlanFlat:
                 if why:
                     return refuse(why)
                 it.update(action=CANCEL_STOP, order_id=ps.stop_id,
-                          text=f"The account holds no {ticker}: cancel the plan's stop (order {ps.stop_id}).")
+                          text=f"The account holds no {ticker}: cancel the plan's stop (order {ps.stop_id})"
+                          + (" and target." if ps.target_id else "."))
             elif abs(held) < filled - 1e-9:
                 # Not confirmed: what Schwab does with the plan's stop for more shares than are held.
                 return refuse(f"The account holds {_sh(abs(held))} of {ticker}, fewer than the {filled:g} the plan's "
@@ -371,6 +372,9 @@ class PlanFlat:
                 it.update(action=CLOSE_PLAN, order_id=ps.stop_id, shares=filled,
                           text=f"Close the plan's {_sh(filled)} at the market." +
                           (f" Your other {rest:g} stay." if rest > 1e-9 else ""))
+        if it["action"] in (CANCEL_STOP, CLOSE_PLAN) and ps.target_id is not None:
+            # The plan's 5% target (plan_close._drop_target): not part of the page's list check.
+            it["target_id"] = ps.target_id
         if blocked is None or ticker in blocked:
             return refuse(f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then press "
                           "Resolve.")
@@ -498,7 +502,7 @@ class PlanFlat:
         """One row through its existing path: (result, text, a 429 seen)."""
         ticker = it["ticker"]
         if it["action"] == CANCEL_STOP:
-            r = plan_close.cancel_plan_stop(self.trader, ticker, it["order_id"])
+            r = plan_close.cancel_plan_stop(self.trader, ticker, it["order_id"], it.get("target_id"))
             if r.get("ok"):
                 return DONE, str(r.get("message") or "Cancelled the plan's stop."), False
             err = str(r.get("error") or "no answer")
@@ -508,7 +512,8 @@ class PlanFlat:
                 return REFUSED, err, False
             return UNCLEAR, err, False
         if it["action"] == CLOSE_PLAN:
-            r = plan_close.close_plan_shares(self.trader, ticker, it["side"], it["order_id"], it["shares"])
+            r = plan_close.close_plan_shares(self.trader, ticker, it["side"], it["order_id"], it["shares"],
+                                             it.get("target_id"))
             return self._closed(r)
         if it["action"] == CANCEL:
             r = self.desk.cancel(ticker, order_id=it["order_id"])

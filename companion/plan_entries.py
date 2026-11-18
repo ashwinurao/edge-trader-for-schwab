@@ -320,6 +320,16 @@ class PlanDesk:
         return ({"trigger": str(trig.quantize(Decimal("0.01"))), "stop": str(stop.quantize(Decimal("0.01"))),
                  "plan_shares": shares, "shares": n}, why)
 
+    def _target(self, row: Mapping, side: str) -> Optional[str]:
+        """The 5% target a Place on this side would send (break_entry.target_for), or None."""
+        n = self._numbers(row, side)
+        if n is None:
+            return None
+        try:
+            return break_entry.fmt(break_entry.target_for(side, n["trigger"]))
+        except ValueError:
+            return None
+
     def _numbers(self, row: Mapping, side: str) -> Optional[dict]:
         return self._sized(row, side)[0]
 
@@ -563,7 +573,11 @@ class PlanDesk:
                  "click_chase": rec.get("click_chase"),
                  "chase": {k.lower(): self._chase_click_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
                            for k in ("LONG", "SHORT")},
-                 "price": {k.lower(): self._price_line(row, k, held.get(ticker)) for k in ("LONG", "SHORT")}}
+                 "price": {k.lower(): self._price_line(row, k, held.get(ticker)) for k in ("LONG", "SHORT")},
+                 # Ash's 5% target: what a Place would send per side, and the target the row's
+                 # last click sent (a chase counts from its own trigger).
+                 "target": {**{k.lower(): self._target(row, k) for k in ("LONG", "SHORT")},
+                            "sent": rec.get("target")}}
             out["rows"].append(r)
         return out
 
@@ -607,10 +621,13 @@ class PlanDesk:
             shown = "" if n is None else f" It is now {side.lower()} {n['trigger']}, stop {n['stop']}, {n['shares']} sh."
             return None, f"The plan changed since the page showed it.{shown} Review and click again."
         try:
-            req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"])
+            # Ash's 5% target (break_entry.TARGET_PCT, 2026-11-18 23:46:05 UTC), from the plan's level.
+            req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"],
+                                            target=break_entry.target_for(side, n["trigger"]))
         except ValueError as e:
             return None, f"Could not build the order: {e}"
         self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, click_chase=None,
+                  target=req.get("target_price"),
                   text=f"Sending the {side.lower()} break entry." if not flip_from else
                   f"Cancelled the {flip_from.lower()} entry; sending the {side.lower()} break entry.")
         log.warning("OPENING PLAN %s %s break: trigger %s stop %s, %s sh (plan %s)", side, ticker,
@@ -966,10 +983,13 @@ class PlanDesk:
         if qty < 1:
             return self._refuse(ticker, f"0 shares at the chase price {break_entry.fmt(lim)} for this risk. Nothing was sent.")
         try:
-            req = break_entry.build_request(ticker, side, trig, stop, qty, cap=abs(lim - trig))
+            # The chase's own trigger is its entry price: the 5% target counts from there.
+            req = break_entry.build_request(ticker, side, trig, stop, qty, cap=abs(lim - trig),
+                                            target=break_entry.target_for(side, trig))
         except ValueError as e:
             return self._refuse(ticker, f"Could not build the order: {e}")
-        chase_rec = {"trigger": req["trigger"], "limit": req["limit"], "stop": req["stop"], "shares": qty,
+        chase_rec = {"trigger": req["trigger"], "limit": req["limit"], "stop": req["stop"],
+                     "target": req.get("target_price"), "shares": qty,
                      "at": self._now().isoformat(timespec="seconds")}
         c = None
         if resting:
@@ -1005,7 +1025,7 @@ class PlanDesk:
                 self._put(ticker, state=NONE, order_id=None, text=f"Cancelled the entry. Did not chase: {held}")
                 return self._refuse(ticker, f"Did not chase: {held}", cancel=c)
             self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
-                            click_chase=chase_rec, chases_click=int(rec.get("chases_click") or 0) + 1,
+                            target=req.get("target_price"), click_chase=chase_rec, chases_click=int(rec.get("chases_click") or 0) + 1,
                             text=f"Sending the {side.lower()} chase at {req['trigger']}, limit {req['limit']}.")
         log.warning("OPENING PLAN %s %s chase: trigger %s limit %s stop %s, %s sh (plan %s)", side, ticker,
                     req["trigger"], req["limit"], req["stop"], qty, plan_n)

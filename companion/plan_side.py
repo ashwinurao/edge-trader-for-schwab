@@ -161,6 +161,7 @@ class PlanShares:
     stop_id: Optional[int] = None       # the plan's working stop
     stop_qty: float = 0.0
     stop_price: Optional[float] = None
+    target_id: Optional[int] = None     # the plan's working LIMIT target (its 5% target, in one OCO with the stop)
     fill_at: Optional[datetime] = None  # the entry's last fill time
     ids: set = field(default_factory=set)
     text: str = ""
@@ -221,9 +222,24 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
     stops_hit = [n for i, n in exits.items() if status[i] == "FILLED" and n.get("orderType") in STOP_TYPES]
     live = [i for i, n in exits.items() if status[i] in LIVE and n.get("orderType") in STOP_TYPES]
     waiting = [i for i, n in exits.items() if status[i] == "AWAITING_PARENT_ORDER"]
+    # The plan's 5% target (Ash, 2026-11-18 23:46:05 UTC): a LIMIT exit, in one OCO with its stop.
+    targets = [i for i, n in exits.items() if status[i] in LIVE and n.get("orderType") not in STOP_TYPES]
+    if any((_f(node[i].get("filledQuantity")) or 0.0) > EPS for i in targets):
+        out.state, out.text = UNCLEAR, "The plan's target filled part of its shares. Check thinkorswim."
+        return out
+    if len(targets) > 1:
+        out.state, out.text = UNCLEAR, "The plan's entry shows more than one working target. Check thinkorswim."
+        return out
+    out.target_id = targets[0] if targets else None
     if closes or stops_hit:
         if live:
             out.state, out.text = UNCLEAR, "Part of the plan's shares closed and its stop still works. Check thinkorswim."
+            return out
+        if targets:
+            # The OCO cancels the target when the stop or the close fills; still working, it could open
+            # a new position. Schwab's list may lag a moment, so this says look again.
+            out.state, out.text = UNCLEAR, ("The plan's shares are closed and its target still works. Look again in a "
+                                            "moment; if it stays, cancel it in thinkorswim.")
             return out
         got = sum(_f(n.get("filledQuantity")) or 0.0 for n in closes + stops_hit)
         if abs(got - filled) > EPS:
@@ -231,7 +247,9 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
                                             "Check thinkorswim.")
             return out
         out.state = CLOSED if closes else STOPPED
-        out.text = ("The plan closed its " if closes else "The plan's stop sold its ") + _sh(filled) + "."
+        hit = closes and all(n.get("orderType") == "LIMIT" for n in closes)
+        out.text = ("The plan's target closed its " if hit else "The plan closed its " if closes
+                    else "The plan's stop sold its ") + _sh(filled) + "."
         return out
     if len(live) > 1:
         out.state, out.text = UNCLEAR, "The plan's entry shows more than one working stop. Check thinkorswim."

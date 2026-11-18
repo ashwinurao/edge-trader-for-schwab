@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from companion import break_entry, plan_entries, plan_size
 from companion.bracket import MAX_NOTIONAL, MAX_SHARES
-from test_plan_entries import BOTH, LONG, LONG_REQ, NOW, make_app, rig, row, without_id  # noqa: F401  (rig is a fixture)
+from test_plan_entries import BOTH, LONG, LONG_CLICK_REQ, LONG_REQ, NOW, make_app, rig, row, without_id  # noqa: F401  (rig is a fixture)
 
 
 # ---------------------------------------------------------------- the stage
@@ -156,11 +156,13 @@ def test_a_plan_entry_at_a_quarter_sends_43_shares(rig):
     res = rig.desk.place("AAAA", "LONG", {**LONG, "shares": 43})
     assert res["ok"], res
     (req,) = rig.sent
-    assert without_id(req) == {**LONG_REQ, "qty": 43, "expected_qty": 43}
+    assert without_id(req) == {**LONG_CLICK_REQ, "qty": 43, "expected_qty": 43}
     (order,) = rig.broker.placed
     assert order["orderLegCollection"][0]["quantity"] == 43
-    (stop,) = [k for oco in order["childOrderStrategies"] for k in (oco.get("childOrderStrategies") or [oco])]
-    assert stop["orderLegCollection"][0]["quantity"] == 43
+    # The stop and the 5% target, one OCO, each for all 43 shares.
+    exits = [k for oco in order["childOrderStrategies"] for k in (oco.get("childOrderStrategies") or [oco])]
+    assert sorted(k["orderType"] for k in exits) == ["LIMIT", "STOP"]
+    assert all(k["orderLegCollection"][0]["quantity"] == 43 for k in exits)
 
 
 def test_a_page_sent_share_count_is_ignored(rig):

@@ -22,7 +22,7 @@ from companion.opening_plan import plan as P
 from companion.opening_plan import routes as R
 from companion.store import Store
 from test_plan_entries import LONG, NOW, SHORT
-from test_plan_flat import TICKERS, by_ticker, expected, fr, mutating, place  # noqa: F401  (fr is a fixture)
+from test_plan_flat import TICKERS, by_ticker, expected, fr, mutating, place, plan_stop  # noqa: F401  (fr is a fixture)
 from test_trading import Resp
 
 ET = P.ET
@@ -532,7 +532,7 @@ def test_flatten_closes_one_picks_shares_and_leaves_the_others(fr):
     assert it["action"] == plan_flat.CLOSE_PLAN
     r = fr.flat.one("AAAA", expected([it])[0], (plan_flat.CLOSE_PLAN,))
     assert r["ok"], r
-    stop_a = fr.broker.orders[a]["childOrderStrategies"][0]["orderId"]
+    stop_a = plan_stop(fr.broker.orders[a])["orderId"]
     assert mutating(fr) == [("replace", stop_a)] and fr.broker.pos["AAAA"] == 0.0
     assert ("cancel", b_) not in fr.broker.calls
 
@@ -556,7 +556,7 @@ def test_cancel_stop_goes_only_through_flat_alls_cancel_stop_item(fr):
     it = by_ticker(fr.flat.items())["AAAA"]
     r = fr.flat.one("AAAA", expected([it])[0], (plan_flat.CANCEL_STOP,))
     assert not r["ok"] and fr.broker.pos["AAAA"] == 1.0
-    stop_a = fr.broker.orders[a]["childOrderStrategies"][0]
+    stop_a = plan_stop(fr.broker.orders[a])
     assert stop_a["status"] == "WORKING"
 
 

@@ -60,6 +60,25 @@ _plan_cap: contextvars.ContextVar = contextvars.ContextVar("break_entry_plan_cap
 _click_chase: contextvars.ContextVar = contextvars.ContextVar("break_entry_click_chase", default=False)
 CHASE_BUFFER = Decimal("0.001")      # Ash's 0.1%: the chase's limit past its trigger
 
+# The Opening plan's target (Ash, project thread, 2026-11-18 23:46:05 UTC: "when placing the order it
+# should be a triggger w/ bracket order with both target and stop and the target should be flat 5% from
+# entry price"). It replaces his earlier "no target" (2026-11-18 13:40 UTC). Every Opening plan click
+# (Place, Place all 4, Flip, Chase) sends its entry with an OCO of this LIMIT target and its stop, the
+# ticket's own bracket shape (bracket.bracket_order). The armed sends of Steps 6 to 8 (on hold) do not.
+TARGET_PCT = Decimal("0.05")
+
+
+def target_for(side: str, entry) -> Decimal:
+    """The plan's target: TARGET_PCT past the entry's trigger on the profitable side (long: up, short:
+    down), on the stock's grid, rounded toward the entry so it is never further than 5%."""
+    side = str(side).upper()
+    e = _price(entry)
+    if side not in ("LONG", "SHORT") or e is None or not e.is_finite() or e <= 0:
+        raise ValueError("a target needs a side and an entry price")
+    if side == "LONG":
+        return _to_tick(e * (1 + TARGET_PCT), ROUND_FLOOR)
+    return _to_tick(e * (1 - TARGET_PCT), ROUND_CEILING)
+
 
 @contextmanager
 def click_chase():
@@ -129,8 +148,10 @@ def limit_for(side: str, trigger, cap) -> Decimal:
     return trig + c if side.upper() == "LONG" else trig - c
 
 
-def build_request(symbol: str, side: str, trigger, stop, shares, cap=None) -> dict:
-    """A complete request for Trader.submit: a break entry by quantity with its stop, no target.
+def build_request(symbol: str, side: str, trigger, stop, shares, cap=None, target=None) -> dict:
+    """A complete request for Trader.submit: a break entry by quantity with its stop, and with a
+    LIMIT target in one OCO with the stop when `target` is given (the Opening plan's clicks,
+    target_for), else no target.
 
     Raises ValueError when a price is not a number or the side is not LONG / SHORT. Everything
     else (sides of the trigger, the share cap, the quote) is checked by Trader.submit at the click.
@@ -149,14 +170,21 @@ def build_request(symbol: str, side: str, trigger, stop, shares, cap=None) -> di
         n = int(shares)
     except (TypeError, ValueError):
         raise ValueError("shares must be a whole number") from None
+    tg = None if target is None else _price(target)
+    if target is not None and (tg is None or not tg.is_finite()):
+        raise ValueError("target must be a number")
     c = default_cap(trig, st) if c is None else c
     lim = limit_for(side, trig, c)
-    return {
+    req = {
         "ticket_id": str(uuid.uuid4()), "symbol": str(symbol).upper().strip(), "side": side,
         "entry": "break", "trigger": fmt(trig), "limit": fmt(lim), "stop": fmt(st),
         "size_mode": "qty", "qty": n, "risk": 0, "r": 0, "targets": 0, "stop_type": "fixed",
         "expected_limit": fmt(lim), "expected_qty": n, "expected_target": 0,
     }
+    if tg is not None:
+        # bracket.plan takes the typed price as the target; prepare checks it again at the click.
+        req.update(targets=1, target_price=fmt(tg), expected_target=fmt(tg))
+    return req
 
 
 def _bad(req: dict, msg: str) -> Plan:
