@@ -458,8 +458,16 @@ class PlanDesk:
                 return o
         return None
 
+    @staticmethod
+    def _taken(ticker: str, rec: Mapping) -> str:
+        """Take control (Ash, 2026-11-18 13:40:22 UTC): the plan leaves a taken pick alone today."""
+        return f"You took {ticker}: the plan leaves it to you. Give it back to use these buttons." \
+            if rec.get("taken") else ""
+
     def _place_refusal(self, view, ticker, side, rec, entry, orders, blocked, fresh: bool = True) -> str:
         state = entry["state"]
+        if rec.get("taken"):
+            return self._taken(ticker, rec)
         if state in BUSY:
             return f"{ticker}: the last click is still running."
         if state == RED:
@@ -478,6 +486,8 @@ class PlanDesk:
         return self._send_refusal(view, ticker, side, blocked)
 
     def _flip_refusal(self, view, ticker, rec, entry, orders, blocked, fresh: bool = True) -> str:
+        if rec.get("taken"):
+            return self._taken(ticker, rec)
         if entry["state"] in BUSY:
             return f"{ticker}: the last click is still running."
         if entry["state"] == RED:
@@ -546,6 +556,11 @@ class PlanDesk:
                  "flip_to": OTHER[entry["side"]].lower() if entry["side"] in OTHER else None,
                  "flip": self._flip_refusal(view, ticker, rec, entry, orders, blocked, fresh),
                  "manual": self._manual_line(ticker, rec, orders),
+                 # The A1 page (2026-11-18): Take control, and the Chase click's own record and check.
+                 "taken": bool(rec.get("taken")),
+                 "click_chase": rec.get("click_chase"),
+                 "chase": {k.lower(): self._chase_click_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
+                           for k in ("LONG", "SHORT")},
                  "price": {k.lower(): self._price_line(row, k, held.get(ticker)) for k in ("LONG", "SHORT")}}
             out["rows"].append(r)
         return out
@@ -593,7 +608,7 @@ class PlanDesk:
             req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"])
         except ValueError as e:
             return None, f"Could not build the order: {e}"
-        self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
+        self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, click_chase=None,
                   text=f"Sending the {side.lower()} break entry." if not flip_from else
                   f"Cancelled the {flip_from.lower()} entry; sending the {side.lower()} break entry.")
         log.warning("OPENING PLAN %s %s break: trigger %s stop %s, %s sh (plan %s)", side, ticker,
@@ -677,6 +692,8 @@ class PlanDesk:
                 rec = recs.get(ticker) or {}
             except Exception as e:
                 return self._refuse(ticker, f"Not cancelled: {e}."[:300])
+            if rec.get("taken"):
+                return self._refuse(ticker, self._taken(ticker, rec))
             if rec.get("state") in BUSY:
                 return self._refuse(ticker, f"{ticker}: the last click is still running.")
             oid = rec.get("order_id")
@@ -775,6 +792,203 @@ class PlanDesk:
                 return self._refuse(ticker, f"Cancelled the {old.lower()} entry. {why}", cancel=c)
         return {**self._send(ticker, new, req), "cancel": c}
 
+    # ---- the A1 page's clicks (Ash's go 2026-11-18 20:00:20 UTC) ------------------------------
+
+    def place_all(self, picks: Any) -> dict:
+        """Place all 4: one click, each pick through Place's own checks, in the order sent (rank
+        order on the page), one at a time under Trader's lock. Ash, 2026-11-18 13:40:22 UTC: "I
+        should have a button at the top which can arm and place all 4 orders". Each pick carries the
+        side and numbers the page showed (`expected`), and any difference refuses that pick only.
+        A pick refused or not sent does not stop the others; Schwab's 429 stops the rest."""
+        if self.demo:
+            return {"ok": False, "error": "Demo mode: no orders and no Schwab calls.", "results": []}
+        if not isinstance(picks, list) or not picks:
+            return {"ok": False, "error": "No picks to place.", "results": []}
+        if len(picks) > 8:
+            return {"ok": False, "error": "Too many picks in one click.", "results": []}
+        seen, results, stopped = set(), [], ""
+        for p in picks:
+            if not isinstance(p, Mapping):
+                results.append(self._refuse("", "A pick must be an object."))
+                continue
+            ticker = str(p.get("ticker") or "").upper().strip()
+            if ticker in seen:
+                results.append(self._refuse(ticker, f"{ticker} was already in this click."))
+                continue
+            seen.add(ticker)
+            if stopped:
+                results.append(self._refuse(ticker, stopped))
+                continue
+            try:
+                r = self.place(ticker, p.get("side"), p.get("expected"))
+            except Exception as e:                   # place reports its own errors; this is a bug
+                log.exception("place all: %s", ticker)
+                r = self._refuse(ticker, f"Error while placing ({e}). Check thinkorswim."[:300])
+            results.append(r)
+            if r.get("status") == "RATE_LIMITED" or "429" in str(r.get("error") or ""):
+                stopped = "Not sent: Schwab is throttling (429), so Place all stopped."
+        ok = all(r.get("ok") for r in results)
+        log.warning("OPENING PLAN place all: %s", ", ".join(
+            f"{r.get('ticker')} {'ok' if r.get('ok') else 'refused'}" for r in results))
+        return {"ok": ok, "results": results,
+                "error": "" if ok else f"{sum(1 for r in results if not r.get('ok'))} of {len(results)} not placed."}
+
+    def take(self, ticker: str, on: bool = True) -> dict:
+        """Take control of a pick, or give it back (Ash, 2026-11-18 13:40:22 UTC: "buttons to take
+        control of one"). A taken pick: the plan's Place, Flip, Chase and Cancel refuse, and Flat all
+        leaves it (companion/plan_flat.py). Nothing is sent; the orders on it stay as they are. Like
+        any click it takes the row from the armed plan for the day (_put_click)."""
+        ticker = str(ticker or "").upper().strip()
+        if not ticker:
+            return self._refuse(ticker, "No pick named.")
+        if self.demo:
+            return self._refuse(ticker, "Demo mode: nothing is saved.")
+        with self._lock:
+            try:
+                recs = self._load()
+            except Exception as e:
+                return self._refuse(ticker, f"Not saved: {e}."[:300])
+            rec = recs.get(ticker) or {}
+            if rec.get("state") in BUSY:
+                return self._refuse(ticker, f"{ticker}: the last click is still running.")
+            self._put_click(ticker, taken=bool(on))
+        log.warning("OPENING PLAN %s %s", "take" if on else "give back", ticker)
+        return {"ok": True, "ticker": ticker, "taken": bool(on)}
+
+    def _chase_click_refusal(self, view, ticker: str, side: str, rec: Mapping, entry: Mapping,
+                             orders: list[dict], blocked: Optional[set], fresh: bool) -> str:
+        """Why a Chase on this side can't go now (before the quote), or "". The price check is the
+        click's own (chase()); the page offers Chase only once the price is past the entry."""
+        if rec.get("taken"):
+            return self._taken(ticker, rec)
+        state = entry["state"]
+        if state in BUSY:
+            return f"{ticker}: the last click is still running."
+        if state == RED:
+            return rec.get("red_why") or f"{ticker} stopped after a flip today. Use the ticket or thinkorswim for it."
+        if state == UNKNOWN:
+            return f"{ticker}: the last entry's outcome is not confirmed. Check thinkorswim, then press Resolve."
+        if not fresh:
+            return ORDERS_OLD
+        if (entry.get("filled") or 0) > 0:
+            return f"{ticker} has filled. Manage it on the dashboard or in thinkorswim."
+        if state == SENT and not entry["done"]:
+            if not entry["resting"]:
+                return f"{ticker}'s entry is not resting unfilled at Schwab. Check thinkorswim."
+            if rec.get("side") != side:
+                return f"{ticker}'s entry is {str(rec.get('side') or '').lower()}: chase that side, or flip."
+        why = self._beside(ticker, side, rec, orders, fresh)
+        if why:
+            return why
+        return self._send_refusal(view, ticker, side, blocked)
+
+    def chase(self, ticker: str, side: str, expected: Any) -> dict:
+        """Chase (Ash, 2026-11-18 14:01:28 UTC): the price is past the entry and nothing filled, so
+        cancel the resting entry (if one rests), confirm it with nothing filled, and send a
+        stop-limit at the price with a 0.1% limit (break_entry.chase_levels), its stop still the
+        09:30 minute's other side. "Chase again" is the same click on the chase order. Shares: the
+        plan's shares for the side, made smaller so the dollar risk does not grow (the stop is
+        farther away), never more; then the size stage (1 share at the test stage).
+        `expected` is {"stop", "shares"} as the page showed the side."""
+        ticker, side = str(ticker or "").upper().strip(), str(side or "").upper().strip()
+        if self.demo:
+            return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.")
+        if side not in OTHER:
+            return self._refuse(ticker, "Pick long or short.")
+        view = self._view()
+        orders = self._orders()
+        fresh = self._orders_fresh()
+        with self._lock:
+            try:
+                recs = self._load()
+                self._settle(recs)
+                blocked = self._blocked_names()
+            except Exception as e:
+                return self._refuse(ticker, f"Not sent: {e}."[:300])
+            rec = recs.get(ticker) or {}
+            entry = self._entry_state(rec, orders)
+            why = self._chase_click_refusal(view, ticker, side, rec, entry, orders, blocked, fresh)
+            if why:
+                return self._refuse(ticker, why)
+            row = self._find_row(view, ticker)
+            n = self._numbers(row, side) if row else None
+            if n is None or not isinstance(expected, Mapping) or _dec(expected.get("stop")) != Decimal(n["stop"]) \
+                    or expected.get("shares") != n["shares"]:
+                return self._refuse(ticker, "The plan changed since the page showed it. Review and click again.")
+            resting = rec.get("order_id") if entry["state"] == SENT and entry["resting"] else None
+        # The price, read once now (one Schwab quote); the send reads it again (break_entry.prepare).
+        try:
+            q = self.trader.quote(ticker, max_age=0)
+        except Exception as e:
+            return self._refuse(ticker, f"Not sent: no quote ({e})."[:300])
+        level, stop = Decimal(n["trigger"]), Decimal(n["stop"])
+        bid, ask = _dec(q.get("bid")), _dec(q.get("ask"))
+        if q.get("realtime") is not True or bid is None or ask is None or not 0 < bid <= ask:
+            return self._refuse(ticker, "Schwab's quote is not usable (not real-time, or no bid and ask). Nothing was sent.")
+        past = ask >= level if side == "LONG" else bid <= level
+        if not past:
+            px = ask if side == "LONG" else bid
+            return self._refuse(ticker, f"Price {px} is back inside the {side.lower()} level {n['trigger']}: no chase. "
+                                        "Use Place.")
+        try:
+            trig, lim = break_entry.chase_levels(side, bid, ask)
+        except ValueError as e:
+            return self._refuse(ticker, f"Not sent: {e}.")
+        rps_level, rps_chase = abs(level - stop), abs(lim - stop)
+        plan_n = int(n["plan_shares"])
+        smaller = int((Decimal(plan_n) * rps_level / rps_chase).to_integral_value(rounding="ROUND_FLOOR")) \
+            if rps_chase > 0 else 0
+        qty, _why = plan_size.shares(min(plan_n, smaller), self.stage, price=lim)
+        if qty < 1:
+            return self._refuse(ticker, f"0 shares at the chase price {break_entry.fmt(lim)} for this risk. Nothing was sent.")
+        try:
+            req = break_entry.build_request(ticker, side, trig, stop, qty, cap=abs(lim - trig))
+        except ValueError as e:
+            return self._refuse(ticker, f"Could not build the order: {e}")
+        chase_rec = {"trigger": req["trigger"], "limit": req["limit"], "stop": req["stop"], "shares": qty,
+                     "at": self._now().isoformat(timespec="seconds")}
+        c = None
+        if resting:
+            with self._lock:
+                recs = self._load()
+                rec = recs.get(ticker) or {}
+                if rec.get("order_id") != resting or rec.get("state") != SENT or rec.get("taken"):
+                    return self._refuse(ticker, "The row changed since the click began. Look again.")
+                self._put_click(ticker, state=FLIPPING, text=f"Chasing: cancelling the {side.lower()} entry.")
+            log.warning("OPENING PLAN chase %s: cancel entry %s, then %s at %s", ticker, resting, side, req["trigger"])
+            try:
+                c = self.trader.cancel_entry(int(resting))
+            except Exception as e:
+                c = {"ok": False, "error": f"Cancel failed: {e}"[:300]}
+            if not c.get("ok"):
+                err = str(c.get("error") or c.get("status") or "no answer")
+                with self._lock:
+                    if err.startswith("Another order action is in progress"):
+                        self._put(ticker, state=SENT, text="")
+                        return self._refuse(ticker, f"Not chased: {err} The entry still rests.")
+                    text = (f"Chase stopped: {err.rstrip('.')}. Nothing new was placed. Check the {ticker} "
+                            "order and position in thinkorswim.")
+                    self._put(ticker, state=RED, text=text, red_why=None)
+                return self._refuse(ticker, text, red=True, cancel=c)
+        with self._lock:
+            blocked = self._blocked_names()
+            if blocked is None or ticker in blocked:
+                self._put(ticker, state=NONE, order_id=None,
+                          text="Cancelled the entry. Did not chase: an earlier order is not confirmed.")
+                return self._refuse(ticker, "Did not chase: an earlier order's outcome is not confirmed.", cancel=c)
+            held = self.held()
+            if held:
+                self._put(ticker, state=NONE, order_id=None, text=f"Cancelled the entry. Did not chase: {held}")
+                return self._refuse(ticker, f"Did not chase: {held}", cancel=c)
+            self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
+                            click_chase=chase_rec, chases_click=int(rec.get("chases_click") or 0) + 1,
+                            text=f"Sending the {side.lower()} chase at {req['trigger']}, limit {req['limit']}.")
+        log.warning("OPENING PLAN %s %s chase: trigger %s limit %s stop %s, %s sh (plan %s)", side, ticker,
+                    req["trigger"], req["limit"], req["stop"], qty, plan_n)
+        with break_entry.click_chase():
+            r = self._send(ticker, side, req)
+        return {**r, "chase": chase_rec, **({"cancel": c} if c else {})}
+
 
     # ---- the armed plan's twins (Step 6, brief 16 item 5) ------------------------------------
 
@@ -830,9 +1044,13 @@ class PlanDesk:
         row = self._find_row(view or {}, ticker)
         if row is None or (row.get("bar") or {}).get("state") != "FINAL":
             return ""
-        n = self._numbers(row, side)
-        if n is None:
+        # Trigger and stop only, never the shares: since the fit rule (opening_plan/fit.py) a row
+        # with no account reading has no shares, and that must not skip this check.
+        s = row.get(side.lower())
+        t0, s0 = (_dec(s.get("entry")), _dec(s.get("stop"))) if isinstance(s, Mapping) else (None, None)
+        if t0 is None or s0 is None:
             return ""
+        n = {"trigger": str(t0.quantize(Decimal("0.01"))), "stop": str(s0.quantize(Decimal("0.01")))}
         cent = Decimal("0.01")
         trig, stop = Decimal(str(o["trigger"])), Decimal(str(o["stop"]))
         if abs(Decimal(n["trigger"]) - trig) > cent or abs(Decimal(n["stop"]) - stop) > cent:
@@ -1854,6 +2072,22 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         b = await body(request)
         return await run_in_threadpool(desk.flip, b.get("ticker"), b.get("expected"))
 
+    # The A1 page (Ash's go 2026-11-18 20:00:20 UTC): Place all 4, Chase, Take control.
+    @app.post("/api/opening-plan/place-all")
+    async def opening_plan_place_all(request: Request):
+        b = await body(request)
+        return await run_in_threadpool(desk.place_all, b.get("picks"))
+
+    @app.post("/api/opening-plan/chase")
+    async def opening_plan_chase(request: Request):
+        b = await body(request)
+        return await run_in_threadpool(desk.chase, b.get("ticker"), b.get("side"), b.get("expected"))
+
+    @app.post("/api/opening-plan/take")
+    async def opening_plan_take(request: Request):
+        b = await body(request)
+        return await run_in_threadpool(desk.take, b.get("ticker"), b.get("on") is not False)
+
     app.state.opening_plan_desk = desk
     # Step 9: Flat all and the cover watch, only with EDGE_TRADER_PLAN_FLAT=1 as well (plan_flat.py).
     plan_flat.register(app, trader, poller, guard, desk, demo=demo, env=env, now=now)
@@ -1871,9 +2105,15 @@ def held_prices(poller, trader, env: Mapping[str, str] = os.environ) -> plan_pri
                              tape=lambda: tape_mod.peek(url) if url else None)
 
 
+DEMO_NO_ENTRIES_ENV = "EDGE_TRADER_PLAN_DEMO_NO_ENTRIES"   # demo only: no invented entries
+
+
 def demo_entries(env: Mapping[str, str] = os.environ) -> tuple[dict, list[dict]]:
     """`--demo` only: AAAA has a resting long entry (Cancel and Flip work), BBBB's flip stopped on a
-    fill (red), CCCC's long filled 1 share beside 100 bought by hand (brief 25). Order ids and fills are invented; nothing reaches Schwab."""
+    fill (red), CCCC's long filled 1 share beside 100 bought by hand (brief 25). Order ids and fills are invented; nothing reaches Schwab.
+    With DEMO_NO_ENTRIES_ENV=1 there are none, so the A1 page shows the morning before Place all 4."""
+    if env.get(DEMO_NO_ENTRIES_ENV) == "1":
+        return {}, []
     recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0},
             # Brief 25: CCCC's long filled 1 share and its stop works; 100 more were bought by hand.
             "CCCC": {"state": SENT, "side": "LONG", "ticket_id": "demo-cccc", "order_id": 9003, "flips": 0},

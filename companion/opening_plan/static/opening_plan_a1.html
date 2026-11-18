@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opening plan · Edge Trader</title>
+<link rel="icon" href="/favicon.ico">
+<!-- The A1 Opening plan (Ash's pick, 2026-11-18 19:52:31 UTC; build go 20:00:20 UTC, project thread
+     "Redesign the opening plan as one-click placement"). Charts: lightweight-charts 4.2.3, the same
+     library and version as Edge Scanner, served from this app (static/vendor), never a CDN.
+     The page decides nothing: every number and every check is the server's. -->
+<script src="/opening-plan/vendor/lightweight-charts-4.2.3/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #121925; --bg2: #0e141d; --panel: #18212f; --panel2: #1f2a3b; --line: #263347;
+    --text: #e8edf5; --dim: #8597ad; --faint: #55657a; --up: #4caf50; --upT: #5cc262; --down: #ef5350; --downT: #ff8583;
+    --blue: #3b82f6; --warn: #f2c56b; --orange: #ffa726; --violet: #a78bfa;
+    --sans: "Inter", "Segoe UI", system-ui, sans-serif; --mono: "Roboto Mono", ui-monospace, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.3 var(--sans); }
+  button { font-family: var(--sans); cursor: pointer; }
+  button:disabled { cursor: not-allowed; opacity: .45; }
+  .cmd { display: flex; align-items: center; gap: 18px; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .cmd h1 { font-size: 16px; margin: 0; font-weight: 700; }
+  .clock { font: 600 14px var(--mono); color: var(--dim); }
+  .ctl { display: flex; align-items: center; gap: 9px; }
+  .ctl .k { color: var(--dim); font-size: 12.5px; }
+  .ctl .v { font: 700 16px var(--mono); min-width: 54px; }
+  input[type=range] { width: 150px; accent-color: var(--blue); }
+  .gauge { display: flex; align-items: center; gap: 10px; }
+  .gbar { position: relative; width: 220px; height: 10px; border-radius: 5px; background: var(--panel2); overflow: hidden; display: flex; }
+  .gbar i { display: block; height: 100%; border-right: 2px solid var(--bg); }
+  .gbar.over { box-shadow: 0 0 0 1.5px var(--down); }
+  .gl { font: 700 14px var(--mono); } .gl small { font: 500 12px var(--sans); color: var(--dim); margin-left: 4px; }
+  .gear { width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--dim); font-size: 16px; }
+  .chip { font: 600 11.5px var(--mono); color: var(--dim); padding: 2px 7px; border-radius: 5px; background: var(--panel2); white-space: nowrap; }
+  .chip.unk { background: transparent; border: 1px dashed var(--faint); }
+  .chip.test { color: var(--warn); background: rgba(242,197,107,.1); }
+  .sp { flex: 1; }
+  .go { height: 40px; padding: 0 22px; border-radius: 9px; border: 0; background: var(--blue); color: #fff; font: 700 15px var(--sans); }
+  .status { font: 600 13px var(--sans); color: var(--dim); display: flex; gap: 6px; align-items: center; }
+  .status b { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-left: 8px; }
+  .flatall { height: 36px; padding: 0 16px; border-radius: 8px; border: 1px solid rgba(239,83,80,.55); background: transparent; color: var(--down); font: 700 14px var(--sans); }
+  .more { color: var(--faint); font-size: 12px; text-decoration: none; }
+  .line { padding: 7px 16px; font-size: 13px; color: var(--warn); border-bottom: 1px solid var(--line); }
+  .line.bad { color: var(--downT); }
+  .pop { position: absolute; z-index: 20; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+         box-shadow: 0 8px 24px #000a; display: none; width: 300px; }
+  .pop .ctl { justify-content: space-between; margin: 6px 0 2px; }
+  .pop input[type=range] { width: 100%; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px 14px 14px; }
+  .card { background: var(--panel); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+  .card.FLIP { box-shadow: inset 0 0 0 1.5px var(--warn); } .card.CHASE { box-shadow: inset 0 0 0 1.5px var(--orange); }
+  .card.FILLED { box-shadow: inset 0 0 0 1.5px rgba(76,175,80,.7); } .card.STOP { box-shadow: inset 0 0 0 1.5px var(--down); }
+  .card.TAKEN { opacity: .55; }
+  .hd { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; min-height: 40px; }
+  .tk { font: 800 17px var(--mono); }
+  .px { font: 700 15px var(--mono); }
+  .tag { font: 700 10.5px var(--sans); letter-spacing: .05em; padding: 3px 7px; border-radius: 9px; white-space: nowrap; }
+  .tag.FILLED { color: var(--upT); background: rgba(76,175,80,.14); } .tag.FLIP { color: var(--warn); background: rgba(242,197,107,.13); }
+  .tag.CHASE { color: var(--orange); background: rgba(255,167,38,.14); } .tag.WORK, .tag.WAIT, .tag.TAKEN { color: var(--dim); background: var(--panel2); }
+  .tag.STOP { color: var(--downT); background: rgba(239,83,80,.14); }
+  .sh { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .shn { font: 800 22px var(--mono); letter-spacing: -.01em; }
+  .shn.LONG { color: var(--upT); } .shn.SHORT { color: var(--downT); } .shn.NONE { color: var(--faint); }
+  .mbw { display: flex; align-items: center; gap: 6px; }
+  .mb { position: relative; width: 96px; height: 4px; border-radius: 2px; background: var(--panel2); }
+  .mb u { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; background: var(--dim); }
+  .mbw em { font: 600 10.5px var(--mono); color: var(--faint); font-style: normal; min-width: 22px; }
+  .chart { height: 300px; position: relative; overflow: hidden; }
+  .btns { display: flex; gap: 8px; margin-top: 8px; align-items: center; min-height: 36px; }
+  .ob { height: 36px; min-width: 230px; padding: 0 16px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--text); font: 700 14px var(--sans); white-space: nowrap; }
+  .ob.place { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .ob.flip { background: var(--warn); color: #1a1302; border-color: var(--warn); }
+  .ob.chase { background: var(--orange); color: #1d0e02; border-color: var(--orange); }
+  .ob.flatten { background: var(--down); border-color: var(--down); color: #fff; }
+  .ib { height: 30px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--dim); font: 600 12.5px var(--sans); }
+  .ib.take { color: var(--violet); border-color: rgba(167,139,250,.35); }
+  .wait { color: var(--dim); font: 600 13px var(--mono); }
+  .why { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .toast { position: fixed; right: 16px; bottom: 16px; max-width: 520px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+           padding: 10px 14px; font-size: 13px; box-shadow: 0 8px 24px #000a; display: none; z-index: 30; }
+  .toast.bad { border-color: rgba(239,83,80,.6); }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .ob { min-width: 0; flex: 1; } }
+</style>
+</head>
+<body>
+<div class="cmd" id="cmd">
+  <h1>Opening plan</h1><span class="clock" id="clock">--:--:--</span>
+  <span class="ctl" id="riskCtl"><span class="k">Risk</span><input type="range" id="risk" min="25" max="2000" step="25"><span class="v" id="riskV">—</span></span>
+  <span class="gauge" id="gauge" title="How much of the account's room the plan's shares use if all 4 fill"><span class="gbar" id="gbar"></span><span class="gl" id="gl">—</span></span>
+  <button class="gear" id="gearBtn" title="Room share and margin for a name with no preview">⚙</button>
+  <span id="stage"></span>
+  <span class="sp"></span>
+  <span class="status" id="status"></span>
+  <button class="go" id="placeAll" disabled>Place all 4</button>
+  <button class="flatall" id="flatAll" style="display:none">Flat all</button>
+  <a class="more" href="/opening-plan/table" target="opening-plan-table" title="Every number and reason, as a table">Details</a>
+</div>
+<div class="pop" id="pop">
+  <div class="ctl"><span class="k">Plan's share of the room</span><span class="v" id="roomV">—</span></div>
+  <input type="range" id="room" min="5" max="100" step="5">
+  <div class="ctl" style="margin-top:12px"><span class="k">Margin for a name with no preview</span><span class="v" id="levV">—</span></div>
+  <input type="range" id="lev" min="1" max="4" step="0.1">
+</div>
+<div id="lines"></div>
+<div class="grid" id="grid"></div>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const S = { view: null, entries: null, flat: null, bars: {}, live: {}, charts: {}, busy: new Set(), barsAt: 0 };
+const f2 = v => (typeof v === "number" ? v.toFixed(2) : "—");
+const ARW = { LONG: "▲", SHORT: "▼" };
+const OTHER = { LONG: "SHORT", SHORT: "LONG" };
+// lightweight-charts shows UTC: every time here is an ET wall time written as if it were UTC (bars.py et_epoch).
+function etEpoch(dateStr, hh, mm) { const [y, m, d] = dateStr.split("-").map(Number); return Date.UTC(y, m - 1, d, hh, mm) / 1000; }
+function nowEtParts(v) { const [hh, mm, ss] = (v.now_et || "00:00:00").split(":").map(Number); return { hh, mm, ss }; }
+
+async function getJSON(url, ms = 1800) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms);
+  try { const r = await fetch(url, { cache: "no-store", signal: ctl.signal }); return r.status === 404 ? null : await r.json(); }
+  finally { clearTimeout(t); }
+}
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Companion": "1" }, body: JSON.stringify(body || {}) });
+  let j = null; try { j = await r.json(); } catch (e) { j = { ok: false, error: `HTTP ${r.status}` }; }
+  if (!r.ok && j && j.detail) j = { ok: false, error: j.detail };
+  return j || { ok: false, error: "No answer." };
+}
+let toastT = 0;
+function toast(text, bad) {
+  const t = $("toast"); t.textContent = text; t.className = "toast" + (bad ? " bad" : ""); t.style.display = "block";
+  clearTimeout(toastT); toastT = setTimeout(() => (t.style.display = "none"), bad ? 9000 : 4000);
+}
+
+// ---------------------------------------------------------------- what each pick shows
+function rowsOf(v) { return v ? (v.rows && v.rows.length ? v.rows : ((v.preview || {}).rows || [])) : []; }
+function entryOf(t) { return ((S.entries || {}).rows || []).find(r => r.ticker === t) || null; }
+function flatItem(t) { return ((S.flat || {}).items || []).find(r => r.ticker === t) || null; }
+function anyEntryToday() { return ((S.entries || {}).rows || []).some(r => r.entry && (r.entry.order_id || r.entry.state !== "NONE" || r.flips)); }
+
+function livePrice(row) {
+  // The newest price Edge Trader holds (the rows' price line: poller quotes, click quotes, the open
+  // tape), else the last bar's close. {px, bid, ask, age}.
+  const e = entryOf(row.ticker);
+  const p = e && e.price ? (e.price.long || e.price.short) : null;
+  if (p && typeof p.bid === "number" && typeof p.ask === "number" && p.age_s !== null && p.age_s <= 10)
+    return { px: (p.bid + p.ask) / 2, bid: p.bid, ask: p.ask, age: p.age_s };
+  const b = (S.bars[row.ticker] || {}).bars || [];
+  if (b.length) { const c = b[b.length - 1].close; return { px: c, bid: c, ask: c, age: (S.bars[row.ticker] || {}).age_s }; }
+  if (typeof row.last === "number") return { px: row.last, bid: row.last, ask: row.last, age: null };
+  const bar = row.bar || {};
+  if (typeof bar.close === "number") return { px: bar.close, bid: bar.close, ask: bar.close, age: null };
+  return null;
+}
+
+function sideOf(row, e, lp) {
+  const ent = e && e.entry;
+  if (ent && ent.side && (ent.order_id || ent.state !== "NONE")) return ent.side;
+  if (!row.long || !row.short) return null;
+  if (lp) return Math.abs(lp.px - row.long.entry) <= Math.abs(lp.px - row.short.entry) ? "LONG" : "SHORT";
+  return row.nearer === "short" ? "SHORT" : "LONG";
+}
+
+function kind(row, e, side, lp) {
+  // What the pick needs now: TAKEN, STOP (red or unclear), SENDING, FILLED, CHASE, FLIP, WORK, PLACE, WAIT.
+  if (e && e.taken) return "TAKEN";
+  const ent = e && e.entry;
+  if (ent && (ent.state === "RED" || ent.state === "UNKNOWN")) return "STOP";
+  if (ent && (ent.state === "SENDING" || ent.state === "FLIPPING")) return "SENDING";
+  if (ent && (ent.filled || 0) > 0) return "FILLED";
+  if (!row.long || !row.short || (row.bar || {}).state !== "FINAL" || !side) return "WAIT";
+  const mine = row[side.toLowerCase()], other = row[OTHER[side].toLowerCase()];
+  const past = lp && (side === "LONG" ? lp.ask >= mine.entry : lp.bid <= mine.entry);
+  const otherPast = lp && (side === "LONG" ? lp.bid <= other.entry : lp.ask >= other.entry);
+  const working = ent && ent.state === "SENT" && ent.resting;
+  if (working) return past ? "CHASE" : otherPast ? "FLIP" : "WORK";
+  return past ? "CHASE" : "PLACE";
+}
+
+// ---------------------------------------------------------------- cards
+function card(row) {
+  const t = row.ticker;
+  let el = $("card-" + t);
+  if (!el) {
+    el = document.createElement("div"); el.className = "card"; el.id = "card-" + t;
+    el.innerHTML = `<div class="hd"></div><div class="chart" id="chart-${t}"></div><div class="btns"></div>`;
+    $("grid").appendChild(el);
+  }
+  return el;
+}
+
+function header(row, e, side, lp, k) {
+  const s = side ? row[side.toLowerCase()] : null;
+  const prevClose = (() => { const b = (S.bars[row.ticker] || {}).bars || []; return b.length > 1 ? b[b.length - 2].close : null; })();
+  const pxColor = lp && prevClose !== null ? (lp.px >= prevClose ? "var(--upT)" : "var(--downT)") : "var(--text)";
+  const atr = typeof row.atr === "number" ? `<span class="chip">ATR ${f2(row.atr)}</span>` : "";
+  let lev = "";
+  if (s && typeof s.leverage === "number")
+    lev = `<span class="chip${s.rate_known ? "" : " unk"}" title="${s.rate_known ? "Schwab's margin for this side, from this morning's preview" : "No preview for this side: the margin set under ⚙"}">${s.leverage.toFixed(1)}x${s.rate_known ? "" : "?"}</span>`;
+  const tags = { FILLED: "FILLED", FLIP: "OTHER SIDE", CHASE: "PAST ENTRY", WORK: "WORKING", TAKEN: "YOURS", STOP: "CHECK", SENDING: "SENDING" };
+  const tag = tags[k] ? `<span class="tag ${k === "SENDING" ? "WORK" : k}">${tags[k]}</span>` : "";
+  let sh;
+  if (s && typeof s.shares === "number") {
+    const risk = typeof s.risk_shares === "number" ? s.risk_shares : s.shares;
+    const w = risk > 0 ? Math.min(100, s.shares / risk * 100) : 0;
+    sh = `<div class="sh"><span class="shn ${side}">${ARW[side]} ${s.shares.toLocaleString()}</span>` +
+         `<span class="mbw" title="${s.shares < risk ? "Cut by the account's room; risk alone gives " + risk : "Risk decides"}"><span class="mb"><u style="width:${w}%"></u></span><em>${s.shares < risk ? risk.toLocaleString() : ""}</em></span></div>`;
+  } else {
+    const est = row.estimate && (row.estimate.used || row.estimate.full);
+    const why = (row.shares || {}).text || "";
+    sh = (row.bar || {}).state === "FINAL"
+      ? `<div class="sh" title="${why.replace(/"/g, "&quot;")}"><span class="shn NONE">—</span></div>`
+      : `<div class="sh"><span class="wait">sizes at 09:31</span></div>`;
+  }
+  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tag}<span class="sp"></span>${sh}`;
+}
+
+function footer(row, e, side, lp, k) {
+  // A1: one big button for the action that matters now; Cancel and Take small.
+  const t = row.ticker, ent = (e || {}).entry || {}, busy = S.busy.has(t);
+  const dis = why => (busy || why ? `disabled title="${(why || "Working…").replace(/"/g, "&quot;")}"` : "");
+  const sideL = side ? side.toLowerCase() : null;
+  const take = e && !e.taken ? `<button class="ib take" data-act="take" data-t="${t}">Take</button>` : "";
+  const cancelBtn = label => `<button class="ib" data-act="cancel" data-t="${t}" ${dis(e.cancel)}>${label}</button>`;
+  const why = text => text ? `<span class="why" title="${text.replace(/"/g, "&quot;")}">${text}</span>` : "";
+  if (!e) return "";
+  if (k === "TAKEN") return `<span class="wait">The plan leaves it to you.</span><span class="sp"></span><button class="ib take" data-act="give" data-t="${t}">Give back</button>`;
+  if (k === "STOP") return `${why(ent.text || ent.order_text || "Check thinkorswim.")}<span class="sp"></span>${ent.state === "RED" && !e.cancel ? cancelBtn("Cancel") : ""}`;
+  if (k === "SENDING") return `<span class="wait">${ent.text || "Sending…"}</span>`;
+  if (k === "FILLED") {
+    const it = flatItem(t);
+    const canFlat = it && it.action === "close_plan", canStop = it && it.action === "cancel_stop";
+    const flatWhy = !S.flat ? "Flatten needs EDGE_TRADER_PLAN_FLAT=1." : !it ? "Not on the list yet." : canFlat ? (S.flat.refusal || "") : (it.text || "Nothing to close now.");
+    return `<button class="ob flatten" data-act="flatten" data-t="${t}" ${dis(flatWhy)}>Flatten ${typeof it?.shares === "number" ? it.shares : ""}</button>` +
+           `<span class="sp"></span>${canStop ? `<button class="ib" data-act="cancelstop" data-t="${t}" ${dis(S.flat.refusal)}>Cancel stop</button>` : ""}${take}`;
+  }
+  if (k === "WAIT") return "";
+  if (k === "WORK") {
+    const lvl = row[sideL].entry;
+    return `<span class="wait">${lp ? f2(Math.abs(lp.px - lvl)) + " to " + f2(lvl) : "Working at " + f2(lvl)}</span><span class="sp"></span>${cancelBtn("Cancel")}${take}`;
+  }
+  if (k === "FLIP") {
+    const o = OTHER[side], lvl = row[o.toLowerCase()].entry;
+    return `<button class="ob flip" data-act="flip" data-t="${t}" ${dis(e.flip)}>Flip ${ARW[o]} ${f2(lvl)}</button><span class="sp"></span>${cancelBtn("Cancel")}${take}`;
+  }
+  const placed = anyEntryToday();
+  if (k === "CHASE") {
+    if (!placed && !(ent.order_id)) return "";
+    const again = !!e.click_chase && (ent.order_id || ent.state === "NONE");
+    const resting = ent.state === "SENT" && ent.resting;
+    return `<button class="ob chase" data-act="chase" data-t="${t}" data-side="${side}" ${dis((e.chase || {})[sideL])}>${again ? "Chase again" : "Chase"} ${ARW[side]} ${lp ? f2(side === "LONG" ? lp.ask : lp.bid) : ""}</button>` +
+           `${why((e.chase || {})[sideL])}<span class="sp"></span>${resting ? cancelBtn(e.click_chase ? "Cancel chase" : "Cancel") : ""}${take}`;
+  }
+  if (k === "PLACE") {
+    if (!placed) return "";                   // before Place all, only the top button acts
+    const refusal = (e.place || {})[sideL];
+    return `<button class="ob place" data-act="place" data-t="${t}" data-side="${side}" ${dis(refusal)}>Place ${ARW[side]} ${f2(row[sideL].entry)}</button>${why(refusal)}<span class="sp"></span>${take}`;
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------- charts
+const LC = window.LightweightCharts;
+function chartFor(t) {
+  if (S.charts[t]) return S.charts[t];
+  const host = $("chart-" + t);
+  const chart = LC.createChart(host, {
+    width: host.clientWidth, height: host.clientHeight,
+    layout: { background: { type: LC.ColorType.Solid, color: "#18212f" }, textColor: "#8597ad", fontSize: 10, fontFamily: "Roboto Mono, ui-monospace, monospace" },
+    grid: { vertLines: { visible: false }, horzLines: { color: "#202b3c" } },
+    rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.08, bottom: 0.2 } },
+    timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false, rightOffset: 0 },
+    handleScroll: false, handleScale: false, crosshair: { mode: LC.CrosshairMode.Normal },
+  });
+  const candles = chart.addCandlestickSeries({ upColor: "#4caf50", downColor: "#ef5350", borderVisible: false, wickUpColor: "#4caf50", wickDownColor: "#ef5350", priceLineVisible: false });
+  const vol = chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", lastValueVisible: false, priceLineVisible: false });
+  chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+  new ResizeObserver(() => chart.applyOptions({ width: host.clientWidth })).observe(host);
+  return (S.charts[t] = { chart, candles, vol, lines: [], key: "" });
+}
+
+function noteLive(t, px, epochMin) {
+  // The live minutes the page builds from the prices it sees (bars.py: none is fetched around the open).
+  if (typeof px !== "number") return;
+  const m = (S.live[t] = S.live[t] || {});
+  const b = m[epochMin];
+  if (!b) m[epochMin] = { time: epochMin, open: px, high: px, low: px, close: px };
+  else { b.high = Math.max(b.high, px); b.low = Math.min(b.low, px); b.close = px; }
+}
+
+function barsFor(row, day) {
+  const hist = ((S.bars[row.ticker] || {}).bars || []).map(b => ({ ...b }));
+  const last = hist.length ? hist[hist.length - 1].time : 0;
+  const live = Object.values(S.live[row.ticker] || {}).filter(b => b.time > last).sort((a, b) => a.time - b.time);
+  const all = hist.concat(live.map(b => ({ ...b, volume: 0 })));
+  // The 09:30 bar: Edge Scanner's row is the plan's own minute, so it wins over any other source.
+  const bar = row.bar || {};
+  if (typeof bar.high === "number" && typeof bar.low === "number") {
+    const t930 = etEpoch(day, 9, 30);
+    let b = all.find(x => x.time === t930);
+    const prev = all.filter(x => x.time < t930).pop();
+    if (!b) { b = { time: t930, open: prev ? prev.close : bar.close ?? bar.low, volume: 0 }; all.push(b); all.sort((a, c) => a.time - c.time); }
+    b.high = bar.high; b.low = bar.low; b.close = bar.close ?? b.close ?? (bar.high + bar.low) / 2;
+    b.open = Math.min(Math.max(b.open ?? b.close, bar.low), bar.high);
+  }
+  return all.filter(b => [b.open, b.high, b.low, b.close].every(x => typeof x === "number"));
+}
+
+function drawChart(row, side, k, day) {
+  const c = chartFor(row.ticker);
+  const data = barsFor(row, day);
+  const end = etEpoch(day, 11, 0), start = etEpoch(day, 8, 30);
+  // Every minute from 08:30 to 11:00 is one slot, a bar or a blank, so the fixed range below
+  // always spans exactly the window even when minutes are missing at the start or in between.
+  const byT = new Map(data.map(({ volume, ...b }) => [b.time, b]));
+  const grid = [];
+  for (let x = start; x <= end; x += 60) grid.push(byT.get(x) || { time: x });
+  c.candles.setData(grid);
+  c.vol.setData(data.map(b => ({ time: b.time, value: b.volume || 0, color: b.close >= b.open ? "#1d3528" : "#3a2427" })));
+  const e = entryOf(row.ticker), ent = (e || {}).entry || {};
+  const key = JSON.stringify([row.long && row.long.entry, row.short && row.short.entry, side, k, e && e.click_chase, ent.filled]);
+  if (key !== c.key) {
+    c.lines.forEach(l => c.candles.removePriceLine(l)); c.lines = [];
+    const line = (price, color, title, style, w = 1) => c.lines.push(c.candles.createPriceLine({ price, color, lineWidth: w, lineStyle: style, axisLabelVisible: true, title }));
+    if (row.long && row.short) {
+      const L = side === "LONG", Sh = side === "SHORT";
+      // The side the plan shows is solid; the other trigger is a faint dashed line.
+      line(row.long.entry, L ? "#4caf50" : "#4caf5066", L ? "BUY" : "", L ? LC.LineStyle.Solid : LC.LineStyle.Dashed, L ? 2 : 1);
+      line(row.short.entry, Sh ? "#ef5350" : "#ef535066", Sh ? "SELL" : "", Sh ? LC.LineStyle.Solid : LC.LineStyle.Dashed, Sh ? 2 : 1);
+      if (k === "FILLED" && side) line(row[side.toLowerCase()].stop, "#8597ad", "STOP", LC.LineStyle.Dotted);
+      if (e && e.click_chase && ent.state === "SENT" && ent.resting) line(Number(e.click_chase.limit), "#ffa726", "CHASE", LC.LineStyle.Solid, 2);
+    }
+    c.key = key;
+  }
+  // Fixed 08:30 to 11:00 ET (Ash, 2026-11-18 14:07:45 UTC): 151 one-minute slots, never scrolled.
+  c.chart.timeScale().setVisibleLogicalRange({ from: -0.5, to: grid.length - 0.5 });
+}
+
+// ---------------------------------------------------------------- top line
+function topLine(v) {
+  $("clock").textContent = v.now_et || "--:--:--";
+  const risk = (v.risk || {}).per_pick;
+  if (document.activeElement !== $("risk")) $("risk").value = risk || 0;
+  $("riskV").textContent = typeof risk === "number" ? "$" + risk.toLocaleString() : "not set";
+  const fit = v.fit || {};
+  const gbar = $("gbar"); gbar.innerHTML = "";
+  const tones = ["#5d7aa6", "#4f6a92", "#6c88b3", "#43597c"];
+  rowsOf(v).forEach((r, i) => {
+    const p = (fit.per_row || {})[r.ticker];
+    if (typeof p === "number" && p > 0) { const el = document.createElement("i"); el.style.width = Math.min(100, p * 100) + "%"; el.style.background = tones[i % 4]; gbar.appendChild(el); }
+  });
+  gbar.classList.toggle("over", typeof fit.live === "number" && fit.live > 1);
+  $("gl").innerHTML = typeof fit.used === "number" ? `${Math.round(fit.used * 100)}%<small>of room</small>` : `—<small>${fit.state === "NOT_KNOWN" ? "room not known" : "of room"}</small>`;
+  $("gauge").title = fit.text || (typeof fit.risk_only_used === "number" ? `Risk alone would use ${Math.round(fit.risk_only_used * 100)}% of the room.` : "");
+  if (document.activeElement !== $("room")) $("room").value = Math.round((fit.room_share ?? 1) * 100);
+  $("roomV").textContent = Math.round((fit.room_share ?? 1) * 100) + "%";
+  const lev = 4 / (fit.unknown_rate || 2.8);
+  if (document.activeElement !== $("lev")) $("lev").value = lev.toFixed(1);
+  $("levV").textContent = lev.toFixed(1) + "x";
+  const ent = S.entries;
+  $("stage").innerHTML = ent && ent.size_stage === "1 share" ? `<span class="chip test" title="The size stage sends 1 share per pick until it is raised (playbook.json size.stage)">sends 1 share</span>` : "";
+}
+
+function placeAllPicks(v) {
+  const out = [];
+  for (const row of v.rows || []) {
+    const e = entryOf(row.ticker); if (!e) continue;
+    const lp = livePrice(row), side = sideOf(row, e, lp), k = kind(row, e, side, lp);
+    if (k !== "PLACE" || !side) continue;
+    const sl = side.toLowerCase();
+    if ((e.place || {})[sl] || !(e.send || {})[sl]) continue;
+    const n = e.send[sl];
+    out.push({ ticker: row.ticker, side, expected: { trigger: n.trigger, stop: n.stop, shares: n.shares } });
+  }
+  return out;
+}
+
+function statusLine(v) {
+  const c = { FILLED: 0, FLIP: 0, CHASE: 0, WORK: 0 };
+  for (const row of v.rows || []) {
+    const e = entryOf(row.ticker), lp = livePrice(row), side = sideOf(row, e, lp), k = kind(row, e, side, lp);
+    if (k in c && (k !== "CHASE" || (e && e.entry && e.entry.order_id))) c[k]++;
+  }
+  const dot = (n, col, w) => n ? `<b style="background:${col}"></b>${n} ${w}` : "";
+  $("status").innerHTML = dot(c.FILLED, "var(--upT)", "filled") + dot(c.FLIP, "var(--warn)", "flip") + dot(c.CHASE, "var(--orange)", "chase") + dot(c.WORK, "var(--dim)", "working");
+}
+
+function lines(v) {
+  const out = [];
+  if (v.state && v.state !== "OK" && v.message) out.push([v.message, v.state === "PREVIEW" ? "" : "bad"]);
+  (v.notes || []).forEach(n => out.push([n, ""]));
+  if (S.entries && S.entries.orders_old) out.push([S.entries.orders_old, "bad"]);
+  if (S.entries && S.entries.error) out.push([S.entries.error, "bad"]);
+  if (v.fit && v.fit.state !== "OK" && v.fit.text && (v.rows || []).length) out.push([v.fit.text, "bad"]);
+  $("lines").innerHTML = out.map(([t, c]) => `<div class="line ${c}">${t}</div>`).join("");
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  const v = S.view; if (!v) return;
+  topLine(v); lines(v);
+  const rows = rowsOf(v);
+  const day = v.today_et;
+  const { hh, mm } = nowEtParts(v);
+  const want = new Set(rows.map(r => r.ticker));
+  [...$("grid").children].forEach(el => { if (!want.has(el.id.slice(5))) { el.remove(); delete S.charts[el.id.slice(5)]; } });
+  for (const row of rows) {
+    const e = entryOf(row.ticker), lp = livePrice(row), side = sideOf(row, e, lp), k = kind(row, e, side, lp);
+    if (lp && lp.age !== null && lp.age <= 10) noteLive(row.ticker, lp.px, etEpoch(day, hh, mm));
+    const el = card(row);
+    el.className = "card " + (k === "FLIP" || k === "CHASE" || k === "FILLED" || k === "STOP" || k === "TAKEN" ? k : "");
+    el.querySelector(".hd").innerHTML = header(row, e, side, lp, k);
+    el.querySelector(".btns").innerHTML = footer(row, e, side, lp, k);
+    if (LC) drawChart(row, side, k, day);
+  }
+  const picks = (v.rows || []).length ? placeAllPicks(v) : [];
+  const btn = $("placeAll");
+  btn.textContent = picks.length && picks.length !== 4 ? `Place ${picks.length}` : "Place all 4";
+  btn.disabled = !S.entries || !picks.length || S.busy.has("*");
+  btn.title = !S.entries ? "The plan buttons are off (EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1)." :
+    picks.length ? picks.map(p => `${p.ticker} ${p.side.toLowerCase()} ${p.expected.trigger}, stop ${p.expected.stop}, ${p.expected.shares} sh`).join("\n") :
+    "Nothing to place: the 09:30 bar is not final, or every pick already has an entry or is refused.";
+  btn.style.display = anyEntryToday() && !picks.length ? "none" : "";
+  $("flatAll").style.display = S.flat ? "" : "none";
+  statusLine(v);
+}
+
+// ---------------------------------------------------------------- clicks
+async function act(a, t, side) {
+  const v = S.view, row = (v.rows || []).find(r => r.ticker === t), e = entryOf(t);
+  if (!row || !e) return;
+  S.busy.add(t); render();
+  try {
+    let r;
+    const sl = side ? side.toLowerCase() : null;
+    if (a === "place") r = await post("/api/opening-plan/place", { ticker: t, side, expected: e.send[sl] });
+    else if (a === "cancel") r = await post("/api/opening-plan/cancel", { ticker: t });
+    else if (a === "flip") r = await post("/api/opening-plan/flip", { ticker: t, expected: e.send[e.flip_to] });
+    else if (a === "chase") r = await post("/api/opening-plan/chase", { ticker: t, side, expected: { stop: e.send[sl].stop, shares: e.send[sl].shares } });
+    else if (a === "take" || a === "give") r = await post("/api/opening-plan/take", { ticker: t, on: a === "take" });
+    else if (a === "flatten" || a === "cancelstop") {
+      const it = flatItem(t);
+      r = await post(a === "flatten" ? "/api/opening-plan/flatten" : "/api/opening-plan/cancel-stop", { ticker: t, expected: it });
+    }
+    if (r && !r.ok) toast(`${t}: ${r.error || r.text || "Not done."}`, true);
+    else if (r) toast(`${t}: ${a === "take" ? "yours now" : a === "give" ? "back with the plan" : "done"}.`);
+  } catch (err) { toast(`${t}: ${err}`, true); }
+  finally { S.busy.delete(t); await tick(); }
+}
+
+$("grid").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-act]"); if (!b || b.disabled) return;
+  act(b.dataset.act, b.dataset.t, b.dataset.side);
+});
+
+$("placeAll").addEventListener("click", async () => {
+  const picks = placeAllPicks(S.view || {}); if (!picks.length) return;
+  S.busy.add("*"); picks.forEach(p => S.busy.add(p.ticker)); render();
+  try {
+    const r = await post("/api/opening-plan/place-all", { picks });
+    const res = r.results || [];
+    const bad = res.filter(x => !x.ok);
+    if (!res.length) toast(r.error || "Nothing placed.", true);
+    else toast(`${res.length - bad.length} of ${res.length} placed.` + bad.map(x => `\n${x.ticker}: ${x.error}`).join(""), !!bad.length);
+  } catch (err) { toast(String(err), true); }
+  finally { S.busy.delete("*"); picks.forEach(p => S.busy.delete(p.ticker)); await tick(); }
+});
+
+$("flatAll").addEventListener("click", async () => {
+  const items = (S.flat || {}).items || [];
+  const todo = items.filter(i => i.action !== "nothing");
+  if (!todo.length) { toast("Flat all: nothing to do."); return; }
+  if (!confirm("Flat all:\n" + todo.map(i => `${i.ticker}: ${i.text}`).join("\n"))) return;
+  const r = await post("/api/opening-plan/flat-all", { expected: items });
+  toast(r.ok ? "Flat all done." : (r.error || "Flat all: not done."), !r.ok);
+  await tick();
+});
+
+let riskT = 0;
+$("risk").addEventListener("input", () => {
+  $("riskV").textContent = "$" + Number($("risk").value).toLocaleString();
+  clearTimeout(riskT); riskT = setTimeout(async () => {
+    const r = await post("/api/opening-plan/risk", { risk: $("risk").value });
+    if (!r.ok) toast(r.error || "Risk not saved.", true); await tick();
+  }, 350);
+});
+let popT = 0;
+function saveSizing(body) { clearTimeout(popT); popT = setTimeout(async () => { const r = await post("/api/opening-plan/risk", body); if (!r.ok) toast(r.error || "Not saved.", true); await tick(); }, 350); }
+$("room").addEventListener("input", () => { $("roomV").textContent = $("room").value + "%"; saveSizing({ room_share: Number($("room").value) / 100 }); });
+$("lev").addEventListener("input", () => { $("levV").textContent = Number($("lev").value).toFixed(1) + "x"; saveSizing({ unknown_rate: (4 / Number($("lev").value)).toFixed(2) }); });
+$("gearBtn").addEventListener("click", ev => {
+  const p = $("pop"), r = ev.target.getBoundingClientRect();
+  p.style.display = p.style.display === "block" ? "none" : "block"; p.style.left = r.left + "px"; p.style.top = (r.bottom + 8) + "px";
+});
+document.addEventListener("click", ev => { if (!ev.target.closest("#pop") && ev.target.id !== "gearBtn") $("pop").style.display = "none"; });
+
+// ---------------------------------------------------------------- polling
+async function tick() {
+  try {
+    const [v, en, fl] = await Promise.all([getJSON("/api/opening-plan"), getJSON("/api/opening-plan/entries").catch(() => null),
+                                           getJSON("/api/opening-plan/flat").catch(() => null)]);
+    if (v) S.view = v;
+    S.entries = en && en.rows ? en : null;
+    S.flat = fl && fl.items ? fl : null;
+    const names = rowsOf(S.view).map(r => r.ticker);
+    if (names.length && Date.now() - S.barsAt > 15000) {
+      S.barsAt = Date.now();
+      getJSON("/api/opening-plan/bars?tickers=" + names.join(","), 8000).then(b => { if (b && b.bars) { S.bars = b.bars; render(); } }).catch(() => {});
+    }
+    render();
+  } catch (err) { /* the next tick tries again; an old view keeps its own age line */ }
+}
+tick();
+setInterval(tick, 1500);
+</script>
+</body>
+</html>

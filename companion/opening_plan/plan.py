@@ -817,13 +817,16 @@ def buying_power_note(row: Mapping, bp: Optional[Mapping], pb: Playbook,
 def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_error: str,
                clock: Optional[Mapping], clock_ok_at: Optional[datetime], clock_error: str,
                risk: Optional[Decimal], now: datetime, pb: Playbook, account: Optional[Mapping] = None,
-               rates: Optional[Mapping] = None) -> dict:
+               rates: Optional[Mapping] = None, fit: Optional[Mapping] = None) -> dict:
     """The whole screen: header facts, the calm flag and one row per pick of the playbook.
 
     `picks` is Edge Scanner's last good answer from GET /api/v2/ov-picks (scanner/ov_picks_route.py),
     `picks_ok_at` when it came, `picks_error` the last failure ("" when the last ask worked).
     `account` feeds the buying power line (buying_power()); None shows it as not known.
     `rates` is the probe's PreviewRates.today() (brief 31): ratios only, never a dollar amount.
+    `fit` turns on the fit-the-account rule (fit.py, Ash's go 2026-11-18 20:00:20 UTC):
+    {"account": the unmasked account read, "room_share", "unknown_rate", "reserved": names with a plan
+    entry today}. None (the tests of the rows before it) leaves the risk shares as they are.
     """
     now_et = now.astimezone(ET)
     view = {
@@ -907,4 +910,11 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         view["state"] = STALE
     view["rows"] = [build_row(r, trading_date, now, risk, view["calm"]["calm"], pb, view["buying_power"], rates)
                     for r in rows]
+    if fit is not None:
+        from . import fit as fit_mod
+        acct = buying_power(fit.get("account"), now)
+        view["fit"] = fit_mod.apply(view["rows"], acct, rates, pb.rank_to - pb.rank_from + 1,
+                                    fit.get("room_share", fit_mod.ROOM_SHARE_DEFAULT),
+                                    fit.get("unknown_rate", fit_mod.UNKNOWN_RATE_DEFAULT),
+                                    fit.get("reserved") or (), balances_counted)
     return view

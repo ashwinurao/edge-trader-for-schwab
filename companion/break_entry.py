@@ -35,7 +35,7 @@ import os
 import time
 import uuid
 from contextlib import contextmanager
-from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from .bracket import Plan, _price, _to_tick, bracket_order, fmt, plan, tick
 
@@ -50,6 +50,40 @@ MAX_QUOTE_AGE_MS = 5_000             # R-03: the ticket has no quote-age rule, s
 # stage's result (companion/plan_size.py), set by the server around the one send it wraps. A context
 # variable, never a request field: nothing a page sends can raise the cap.
 _plan_cap: contextvars.ContextVar = contextvars.ContextVar("break_entry_plan_cap", default=None)
+
+
+# The Opening plan's Chase click (Ash, 2026-11-18 14:01:28 UTC: "if we crossed entry already, then
+# instead of flip the button should say "Chase" and it should place a stoplimit order with 0.1%
+# buffer to see if we can get a fill"; built on his go of 2026-11-18 20:00:20 UTC). Set by the server
+# around the one send it wraps (PlanDesk.chase), never a request field: the ticket's own Break entry
+# still refuses a price already through its level.
+_click_chase: contextvars.ContextVar = contextvars.ContextVar("break_entry_click_chase", default=False)
+CHASE_BUFFER = Decimal("0.001")      # Ash's 0.1%: the chase's limit past its trigger
+
+
+@contextmanager
+def click_chase():
+    """While inside, a break entry may go with the price already through its trigger, as long as
+    the price is still inside its limit (the Chase click, companion/plan_entries.py)."""
+    token = _click_chase.set(True)
+    try:
+        yield
+    finally:
+        _click_chase.reset(token)
+
+
+def chase_levels(side: str, bid, ask) -> tuple[Decimal, Decimal]:
+    """(trigger, limit) of a Chase from the quote: a long's trigger is the ask, a short's the bid,
+    on the stock's grid; the limit is CHASE_BUFFER past it, rounded toward the trigger, at least one
+    tick. Raises ValueError without a usable price."""
+    side = str(side).upper()
+    px = _price(ask if side == "LONG" else bid)
+    if px is None or not px.is_finite() or px <= 0:
+        raise ValueError("no usable price in the quote")
+    t = tick(px)
+    trig = _to_tick(px, ROUND_CEILING if side == "LONG" else ROUND_FLOOR)
+    buf = max((trig * CHASE_BUFFER / t).to_integral_value(rounding=ROUND_FLOOR) * t, t)
+    return trig, (trig + buf if side == "LONG" else trig - buf)
 
 
 @contextmanager
@@ -169,12 +203,19 @@ def make_plan(req: dict, q: dict) -> Plan:
     if not long and lim > trig:
         return _bad(req, f"limit {fmt(lim)} must be at or below the break level {fmt(trig)}")
     bid, ask = q.get("bid"), q.get("ask")
+    if _click_chase.get():
+        # The Chase click: through the trigger is the point, but never past the limit, where the
+        # order could only rest (Ash's "to see if we can get a fill").
+        if long and ask is not None and Decimal(str(ask)) > lim:
+            return _bad(req, f"Price ran past the chase limit: ask {fmt(Decimal(str(ask)))} is above {fmt(lim)}.")
+        if not long and bid is not None and Decimal(str(bid)) < lim:
+            return _bad(req, f"Price ran past the chase limit: bid {fmt(Decimal(str(bid)))} is below {fmt(lim)}.")
     # Long: the ask is already at or past the level, so a buy stop would trigger at once and could
     # fill anywhere up to the limit. No chase by click in this step: refuse.
-    if long and ask is not None and Decimal(str(ask)) >= trig:
+    elif long and ask is not None and Decimal(str(ask)) >= trig:
         return _bad(req, f"Price is already through the break level: ask {fmt(Decimal(str(ask)))} is at or above "
                          f"{fmt(trig)}.")
-    if not long and bid is not None and Decimal(str(bid)) <= trig:
+    elif not long and bid is not None and Decimal(str(bid)) <= trig:
         return _bad(req, f"Price is already through the break level: bid {fmt(Decimal(str(bid)))} is at or below "
                          f"{fmt(trig)}.")
     # Brief 29 part A (finding 1 of the 2026-11-13 live test): the stop must rest on the right side
