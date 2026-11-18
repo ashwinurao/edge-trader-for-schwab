@@ -162,6 +162,7 @@ class PlanDesk:
         the rows' price line (brief 29 part B). Display only: no click reads it."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
         self.stage = plan_size.parse_stage(stage)
+        self.full_ok = False            # register(): the size switch may say Full only with the cover watch on
         self._orders_fresh_fn = orders_fresh or (lambda: True)
         self._positions_fn = positions or (lambda: {})
         self._positions_fresh_fn = positions_fresh or (lambda: True)
@@ -530,6 +531,7 @@ class PlanDesk:
         out = {"enabled": True, "demo": self.demo, "armed": self._armed(), "market_open": self._market_open(),
                "break_max_shares": break_entry.BREAK_MAX_SHARES, "max_flips": self.flips, "rows": [],
                "size_stage": plan_size.label(self.stage),
+               "size_switch": plan_size.switch_name(self.stage), "size_full_ok": self.full_ok,
                "error": "", "orders_old": "" if fresh else ORDERS_OLD}
         try:
             with self._lock:
@@ -791,6 +793,28 @@ class PlanDesk:
                 self._put(ticker, state=NONE, order_id=None, text=f"Cancelled the {old.lower()} entry. {why}")
                 return self._refuse(ticker, f"Cancelled the {old.lower()} entry. {why}", cancel=c)
         return {**self._send(ticker, new, req), "cancel": c}
+
+    # ---- the size switch (Ash, 2026-11-18 22:34:51 UTC) --------------------------------------
+
+    def set_size(self, name: Any, save: Optional[Callable[[str, str], None]] = None) -> dict:
+        """Ash's "1 share" / "Full" switch: the stage every later Place, Place all 4, Flip and Chase
+        click uses. Nothing is sent and nothing resting changes. Full needs the cover watch
+        (EDGE_TRADER_PLAN_FLAT=1, brief 19 Part C), as a playbook stage above 1 share does. A click
+        that began on the other size is refused by its own check (the page sends the shares it showed)."""
+        key = str(name or "").strip().lower()
+        if key not in plan_size.SWITCH:
+            return {"ok": False, "error": "Pick 1 share or Full."}
+        if key != "1_share" and not self.full_ok:
+            return {"ok": False, "error": "Full needs Flat all and the cover watch on (EDGE_TRADER_PLAN_FLAT=1)."}
+        with self._lock:
+            if save is not None:
+                try:
+                    save(plan_size.SWITCH_KEY, key)
+                except Exception as e:
+                    return {"ok": False, "error": f"Not saved: {e}."[:300]}
+            self.stage = plan_size.SWITCH[key]
+        log.warning("OPENING PLAN size switch: %s", plan_size.label(self.stage))
+        return {"ok": True, "size_switch": key, "size_stage": plan_size.label(self.stage)}
 
     # ---- the A1 page's clicks (Ash's go 2026-11-18 20:00:20 UTC) ------------------------------
 
@@ -2042,6 +2066,21 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
             # Records that don't read: every click refuses until they do (_load raises).
             log.error("opening plan: could not check the entry records at startup: %s", e)
 
+    # Ash's size switch (plan_size.SWITCH): the saved choice replaces the playbook's stage. Full
+    # only with the cover watch on, like any stage above 1 share.
+    desk.full_ok = plan_flat.enabled(env)
+    store = getattr(trader, "store", None)
+    try:
+        saved = (store.get_setting(plan_size.SWITCH_KEY) or "") if store is not None else ""
+    except Exception as e:
+        saved = ""
+        log.error("opening plan: the size switch could not be read (%s); the playbook's stage stays", e)
+    if saved in plan_size.SWITCH and (saved == "1_share" or desk.full_ok):
+        desk.stage = plan_size.SWITCH[saved]
+    elif saved:
+        log.error("opening plan: size switch %r ignored; the playbook's stage %s stays", saved,
+                  plan_size.label(desk.stage))
+
     async def body(request: Request) -> dict:
         guard(request)
         try:
@@ -2087,6 +2126,11 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
     async def opening_plan_take(request: Request):
         b = await body(request)
         return await run_in_threadpool(desk.take, b.get("ticker"), b.get("on") is not False)
+
+    @app.post("/api/opening-plan/size")
+    async def opening_plan_size(request: Request):
+        b = await body(request)
+        return desk.set_size(b.get("size"), save=getattr(store, "set_setting", None))
 
     app.state.opening_plan_desk = desk
     # Step 9: Flat all and the cover watch, only with EDGE_TRADER_PLAN_FLAT=1 as well (plan_flat.py).

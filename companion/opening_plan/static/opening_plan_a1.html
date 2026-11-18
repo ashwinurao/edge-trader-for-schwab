@@ -37,6 +37,11 @@
   .chip { font: 600 11.5px var(--mono); color: var(--dim); padding: 2px 7px; border-radius: 5px; background: var(--panel2); white-space: nowrap; }
   .chip.unk { background: transparent; border: 1px dashed var(--faint); }
   .chip.test { color: var(--warn); background: rgba(242,197,107,.1); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { height: 30px; padding: 0 12px; border: 0; background: transparent; color: var(--dim); font: 700 12.5px var(--sans); }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on[data-size="1_share"] { background: rgba(242,197,107,.14); color: var(--warn); }
+  .seg button.on[data-size="full"] { background: rgba(76,175,80,.16); color: var(--upT); }
   .sp { flex: 1; }
   .go { height: 40px; padding: 0 22px; border-radius: 9px; border: 0; background: var(--blue); color: #fff; font: 700 15px var(--sans); }
   .status { font: 600 13px var(--sans); color: var(--dim); display: flex; gap: 6px; align-items: center; }
@@ -91,7 +96,7 @@
   <span class="ctl" id="riskCtl"><span class="k">Risk</span><input type="range" id="risk" min="25" max="2000" step="25"><span class="v" id="riskV">—</span></span>
   <span class="gauge" id="gauge" title="How much of the account's room the plan's shares use if all 4 fill"><span class="gbar" id="gbar"></span><span class="gl" id="gl">—</span></span>
   <button class="gear" id="gearBtn" title="Room share and margin for a name with no preview">⚙</button>
-  <span id="stage"></span>
+  <span class="seg" id="sizeSeg" style="display:none" title="What each Place, Place all 4, Flip and Chase sends"><button data-size="1_share">1 share</button><button data-size="full">Full</button></span>
   <span class="sp"></span>
   <span class="status" id="status"></span>
   <button class="go" id="placeAll" disabled>Place all 4</button>
@@ -361,7 +366,13 @@ function topLine(v) {
   if (document.activeElement !== $("lev")) $("lev").value = lev.toFixed(1);
   $("levV").textContent = lev.toFixed(1) + "x";
   const ent = S.entries;
-  $("stage").innerHTML = ent && ent.size_stage === "1 share" ? `<span class="chip test" title="The size stage sends 1 share per pick until it is raised (playbook.json size.stage)">sends 1 share</span>` : "";
+  const seg = $("sizeSeg");
+  seg.style.display = ent ? "" : "none";
+  if (ent) seg.querySelectorAll("button").forEach(b => {
+    b.classList.toggle("on", b.dataset.size === ent.size_switch);
+    b.disabled = S.busy.has("size") || (b.dataset.size === "full" && !ent.size_full_ok);
+    if (b.dataset.size === "full") b.title = ent.size_full_ok ? "Each pick sends its full shares" : "Full needs Flat all and the cover watch on (EDGE_TRADER_PLAN_FLAT=1)";
+  });
 }
 
 function placeAllPicks(v) {
@@ -477,6 +488,18 @@ $("flatAll").addEventListener("click", async () => {
   const r = await post("/api/opening-plan/flat-all", { expected: items });
   toast(r.ok ? "Flat all done." : (r.error || "Flat all: not done."), !r.ok);
   await tick();
+});
+
+$("sizeSeg").addEventListener("click", async ev => {
+  const b = ev.target.closest("button[data-size]"); if (!b || b.disabled || b.classList.contains("on")) return;
+  const want = b.dataset.size;
+  if (want === "full" && !confirm("Send full size?\nEach Place, Place all 4, Flip and Chase sends the card's shares, not 1.")) return;
+  S.busy.add("size"); render();
+  try {
+    const r = await post("/api/opening-plan/size", { size: want });
+    if (!r.ok) toast(r.error || "Not changed.", true); else toast(want === "full" ? "Full size." : "1 share.");
+  } catch (err) { toast(String(err), true); }
+  finally { S.busy.delete("size"); await tick(); }
 });
 
 let riskT = 0;

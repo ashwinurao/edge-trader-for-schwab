@@ -990,7 +990,7 @@ ACTIONS = frozenset({"/api/ticket/submit", "/api/ticket/cancel", "/api/ticket/ca
                      # Flat all and Add stop (Step 9, companion/plan_flat.py): ok, error (ticker on Add stop)
                      "/api/opening-plan/flat-all", "/api/opening-plan/add-stop",
                      # the A1 page (2026-11-18): Place all 4, Chase, Take control, one pick's Flatten and Cancel stop
-                     "/api/opening-plan/place-all", "/api/opening-plan/chase", "/api/opening-plan/take",
+                     "/api/opening-plan/place-all", "/api/opening-plan/chase", "/api/opening-plan/take", "/api/opening-plan/size",
                      "/api/opening-plan/flatten", "/api/opening-plan/cancel-stop"})
 BODY_CAP = 65_536
 

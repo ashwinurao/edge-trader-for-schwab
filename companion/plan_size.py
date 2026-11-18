@@ -11,7 +11,9 @@ names the stage:
 
 Any other value is a bad playbook: the plan buttons stay off, as for any bad playbook
 (companion/plan_entries.py register). Raising the stage is a one-line playbook PR that quotes
-Ash's go for that stage (brief 19). A stage above 1 share also needs the cover watch on
+Ash's go for that stage (brief 19). Since 2026-11-18 Ash also sets it himself on the Opening plan
+page: "1 share" or "Full" (SWITCH below, saved in the settings table; Ash, project thread, 22:34:51
+UTC). A stage above 1 share also needs the cover watch on
 (EDGE_TRADER_PLAN_FLAT=1, companion/plan_flat.py): a partly filled entry of more than one share
 can leave shares without a stop.
 
@@ -42,6 +44,22 @@ FRACTIONS = (Decimal("0.10"), Decimal("0.25"), Decimal("0.50"), Decimal("1.0"))
 STAGES = (ONE_SHARE,) + FRACTIONS
 
 Stage = Union[str, Decimal]
+
+# Ash's switch on the Opening plan page (2026-11-18 22:34:51 UTC, project thread: "can you leave this
+# control of 1 share or full BP control with me in the UI"): "1_share" or "full" (the plan's fitted
+# shares, stage 1.0), saved in Edge Trader's settings table. It replaces the playbook's stage while
+# set; blank means the playbook's. Anything else saved there is ignored and the log says so.
+SWITCH_KEY = "opening_plan_size_switch"
+SWITCH = {"1_share": ONE_SHARE, "full": Decimal("1.0")}
+
+
+def switch_name(stage: "Stage") -> str:
+    """The page's name for a stage: "1_share", "full", or its label for a playbook-only stage."""
+    stage = parse_stage(stage)
+    for k, v in SWITCH.items():
+        if stage == v:
+            return k
+    return label(stage)
 
 
 def parse_stage(value: Any) -> Stage:

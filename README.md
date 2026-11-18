@@ -539,7 +539,7 @@ before a fill (60% of the way to the low) would flip it to the short side. 50.04
 the day's four picks as cards in rank order (`companion/opening_plan/static/opening_plan_a1.html`):
 - **Top line:** the clock, the risk per pick (a slider, saved like before), a meter of how much of the
   account's room the four picks use if all fill, the gear (the room share and the margin for a name with
-  no preview), "sends 1 share" while the size stage is the test stage, a count of filled, working, flip
+  no preview), the **1 share / Full** switch (below, "The 1 share / Full switch"), a count of filled, working, flip
   and chase picks, **Place all 4**, **Flat all**, and **Details** (the table).
 - **Each card:** the ticker, its live price, ATR, the margin Schwab charges for the side ("2.5x", or
   "1.4x?" when no preview gave the name's rate), the shares, and a chart of 1-minute bars fixed from
@@ -679,7 +679,17 @@ and the points under "Before any stage above 1 share" below.
 The size is decided on the server only: the page sends the shares it showed, and a difference
 refuses. The ticket's own Break entry stays at `BREAK_MAX_SHARES` (1); only a plan entry may go above
 it, by its stage, which the server passes inside itself (`break_entry.plan_cap`), never from a
-request. Raising the stage is its own one-line PR that quotes Ash's go for that stage.
+request. Raising the stage in the playbook is its own one-line PR that quotes Ash's go for that stage.
+
+**The 1 share / Full switch (Ash, 2026-11-18 22:34:51 UTC, project thread: "can you leave this
+control of 1 share or full BP control with me in the UI").** The A1 page's top line has a switch:
+**1 share** sends 1 share a pick; **Full** sends each card's shares (stage 1.0: the risk shares, cut
+to fit the account by `fit.py`). It is saved in the settings table (`opening_plan_size_switch`) and
+read back at start, and it replaces the playbook's stage while set. Full asks you to confirm, needs
+Flat all and the cover watch on (`EDGE_TRADER_PLAN_FLAT=1`), and changes nothing already sent: it
+applies to the next Place, Place all 4, Flip or Chase. A click the page showed at the other size is
+refused (the page sends the shares it showed). The armed plan still arms only at 1 share. The gaps under
+"Before any stage above 1 share" below are still open; with Full on you trade with them.
 
 **Flat all and the cover watch (Step 9, off by default).** With `EDGE_TRADER_PLAN_FLAT=1` as well as
 both plan button switches, the Opening plan gets a **Flat all** button and the cover watch

@@ -605,3 +605,65 @@ def test_the_apps_bars_source_uses_the_pollers_read_client_and_budget():
     src._now = lambda: datetime(2026, 11, 13, 9, 20, tzinfo=ET).astimezone(timezone.utc)
     src.read(["AAAA"])
     assert p.asked == [1] and p.counted == 1 and p.paused == ["7"] and len(p.client.calls) == 1
+
+
+# ---------------------------------------------------------------- the size switch (Ash, 2026-11-18 22:34:51 UTC)
+
+from companion import plan_size  # noqa: E402
+
+
+def test_the_size_switch_sends_the_full_plan_shares_and_back(fr):
+    """Full is stage 1.0: AAAA's plan size 175 (risk $100 / 0.57) is sent; 1 share sends 1."""
+    fr.desk.full_ok = True
+    saved = {}
+    assert fr.desk.set_size("full", save=saved.__setitem__) == {"ok": True, "size_switch": "full", "size_stage": "100%"}
+    assert saved == {plan_size.SWITCH_KEY: "full"}
+    assert "1 share" not in next(r for r in fr.desk.state()["rows"] if r["ticker"] == "AAAA")["stage"]["long"]
+    r = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 1})
+    assert not r["ok"] and fr.broker.calls == []                   # the page showed 1: refused, nothing sent
+    r = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 175})
+    assert r["ok"], r
+    assert fr.broker.orders[r["order_id"]]["orderLegCollection"][0]["quantity"] == 175
+    assert fr.desk.set_size("1_share")["size_stage"] == "1 share"
+    assert fr.desk.place("BBBB", "LONG", LONG)["ok"]
+
+
+def test_the_size_switch_refuses_full_without_the_cover_watch_and_other_names(fr):
+    assert fr.desk.full_ok is False
+    r = fr.desk.set_size("full")
+    assert not r["ok"] and "EDGE_TRADER_PLAN_FLAT" in r["error"] and fr.desk.stage == plan_size.ONE_SHARE
+    for bad in ("", "0.25", "half", None, 1):
+        assert not fr.desk.set_size(bad)["ok"]
+    assert fr.desk.state()["size_switch"] == "1_share" and fr.desk.state()["size_full_ok"] is False
+
+
+def test_the_size_route_saves_and_a_restart_reads_it_back(fr):
+    from test_plan_flat import FLAT_ON, make_app
+    app, _ = make_app(fr, FLAT_ON)
+    c = TestClient(app)
+    assert c.get("/api/opening-plan/entries").json()["size_switch"] == "1_share"
+    r = c.post("/api/opening-plan/size", json={"size": "full"}).json()
+    assert r["ok"] and fr.trader.store.get_setting(plan_size.SWITCH_KEY) == "full"
+    desk = app.state.opening_plan_desk
+    assert desk.stage == plan_size.SWITCH["full"]
+    app2, _ = make_app(fr, FLAT_ON)                                 # a restart: the saved choice stays
+    assert app2.state.opening_plan_desk.stage == plan_size.SWITCH["full"]
+    assert TestClient(app2).get("/api/opening-plan/entries").json()["size_switch"] == "full"
+
+
+def test_a_saved_full_is_ignored_without_the_cover_watch(fr):
+    from test_plan_entries import BOTH
+    from test_plan_flat import make_app
+    fr.trader.store.set_setting(plan_size.SWITCH_KEY, "full")
+    app, _ = make_app(fr, BOTH)
+    assert app.state.opening_plan_desk.stage == plan_size.ONE_SHARE
+    fr.trader.store.set_setting(plan_size.SWITCH_KEY, "nonsense")
+    from test_plan_flat import FLAT_ON
+    app, _ = make_app(fr, FLAT_ON)
+    assert app.state.opening_plan_desk.stage == plan_size.ONE_SHARE
+
+
+def test_the_page_has_the_switch_and_confirms_full():
+    page = (STATIC / "opening_plan_a1.html").read_text()
+    assert 'data-size="1_share"' in page and 'data-size="full"' in page
+    assert 'confirm("Send full size?' in page and "/api/opening-plan/size" in page
