@@ -568,8 +568,9 @@ the day's four picks as cards in rank order (`companion/opening_plan/static/open
   **estimated shares** below, marked EST; with no estimate it says "sizes at 09:31".
 - **Estimated shares before the 09:30 minute** (2026-11-19, Ash's pick 14:19:00 UTC in the project
   thread, "Preview new names, reprice each minute"; `companion/opening_plan/estimate_fit.py`). Each
-  preview card from 09:00 ET, and each frozen card still waiting for its minute, shows "≈ ▲N ▼N": the
-  shares **Place all 4** would send for each side if the 09:30 minute came out typical. The typical
+  preview card from 09:00 ET, and each frozen card still waiting for its minute, shows "≈ N": the
+  shares **Place all 4** would send if the 09:30 minute came out typical, for the side that gets fewer
+  (Ash picked "B: one number with range" on 2026-11-19 16:05:53 UTC). The typical
   minute is a bar of 0.27 x ATR centred on the card's price (`size.estimate.first_minute_atr` in
   `playbook.json`), so each entry sits about 0.13 x ATR past the price and the risk per share is about
   0.27 x ATR. On OV's 2026 top 4 (835 picks, 2026-01-02 to 2026-10-30), from the 09:10 price the
@@ -579,9 +580,10 @@ the day's four picks as cards in rank order (`companion/opening_plan/static/open
   margin rate from this morning's previews, the margin under the gear for a side without one, the room
   share and the live buying power check), all four cards together. The price is Edge Scanner's last
   price in its preview, which it refreshes once a minute, so the estimate changes once a minute; after
-  the 09:25 freeze it is the frozen pick's price. The dotted bar shows how far the room cuts the
-  shares below what risk alone gives; the card's tooltip gives the usual range (the same sizing at a
-  wide 0.37 and a narrow 0.19 x ATR minute). Until any pick has real shares, the top meter shows the
+  the 09:25 freeze it is the frozen pick's price. Under the number, "est HH:MM" and "usually L–H": the
+  same sizing at a wide 0.37 and a narrow 0.19 x ATR minute. When the two ends are less than 10 shares
+  apart it says "room decides" instead if the account's room cuts the shares below what risk alone
+  gives. The card's tooltip gives both sides' numbers. Until any pick has real shares, the top meter shows the
   estimate's use of the room, marked "≈ ... est". An estimate is never a size: nothing that sends an
   order reads it, and a card sizes from its own 09:30 minute as soon as that minute is in. With no
   risk set, no ATR or no price from Edge Scanner the card says why there is no estimate; with

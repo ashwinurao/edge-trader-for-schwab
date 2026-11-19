@@ -79,12 +79,10 @@
   .ib.take { color: var(--violet); border-color: rgba(167,139,250,.35); }
   .wait { color: var(--dim); font: 600 13px var(--mono); }
   /* Estimated shares before the 09:30 bar (estimate_fit.py, Ash's pick 2026-11-19): dimmed, marked EST. */
-  .estn { font: 800 20px var(--mono); opacity: .78; }
+  .estn { font: 800 20px var(--mono); color: var(--text); opacity: .78; }
   .estn i { font-style: normal; color: var(--faint); margin-right: 3px; }
-  .estn .LONG { color: var(--upT); } .estn .SHORT { color: var(--downT); }
   .estsub { font: 600 10.5px var(--mono); color: var(--faint); }
   .tag.EST { color: var(--dim); border: 1px dashed var(--faint); background: transparent; }
-  .mb.est u { background: repeating-linear-gradient(90deg, var(--dim) 0 4px, transparent 4px 6px); }
   .why { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .toast { position: fixed; right: 16px; bottom: 16px; max-width: 520px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
            padding: 10px 14px; font-size: 13px; box-shadow: 0 8px 24px #000a; display: none; z-index: 30; }
@@ -228,18 +226,23 @@ function header(row, e, side, lp, k) {
   return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${estTag}${tag}<span class="sp"></span>${sh}`;
 }
 
-// Layout A (the mockup recommended to Ash, 2026-11-19): both sides' estimated shares, and a dotted bar for the room's cut.
+// Layout B (Ash's pick on the card, 2026-11-19 16:05:53 UTC, "B: one number with range"): one number,
+// the smaller side's estimated shares, with the usual range (wide and narrow first minute) under it.
 function estimateShares(ef) {
-  const n = x => x && typeof x.shares === "number" ? x.shares.toLocaleString() : "—";
   const l = ef.long || {}, sh = ef.short || {};
-  const risk = Math.max(l.risk_shares || 0, sh.risk_shares || 0), most = Math.max(l.shares || 0, sh.shares || 0);
-  const w = risk > 0 ? Math.min(100, most / risk * 100) : 0;
+  const num = x => typeof x === "number";
+  const n = [l.shares, sh.shares].filter(num);
+  if (!n.length) return `<div class="sh" title="${esc(ef.text || "")}"><span class="wait">sizes at 09:31</span></div>`;
+  const most = Math.min(...n);
+  const ends = i => [l, sh].map(x => (x.usually || [])[i]).filter(num);
+  const lo = ends(0).length ? Math.min(...ends(0)) : null, hi = ends(1).length ? Math.min(...ends(1)) : null;
+  const risk = Math.min(...[l.risk_shares, sh.risk_shares].filter(num).concat([Infinity]));
   const cut = most < risk;
-  const usual = [l, sh].map(x => (x.usually || []).filter(v => typeof v === "number")).flat();
-  const tip = (usual.length ? `Usually ${Math.min(...usual).toLocaleString()} to ${Math.max(...usual).toLocaleString()}. ` : "") +
+  const rng = lo !== null && hi !== null && hi - lo >= 10 ? `usually ${lo.toLocaleString()}–${hi.toLocaleString()}` : (cut ? "room decides" : "");
+  const tip = `Long ≈${num(l.shares) ? l.shares.toLocaleString() : "—"}, short ≈${num(sh.shares) ? sh.shares.toLocaleString() : "—"}. ` +
               (cut ? `Cut by the account's room; risk alone gives ${risk.toLocaleString()}.` : "Risk decides.");
-  return `<div class="sh" title="${esc(tip)}"><span class="estn"><i>≈</i><span class="LONG">${ARW.LONG}${n(l)}</span> <span class="SHORT">${ARW.SHORT}${n(sh)}</span></span>` +
-         `<span class="mbw"><span class="estsub">est${ef.as_of_et ? " " + ef.as_of_et : ""}</span><span class="mb est"><u style="width:${w}%"></u></span><em>${cut ? risk.toLocaleString() : ""}</em></span></div>`;
+  const sub = [`est${ef.as_of_et ? " " + ef.as_of_et : ""}`, rng].filter(Boolean).join(" · ");
+  return `<div class="sh" title="${esc(tip)}"><span class="estn"><i>≈</i>${most.toLocaleString()}</span><span class="estsub">${sub}</span></div>`;
 }
 
 function footer(row, e, side, lp, k) {
