@@ -7,6 +7,7 @@ the record, so waits are exact and nothing sleeps for real. Nothing reaches the 
 import json
 import queue
 import socket
+import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -155,6 +156,85 @@ def test_wait_parts_of_a_plain_call_are_the_client_alone(rig):
     assert c["wait_pause_ms"] is None and c["wait_throttle_ms"] is None
     assert c["wait_ms"] == c["wait_client_ms"] == 0.0     # the wire time covers the 10 ms: none left over
     assert c["wire_ms"] == 250.0 and c["ok"] is True and c["http"] == 201
+
+
+def test_the_quote_read_before_a_send_records_schwabs_quote_age(rig):
+    """The open of 2026-11-19: the quote each armed send read just before its order had no age in
+    the record, only the poller's quotes did. Schwab's newest quoteTime/tradeTime (here the quote,
+    1.5 s old) gives data_ts and data_age_ms, as for the poller's quotes."""
+    quoted = round(time.time() * 1000) - 1500          # the record stamps answers with the real wall clock
+
+    def fn():
+        netlog.answered("schwab", "GET", "https://api.schwabapi.com/marketdata/v1/quotes", 200, 650.0)
+        return Resp(200, {"ASTS": {"quote": {"quoteTime": quoted, "tradeTime": quoted - 1000}}})
+
+    assert rig.t._logged("ticket_quote", fn).json()["ASTS"]["quote"]["quoteTime"] == quoted
+    (c,) = rig.rec.lines("call")
+    assert c["endpoint"] == "ticket_quote" and c["items"] == 1
+    assert c["data_ts"] == datetime.fromtimestamp(quoted / 1000, timezone.utc).isoformat(timespec="milliseconds")
+    assert 1500 <= c["data_age_ms"] < 2500            # 1.5 s, plus the moments this test takes
+
+
+def test_a_quote_answer_that_is_not_json_is_returned_as_it_came_with_no_age(rig):
+    class NotJson(Resp):
+        def json(self):
+            raise ValueError("not JSON")
+
+    answer = NotJson(200)
+    assert rig.t._logged("ticket_quote", lambda: answer) is answer
+    (c,) = rig.rec.lines("call")
+    assert c["ok"] is True and c["data_ts"] is None and c["data_age_ms"] is None
+
+
+def test_a_send_reads_no_body_for_its_record(rig):
+    """Only a quote's body is read for the record: an order's answer is left alone."""
+    class Watched(Resp):
+        def json(self):
+            raise AssertionError("an order answer's body was read")
+
+    r = rig.t._logged("place_order", lambda: Watched(201, None, {"Location": f"{ACCOUNT_URL}/orders/{ORDER_ID}"}))
+    assert r.status_code == 201
+    (c,) = rig.rec.lines("call")
+    assert c["data_age_ms"] is None
+
+
+def test_named_calls_only_inside_naming_and_only_until_named_none(rec):
+    """netlog.naming runs one armed-plan step in its own context; name_calls names the calls made
+    in it until name_calls(None). Outside naming it does nothing, so nothing leaks to other calls."""
+    netlog.name_calls("outside", "armed_plan")
+    with netlog.call("schwab", "account_details"):
+        pass
+
+    def step():
+        with netlog.call("schwab", "ticket_quote"):
+            pass
+        netlog.name_calls("ticket-1", "armed_plan")
+        with netlog.call("schwab", "ticket_quote"):
+            pass
+        with netlog.call("schwab", "place_order"):
+            pass
+        netlog.name_calls(None)
+        with netlog.call("schwab", "order_details"):
+            pass
+        netlog.name_calls("ticket-2", "armed_plan")     # a step that ends while named
+        return "done"
+
+    assert netlog.naming(step) == "done"
+    with netlog.call("schwab", "account_details"):
+        pass
+    got = [(c["endpoint"], c["req"], c["purpose"]) for c in rec.lines("call")]
+    assert got == [("account_details", None, "other"), ("ticket_quote", None, "other"),
+                   ("ticket_quote", "ticket-1", "armed_plan"), ("place_order", "ticket-1", "armed_plan"),
+                   ("order_details", None, "other"), ("account_details", None, "other")]
+    assert "ticket-1" not in netlog._req_writes
+
+
+def test_naming_passes_the_steps_error_on_unchanged():
+    def step():
+        raise KeyError("boom")
+
+    with pytest.raises(KeyError, match="boom"):
+        netlog.naming(step)
 
 
 def test_a_call_with_two_answers_counts_two_attempts(rig):

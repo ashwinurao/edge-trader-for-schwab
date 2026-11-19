@@ -60,7 +60,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import break_entry, plan_entries, plan_flat, plan_size
+from .. import break_entry, netlog, plan_entries, plan_flat, plan_size
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
@@ -352,6 +352,12 @@ class AutoPlan:
                     fh.write(_no_dollars(json.dumps(row, default=str)) + "\n")
         except OSError:
             log.exception("armed plan: could not write its log")
+        # The network record names the send's Schwab calls by its ticket id (a cancel by its pick),
+        # from its start line to its answer line (netlog.name_calls; the open of 2026-11-19).
+        if event in ("send_start", "cancel_start"):
+            netlog.name_calls(fields.get("ticket_id") or f"{ticker}-cancel", "armed_plan")
+        elif event in ("send_answer", "cancel_answer"):
+            netlog.name_calls(None)
         if event == "send_start":
             # Every send of the plan (the break entry, and the later steps' flips and chases) logs this
             # line just before its Schwab call: the poller's hold runs to 60 s after the last one.
@@ -802,7 +808,7 @@ class AutoPlan:
 
     def safe_step(self) -> bool:
         try:
-            return self.step()
+            return netlog.naming(self.step)     # a step's own context: names in the record end with it
         except Exception as e:
             problem = f"{type(e).__name__}: {e}"[:300]
             if problem != self.problem:
