@@ -336,6 +336,59 @@ def test_late_and_not_ready_picks_are_noted():
     assert any("late" in n for n in v["notes"]) and any("bars missing" in n for n in v["notes"])
 
 
+# The 09:26 re-check note shows only what touches the plan's ranks 1 to 4 (Ash, project thread
+# "Explain the 09:26 re-check mismatch", 2026-11-19 00:53:08 UTC). The texts are ov-picks' own
+# sentence parts (ov_picks/runner/morning.py compare_picks).
+TOP4 = [pick(1, "AAAA", 42.48, 41.92, 42.37), pick(2, "BBBB", 42.48, 41.92, 42.37),
+        pick(3, "CCCC", 42.48, 41.92, 42.37), pick(4, "DDDD", 42.48, 41.92, 42.37),
+        pick(5, "EEEE", 42.48, 41.92, 42.37)]
+ROW_9 = ("the re-check's ranked list differs from row 9: HL in the re-check, NBIS in the frozen list "
+         "(27 rows in the re-check, 27 frozen)")
+
+
+def recheck_notes(difference):
+    v = view(picks=answer(TOP4, settled_state="SETTLED_DIFF", settled_difference=difference))
+    return [n for n in v["notes"] if n.startswith("The 09:26 re-check")]
+
+
+def test_recheck_difference_below_the_top_4_is_not_noted():
+    # 2026-11-18's note: rows 1 to 8 were the same in both lists.
+    assert recheck_notes(ROW_9) == []
+    # Row 5 is the first row the plan does not use.
+    assert recheck_notes(ROW_9.replace("row 9", "row 5")) == []
+
+
+def test_recheck_difference_inside_the_top_4_is_noted():
+    text = ("the re-check's ranked list differs from row 4: EEEE in the re-check, DDDD in the frozen list "
+            "(27 rows in the re-check, 27 frozen)")
+    assert recheck_notes(text) == [f"The 09:26 re-check differs: {text}"]
+
+
+def test_recheck_top_picks_and_earnings_status_are_always_noted():
+    top = ("the re-check's top picks are AAAA, BBBB, EEEE, CCCC, the frozen top picks are AAAA, BBBB, CCCC, "
+           "DDDD (first difference at top pick 3: EEEE in the re-check, CCCC in the frozen picks)")
+    earnings = "OV's earnings data was available at the frozen scan and missing in the re-check"
+    assert recheck_notes(f"{earnings}; {top}; {ROW_9}") == [f"The 09:26 re-check differs: {earnings}; {top}"]
+
+
+def test_recheck_earnings_label_is_noted_only_for_a_plan_name():
+    assert recheck_notes("EEEE's earnings label is AMC in the re-check, none frozen") == []
+    text = "CCCC's earnings label is AMC in the re-check, none frozen"
+    assert recheck_notes(f"{text}; EEEE's earnings label is BMO in the re-check, none frozen") == [
+        f"The 09:26 re-check differs: {text}"]
+
+
+def test_recheck_text_this_code_does_not_know_is_still_noted():
+    # When unsure, show it: a new kind of part, and a SETTLED_DIFF with no text at all.
+    assert recheck_notes("something new differs") == ["The 09:26 re-check differs: something new differs"]
+    assert recheck_notes(None) == ["The 09:26 re-check differs:"]
+
+
+def test_recheck_same_is_not_noted():
+    v = view(picks=answer(TOP4, settled_state="SETTLED_SAME", settled_difference=None))
+    assert not any(n.startswith("The 09:26 re-check") for n in v["notes"])
+
+
 # ---------------------------------------------------------------- the feed
 
 class Clock:

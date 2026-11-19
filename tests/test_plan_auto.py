@@ -207,6 +207,7 @@ def rig(tmp_path, monkeypatch):
                       lambda: knobs["fresh"], lambda: knobs["cooldown"], env=ENV, now=clock.now,
                       out_dir=tmp_path / "auto", hold_later=lambda sec, why: holds.append((clock.now(), sec, why)))
     plan._mono = clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     broker.locks = [plan._lock, desk._lock, plan.arming._lock]
 
     class Rig:
@@ -434,6 +435,23 @@ def test_four_picks_go_out_one_at_a_time_nearest_first_each_exactly_the_break_en
     run(rig, et(9, 31, 30))
     assert len(rig.broker.placed) == 4 and rig.plan.orders_day == 4
     assert [x["ticker"] for x in lines(rig, "send_start")] == NEAREST_FIRST
+
+
+def test_the_record_names_each_armed_send_by_its_ticket(rig, rec):  # noqa: F811
+    """The open of 2026-11-19: the armed plan's Schwab calls had no id and purpose "other", so they
+    matched their pick only by time. Each send's calls now carry its ticket id (the auto log's
+    send_start line) and purpose armed_plan, and the record stops naming them after send_answer."""
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    starts = lines(rig, "send_start")
+    assert [x["ticker"] for x in starts] == NEAREST_FIRST
+    places = [c for c in rec.lines("call") if c["endpoint"] == "place_order"]
+    assert [c["req"] for c in places] == [x["ticket_id"] for x in starts]
+    assert {c["purpose"] for c in places} == {"armed_plan"}
+    assert netlog._req.get() is None and netlog._purpose.get() is None
+    with netlog.call("schwab", "account_details"):
+        pass
+    assert rec.lines("call")[-1]["req"] is None and rec.lines("call")[-1]["purpose"] == "other"
 
 
 def test_nothing_before_act_from(rig):
@@ -737,26 +755,28 @@ def test_the_hold_starts_30_s_before_act_from_not_at_the_arm_click_and_sends_not
 
 
 def test_four_sends_end_the_hold_60_s_after_the_last_and_resting_entries_and_cancels_call_none(rig):
-    # Review 6 item 6: four sends from 09:31:00 to 09:31:05.1 (0.85 s a Schwab call). The entries
-    # then rest until the 09:35 cancels: neither renews the hold nor starts another.
+    # Review 6 item 6: four sends at 09:31:00 (0.85 s a Schwab call). The entries then rest until the
+    # 09:35 cancels: neither renews the hold nor starts another. Since the burst ("do all 5", change 1)
+    # the four go on one reading with no quote first; burst.in_order runs them one POST apart on the
+    # fake clock (they were 1.7 s apart: a quote and a POST each).
     rig.broker.delay = 0.85
     arm(rig, at=et(9, 29, 0))
     run(rig, et(9, 36, 0), start=et(9, 29, 0))
     assert placed(rig) == NEAREST_FIRST and len(rig.broker.cancelled) == 4
-    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 1.7), et(9, 31, 3.4), et(9, 31, 5.1)]
+    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 0.85), et(9, 31, 1.7), et(9, 31, 2.55)]
     assert rig.holds[0][0] == et(9, 30, 30)
-    assert held_through(rig) == et(9, 32, 5.1)                    # cut to the second: 60 s after the last send
-    assert max(t for t, _, _ in rig.holds) < et(9, 32, 5.1)       # nothing renewed after it
+    assert held_through(rig) == et(9, 32, 2.55)                   # cut to the second: 60 s after the last send
+    assert max(t for t, _, _ in rig.holds) < et(9, 32, 2.55)      # nothing renewed after it
     times = [t for t, _, _ in rig.holds]
     for (t1, s1, _), t2 in zip(rig.holds, times[1:]):
         assert t2 < t1 + timedelta(seconds=s1)                   # no gap between two holds
         assert X.POLL_HOLD_RENEW_SECONDS <= (t2 - t1).total_seconds() < X.POLL_HOLD_RENEW_SECONDS + 2
     first_cancel = min(datetime.fromisoformat(x["t"]) for x in lines(rig, "cancel_start"))
-    assert first_cancel >= et(9, 35, 0) and not [t for t, _, _ in rig.holds if t >= et(9, 32, 5.1)]
+    assert first_cancel >= et(9, 35, 0) and not [t for t, _, _ in rig.holds if t >= et(9, 32, 2.55)]
     assert len(lines(rig, "poll_hold")) == 1                      # one hold for the arm
     (end,) = lines(rig, "poll_hold_end")
     assert end["why"] == "60 s after the plan's last send"
-    assert et(9, 32, 5.1) <= datetime.fromisoformat(end["t"]) < et(9, 32, 7)
+    assert et(9, 32, 2.55) <= datetime.fromisoformat(end["t"]) < et(9, 32, 4.5)
 
 
 def release_at(rig, times):
@@ -880,15 +900,55 @@ def test_the_hold_never_runs_past_the_plans_own_end(rig):
     assert end["why"] == "the plan is not armed" and datetime.fromisoformat(end["t"]) >= et(9, 31, 45)
 
 
-@pytest.mark.parametrize("price", [42.49, 42.60])
-def test_must_not_send_at_or_past_the_trigger(rig, price):
+@pytest.mark.parametrize("price", [42.49, 42.54])
+def test_through_the_trigger_inside_the_limit_goes_as_a_limit_at_the_limit(rig, price):
+    """Change 2 of Ash's "do all 5" (2026-11-19 17:02:46 UTC): at or through AAAA's trigger 42.49 but
+    with the ask (price + 0.01) not past its limit 42.55, the entry goes as a LIMIT at 42.55 with its
+    stop attached. It was left to Ash (test_must_not_send_at_or_past_the_trigger)."""
+    arm(rig)
+    rig.tape.prices["AAAA"] = price
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig)[0] == "AAAA" and sorted(placed(rig)) == sorted(PICKS)   # through: nearest of all
+    assert "AAAA" not in rig.plan.left
+    (o,) = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == "AAAA"]
+    assert (o["orderType"], o["price"], o["orderLegCollection"][0]["instruction"]) == ("LIMIT", "42.55", "BUY")
+    assert "stopPrice" not in o
+    (child,) = o["childOrderStrategies"]
+    assert (child["orderType"], child["stopPrice"], child["orderLegCollection"][0]["instruction"]) == \
+        ("STOP", "41.92", "SELL")
+    others = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] != "AAAA"]
+    assert {o["orderType"] for o in others} == {"STOP_LIMIT"}
+
+
+@pytest.mark.parametrize("price", [42.56, 42.60])
+def test_must_not_send_past_the_limit(rig, price):
+    """The last trade past AAAA's limit 42.55: a LIMIT there could only rest, so the pick is left."""
     arm(rig)
     rig.tape.prices["AAAA"] = price
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
     assert "AAAA" not in placed(rig) and len(rig.broker.placed) == 3
-    assert rig.plan.left["AAAA"] == H.LEFT_PAST_TRIGGER
+    assert rig.plan.left["AAAA"] == H.LEFT_PAST_LIMIT
     notes = [x for x in lines(rig, "leave") if x["ticker"] == "AAAA"]
     assert len(notes) == 1                          # said once
+
+
+def test_must_not_send_when_the_tape_ask_is_past_the_limit(rig):
+    """The last trade 42.54 is inside the limit 42.55, but the tape's ask is 42.57: break_entry
+    refuses on the ask, nothing goes, and the pick is left with the words."""
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.54
+    real = rig.tape.read
+
+    def read():
+        r = real()
+        for p in r["picks"]:
+            if p["symbol"] == "AAAA":
+                p["ask"] = 42.57
+        return r
+    rig.tape.read = read
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert "AAAA" not in placed(rig) and len(rig.broker.placed) == 3
+    assert "past this entry's limit: ask 42.57 is above 42.55" in rig.plan.left["AAAA"]
 
 
 def test_a_bound_reached_disarms(rig, monkeypatch):
@@ -931,26 +991,41 @@ def test_one_cent_of_difference_is_not_a_disagreement(rig):
 
 # ---------------------------------------------------------------- a slow broker
 
-def test_slow_broker_still_one_at_a_time(rig):
+def test_slow_broker_the_four_go_in_one_burst_with_no_quote_first(rig):
+    """Change 1 and 2 of Ash's "do all 5": one reading, one burst of four sends, no Schwab quote
+    before them (the tape's price). It was one pick a reading, a quote and a POST each
+    (test_slow_broker_still_one_at_a_time)."""
     arm(rig)
     rig.broker.delay = 1.5
     run(rig, et(9, 31, 15), start=et(9, 31, 0.1))
     assert placed(rig) == NEAREST_FIRST
+    assert [c for c in rig.broker.calls if c[0] == "quote"] == []
+    (b,) = lines(rig, "burst")
+    assert b["picks"] == NEAREST_FIRST
+    (end,) = lines(rig, "burst_end")
+    assert end["acted"] == NEAREST_FIRST and end["errors"] == []
     times = [t for _, t in rig.broker.at]
     gaps = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
-    assert all(g >= 3.0 for g in gaps)                   # a quote and a POST each, never two at once
+    assert gaps == [1.5, 1.5, 1.5]                       # in_order: one POST apart on the fake clock
 
 
-def test_a_pick_that_crossed_its_trigger_while_waiting_is_not_sent(rig):
+def test_the_burst_sends_every_pick_on_the_one_reading(rig):
+    """The burst's picks all go on the reading that decided them (change 1 of Ash's "do all 5"): a
+    later price does not stop a send already decided. It was a new reading per send
+    (test_a_pick_that_crossed_its_trigger_while_waiting_is_not_sent); the order's own limit is the
+    guard now."""
     arm(rig)
     rig.broker.delay = 1.5
+    reads = []
+    real = rig.tape.read
+    rig.tape.read = lambda: reads.append(rig.clock.now()) or real()
 
     def hook(n):
         if n == 1:
-            rig.tape.prices["CCCC"] = 71.86             # through CCCC's trigger 71.85
+            rig.tape.prices["CCCC"] = 71.86             # through CCCC's trigger 71.85 after the reading
     rig.broker.after_place = hook
-    run(rig, et(9, 31, 15), start=et(9, 31, 0.1))
-    assert placed(rig) == ["DDDD", "AAAA", "BBBB"] and rig.plan.left["CCCC"] == H.LEFT_PAST_TRIGGER
+    run(rig, et(9, 31, 0.2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST and reads == [et(9, 31, 0.1)]
 
 
 def test_disarm_between_pick_2_and_3_stops_3_and_4(rig):
@@ -968,17 +1043,18 @@ def test_disarm_between_pick_2_and_3_stops_3_and_4(rig):
 
 def test_timeline_at_0_4_s_a_call(rig):
     """Brief 16's report: with the fake broker at 0.4 s a call, when each pick rests after 09:31:00.
-    Each send is the quote in break_entry.prepare (0.4 s) and the POST (0.4 s); the tape reading,
-    the engine and the desk take no fake time. The two status reads after a 201 run on their own
-    client and do not hold up the next send (fork PR #15)."""
+    Each send is the POST alone (0.4 s): no quote first since change 2 of Ash's "do all 5" (it was a
+    quote and a POST, 0.8 s, DDDD at 0.9 and CCCC at 3.3). burst.in_order runs them one after another
+    on the fake clock; burst.together starts them at once (tests/test_plan_burst.py). The two status
+    reads after a 201 run on their own client and do not hold up the next send (fork PR #15)."""
     arm(rig)
     rig.broker.delay = 0.4
     run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
     got = [(s, round((t - et(9, 31)).total_seconds(), 2)) for s, t in rig.broker.at]
-    assert got == [("DDDD", 0.9), ("AAAA", 1.7), ("BBBB", 2.5), ("CCCC", 3.3)]
+    assert got == [("DDDD", 0.5), ("AAAA", 0.9), ("BBBB", 1.3), ("CCCC", 1.7)]
     start = {x["ticker"]: x["t"] for x in lines(rig, "send_start")}
     answer = {x["ticker"]: x["t"] for x in lines(rig, "send_answer")}
-    assert start["DDDD"] == "2026-11-13T14:31:00.100Z" and answer["DDDD"] == "2026-11-13T14:31:00.900Z"
+    assert start["DDDD"] == "2026-11-13T14:31:00.100Z" and answer["DDDD"] == "2026-11-13T14:31:00.500Z"
 
 
 def test_steps_read_the_plan_view_before_the_tape_never_between_reading_and_send(rig):
@@ -1043,22 +1119,26 @@ def test_a_partial_refund_keeps_the_rest_of_the_reservation_and_its_time(rig):
     assert rig.plan._calls_used() == 0
 
 
-def test_a_quote_older_than_5_s_leaves_the_pick_for_the_day(rig, monkeypatch):
-    """break_entry.prepare refuses a Schwab quote older than MAX_QUOTE_AGE_MS (5 s, R-03) before any
-    order request. The plan does not try again: that pick is left (2026-11-13 11:00 ET probe: the
-    quote was up to 3.6 s old on COIN and 7.2 s on CRWD)."""
+def test_a_tape_quote_older_than_1_s_leaves_the_pick_for_the_day(rig):
+    """break_entry.prepare refuses the open tape's quote when it was more than TAPE_PRICE_MAX_AGE_MS
+    (1 s) old at the reading, before any order request, and the plan does not try again: that pick is
+    left. It was Schwab's quote and 5 s before change 2 of Ash's "do all 5"
+    (test_a_quote_older_than_5_s_leaves_the_pick_for_the_day; that rule still holds where the plan
+    falls back to Schwab's quote, tests/test_shared_quotes.py)."""
+    assert break_entry.TAPE_PRICE_MAX_AGE_MS == 1_000
     arm(rig)
-    real_quote = rig.trader.quote
+    real = rig.tape.read
 
-    def quote(sym, max_age=1.0):
-        q = real_quote(sym, max_age)
-        if sym == "DDDD":
-            q = {**q, "quote_time": _time.time() * 1000 - 6000}
-        return q
-    monkeypatch.setattr(rig.trader, "quote", quote)
+    def read():
+        r = real()
+        for p in r["picks"]:
+            if p["symbol"] == "DDDD":
+                p["quote_at"] = r["received"] - timedelta(seconds=1.2)
+        return r
+    rig.tape.read = read
     run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
     assert placed(rig) == ["AAAA", "BBBB", "CCCC"]
-    assert "quote is 6.0 s old" in rig.plan.left["DDDD"]
+    assert "The open tape's price is 1.20 s old" in rig.plan.left["DDDD"]
     assert rig.plan.orders_pick["DDDD"] == 0 and rig.plan.arming.is_armed(rig.clock.now())
     rec = rig.desk.records()["DDDD"]
     assert rec["state"] == plan_entries.NONE and rec["order_id"] is None and "Not sent" in rec["text"]
@@ -1926,6 +2006,7 @@ def with_flat(rig, wire=True):
     plan = X.register(app, rig.trader, Poller(), lambda r: None, env=ENV, tape=rig.tape,
                       usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.plan = plan
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     return flat
@@ -2148,6 +2229,7 @@ def app_registers(rig, env, between=None):
     plan = X.register(app, rig.trader, poller, lambda r: None, env=env, tape=rig.tape,
                       usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.plan, rig.desk, rig.app_poller = plan, app.state.opening_plan_desk, poller
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     return app

@@ -26,7 +26,7 @@ from companion.opening_plan import engine
 from companion.opening_plan import plan as P
 from companion.plan_auto import CHASE_FLAG, chase, handlers
 from companion.plan_auto.arming import armed_rules_from
-from companion.plan_auto.handlers import LEFT_PAST_TRIGGER, PAST_TRIGGER, Lane
+from companion.plan_auto.handlers import LEFT_PAST_LIMIT, PAST_TRIGGER, Lane
 from companion.store import Store
 from companion.trading import Trader
 from test_plan_entries import Plan, PlanBroker
@@ -248,12 +248,28 @@ def nothing_sent(rig):
 
 # ---- the switch ------------------------------------------------------------------------------
 
-def test_switch_off_leaves_the_pick_to_ash_as_step_6_does(rig):
+def test_switch_off_inside_the_limit_step_6_sends_a_limit_at_the_limit(rig):
+    """Change 2 of Ash's "do all 5" (2026-11-19 17:02:46 UTC): with the chase off, a price through the
+    level but inside the limit is Step 6's own send, as a LIMIT at the limit with its stop (here on
+    Schwab's quote: this tape has no bid and ask). It was left to Ash with LEFT_PAST_TRIGGER
+    (test_switch_off_leaves_the_pick_to_ash_as_step_6_does)."""
     rig.host.env.pop(CHASE_FLAG)
     assert rig.host.registry.get(PAST_TRIGGER, rig.host.env) is None
     assert PAST_TRIGGER not in rig.host.registry.kinds(rig.host.env)
-    assert rig.host.handle("would_place", tape(42.51)) is False
-    assert rig.host.left == {"AAAA": LEFT_PAST_TRIGGER}
+    assert rig.host.handle("would_place", tape(42.51)) is True
+    assert rig.host.left == {} and rig.quotes == ["AAAA"]
+    (order,) = rig.broker.placed
+    assert (order["orderType"], order["price"], order.get("stopPrice")) == ("LIMIT", "42.55", None)
+    (stop,) = order["childOrderStrategies"]
+    assert (stop["orderType"], stop["stopPrice"]) == ("STOP", "41.92")
+    (req,) = rig.sent
+    assert (req["entry"], req["trigger"], req["limit"]) == ("break", "42.49", "42.55")
+
+
+def test_switch_off_past_the_limit_leaves_the_pick_to_ash(rig):
+    rig.host.env.pop(CHASE_FLAG)
+    assert rig.host.handle("would_place", tape(42.56)) is False
+    assert rig.host.left == {"AAAA": LEFT_PAST_LIMIT}
     nothing_sent(rig)
     assert rig.quotes == [] and rig.host.calls == 40 and rig.host.orders_pick == 1
 

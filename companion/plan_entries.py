@@ -58,7 +58,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, chase_entry, plan_price, plan_side, plan_size, trading
+from . import break_entry, chase_entry, plan_price, plan_side, plan_size, send_gate, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -848,6 +848,9 @@ class PlanDesk:
         if len(picks) > 8:
             return {"ok": False, "error": "Too many picks in one click.", "results": []}
         seen, results, stopped = set(), [], ""
+        # One Schwab quotes call for all the picks, reused by their sends while young (Ash's card
+        # pick "One quote call for all 4", 2026-11-19 16:13:44 UTC; break_entry.shared_quotes).
+        names = [str(p.get("ticker") or "") for p in picks if isinstance(p, Mapping)]
         for p in picks:
             if not isinstance(p, Mapping):
                 results.append(self._refuse("", "A pick must be an object."))
@@ -861,7 +864,8 @@ class PlanDesk:
                 results.append(self._refuse(ticker, stopped))
                 continue
             try:
-                r = self.place(ticker, p.get("side"), p.get("expected"))
+                with break_entry.shared_quotes(names):
+                    r = self.place(ticker, p.get("side"), p.get("expected"))
             except Exception as e:                   # place reports its own errors; this is a bug
                 log.exception("place all: %s", ticker)
                 r = self._refuse(ticker, f"Error while placing ({e}). Check thinkorswim."[:300])
@@ -1102,6 +1106,27 @@ class PlanDesk:
                     f"{stop}, plan row trigger {n['trigger']} stop {n['stop']}. The armed plan sent nothing for it.")
         return ""
 
+    def burst_clear(self) -> bool:
+        """Nothing that makes every pick wait: Trader's order lock is free, and Schwab's order list and
+        positions are fresh. The armed plan's burst runs only then (plan_auto/burst.py); otherwise its
+        step stays one pick at a time, as before. No Schwab call."""
+        lk = getattr(self.trader, "_send_lock", None)
+        try:
+            if lk is not None and lk.locked():
+                return False
+            return bool(self._orders_fresh()) and self._positions_read()[1]
+        except Exception:
+            return False
+
+    def _burst_busy(self, ticker: str) -> bool:
+        """trader_busy for a send of the armed plan's burst (send_gate.burst): the other picks' holds do
+        not count, only the lock itself or this ticker's own hold. Only a hint, as trader_busy."""
+        lk = getattr(self.trader, "_send_lock", None)
+        try:
+            return bool(lk is not None and (lk.held_for(ticker) if hasattr(lk, "held_for") else lk.locked()))
+        except Exception:
+            return False
+
     def trader_busy(self) -> bool:
         """Trader's order lock is held right now (a click, a ticket send or Flat all). Only a hint:
         Trader.submit and cancel_entry still refuse if it is taken after this check."""
@@ -1125,7 +1150,7 @@ class PlanDesk:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
         if side not in OTHER:
             return self._refuse(ticker, "Pick long or short.", not_sent=True)
-        if self.trader_busy():
+        if (self._burst_busy(ticker) if send_gate.in_burst() else self.trader_busy()):
             # Before the row is claimed: a busy lock writes and removes no SENDING record.
             return self._refuse(ticker, TRADER_BUSY, not_sent=True, again=True, busy=True)
         orders = self._orders()

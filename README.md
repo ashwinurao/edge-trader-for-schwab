@@ -50,9 +50,9 @@ name are refused). It needs no account and sends no telemetry.
   `companion/netlog.py`). An `answer` line per HTTP answer (Schwab, Edge Scanner, GitHub): the path with
   account and order ids removed, the status, the time on the wire and the vendor's own clock. A `call`
   line per call as the app sees it: who asked (the poller, a ticket click, the status reads after a send,
-  Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
+  Auto B/E, the armed Opening plan), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
-  quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
+  quote was when it arrived: the poller's quotes and the quote a ticket or plan send reads just before its order. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
   `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
   `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
   pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
@@ -260,7 +260,12 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   "Preview, not locked. Picks freeze at 09:25 ET." A preview row has no 09:30 minute, no levels, no
   shares and no buttons, and nothing that places an order or the shadow log reads it as a pick. The
   opening probe previews its names (no order) only to learn each name's margin rate before the freeze. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
-  or for another day. The header's **Buying power** line shows Schwab's day-trading buying power, buying
+  or for another day. At 09:26 ET the OV picks module re-checks the frozen picks with bars that came in
+  late; the frozen picks always stand. The screen notes "The 09:26 re-check differs" only when the
+  difference touches the plan: a ranked-list change at rank 4 or above, OV's top picks, OV's earnings
+  data, or the earnings label of a name on the plan. A change further down the list is not shown, and
+  text the screen does not know is shown (`settled_difference_for_plan` in
+  `companion/opening_plan/plan.py`). The header's **Buying power** line shows Schwab's day-trading buying power, buying
   power and equity from the account read Edge Trader already makes every 5 seconds, with the time read.
   Missing, or older than 30 seconds, it says "not known", never a zero; with `--private` it is hidden. It
   is on the screen only, never in a log. `--demo` shows invented numbers; set `EDGE_TRADER_PLAN_DEMO_ET`
@@ -556,7 +561,8 @@ sends only on its click, and every click is checked on the server against its la
 sends what it showed; a difference refuses). Nothing is automatic.
 - **Place all 4** places each pick through Place's own checks, one at a time in rank order. A pick that
   is refused does not stop the others; a 429 from Schwab stops the rest
-  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`).
+  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`). Its sends share one Schwab quotes call,
+  as the armed plan's do (see the armed plan's sends below).
 - **Chase** (`PlanDesk.chase`, `POST /api/opening-plan/chase`): reads one Schwab quote; when the price is
   still past the entry it cancels the resting entry (if one rests) and waits until Schwab confirms it
   CANCELED with nothing filled, then sends a break entry with its trigger at the ask (long) or bid (short)
@@ -618,8 +624,8 @@ bracket: the stop-limit entry, then one OCO of a LIMIT target and the STOP, each
 (`break_entry.TARGET_PCT`, `target_for`): long at trigger x 1.05, short at trigger x 0.95, on the
 stock's grid, rounded toward the entry. A chase counts from its own trigger (the ask or bid it chases).
 Example: long trigger 42.49 gives 44.61 (44.6145 rounded down); short trigger 41.91 gives 39.82. This
-replaces Ash's earlier "no target" (2026-11-18 13:40 UTC). The armed plan's sends (Steps 6 to 8, on
-hold) still carry no target. When the target fills, the OCO cancels the stop and the row says "The
+replaces Ash's earlier "no target" (2026-11-18 13:40 UTC). The armed plan's sends (Steps 6 to 8)
+still carry no target. When the target fills, the OCO cancels the stop and the row says "The
 plan's target closed its N shares." A target that filled only part, or that still works after the
 plan's shares closed, turns the row unclear. Flatten, Flat all and Cancel stop read the plan's target
 after the close or the stop's cancel and cancel it if Schwab left it working (the OCO normally takes
@@ -832,13 +838,31 @@ the stage: the stage is for your clicks only, so Arm is refused at any other sta
 Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
 `Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
-attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
-again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
+attached. When one reading gives several picks to send, it sends them all at once, each on its own
+thread (`companion/plan_auto/burst.py`; Ash's go "do all 5", project thread, 2026-11-19 17:02:46 UTC,
+change 1). Each send keeps every check it had, and the bounds are taken one pick at a time, so four
+picks never pass the day's 4 orders. Edge Trader's order lock has a hold per name for this burst only
+(`companion/send_gate.py`): your click, Flat all or a cancel still waits for the burst, and the burst
+waits for them. While the lock is held or Schwab's order list or positions are old, the plan stays one
+pick at a time as before. On 2026-11-19, one at a time, the fourth order reached Schwab 6.4 s after the
+bar closed. A send checks the open tape's bid and ask, which the plan already holds, instead of asking
+Schwab for a quote (change 2: "let the limit guard the price"); that quote took 0.57 to 1.69 s at
+09:31. The tape's quote may be at most 1 second old when the plan read it
+(`break_entry.TAPE_PRICE_MAX_AGE_MS`, a start number), or the pick is left for the day. A pick already
+through its trigger but not past its limit (the cap) goes as a LIMIT at the limit with the same stop
+attached, instead of being left: the limit caps the fill (ASTS was refused on 2026-11-19 for being
+1 cent through). Past the limit it is left to you, as before. Three seconds before 09:31:00
+(`armed.warm_up_seconds_before`) the plan makes one Schwab quotes read per pick on the trading
+client, all at once on their own threads, to open the connections the burst uses (change 3,
+`companion/plan_auto/warm.py`). They are counted in the calls bound, never hold the order lock, and a
+failed one changes nothing but its log line. From 09:30:59 to 09:31:03 the plan reads the tape every
+0.1 s (`armed.fast_every_seconds`, change 4), every 0.25 s otherwise, and its first reading comes at
+09:31:00 itself. It cancels a plan entry that has not filled in two cases: its trigger traded
 but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
 log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
 waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never exits, moves a stop or
 resends, and flips or chases only with that step's own switch (below). Without the capped chase
-(below), a pick whose price is already at or past its trigger is left to you.
+(below), a pick whose price is already past its limit is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
 Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
@@ -899,7 +923,16 @@ not confirm (the row turns red); a reached bound; ARM turned off on the dashboar
 error. A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
 pick and is never retried, and so does an entry Schwab rejects after accepting it (on 2026-11-13 a
 REJECTED came 4.0 s after the 201: "The stop price must be above the current ask…"); the row shows
-Schwab's reason. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+Schwab's reason. A pick the tape gives no bid and ask for falls back to Schwab's quote, and then the
+plan's sends share one Schwab quotes call (Ash's card pick "One quote call for
+all 4", 2026-11-19 16:13:44 UTC): the first send's quote call asks for every pick of the reading, and
+the next sends use that answer while the app got it at most 2 seconds ago
+(`break_entry.SHARED_QUOTE_MAX_AGE_S`, a start number); older, the next send asks again for all of
+them. The call sits where the send's own quote call was, after every check before it, and the checks on
+the quote do not change. A failed shared call lets the send read its own quote, as before. On
+2026-11-19 each send's own quote took 0.57 to 1.69 s at 09:31 ET, one pick after the other. The
+ticket's own Break entry and a row's Place, Flip and Chase clicks still read a new quote each.
+On that fallback a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`) leaves the pick the same way:
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
 up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
 at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
@@ -954,7 +987,9 @@ with how long it waited (`waited_s`). A side rule line keeps the rule's code and
 adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
 row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
 request body or share count of your own positions, and no dollar amount: each `$` amount in its text, such as one in Schwab's words when it rejects a flip, is written as `$[masked]` (`companion/plan_auto/executor.py`), whatever the value it came from (the written line is masked too). A number without a dollar sign is not masked, and what Schwab writes in a reject is not confirmed. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
-`refusal` line, and the plan's Schwab calls their usual `call` lines.
+`refusal` line, and the plan's Schwab calls their usual `call` lines with purpose `armed_plan`. The
+calls of one send carry its ticket id as `req` (the same `ticket_id` as its `send_start` line here), and
+a cancel's calls carry `<pick>-cancel`, from the start line to the answer line (`netlog.name_calls`).
 
 **Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
 as the armed plan's switches above, the armed plan may also move its own resting entry without a

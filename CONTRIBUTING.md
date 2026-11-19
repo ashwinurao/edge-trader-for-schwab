@@ -19,7 +19,9 @@ These decide most review questions:
    sends that spread's close once, only while it runs, never retried. The armed plan (OV entries
    Step 6, `companion/plan_auto/`, `EDGE_TRADER_PLAN_AUTO=1`), armed for one day by the user's Arm
    click that shows its bounds: from 09:31 ET it sends that day's Opening plan break entries at 1 share,
-   one at a time, and cancels one that has not filled after the pullback wait or at the end of the
+   all picks of one reading at once (one hold per name on Trader's order lock, `companion/send_gate.py`;
+   Ash's go "do all 5", 2026-11-19 17:02:46 UTC), a pick through its trigger but inside its limit as a
+   LIMIT at the limit, and cancels one that has not filled after the pullback wait or at the end of the
    fast watch, once per order. With its own switch on (`EDGE_TRADER_PLAN_AUTO_FLIP=1`, Step 7,
    `companion/plan_auto/flip.py`) it may also cancel its own resting, untriggered entry and place
    the other side (a flip, at most 3 a row a day, counted with the Flip button) or the same side
