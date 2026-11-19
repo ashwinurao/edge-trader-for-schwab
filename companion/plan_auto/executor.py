@@ -346,8 +346,9 @@ class AutoPlan:
         high, low = _dec(pick.get("high")), _dec(pick.get("low"))
         if high is None or low is None or self.risk is None or self.calm is None or side not in ("long", "short"):
             return None
-        risk_used = self.risk * self.rules.calm_multiplier if self.calm else self.risk
-        return engine.order_for(side, high, low, risk_used, self.rules)
+        if self.calm and side == "long":
+            return None                        # calm day: no longs (playbook size.calm_rule, Ash 2026-11-19)
+        return engine.order_for(side, high, low, self.risk, self.rules)
 
     def log(self, event: str, ticker: Optional[str] = None, **fields) -> None:
         now = self._now()

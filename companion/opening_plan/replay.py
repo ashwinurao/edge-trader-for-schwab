@@ -97,7 +97,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m companion.opening_plan.replay",
                                  description="What the automatic OR1 plan would do over one opening-recorder file.")
     ap.add_argument("file", type=Path, help="an Edge Scanner data/open_recorder/YYYY-MM-DD.jsonl")
-    ap.add_argument("--risk", type=Decimal, required=True, help="risk per pick in dollars, before the calm half")
+    ap.add_argument("--risk", type=Decimal, required=True, help="risk per pick in dollars (a calm day sends no longs, shorts at this risk)")
     ap.add_argument("--calm", choices=("yes", "no", "unknown"), required=True,
                     help="was it a calm SPY day (RV20 at or below the playbook's calm_rv20_max)")
     ap.add_argument("--out", default="-", help="where the decisions go (default stdout)")

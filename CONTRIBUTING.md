@@ -23,7 +23,8 @@ These decide most review questions:
    Ash's pick "Full for clicks and Arm", 2026-11-19 22:05:02 UTC) with the 5% target and the stop, all picks of one reading at once (one hold per name on Trader's order lock, `companion/send_gate.py`;
    Ash's go "do all 5", 2026-11-19 17:02:46 UTC), a pick through its trigger but inside its limit as a
    LIMIT at the limit, and cancels one that has not filled after the pullback wait or at the end of the
-   fast watch, once per order. With its own switch on (`EDGE_TRADER_PLAN_AUTO_FLIP=1`, Step 7,
+   fast watch, or (calm SPY day: no longs, shorts at the full risk; Ash, 2026-11-19 22:33:09 UTC) a
+   short that has not triggered once the long trigger trades first, once per order. With its own switch on (`EDGE_TRADER_PLAN_AUTO_FLIP=1`, Step 7,
    `companion/plan_auto/flip.py`) it may also cancel its own resting, untriggered entry and place
    the other side (a flip, at most 3 a row a day, counted with the Flip button) or the same side
    from a moved 09:30 bar (a re-level, at most once a pick a day), each only after Schwab confirms
