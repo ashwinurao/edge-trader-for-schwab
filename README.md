@@ -50,9 +50,9 @@ name are refused). It needs no account and sends no telemetry.
   `companion/netlog.py`). An `answer` line per HTTP answer (Schwab, Edge Scanner, GitHub): the path with
   account and order ids removed, the status, the time on the wire and the vendor's own clock. A `call`
   line per call as the app sees it: who asked (the poller, a ticket click, the status reads after a send,
-  Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
+  Auto B/E, the armed Opening plan), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
-  quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
+  quote was when it arrived: the poller's quotes and the quote a ticket or plan send reads just before its order. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
   `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
   `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
   pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
@@ -919,7 +919,9 @@ with how long it waited (`waited_s`). A side rule line keeps the rule's code and
 adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
 row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
 request body or share count of your own positions, and no dollar amount: each `$` amount in its text, such as one in Schwab's words when it rejects a flip, is written as `$[masked]` (`companion/plan_auto/executor.py`), whatever the value it came from (the written line is masked too). A number without a dollar sign is not masked, and what Schwab writes in a reject is not confirmed. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
-`refusal` line, and the plan's Schwab calls their usual `call` lines.
+`refusal` line, and the plan's Schwab calls their usual `call` lines with purpose `armed_plan`. The
+calls of one send carry its ticket id as `req` (the same `ticket_id` as its `send_start` line here), and
+a cancel's calls carry `<pick>-cancel`, from the start line to the answer line (`netlog.name_calls`).
 
 **Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
 as the armed plan's switches above, the armed plan may also move its own resting entry without a

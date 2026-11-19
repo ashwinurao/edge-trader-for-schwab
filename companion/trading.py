@@ -458,6 +458,13 @@ class Trader:
                 self.store.log_request(endpoint, started, False, None, repr(e2)[:300])
                 raise
         call.returned(r)
+        if endpoint == "ticket_quote" and r.status_code == 200:
+            # Schwab's quote time for the record (data_age_ms), as the poller's quotes have: the open
+            # of 2026-11-19 showed no age for the quote a send reads just before its order.
+            try:
+                call.data(r.json())
+            except Exception:
+                pass
         if r.status_code == 429 and self.on_request:
             self.on_request(r.headers.get("Retry-After") or "30")
         ok = r.status_code in (200, 201)
