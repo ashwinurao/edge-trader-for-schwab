@@ -25,7 +25,9 @@ every line has ts (UTC, milliseconds), kind and app. Kinds written here:
   read whose connection dropped was tried once more, brief 26, with that drop in first_error), http, ok,
   error (a class: timeout_connect, timeout_read, tls, dns, refused, reset,
   http_429, http_4xx, http_5xx, other), error_text (200 characters, ids removed), items, data_ts
-  and data_age_ms (quotes only: Schwab's newest quoteTime/tradeTime), purpose, req.
+  and data_age_ms (quotes only, the poller's and the quote read before a send: Schwab's newest
+  quoteTime/tradeTime), purpose, req (the route's request id; for the armed plan's sends the
+  send's ticket id, name_calls).
 - inflight: a call still open after 2, 5, 10, 30 and 60 s (the only trace of a call that hangs).
 - skip: a call our code chose not to send, with its `reason`: a read during a 429 pause
   (`pause_429`), or a poller read that gave way to order traffic (`light`, `after_burst`,
@@ -63,6 +65,7 @@ import time
 import weakref
 from array import array
 from collections import Counter, deque
+import contextvars
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -287,6 +290,7 @@ def _to_rollup(kind: str, fields: dict) -> None:
 _tl = threading.local()                    # .call: the call open on this thread (answers join it)
 _req: ContextVar = ContextVar("netlog_req", default=None)          # the inbound request being served
 _purpose: ContextVar = ContextVar("netlog_purpose", default=None)  # who asked: the route being served
+_naming: ContextVar = ContextVar("netlog_naming", default=False)  # inside naming(): name_calls works
 _open: dict = {}                           # call id -> open call, for the watcher
 _check_lock = threading.Lock()
 _req_writes: dict = {}                     # inbound request id -> order calls made under it
@@ -308,6 +312,42 @@ def _purpose_now(given: str | None) -> str:
         if name.startswith(prefix):
             return p
     return "other"
+
+
+def naming(fn):
+    """Run fn() in a context of its own, where name_calls() may name the calls fn makes. The armed
+    plan runs each step this way (companion/plan_auto/executor.py), so a name set in a step ends with
+    it. Returns what fn returns and raises what fn raises, unchanged."""
+    try:
+        ctx = contextvars.copy_context()
+    except Exception:
+        return fn()
+
+    def inside():
+        _naming.set(True)
+        return fn()
+    return ctx.run(inside)
+
+
+def name_calls(req: str | None, purpose: str | None = None) -> None:
+    """Inside naming(): the calls this thread makes next carry `req` and `purpose`, until
+    name_calls(None). The open of 2026-11-19: the armed plan's sends had no id and purpose "other",
+    so they matched their pick only by time; the plan names them by the send's ticket id. Outside
+    naming() it does nothing. Never raises."""
+    try:
+        if not _naming.get():
+            return
+        if req is None:
+            old = _req.get()
+            if old:
+                _req_writes.pop(old, None)     # no route line will come for it
+            _req.set(None)
+            _purpose.set(None)
+        else:
+            _req.set(_SAFE_ID.sub("", str(req))[:64] or None)
+            _purpose.set(purpose)
+    except Exception:
+        pass
 
 
 def classify(exc) -> str:
@@ -990,7 +1030,7 @@ ACTIONS = frozenset({"/api/ticket/submit", "/api/ticket/cancel", "/api/ticket/ca
                      # Flat all and Add stop (Step 9, companion/plan_flat.py): ok, error (ticker on Add stop)
                      "/api/opening-plan/flat-all", "/api/opening-plan/add-stop",
                      # the A1 page (2026-11-18): Place all 4, Chase, Take control, one pick's Flatten and Cancel stop
-                     "/api/opening-plan/place-all", "/api/opening-plan/chase", "/api/opening-plan/take",
+                     "/api/opening-plan/place-all", "/api/opening-plan/chase", "/api/opening-plan/take", "/api/opening-plan/size",
                      "/api/opening-plan/flatten", "/api/opening-plan/cancel-stop"})
 BODY_CAP = 65_536
 

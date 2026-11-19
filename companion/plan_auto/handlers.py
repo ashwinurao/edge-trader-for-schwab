@@ -74,11 +74,13 @@ on (would_flip until Step 7) is said once: "<kind> is not on: nothing done".
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
-from .. import plan_entries
+from .. import break_entry, plan_entries, plan_size
 from . import CHASE_FLAG, switch_on
 
 Handler = Callable[["Lane"], bool]
@@ -88,6 +90,9 @@ Handler = Callable[["Lane"], bool]
 PAST_TRIGGER = "past_trigger"
 
 LEFT_PAST_TRIGGER = "the price is past the trigger; the chase step is not on; left to you"
+# Change 2 of Ash's "do all 5" (2026-11-19 17:02:46 UTC): through the trigger but inside the limit is
+# sent (a LIMIT at the limit); only past the limit is the pick handed to the chase or left.
+LEFT_PAST_LIMIT = "the price is past the entry's limit; the chase step is not on; left to you"
 
 
 @dataclass(frozen=True)
@@ -177,6 +182,16 @@ class Lane:
         return dict(self.pick.get("entry") or {"state": "none"})
 
     @property
+    def stage(self) -> Any:
+        """The size stage of this send (executor.AutoPlan.armed_stage). A host without one (the
+        flip's and chase's test hosts) sends 1 share, as before."""
+        fn = getattr(self.host, "armed_stage", None)
+        try:
+            return fn() if callable(fn) else plan_size.ONE_SHARE
+        except Exception:
+            return plan_size.ONE_SHARE
+
+    @property
     def bounds(self) -> dict:
         return self.host.bounds_left(self.ticker)
 
@@ -239,6 +254,23 @@ def past_trigger(side: str, last: Optional[Decimal], trigger: Decimal) -> bool:
     return last >= trigger if side.lower() == "long" else last <= trigger
 
 
+def past_limit(side: str, last: Optional[Decimal], limit: Decimal) -> bool:
+    """The last trade is past the entry's limit (long: above; short: below)."""
+    if last is None:
+        return False
+    return last > limit if side.lower() == "long" else last < limit
+
+
+def _when(v: Any) -> Optional[datetime]:
+    if isinstance(v, datetime):
+        return v if v.tzinfo else None
+    try:
+        t = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return t if t.tzinfo else None
+
+
 def outcome(lane: Lane, r: Mapping, what: str) -> None:
     """What Schwab's answer to a plan send means for the plan (brief 14 safety rule 3)."""
     status = r.get("status")
@@ -264,19 +296,29 @@ def on_place(lane: Lane) -> bool:
     if o is None:
         lane.say("no_numbers", "no range, risk or calm flag to build the order from")
         return False
-    if past_trigger(side, _dec(lane.pick.get("last")), o["trigger"]):
-        took = lane.delegate(PAST_TRIGGER)
+    last = _dec(lane.pick.get("last"))
+    if past_trigger(side, last, o["trigger"]):
+        took = lane.delegate(PAST_TRIGGER)      # the chase (Step 8), when its switch is on
         if took is not None:
             return took
-        lane.leave(LEFT_PAST_TRIGGER)
-        return False
+        if past_limit(side, last, o["limit"]):
+            # Past the limit a LIMIT there could only rest: left, as before.
+            lane.leave(LEFT_PAST_LIMIT)
+            return False
+        # Through but inside the limit (change 2 of Ash's "do all 5"): the send goes on, and
+        # break_entry (limit_guards) sends it as a LIMIT at the limit.
     calls = int(lane.armed_rules.calls_per_send)
     if lane.spend(orders=1, calls=calls):
         return False                          # a bound: spend() has disarmed and said why
     if not lane.armed():
         lane.refund(orders=1, calls=calls)
         return False
-    r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log)
+    # One Schwab quotes call for every pick of the reading, reused by the next picks' sends while
+    # young (Ash's card pick "One quote call for all 4", 2026-11-19 16:13:44 UTC; break_entry).
+    names = [str(p.get("symbol") or "") for p in lane.reading.get("picks") or [] if isinstance(p, Mapping)]
+    with break_entry.shared_quotes(names), break_entry.limit_guards(), _tape_price(lane):
+        r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log,
+                                 stage=lane.stage)
     if r.get("not_sent"):
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
         # Schwab, so the order and calls go back.
@@ -301,6 +343,18 @@ def on_place(lane: Lane) -> bool:
         return True
     outcome(lane, r, "send")
     return True
+
+
+def _tape_price(lane: Lane):
+    """The send checks the open tape's bid and ask, as old as they were when the plan read them, instead
+    of a Schwab quote (change 2 of Ash's "do all 5", 2026-11-19 17:02:46 UTC; break_entry.tape_price).
+    A pick without a bid, ask or quote time on the tape falls back to Schwab's quote, as before."""
+    p = lane.pick
+    at, received = _when(p.get("quote_at")), _when(lane.reading.get("received"))
+    bid, ask = _dec(p.get("bid")), _dec(p.get("ask"))
+    if at is None or received is None or bid is None or ask is None or not 0 < bid <= ask:
+        return nullcontext()
+    return break_entry.tape_price(bid, ask, (received - at).total_seconds() * 1000)
 
 
 def on_cancel(lane: Lane) -> bool:

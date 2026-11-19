@@ -58,7 +58,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import break_entry, chase_entry, plan_price, plan_side, plan_size, trading
+from . import break_entry, chase_entry, plan_price, plan_side, plan_size, send_gate, trading
 from .orders import LIVE
 from .pnl import ET
 
@@ -162,6 +162,7 @@ class PlanDesk:
         the rows' price line (brief 29 part B). Display only: no click reads it."""
         self.trader, self._view, self._orders, self.flips, self._now = trader, view, orders, flips, now
         self.stage = plan_size.parse_stage(stage)
+        self.full_ok = False            # register(): the size switch may say Full only with the cover watch on
         self._orders_fresh_fn = orders_fresh or (lambda: True)
         self._positions_fn = positions or (lambda: {})
         self._positions_fresh_fn = positions_fresh or (lambda: True)
@@ -318,6 +319,16 @@ class PlanDesk:
         n, why = plan_size.shares(shares, self.stage, price=trig)
         return ({"trigger": str(trig.quantize(Decimal("0.01"))), "stop": str(stop.quantize(Decimal("0.01"))),
                  "plan_shares": shares, "shares": n}, why)
+
+    def _target(self, row: Mapping, side: str) -> Optional[str]:
+        """The 5% target a Place on this side would send (break_entry.target_for), or None."""
+        n = self._numbers(row, side)
+        if n is None:
+            return None
+        try:
+            return break_entry.fmt(break_entry.target_for(side, n["trigger"]))
+        except ValueError:
+            return None
 
     def _numbers(self, row: Mapping, side: str) -> Optional[dict]:
         return self._sized(row, side)[0]
@@ -530,6 +541,7 @@ class PlanDesk:
         out = {"enabled": True, "demo": self.demo, "armed": self._armed(), "market_open": self._market_open(),
                "break_max_shares": break_entry.BREAK_MAX_SHARES, "max_flips": self.flips, "rows": [],
                "size_stage": plan_size.label(self.stage),
+               "size_switch": plan_size.switch_name(self.stage), "size_full_ok": self.full_ok,
                "error": "", "orders_old": "" if fresh else ORDERS_OLD}
         try:
             with self._lock:
@@ -561,7 +573,11 @@ class PlanDesk:
                  "click_chase": rec.get("click_chase"),
                  "chase": {k.lower(): self._chase_click_refusal(view, ticker, k, rec, entry, orders, blocked, fresh)
                            for k in ("LONG", "SHORT")},
-                 "price": {k.lower(): self._price_line(row, k, held.get(ticker)) for k in ("LONG", "SHORT")}}
+                 "price": {k.lower(): self._price_line(row, k, held.get(ticker)) for k in ("LONG", "SHORT")},
+                 # Ash's 5% target: what a Place would send per side, and the target the row's
+                 # last click sent (a chase counts from its own trigger).
+                 "target": {**{k.lower(): self._target(row, k) for k in ("LONG", "SHORT")},
+                            "sent": rec.get("target")}}
             out["rows"].append(r)
         return out
 
@@ -605,10 +621,13 @@ class PlanDesk:
             shown = "" if n is None else f" It is now {side.lower()} {n['trigger']}, stop {n['stop']}, {n['shares']} sh."
             return None, f"The plan changed since the page showed it.{shown} Review and click again."
         try:
-            req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"])
+            # Ash's 5% target (break_entry.TARGET_PCT, 2026-11-18 23:46:05 UTC), from the plan's level.
+            req = break_entry.build_request(ticker, side, n["trigger"], n["stop"], n["shares"],
+                                            target=break_entry.target_for(side, n["trigger"]))
         except ValueError as e:
             return None, f"Could not build the order: {e}"
         self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, click_chase=None,
+                  target=req.get("target_price"),
                   text=f"Sending the {side.lower()} break entry." if not flip_from else
                   f"Cancelled the {flip_from.lower()} entry; sending the {side.lower()} break entry.")
         log.warning("OPENING PLAN %s %s break: trigger %s stop %s, %s sh (plan %s)", side, ticker,
@@ -792,6 +811,28 @@ class PlanDesk:
                 return self._refuse(ticker, f"Cancelled the {old.lower()} entry. {why}", cancel=c)
         return {**self._send(ticker, new, req), "cancel": c}
 
+    # ---- the size switch (Ash, 2026-11-18 22:34:51 UTC) --------------------------------------
+
+    def set_size(self, name: Any, save: Optional[Callable[[str, str], None]] = None) -> dict:
+        """Ash's "1 share" / "Full" switch: the stage every later Place, Place all 4, Flip and Chase
+        click uses. Nothing is sent and nothing resting changes. Full needs the cover watch
+        (EDGE_TRADER_PLAN_FLAT=1, brief 19 Part C), as a playbook stage above 1 share does. A click
+        that began on the other size is refused by its own check (the page sends the shares it showed)."""
+        key = str(name or "").strip().lower()
+        if key not in plan_size.SWITCH:
+            return {"ok": False, "error": "Pick 1 share or Full."}
+        if key != "1_share" and not self.full_ok:
+            return {"ok": False, "error": "Full needs Flat all and the cover watch on (EDGE_TRADER_PLAN_FLAT=1)."}
+        with self._lock:
+            if save is not None:
+                try:
+                    save(plan_size.SWITCH_KEY, key)
+                except Exception as e:
+                    return {"ok": False, "error": f"Not saved: {e}."[:300]}
+            self.stage = plan_size.SWITCH[key]
+        log.warning("OPENING PLAN size switch: %s", plan_size.label(self.stage))
+        return {"ok": True, "size_switch": key, "size_stage": plan_size.label(self.stage)}
+
     # ---- the A1 page's clicks (Ash's go 2026-11-18 20:00:20 UTC) ------------------------------
 
     def place_all(self, picks: Any) -> dict:
@@ -807,6 +848,9 @@ class PlanDesk:
         if len(picks) > 8:
             return {"ok": False, "error": "Too many picks in one click.", "results": []}
         seen, results, stopped = set(), [], ""
+        # One Schwab quotes call for all the picks, reused by their sends while young (Ash's card
+        # pick "One quote call for all 4", 2026-11-19 16:13:44 UTC; break_entry.shared_quotes).
+        names = [str(p.get("ticker") or "") for p in picks if isinstance(p, Mapping)]
         for p in picks:
             if not isinstance(p, Mapping):
                 results.append(self._refuse("", "A pick must be an object."))
@@ -820,7 +864,8 @@ class PlanDesk:
                 results.append(self._refuse(ticker, stopped))
                 continue
             try:
-                r = self.place(ticker, p.get("side"), p.get("expected"))
+                with break_entry.shared_quotes(names):
+                    r = self.place(ticker, p.get("side"), p.get("expected"))
             except Exception as e:                   # place reports its own errors; this is a bug
                 log.exception("place all: %s", ticker)
                 r = self._refuse(ticker, f"Error while placing ({e}). Check thinkorswim."[:300])
@@ -942,10 +987,13 @@ class PlanDesk:
         if qty < 1:
             return self._refuse(ticker, f"0 shares at the chase price {break_entry.fmt(lim)} for this risk. Nothing was sent.")
         try:
-            req = break_entry.build_request(ticker, side, trig, stop, qty, cap=abs(lim - trig))
+            # The chase's own trigger is its entry price: the 5% target counts from there.
+            req = break_entry.build_request(ticker, side, trig, stop, qty, cap=abs(lim - trig),
+                                            target=break_entry.target_for(side, trig))
         except ValueError as e:
             return self._refuse(ticker, f"Could not build the order: {e}")
-        chase_rec = {"trigger": req["trigger"], "limit": req["limit"], "stop": req["stop"], "shares": qty,
+        chase_rec = {"trigger": req["trigger"], "limit": req["limit"], "stop": req["stop"],
+                     "target": req.get("target_price"), "shares": qty,
                      "at": self._now().isoformat(timespec="seconds")}
         c = None
         if resting:
@@ -981,7 +1029,7 @@ class PlanDesk:
                 self._put(ticker, state=NONE, order_id=None, text=f"Cancelled the entry. Did not chase: {held}")
                 return self._refuse(ticker, f"Did not chase: {held}", cancel=c)
             self._put_click(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None,
-                            click_chase=chase_rec, chases_click=int(rec.get("chases_click") or 0) + 1,
+                            target=req.get("target_price"), click_chase=chase_rec, chases_click=int(rec.get("chases_click") or 0) + 1,
                             text=f"Sending the {side.lower()} chase at {req['trigger']}, limit {req['limit']}.")
         log.warning("OPENING PLAN %s %s chase: trigger %s limit %s stop %s, %s sh (plan %s)", side, ticker,
                     req["trigger"], req["limit"], req["stop"], qty, plan_n)
@@ -1058,6 +1106,27 @@ class PlanDesk:
                     f"{stop}, plan row trigger {n['trigger']} stop {n['stop']}. The armed plan sent nothing for it.")
         return ""
 
+    def burst_clear(self) -> bool:
+        """Nothing that makes every pick wait: Trader's order lock is free, and Schwab's order list and
+        positions are fresh. The armed plan's burst runs only then (plan_auto/burst.py); otherwise its
+        step stays one pick at a time, as before. No Schwab call."""
+        lk = getattr(self.trader, "_send_lock", None)
+        try:
+            if lk is not None and lk.locked():
+                return False
+            return bool(self._orders_fresh()) and self._positions_read()[1]
+        except Exception:
+            return False
+
+    def _burst_busy(self, ticker: str) -> bool:
+        """trader_busy for a send of the armed plan's burst (send_gate.burst): the other picks' holds do
+        not count, only the lock itself or this ticker's own hold. Only a hint, as trader_busy."""
+        lk = getattr(self.trader, "_send_lock", None)
+        try:
+            return bool(lk is not None and (lk.held_for(ticker) if hasattr(lk, "held_for") else lk.locked()))
+        except Exception:
+            return False
+
     def trader_busy(self) -> bool:
         """Trader's order lock is held right now (a click, a ticket send or Flat all). Only a hint:
         Trader.submit and cancel_entry still refuse if it is taken after this check."""
@@ -1068,10 +1137,13 @@ class PlanDesk:
             return False
 
     def place_auto(self, ticker: str, side: str, o: Mapping, pick: Optional[Mapping] = None,
-                   view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None) -> dict:
+                   view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None,
+                   stage: Any = plan_size.ONE_SHARE) -> dict:
         """Place's twin for the armed plan: Step 3's break entry from the open tape's final range.
-        `o` is engine.order_for of that range (trigger, stop, cap, shares); shares are capped by
-        BREAK_MAX_SHARES. `view` is Step 2's view from the feed's last answer (the executor's);
+        `o` is engine.order_for of that range (trigger, stop, cap, shares). At the 1-share `stage`
+        shares are capped by BREAK_MAX_SHARES; above it (_auto_shares) they are the card's shares at
+        that stage, never more than `o`'s. The entry carries the 5% target in one OCO with the stop,
+        as a click's does. `view` is Step 2's view from the feed's last answer (the executor's);
         this twin never asks Edge Scanner, and None or {} means no row check. Answers Trader.submit's
         dict, plus `not_sent` when no request left (then `again` and `busy`: Trader's own lock was
         busy, so the pick may try on a later reading)."""
@@ -1081,7 +1153,7 @@ class PlanDesk:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
         if side not in OTHER:
             return self._refuse(ticker, "Pick long or short.", not_sent=True)
-        if self.trader_busy():
+        if (self._burst_busy(ticker) if send_gate.in_burst() else self.trader_busy()):
             # Before the row is claimed: a busy lock writes and removes no SENDING record.
             return self._refuse(ticker, TRADER_BUSY, not_sent=True, again=True, busy=True)
         orders = self._orders()
@@ -1108,7 +1180,7 @@ class PlanDesk:
                     {"why": f"the side rule said {side_rule}", "side_rule": side_rule, "side": side.lower()}
                 return self._refuse(ticker, why, not_sent=True, again=bool(wait), this_name=wait == WAIT_NAME,
                                     side_rule=side_rule, log_fields=logged)
-            shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
+            shares, card, size_why = self._auto_shares(view, ticker, side, o, stage)
             if shares < 1:
                 return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
             red = self._row_disagrees(view, ticker, side, o)
@@ -1118,7 +1190,12 @@ class PlanDesk:
                                             "thinkorswim for it today.")
                 return self._refuse(ticker, red, not_sent=True, red=True)
             try:
-                req = break_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, cap=o["cap"])
+                # Ash, project thread "Redesign the opening plan as one-click placement", 2026-11-18
+                # 23:46:05 UTC: every plan order is a trigger bracket with a target 5% from its entry
+                # and the stop. The armed send joins the clicks (pick "Full for clicks and Arm",
+                # 2026-11-19 22:05:02 UTC).
+                req = break_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, cap=o["cap"],
+                                                target=break_entry.target_for(side, o["trigger"]))
             except ValueError as e:
                 return self._refuse(ticker, f"Could not build the order: {e}", not_sent=True)
             sent_at = self._now().isoformat(timespec="milliseconds")
@@ -1127,10 +1204,12 @@ class PlanDesk:
             self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
                       kind="break", range=rng, sent_at=sent_at, flips=int(rec.get("flips") or 0),
                       sent={"ticket_id": req["ticket_id"], "trigger": req["trigger"], "limit": req["limit"],
-                            "stop": req["stop"], "shares": shares},
+                            "stop": req["stop"], "target": req.get("target_price"), "shares": shares},
+                      target=req.get("target_price"),
                       text=f"Sending the {side.lower()} break entry (armed plan).")
         log("send_start", side=side.lower(), trigger=req["trigger"], limit=req["limit"], stop=req["stop"],
-            shares=shares, plan_shares=int(o["shares"]), ticket_id=req["ticket_id"])
+            target=req.get("target_price"), shares=shares, plan_shares=int(o["shares"]), card_shares=card,
+            size=plan_size.switch_name(stage), size_why=size_why, ticket_id=req["ticket_id"])
         logging.getLogger("companion.plan_auto").warning(
             "ARMED PLAN %s %s break: trigger %s limit %s stop %s, %s sh", side, ticker, req["trigger"],
             req["limit"], req["stop"], shares)
@@ -1147,6 +1226,32 @@ class PlanDesk:
                     self._save(recs)
             return {**r, "not_sent": True, "again": again, "busy": again}
         return r
+
+    def _auto_shares(self, view: Optional[Mapping], ticker: str, side: str, o: Mapping,
+                     stage: Any) -> tuple[int, Optional[int], str]:
+        """(shares to send, the card's shares or None, why) for an armed send at `stage`.
+
+        1 share: min(o's shares, BREAK_MAX_SHARES), as before. Above it (Ash's pick "Full for clicks
+        and Arm", project thread, 2026-11-19 22:05:02 UTC): the stage of the smaller of the card's
+        shares (the row Ash sees, fitted to the account, opening_plan/fit.py) and o's shares (risk per
+        pick over the final range's risk per share), inside the ticket's limits (plan_size.shares). A
+        card with no shares for this side (no row, or no account reading) sends 1 share and says so:
+        the plan never sizes above what the page showed."""
+        plan_n = int(o["shares"])
+        one = min(plan_n, break_entry.BREAK_MAX_SHARES)
+        try:
+            stage = plan_size.parse_stage(stage)
+        except ValueError:
+            return one, None, "the size stage is not readable: 1 share"
+        if stage == plan_size.ONE_SHARE:
+            return one, None, ""
+        row = self._find_row(view or {}, ticker)
+        s = row.get(side.lower()) if row is not None else None
+        card = s.get("shares") if isinstance(s, Mapping) else None
+        if isinstance(card, bool) or not isinstance(card, int) or card < 0:
+            return one, None, "the card shows no shares for this side: 1 share"
+        n, why = plan_size.shares(min(plan_n, card), stage, price=o["trigger"])
+        return n, card, why
 
     def cancel_auto(self, ticker: str, why: str = "", log: Optional[Callable[..., None]] = None,
                     log_fields: Optional[Mapping] = None) -> dict:
@@ -2042,6 +2147,21 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
             # Records that don't read: every click refuses until they do (_load raises).
             log.error("opening plan: could not check the entry records at startup: %s", e)
 
+    # Ash's size switch (plan_size.SWITCH): the saved choice replaces the playbook's stage. Full
+    # only with the cover watch on, like any stage above 1 share.
+    desk.full_ok = plan_flat.enabled(env)
+    store = getattr(trader, "store", None)
+    try:
+        saved = (store.get_setting(plan_size.SWITCH_KEY) or "") if store is not None else ""
+    except Exception as e:
+        saved = ""
+        log.error("opening plan: the size switch could not be read (%s); the playbook's stage stays", e)
+    if saved in plan_size.SWITCH and (saved == "1_share" or desk.full_ok):
+        desk.stage = plan_size.SWITCH[saved]
+    elif saved:
+        log.error("opening plan: size switch %r ignored; the playbook's stage %s stays", saved,
+                  plan_size.label(desk.stage))
+
     async def body(request: Request) -> dict:
         guard(request)
         try:
@@ -2088,6 +2208,11 @@ def register(app, trader, poller, guard, demo: bool = False, env: Mapping[str, s
         b = await body(request)
         return await run_in_threadpool(desk.take, b.get("ticker"), b.get("on") is not False)
 
+    @app.post("/api/opening-plan/size")
+    async def opening_plan_size(request: Request):
+        b = await body(request)
+        return desk.set_size(b.get("size"), save=getattr(store, "set_setting", None))
+
     app.state.opening_plan_desk = desk
     # Step 9: Flat all and the cover watch, only with EDGE_TRADER_PLAN_FLAT=1 as well (plan_flat.py).
     plan_flat.register(app, trader, poller, guard, desk, demo=demo, env=env, now=now)
@@ -2114,7 +2239,8 @@ def demo_entries(env: Mapping[str, str] = os.environ) -> tuple[dict, list[dict]]
     With DEMO_NO_ENTRIES_ENV=1 there are none, so the A1 page shows the morning before Place all 4."""
     if env.get(DEMO_NO_ENTRIES_ENV) == "1":
         return {}, []
-    recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0},
+    recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0,
+                     "target": "44.61"},     # the 5% target of level 42.49 (break_entry.target_for)
             # Brief 25: CCCC's long filled 1 share and its stop works; 100 more were bought by hand.
             "CCCC": {"state": SENT, "side": "LONG", "ticket_id": "demo-cccc", "order_id": 9003, "flips": 0},
             "BBBB": {"state": RED, "side": "SHORT", "ticket_id": "demo-bbbb", "order_id": 9002, "flips": 1,

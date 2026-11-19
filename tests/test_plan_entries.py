@@ -34,6 +34,11 @@ LONG_REQ = {"symbol": "AAAA", "side": "LONG", "entry": "break", "trigger": "42.4
             "expected_limit": "42.55", "expected_qty": 1, "expected_target": 0}
 SHORT_REQ = {**LONG_REQ, "side": "SHORT", "trigger": "41.91", "limit": "41.85", "stop": "42.48",
              "expected_limit": "41.85"}
+# A click (Place, Flip, Chase) sends Ash's 5% target with the stop (2026-11-18 23:46:05 UTC):
+# long 42.49 x 1.05 = 44.6145, down to 44.61; short 41.91 x 0.95 = 39.8145, up to 39.82. The armed
+# sends of Steps 6 to 8 (LONG_REQ, SHORT_REQ) still carry none.
+LONG_CLICK_REQ = {**LONG_REQ, "targets": 1, "target_price": "44.61", "expected_target": "44.61"}
+SHORT_CLICK_REQ = {**SHORT_REQ, "targets": 1, "target_price": "39.82", "expected_target": "39.82"}
 
 
 def pick(rank, ticker, high, low, close, as_of=None):
@@ -142,12 +147,15 @@ def test_place_long_sends_the_break_entry_built_from_the_servers_row(rig):
     r = rig.desk.place("AAAA", "LONG", LONG)
     assert r["ok"], r
     (req,) = rig.sent
-    assert without_id(req) == LONG_REQ and len(req["ticket_id"]) >= 8
+    assert without_id(req) == LONG_CLICK_REQ and len(req["ticket_id"]) >= 8
     (order,) = rig.broker.placed
     assert (order["orderType"], order["stopPrice"], order["price"]) == ("STOP_LIMIT", "42.49", "42.55")
     assert order["orderLegCollection"][0]["instruction"] == "BUY" and order["orderLegCollection"][0]["quantity"] == 1
-    (stop,) = [k for oco in order["childOrderStrategies"] for k in (oco.get("childOrderStrategies") or [oco])]
+    (oco,) = order["childOrderStrategies"]
+    assert oco["orderStrategyType"] == "OCO"
+    target, stop = oco["childOrderStrategies"]
     assert (stop["orderType"], stop["stopPrice"]) == ("STOP", "41.92")
+    assert (target["orderType"], target["price"], target["orderLegCollection"][0]["instruction"]) == ("LIMIT", "44.61", "SELL")
     e = row(rig)["entry"]
     assert e["state"] == plan_entries.SENT and e["resting"] and e["side"] == "LONG"
 
@@ -155,7 +163,7 @@ def test_place_long_sends_the_break_entry_built_from_the_servers_row(rig):
 def test_place_short_sends_the_mirror(rig):
     r = rig.desk.place("AAAA", "SHORT", SHORT)
     assert r["ok"], r
-    assert without_id(rig.sent[0]) == SHORT_REQ
+    assert without_id(rig.sent[0]) == SHORT_CLICK_REQ
     (order,) = rig.broker.placed
     assert order["orderLegCollection"][0]["instruction"] == "SELL_SHORT"
     assert (order["stopPrice"], order["price"]) == ("41.91", "41.85")
@@ -322,7 +330,7 @@ def test_flip_cancels_reads_back_then_places_the_other_side(rig):
     assert r["ok"], r
     # In order: the read before the cancel, the cancel, the read that confirms CANCELED, then the send.
     assert rig.broker.calls == [("read", oid), ("cancel", oid), ("read", oid), ("place", "SELL_SHORT")]
-    assert without_id(rig.sent[-1]) == SHORT_REQ
+    assert without_id(rig.sent[-1]) == SHORT_CLICK_REQ
     assert rig.broker.orders[oid]["status"] == "CANCELED"
     r = row(rig)
     assert r["entry"]["side"] == "SHORT" and r["entry"]["resting"] and r["flips"] == 1 and r["flip_to"] == "long"

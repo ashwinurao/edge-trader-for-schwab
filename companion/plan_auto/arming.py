@@ -36,6 +36,13 @@ class ArmedRules:
     clock_ahead_seconds: float
     chase_quote_tries: int                 # Step 8 (brief 18): refused chase tries a pick a day after a quote
     chase_retry_seconds: float             # Step 8: no new chase quote for that pick before this (review 1 of #25)
+    # Ash's go "do all 5" (2026-11-19 17:02:46 UTC), changes 3 and 4: the warm-up reads this long before
+    # act_from (plan_auto/warm.py), and the tape is read every fast_every_seconds from fast_from_seconds
+    # to fast_until_seconds around act_from. Optional in the file; these defaults are start numbers.
+    warm_up_seconds_before: float = 3.0
+    fast_every_seconds: float = 0.1
+    fast_from_seconds: float = -1.0
+    fast_until_seconds: float = 3.0
 
     def bounds(self) -> dict:
         """What the Arm dialog shows and the click confirms."""
@@ -66,7 +73,9 @@ def armed_rules_from(raw: Mapping) -> ArmedRules:
             end_grace_seconds=float(_val(a, "end_grace_seconds")),
             clock_ahead_seconds=float(_val(a, "clock_ahead_seconds")),
             chase_quote_tries=int(_val(a, "chase_quote_tries")),
-            chase_retry_seconds=float(_val(a, "chase_retry_seconds")))
+            chase_retry_seconds=float(_val(a, "chase_retry_seconds")),
+            **{k: float(_val(a, k)) for k in ("warm_up_seconds_before", "fast_every_seconds", "fast_from_seconds",
+                                              "fast_until_seconds") if k in a})
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"playbook armed: {type(e).__name__}: {e}") from e
     if not (r.arm_from_et < r.arm_until_et <= r.act_from_et < r.watch_until_et):
@@ -74,7 +83,8 @@ def armed_rules_from(raw: Mapping) -> ArmedRules:
     if min(r.orders_per_pick, r.orders_per_day, r.calls_per_minute, r.calls_per_send, r.calls_per_cancel,
            r.chase_quote_tries) < 1 \
             or r.every_seconds <= 0 or r.end_grace_seconds <= 0 or r.clock_ahead_seconds <= 0 \
-            or r.chase_retry_seconds <= 0:
+            or r.chase_retry_seconds <= 0 or r.warm_up_seconds_before < 0 \
+            or not 0 < r.fast_every_seconds <= r.every_seconds or r.fast_from_seconds > r.fast_until_seconds:
         raise ValueError("playbook armed: a number is out of range")
     return r
 
@@ -97,6 +107,7 @@ class Facts:
     tape: str = ""                # "" when the tape route answered usably, else why not
     blocked_today: str = ""       # a disarm for the day (429, error): why
     size_stage: str = ""          # "" at the 1-share stage, else the stage's label (plan_size.label)
+    full_ok: bool = False         # the desk may size above 1 share: the cover watch is on (plan_entries.register)
     flat_unwired: str = ""        # why Flat all is on but its click would not disarm the plan (executor)
 
 
@@ -131,12 +142,16 @@ def refusals(f: Facts, rules: ArmedRules) -> list[str]:
         out.append(f"{ticker} already has an entry ({why}). The plan arms only on clean rows.")
     if f.tape:
         out.append(f"The open tape does not answer: {f.tape}.")
-    if f.size_stage:
-        # The armed plan sends 1 share (break_entry.BREAK_MAX_SHARES); Step 9's size stage is for the
-        # clicks' entries. An armed size above 1 share is a later decision of Ash's (architect,
-        # 2026-11-13 17:42 UTC).
-        out.append(f"The size stage is {f.size_stage}. The armed plan sends 1 share only, so it arms only at "
-                   "the 1-share stage (size.stage \"1_share\" in playbook.json).")
+    if f.size_stage.startswith("not readable"):
+        # Strict: a desk without a readable stage is not 1 share (architect's review 3 of PR #27).
+        out.append(f"The size is {f.size_stage}. Arm is refused until the 1 share / Full switch reads again.")
+    elif f.size_stage and not f.full_ok:
+        # Above 1 share the armed plan sends the card's shares (Ash's pick "Full for clicks and Arm",
+        # project thread, 2026-11-19 22:05:02 UTC), and only with the cover watch on, as a click at Full
+        # (plan_entries.PlanDesk.set_size): a part-filled entry of more than one share can leave shares
+        # without a stop (brief 19 Part C).
+        out.append(f"The size is {f.size_stage}. Above 1 share the armed plan needs the cover watch "
+                   "(EDGE_TRADER_PLAN_FLAT=1); set 1 share or turn the cover watch on.")
     if f.flat_unwired:
         out.append(f.flat_unwired)
     return out

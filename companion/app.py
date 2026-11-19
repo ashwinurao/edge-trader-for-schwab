@@ -86,6 +86,9 @@ async def lifespan(_app: FastAPI):
         from .opening_plan import shadow as _plan_shadow
         _plan_shadow.log_start(os.environ)
     poller.start()
+    if _plan_routes is not None and not DEMO:   # gap 2: the cover watch runs on a server clock
+        from . import plan_flat as _plan_flat
+        _plan_flat.start_watch(app)
     open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add, budget=(poller.probe_gives_way, poller.note_probe_request), share=poller.set_quote_guest)  # briefs 09, 21, 23, 33, 34, off by default
     new_name_previews.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, PREVIEW_RATES, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), budget=(poller.probe_gives_way, poller.note_probe_request))  # Ash's pick 2026-11-19, with the probe
     if not DEMO:

@@ -10,7 +10,9 @@ Ash's words, project thread "Review OV picks desk architecture":
 
 Schwab nets each name in the account: the plan's shares and the user's are one position. The plan's
 entry is a TRIGGER order with its own STOP child for the plan's quantity, and that child is the only
-thing that tells the plan's shares from the user's. This file reads both, and nothing else:
+thing that tells the plan's shares from the user's. Since 2026-11-18 a click's entry carries the plan's
+5% target too, in one OCO with that stop (break_entry.TARGET_PCT); plan_shares reports it (target_id).
+This file reads both, and nothing else:
 - plan_shares (rule C): the plan's shares are its entry's filled quantity for as long as its own
   stop works (the entry's child, followed through a replacement the same way Trader follows a
   ticket's tree, or a stop Add stop created for the row).
@@ -161,6 +163,8 @@ class PlanShares:
     stop_id: Optional[int] = None       # the plan's working stop
     stop_qty: float = 0.0
     stop_price: Optional[float] = None
+    target_id: Optional[int] = None     # the plan's working LIMIT target (its 5% target, in one OCO with the stop)
+    stop_short: bool = False            # UNCLEAR only: the plan's one working stop is for fewer shares than filled
     fill_at: Optional[datetime] = None  # the entry's last fill time
     ids: set = field(default_factory=set)
     text: str = ""
@@ -221,9 +225,24 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
     stops_hit = [n for i, n in exits.items() if status[i] == "FILLED" and n.get("orderType") in STOP_TYPES]
     live = [i for i, n in exits.items() if status[i] in LIVE and n.get("orderType") in STOP_TYPES]
     waiting = [i for i, n in exits.items() if status[i] == "AWAITING_PARENT_ORDER"]
+    # The plan's 5% target (Ash, 2026-11-18 23:46:05 UTC): a LIMIT exit, in one OCO with its stop.
+    targets = [i for i, n in exits.items() if status[i] in LIVE and n.get("orderType") not in STOP_TYPES]
+    if any((_f(node[i].get("filledQuantity")) or 0.0) > EPS for i in targets):
+        out.state, out.text = UNCLEAR, "The plan's target filled part of its shares. Check thinkorswim."
+        return out
+    if len(targets) > 1:
+        out.state, out.text = UNCLEAR, "The plan's entry shows more than one working target. Check thinkorswim."
+        return out
+    out.target_id = targets[0] if targets else None
     if closes or stops_hit:
         if live:
             out.state, out.text = UNCLEAR, "Part of the plan's shares closed and its stop still works. Check thinkorswim."
+            return out
+        if targets:
+            # The OCO cancels the target when the stop or the close fills; still working, it could open
+            # a new position. Schwab's list may lag a moment, so this says look again.
+            out.state, out.text = UNCLEAR, ("The plan's shares are closed and its target still works. Look again in a "
+                                            "moment; if it stays, cancel it in thinkorswim.")
             return out
         got = sum(_f(n.get("filledQuantity")) or 0.0 for n in closes + stops_hit)
         if abs(got - filled) > EPS:
@@ -231,7 +250,9 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
                                             "Check thinkorswim.")
             return out
         out.state = CLOSED if closes else STOPPED
-        out.text = ("The plan closed its " if closes else "The plan's stop sold its ") + _sh(filled) + "."
+        hit = closes and all(n.get("orderType") == "LIMIT" for n in closes)
+        out.text = ("The plan's target closed its " if hit else "The plan closed its " if closes
+                    else "The plan's stop sold its ") + _sh(filled) + "."
         return out
     if len(live) > 1:
         out.state, out.text = UNCLEAR, "The plan's entry shows more than one working stop. Check thinkorswim."
@@ -242,6 +263,10 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
         if q is None or abs(q - filled) > EPS:
             out.state, out.text = UNCLEAR, (f"The plan's stop is for {q if q is not None else '?'} shares, not the "
                                             f"{filled:g} its entry filled. Check thinkorswim.")
+            if q is not None and EPS < q < filled:
+                # Gap 2 (Ash's pick "Resize the plan's stop to all shares", 2026-11-18 23:43:51 UTC): the
+                # cover watch's Add stop resizes this one stop to every filled share (plan_close.resize_plan_exits).
+                out.stop_id, out.stop_qty, out.stop_price, out.stop_short = live[0], q, _f(n.get("stopPrice")), True
             return out
         out.state, out.stop_id, out.stop_qty = HELD, live[0], q
         out.stop_price = _f(n.get("stopPrice"))

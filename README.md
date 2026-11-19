@@ -50,9 +50,9 @@ name are refused). It needs no account and sends no telemetry.
   `companion/netlog.py`). An `answer` line per HTTP answer (Schwab, Edge Scanner, GitHub): the path with
   account and order ids removed, the status, the time on the wire and the vendor's own clock. A `call`
   line per call as the app sees it: who asked (the poller, a ticket click, the status reads after a send,
-  Auto B/E), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
+  Auto B/E, the armed Opening plan), what it waited on before it went out (the 429 pause, the poller's limiter, Schwabdev's lock
   and token check), the time on the wire, the body, the error class and, for quotes, how old Schwab's
-  quote was when it arrived. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
+  quote was when it arrived: the poller's quotes and the quote a ticket or plan send reads just before its order. An `inflight` line when a call is still open after 2, 5, 10, 30 and 60 s, a
   `skip` line for a read the 429 pause held back or a poll that gave way to busy order traffic (reason
   `light`, `after_burst`, `reserve`, `held` or `minute_full`, `companion/poll_budget.py`), `pause` lines for the
   pause's start and end, a `token` line when a call sees the access token renewed, and once a minute a `lag` line (how late a thread and the
@@ -559,12 +559,13 @@ before a fill (60% of the way to the low) would flip it to the short side. 50.04
 the day's four picks as cards in rank order (`companion/opening_plan/static/opening_plan_a1.html`):
 - **Top line:** the clock, the risk per pick (a slider, saved like before), a meter of how much of the
   account's room the four picks use if all fill, the gear (the room share and the margin for a name with
-  no preview), "sends 1 share" while the size stage is the test stage, a count of filled, working, flip
+  no preview), the **1 share / Full** switch (below, "The 1 share / Full switch"), a count of filled, working, flip
   and chase picks, **Place all 4**, **Flat all**, and **Details** (the table).
 - **Each card:** the ticker, its live price, ATR, the margin Schwab charges for the side ("2.5x", or
   "1.4x?" when no preview gave the name's rate), the shares, and a chart of 1-minute bars fixed from
   08:30 to 11:00 ET with the BUY and SELL levels (the side shown is solid, the other dashed), the STOP
-  once filled and the CHASE limit while a chase rests. Before its 09:30 minute the card shows the
+  once filled, the TARGET line (in range once the price nears it; the header's "TGT" chip names it as
+  soon as the entry is sent), and the CHASE limit while a chase rests. Before its 09:30 minute the card shows the
   **estimated shares** below, marked EST; with no estimate it says "sizes at 09:31".
 - **Estimated shares before the 09:30 minute** (2026-11-19, Ash's pick 14:19:00 UTC in the project
   thread, "Preview new names, reprice each minute"; `companion/opening_plan/estimate_fit.py`). Each
@@ -598,7 +599,8 @@ sends only on its click, and every click is checked on the server against its la
 sends what it showed; a difference refuses). Nothing is automatic.
 - **Place all 4** places each pick through Place's own checks, one at a time in rank order. A pick that
   is refused does not stop the others; a 429 from Schwab stops the rest
-  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`).
+  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`). Its sends share one Schwab quotes call,
+  as the armed plan's do (see the armed plan's sends below).
 - **Chase** (`PlanDesk.chase`, `POST /api/opening-plan/chase`): reads one Schwab quote; when the price is
   still past the entry it cancels the resting entry (if one rests) and waits until Schwab confirms it
   CANCELED with nothing filled, then sends a break entry with its trigger at the ask (long) or bid (short)
@@ -614,7 +616,8 @@ sends what it showed; a difference refuses). Nothing is automatic.
   and Cancel refuse it and Flat all leaves it. Nothing is sent and its orders stay as they are. **Give
   back** undoes it.
 - **Flatten** (`POST /api/opening-plan/flatten`) is Flat all for one pick: the same list, checks and
-  path (close the plan's shares, which replaces its stop). **Cancel stop** (`POST
+  path (close the plan's shares, which replaces its stop; on an entry still working after a part fill,
+  cancel the rest first). **Cancel stop** (`POST
   /api/opening-plan/cancel-stop`) shows only when Flat all's list says the plan's stop rests with no
   shares held: a stop is never cancelled under shares you hold (CONTRIBUTING.md rule 2). For held shares
   without the plan, use Take and thinkorswim.
@@ -637,8 +640,9 @@ and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
 (`companion/plan_entries.py`). Without both, there are no buttons and no button routes. Each button
 sends one request to Schwab when you click it; nothing is sent without a click.
 - **Place long break / Place short break** sends the break entry (a stop-limit entry with its stop
-  attached, `companion/break_entry.py`) for that pick: trigger one cent past the 09:30 ET minute, stop at
-  the other side, built from the server's own latest row, never from the page's prices. The page sends
+  and its target attached as one OCO, `companion/break_entry.py`) for that pick: trigger one cent past
+  the 09:30 ET minute, stop at the other side, built from the server's own latest row, never from the
+  page's prices. The page sends
   what it showed; if the server's row differs, nothing is sent. The shares sent are the size stage's
   (see "Size stage" below): 1 share by default, and the row says so next to the plan size, for example
   "1 share (plan size 175)" or "25%: 43 of 175 shares".
@@ -649,6 +653,23 @@ sends one request to Schwab when you click it; nothing is sent without a click.
   filled, nothing new is placed, the row turns red and says what to check, and the row sends nothing
   more that day. At most `max_flips_per_row` flips per row a day (3, in
   `companion/opening_plan/playbook.json`).
+
+**The 5% target (Ash, 2026-11-18 23:46:05 UTC, project thread: "when placing the order it should be
+a triggger w/ bracket order with both target and stop and the target should be flat 5% from entry
+price").** Every click that sends a plan entry (Place, Place all 4, Flip, Chase) sends it as a trigger
+bracket: the stop-limit entry, then one OCO of a LIMIT target and the STOP, each for the entry's shares
+(`bracket.bracket_order`, the ticket's own shape). The target is 5% past the entry's trigger
+(`break_entry.TARGET_PCT`, `target_for`): long at trigger x 1.05, short at trigger x 0.95, on the
+stock's grid, rounded toward the entry. A chase counts from its own trigger (the ask or bid it chases).
+Example: long trigger 42.49 gives 44.61 (44.6145 rounded down); short trigger 41.91 gives 39.82. This
+replaces Ash's earlier "no target" (2026-11-18 13:40 UTC). The armed plan's break entry carries the
+same target since Ash's pick "Full for clicks and Arm" (project thread, 2026-11-19 22:05:02 UTC); its
+flip and chase (Steps 7 and 8, off) still carry none. When the target fills, the OCO cancels the stop and the row says "The
+plan's target closed its N shares." A target that filled only part, or that still works after the
+plan's shares closed, turns the row unclear. Flatten, Flat all and Cancel stop read the plan's target
+after the close or the stop's cancel and cancel it if Schwab left it working (the OCO normally takes
+it: seen live on a ticket bracket, 2026-11-06); if that cancel is not confirmed, the row turns red and
+says to cancel it in thinkorswim, since a target left alone could open a new position.
 
 **The price line (brief 29).** Once the 09:30 minute is final, each row side can get one short line
 under the row (`companion/plan_price.py`), for example "Long: Ask 754.50, 3 s ago: through the long
@@ -722,7 +743,19 @@ and the points under "Before any stage above 1 share" below.
 The size is decided on the server only: the page sends the shares it showed, and a difference
 refuses. The ticket's own Break entry stays at `BREAK_MAX_SHARES` (1); only a plan entry may go above
 it, by its stage, which the server passes inside itself (`break_entry.plan_cap`), never from a
-request. Raising the stage is its own one-line PR that quotes Ash's go for that stage.
+request. Raising the stage in the playbook is its own one-line PR that quotes Ash's go for that stage.
+
+**The 1 share / Full switch (Ash, 2026-11-18 22:34:51 UTC, project thread: "can you leave this
+control of 1 share or full BP control with me in the UI").** The A1 page's top line has a switch:
+**1 share** sends 1 share a pick; **Full** sends each card's shares (stage 1.0: the risk shares, cut
+to fit the account by `fit.py`). It is saved in the settings table (`opening_plan_size_switch`) and
+read back at start, and it replaces the playbook's stage while set. Full asks you to confirm, needs
+Flat all and the cover watch on (`EDGE_TRADER_PLAN_FLAT=1`), and changes nothing already sent: it
+applies to the next Place, Place all 4, Flip or Chase. A click the page showed at the other size is
+refused (the page sends the shares it showed). The armed plan takes the switch at the Arm click (below,
+"The armed plan"). The gaps under
+"Before any stage above 1 share" below are answered (gaps 1 and 2 built, 3 and 4 from Ash's own
+words and picks); read them before you switch to Full.
 
 **Flat all and the cover watch (Step 9, off by default).** With `EDGE_TRADER_PLAN_FLAT=1` as well as
 both plan button switches, the Opening plan gets a **Flat all** button and the cover watch
@@ -755,8 +788,18 @@ by the clock: every order is your click.
   - the plan's stop is gone without a fill and shares are held: refused, "The plan's stop is not
     working any more, so the plan cannot tell its share from yours. Close it on the dashboard or in
     thinkorswim.";
+  - an entry that filled part while the rest still works (gap 1, Ash's card pick "Cancel the rest,
+    then close", 2026-11-18 23:43:21 UTC): "Cancel the rest of the long entry (order N), then close
+    the plan's N shares at the market." Under Trader's lock, as one action: cancel the rest, read the
+    entry back until Schwab ends it (CANCELED, or FILLED when the rest filled first), then, only while
+    Schwab's answer shows the plan's stop working for exactly the shares the entry filled, the same one
+    PUT as above (`plan_close.cancel_rest_then_close`). Otherwise no close is sent and the row turns red:
+    "The entry's rest is cancelled. No close was sent: ... Close the plan's N T in thinkorswim now." A
+    429 on the cancel closes nothing and stops the batch; a cancel Schwab does not confirm closes nothing
+    and blocks the name until Resolve. Refused before anything is sent when the plan's stop is not
+    working for the filled shares, or the account holds fewer;
   - fewer shares than the plan filled while its stop works, the other side, or anything not clear:
-    refused for that row. So is an entry that is partly filled and still working.
+    refused for that row.
   A row with no plan entry says "No plan entry today" and, when shares are held, that they are not
   from the plan. An unclear answer to the PUT or to the stop's cancel turns the row red and blocks the
   name until you press Resolve, as an unclear close does.
@@ -780,29 +823,38 @@ by the clock: every order is your click.
   have no stop", with one **Add stop** button. The click sends a stop for those shares at the row's
   stop price (the stop its entry was sent with) through the dashboard's own Set stop path, with that
   path's refusals; it needs entries armed. That path creates a stop only when the position has none,
-  so a row whose position is partly covered stays red and says to set the rest in thinkorswim. The stop
-  Add stop creates becomes the row's own plan stop.
-  Nothing is added automatically. The grace counts only while the Opening plan page is open: the
-  server measures it when the page asks (every 2 s), so with the page closed no row turns red.
+  so a row whose position is partly covered by your own stops stays red and says to set the rest in
+  thinkorswim. The stop Add stop creates becomes the row's own plan stop.
+  When the plan's one stop works for fewer shares than its entry filled (gap 2, Ash's card pick "Resize
+  the plan's stop to all shares", 2026-11-18 23:43:51 UTC), Add stop instead replaces that stop with the
+  same stop for every share the plan filled, then the plan's target the same way
+  (`plan_close.resize_plan_exits`): the stop first, so protection never shrinks first, and nothing else
+  on the name changes. It needs entries armed and the account to hold the plan's shares.
+  Nothing is added automatically. The grace runs on a server clock (gap 2, same pick): a thread looks
+  at the cover every second in regular hours (`plan_flat.WATCH_SECONDS`, started in
+  `companion/app.py`), so it counts from when the server first saw the shares uncovered, with or
+  without the page open. It reads only what the poller already holds and sends nothing.
 
 Not confirmed at Schwab: whether the stop attached to a break entry starts working on the entry's
 first partial fill. The cover watch is there for that case.
 
 **Before any stage above 1 share.** At 1 share an entry cannot fill in part, so the gaps below cannot
-happen. Above 1 share they can. Each must be closed before the PR that raises `size.stage` (architect's
-reviews 1 and 2 of Step 9, 2026-11-13):
-1. Flat all handles an entry that is partly filled and still working: cancel the rest, read it back,
-   then close what filled. Today that row is refused.
-2. Add stop covers a partly covered position. Today that row is refused, because the dashboard's stop
-   path moves the working stop instead of adding one. This needs a `companion/trading.py` change and
-   Ash's go.
-3. Schwab's behavior for the attached stop on an entry's first partial fill is confirmed on a real
-   order.
-4. The cover's grace runs on a server clock, or the page says it counts only while the page is open.
-5. A row whose stop is under the research's minimum (2% of ATR, `entry.min_stop_atr`) has a rule:
-   refuse the row, or size it from the minimum stop. Today the page only notes it. Ash decides, since
-   it is a sizing rule. For example, a one-cent 09:30 minute at the 10,000 share cap is 2,500 shares
-   at 25%, where ten cents of slippage is ten times the planned risk.
+happen. Above 1 share they can. The architect's reviews 1 and 2 of Step 9 (2026-11-13) listed five;
+Ash answered each on 2026-11-18 in the project thread:
+1. Flat all and Flatten handle an entry that is partly filled and still working: cancel the rest, read
+   it back, then close what filled. **Built** (his pick "Cancel the rest, then close", 23:43:21 UTC;
+   Flat all above).
+2. Add stop covers a part-covered plan position by resizing the plan's own stop to every filled share,
+   and the grace runs on a server clock. **Built** (his pick "Resize the plan's stop to all shares",
+   23:43:51 UTC; cover watch above). No `companion/trading.py` change was needed: the resize replaces
+   only the plan's own orders (`companion/plan_close.py`).
+3. Schwab's behavior for the attached stop on a partial fill: Ash, 23:45:24 UTC, "schwab will set stop
+   only for the filled shares". Not yet seen in Edge Trader's own logs; the first part fill above 1
+   share shows it. Flat all and Flatten close only when Schwab's answer shows exactly that.
+4. The grace on a server clock: built with item 2.
+5. A stop under the research's minimum (2% of ATR, `entry.min_stop_atr`): Ash's pick "Leave it, room
+   cap limits it" (23:45:12 UTC). No rule; the page notes it, and the account's room (fit the account,
+   above) limits the shares.
 
 **The armed plan (OV entries Step 6, off by default).** This is the one place Edge Trader sends and
 cancels orders without a click on each order (CONTRIBUTING rule 1, third exception). It needs
@@ -811,28 +863,56 @@ cancels orders without a click on each order (CONTRIBUTING rule 1, third excepti
 (`companion/plan_auto/`).
 
 The switch alone sends nothing. You arm it for the day with **Arm…** on the Opening plan page, from
-09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, 1 share each, the risk per pick and
+09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, the size (1 share each, or Full), the
+risk per pick and
 the calm flag, what the plan will and will not do, and its bounds. **Arm with these bounds** is refused,
 with every reason listed, when: it is not a market day or outside that window; ARM is off on the
 dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
 or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
 answer; the bounds or the playbook changed since the dialog showed them; the plan was disarmed for
-the day; the size stage (`size.stage`, above) is not 1 share or cannot be read; or Flat all is on
+the day; the size cannot be read, or it is above 1 share without the cover watch
+(`EDGE_TRADER_PLAN_FLAT=1`); or Flat all is on
 (`EDGE_TRADER_PLAN_FLAT=1`) but the armed plan found no Flat all to wire its Disarm to, so a Flat all
-click would not disarm it (Edge Trader's log says so at start). The armed plan sends 1 share whatever
-the stage: the stage is for your clicks only, so Arm is refused at any other stage ("The size stage is
-25%. The armed plan sends 1 share only, so it arms only at the 1-share stage").
+click would not disarm it (Edge Trader's log says so at start).
+
+**Size of the armed sends (Ash's pick "Full for clicks and Arm", project thread, 2026-11-19 22:05:02
+UTC).** The Arm click takes the 1 share / Full switch as it is then. At 1 share each send is 1 share
+(`break_entry.BREAK_MAX_SHARES`). At Full each send is the smaller of the card's shares (what the A1 card
+shows, fitted to the account by `fit.py`) and the risk per pick over the final range's risk per share,
+inside the ticket's share and notional limits (`plan_entries.PlanDesk._auto_shares`, `plan_size.shares`).
+A card with no shares for the side (no account reading) sends 1 share, and the day log's `send_start`
+line says why. While armed the plan sends at the smaller of the Arm's size and the switch now: a switch
+to 1 share lowers it, a switch to Full does not raise it (`AutoPlan.armed_stage`). The Armed plan panel
+shows the size it sends at.
 
 Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
-`Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
-attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
-again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
+`Trader.submit`): the side nearer the last trade, at the size above, the stop and the 5% target attached
+in one OCO. When one reading gives several picks to send, it sends them all at once, each on its own
+thread (`companion/plan_auto/burst.py`; Ash's go "do all 5", project thread, 2026-11-19 17:02:46 UTC,
+change 1). Each send keeps every check it had, and the bounds are taken one pick at a time, so four
+picks never pass the day's 4 orders. Edge Trader's order lock has a hold per name for this burst only
+(`companion/send_gate.py`): your click, Flat all or a cancel still waits for the burst, and the burst
+waits for them. While the lock is held or Schwab's order list or positions are old, the plan stays one
+pick at a time as before. On 2026-11-19, one at a time, the fourth order reached Schwab 6.4 s after the
+bar closed. A send checks the open tape's bid and ask, which the plan already holds, instead of asking
+Schwab for a quote (change 2: "let the limit guard the price"); that quote took 0.57 to 1.69 s at
+09:31. The tape's quote may be at most 1 second old when the plan read it
+(`break_entry.TAPE_PRICE_MAX_AGE_MS`, a start number), or the pick is left for the day. A pick already
+through its trigger but not past its limit (the cap) goes as a LIMIT at the limit with the same stop
+attached, instead of being left: the limit caps the fill (ASTS was refused on 2026-11-19 for being
+1 cent through). Past the limit it is left to you, as before. Three seconds before 09:31:00
+(`armed.warm_up_seconds_before`) the plan makes one Schwab quotes read per pick on the trading
+client, all at once on their own threads, to open the connections the burst uses (change 3,
+`companion/plan_auto/warm.py`). They are counted in the calls bound, never hold the order lock, and a
+failed one changes nothing but its log line. From 09:30:59 to 09:31:03 the plan reads the tape every
+0.1 s (`armed.fast_every_seconds`, change 4), every 0.25 s otherwise, and its first reading comes at
+09:31:00 itself. It cancels a plan entry that has not filled in two cases: its trigger traded
 but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
 log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
 waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never exits, moves a stop or
 resends, and flips or chases only with that step's own switch (below). Without the capped chase
-(below), a pick whose price is already at or past its trigger is left to you.
+(below), a pick whose price is already past its limit is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
 Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
@@ -893,7 +973,16 @@ not confirm (the row turns red); a reached bound; ARM turned off on the dashboar
 error. A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
 pick and is never retried, and so does an entry Schwab rejects after accepting it (on 2026-11-13 a
 REJECTED came 4.0 s after the 201: "The stop price must be above the current ask…"); the row shows
-Schwab's reason. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+Schwab's reason. A pick the tape gives no bid and ask for falls back to Schwab's quote, and then the
+plan's sends share one Schwab quotes call (Ash's card pick "One quote call for
+all 4", 2026-11-19 16:13:44 UTC): the first send's quote call asks for every pick of the reading, and
+the next sends use that answer while the app got it at most 2 seconds ago
+(`break_entry.SHARED_QUOTE_MAX_AGE_S`, a start number); older, the next send asks again for all of
+them. The call sits where the send's own quote call was, after every check before it, and the checks on
+the quote do not change. A failed shared call lets the send read its own quote, as before. On
+2026-11-19 each send's own quote took 0.57 to 1.69 s at 09:31 ET, one pick after the other. The
+ticket's own Break entry and a row's Place, Flip and Chase clicks still read a new quote each.
+On that fallback a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`) leaves the pick the same way:
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
 up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
 at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
@@ -948,7 +1037,9 @@ with how long it waited (`waited_s`). A side rule line keeps the rule's code and
 adds one `poll_hold` line when it starts and one `poll_hold_end` line with why it stopped. A skipped
 row check adds one `row_check_skipped` line (`row_check_back` when it runs again). It holds no account number, token,
 request body or share count of your own positions, and no dollar amount: each `$` amount in its text, such as one in Schwab's words when it rejects a flip, is written as `$[masked]` (`companion/plan_auto/executor.py`), whatever the value it came from (the written line is masked too). A number without a dollar sign is not masked, and what Schwab writes in a reject is not confirmed. In `data/netlog/` the Arm and Disarm clicks get `route` lines, a refused one a
-`refusal` line, and the plan's Schwab calls their usual `call` lines.
+`refusal` line, and the plan's Schwab calls their usual `call` lines with purpose `armed_plan`. The
+calls of one send carry its ticket id as `req` (the same `ticket_id` as its `send_start` line here), and
+a cancel's calls carry `<pick>-cancel`, from the start line to the answer line (`netlog.name_calls`).
 
 **Automatic flip and re-level (Step 7, off by default).** With `EDGE_TRADER_PLAN_AUTO_FLIP=1` as well
 as the armed plan's switches above, the armed plan may also move its own resting entry without a

@@ -20,7 +20,7 @@
     "calm_multiplier": 0.5,
     "rv20_through_max_days": 4,
     "stage": "1_share",
-    "_stage_about": "Step 9 size stage (companion/plan_size.py, brief 19): what a plan entry sends. \"1_share\" (the default, the test stage) sends 1 share; 0.10, 0.25, 0.50 or 1.0 send floor(plan shares x stage), at least 1, inside the ticket's limits. Nothing else is allowed. Raising it is its own one-line PR that quotes Ash's go for that stage (who, when, where). A stage above 1 share needs EDGE_TRADER_PLAN_FLAT=1 (the cover watch) and every point of README section \"Before any stage above 1 share\", including the rule for a stop under entry.min_stop_atr, which Ash decides.",
+    "_stage_about": "Step 9 size stage (companion/plan_size.py, brief 19): what a plan entry sends. \"1_share\" (the default, the test stage) sends 1 share; 0.10, 0.25, 0.50 or 1.0 send floor(plan shares x stage), at least 1, inside the ticket's limits. Nothing else is allowed. Raising it is its own one-line PR that quotes Ash's go for that stage (who, when, where). A stage above 1 share needs EDGE_TRADER_PLAN_FLAT=1 (the cover watch) and every point of README section \"Before any stage above 1 share\", each answered by Ash on 2026-11-18 (for a stop under entry.min_stop_atr he picked no rule: the room cap limits it).",
     "estimate": {
       "_about": "Brief 22: estimated shares on the plan rows before the 09:30 minute exists, display only (companion/opening_plan/plan.py estimate_row). Shares = risk used / (ATR x a typical first-minute range), at the row's last price. From the 2026 study /mnt/project-files/ov-research/allocation/pm_bar_break_trades.parquet, column or1_risk_atr: OV's top 4, 835 picks on 209 days (2026-01-02 to 2026-10-30), median 0.268, quartiles 0.193 and 0.373. Never a size: no button or send reads it.",
       "show": {
@@ -194,6 +194,22 @@
     "every_seconds": {
       "value": 0.25,
       "note": "start number, not approved by Ash; how often the armed plan reads the open tape (brief 15 tape.every_seconds)"
+    },
+    "warm_up_seconds_before": {
+      "value": 3.0,
+      "note": "start number, not approved by Ash on its own; Ash's go \"do all 5\" (project thread, 2026-11-19 17:02:46 UTC), change 3: one Schwab quotes read per pick this long before act_from_et opens the trading client's connections for the 09:31 burst (companion/plan_auto/warm.py)"
+    },
+    "fast_every_seconds": {
+      "value": 0.1,
+      "note": "start number, not approved by Ash on its own; change 4 of the same go: how often the armed plan reads the open tape from fast_from_seconds to fast_until_seconds around act_from_et (every_seconds otherwise)"
+    },
+    "fast_from_seconds": {
+      "value": -1.0,
+      "note": "start number; seconds from act_from_et where the fast reads start"
+    },
+    "fast_until_seconds": {
+      "value": 3.0,
+      "note": "start number; seconds from act_from_et where the fast reads end"
     },
     "end_grace_seconds": {
       "value": 45,

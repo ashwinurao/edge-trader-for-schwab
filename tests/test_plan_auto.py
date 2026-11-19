@@ -106,6 +106,7 @@ class View:
     def __init__(self, clock):
         self.clock, self.rv, self.risk = clock, 12.3, 100
         self.bars = {s: (v[1], v[2], v[3]) for s, v in PICKS.items()}
+        self.shares = {}                   # {ticker: {"long": n, "short": n}}: the cards' fitted shares
 
     def __call__(self):
         now = self.clock.now()
@@ -113,8 +114,13 @@ class View:
         rows = [{**r, "first_minute": {**r["first_minute"]}} for r in rows]
         clock = {"spy_rv": None if self.rv is None else
                  {"rv20": self.rv, "through": "2026-11-12", "calm": self.rv <= 10.5, "calm_max": 10.5}}
-        return P.build_view(answer(rows), now - timedelta(seconds=0.5), "", clock, now - timedelta(seconds=10), "",
-                            P.parse_risk(self.risk), now, P.load_playbook())
+        v = P.build_view(answer(rows), now - timedelta(seconds=0.5), "", clock, now - timedelta(seconds=10), "",
+                         P.parse_risk(self.risk), now, P.load_playbook())
+        for r in v.get("rows") or []:
+            for side, n in (self.shares.get(r.get("ticker")) or {}).items():
+                if isinstance(r.get(side), dict):
+                    r[side] = {**r[side], "shares": n}
+        return v
 
 
 class Broker(PlanBroker):
@@ -207,6 +213,7 @@ def rig(tmp_path, monkeypatch):
                       lambda: knobs["fresh"], lambda: knobs["cooldown"], env=ENV, now=clock.now,
                       out_dir=tmp_path / "auto", hold_later=lambda sec, why: holds.append((clock.now(), sec, why)))
     plan._mono = clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     broker.locks = [plan._lock, desk._lock, plan.arming._lock]
 
     class Rig:
@@ -247,13 +254,23 @@ def lines(rig, event=None):
     return [x for x in rows if event is None or x["event"] == event]
 
 
+# The 5% targets, by hand: DDDD short 9.99 x 0.95 = 9.4905 -> 9.50 (rounded up for a short), AAAA long
+# 42.49 x 1.05 = 44.6145 -> 44.61, BBBB short 19.99 x 0.95 = 18.9905 -> 19.00, CCCC long 71.85 x 1.05 =
+# 75.4425 -> 75.44 (break_entry.target_for).
+WANT_TARGET = {"DDDD": "9.50", "AAAA": "44.61", "BBBB": "19.00", "CCCC": "75.44"}
+
+
 def want_req(sym, shares=1):
     side, trig, lim, stop = WANT[sym]
     risk = PICKS[sym]
     o = engine.order_for(side.lower(), Decimal(str(risk[1])), Decimal(str(risk[2])), Decimal(100),
                          engine.rules_from(PB_RAW))
-    req = break_entry.build_request(sym, side, o["trigger"], o["stop"], shares, cap=o["cap"])
+    # Every plan order carries Ash's 5% target in one OCO with the stop (2026-11-18 23:46:05 UTC); the
+    # armed send too since his pick "Full for clicks and Arm" (2026-11-19 22:05:02 UTC).
+    req = break_entry.build_request(sym, side, o["trigger"], o["stop"], shares, cap=o["cap"],
+                                    target=break_entry.target_for(side, o["trigger"]))
     assert (req["trigger"], req["limit"], req["stop"]) == (trig, lim, stop)   # the hand-worked numbers
+    assert req["target_price"] == WANT_TARGET[sym]                             # hand-worked: 5% from the trigger
     return {k: v for k, v in req.items() if k != "ticket_id"}
 
 
@@ -434,6 +451,23 @@ def test_four_picks_go_out_one_at_a_time_nearest_first_each_exactly_the_break_en
     run(rig, et(9, 31, 30))
     assert len(rig.broker.placed) == 4 and rig.plan.orders_day == 4
     assert [x["ticker"] for x in lines(rig, "send_start")] == NEAREST_FIRST
+
+
+def test_the_record_names_each_armed_send_by_its_ticket(rig, rec):  # noqa: F811
+    """The open of 2026-11-19: the armed plan's Schwab calls had no id and purpose "other", so they
+    matched their pick only by time. Each send's calls now carry its ticket id (the auto log's
+    send_start line) and purpose armed_plan, and the record stops naming them after send_answer."""
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    starts = lines(rig, "send_start")
+    assert [x["ticker"] for x in starts] == NEAREST_FIRST
+    places = [c for c in rec.lines("call") if c["endpoint"] == "place_order"]
+    assert [c["req"] for c in places] == [x["ticket_id"] for x in starts]
+    assert {c["purpose"] for c in places} == {"armed_plan"}
+    assert netlog._req.get() is None and netlog._purpose.get() is None
+    with netlog.call("schwab", "account_details"):
+        pass
+    assert rec.lines("call")[-1]["req"] is None and rec.lines("call")[-1]["purpose"] == "other"
 
 
 def test_nothing_before_act_from(rig):
@@ -737,26 +771,28 @@ def test_the_hold_starts_30_s_before_act_from_not_at_the_arm_click_and_sends_not
 
 
 def test_four_sends_end_the_hold_60_s_after_the_last_and_resting_entries_and_cancels_call_none(rig):
-    # Review 6 item 6: four sends from 09:31:00 to 09:31:05.1 (0.85 s a Schwab call). The entries
-    # then rest until the 09:35 cancels: neither renews the hold nor starts another.
+    # Review 6 item 6: four sends at 09:31:00 (0.85 s a Schwab call). The entries then rest until the
+    # 09:35 cancels: neither renews the hold nor starts another. Since the burst ("do all 5", change 1)
+    # the four go on one reading with no quote first; burst.in_order runs them one POST apart on the
+    # fake clock (they were 1.7 s apart: a quote and a POST each).
     rig.broker.delay = 0.85
     arm(rig, at=et(9, 29, 0))
     run(rig, et(9, 36, 0), start=et(9, 29, 0))
     assert placed(rig) == NEAREST_FIRST and len(rig.broker.cancelled) == 4
-    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 1.7), et(9, 31, 3.4), et(9, 31, 5.1)]
+    assert send_times(rig) == [et(9, 31, 0), et(9, 31, 0.85), et(9, 31, 1.7), et(9, 31, 2.55)]
     assert rig.holds[0][0] == et(9, 30, 30)
-    assert held_through(rig) == et(9, 32, 5.1)                    # cut to the second: 60 s after the last send
-    assert max(t for t, _, _ in rig.holds) < et(9, 32, 5.1)       # nothing renewed after it
+    assert held_through(rig) == et(9, 32, 2.55)                   # cut to the second: 60 s after the last send
+    assert max(t for t, _, _ in rig.holds) < et(9, 32, 2.55)      # nothing renewed after it
     times = [t for t, _, _ in rig.holds]
     for (t1, s1, _), t2 in zip(rig.holds, times[1:]):
         assert t2 < t1 + timedelta(seconds=s1)                   # no gap between two holds
         assert X.POLL_HOLD_RENEW_SECONDS <= (t2 - t1).total_seconds() < X.POLL_HOLD_RENEW_SECONDS + 2
     first_cancel = min(datetime.fromisoformat(x["t"]) for x in lines(rig, "cancel_start"))
-    assert first_cancel >= et(9, 35, 0) and not [t for t, _, _ in rig.holds if t >= et(9, 32, 5.1)]
+    assert first_cancel >= et(9, 35, 0) and not [t for t, _, _ in rig.holds if t >= et(9, 32, 2.55)]
     assert len(lines(rig, "poll_hold")) == 1                      # one hold for the arm
     (end,) = lines(rig, "poll_hold_end")
     assert end["why"] == "60 s after the plan's last send"
-    assert et(9, 32, 5.1) <= datetime.fromisoformat(end["t"]) < et(9, 32, 7)
+    assert et(9, 32, 2.55) <= datetime.fromisoformat(end["t"]) < et(9, 32, 4.5)
 
 
 def release_at(rig, times):
@@ -880,15 +916,59 @@ def test_the_hold_never_runs_past_the_plans_own_end(rig):
     assert end["why"] == "the plan is not armed" and datetime.fromisoformat(end["t"]) >= et(9, 31, 45)
 
 
-@pytest.mark.parametrize("price", [42.49, 42.60])
-def test_must_not_send_at_or_past_the_trigger(rig, price):
+@pytest.mark.parametrize("price", [42.49, 42.54])
+def test_through_the_trigger_inside_the_limit_goes_as_a_limit_at_the_limit(rig, price):
+    """Change 2 of Ash's "do all 5" (2026-11-19 17:02:46 UTC): at or through AAAA's trigger 42.49 but
+    with the ask (price + 0.01) not past its limit 42.55, the entry goes as a LIMIT at 42.55 with its
+    stop attached. It was left to Ash (test_must_not_send_at_or_past_the_trigger)."""
+    arm(rig)
+    rig.tape.prices["AAAA"] = price
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert placed(rig)[0] == "AAAA" and sorted(placed(rig)) == sorted(PICKS)   # through: nearest of all
+    assert "AAAA" not in rig.plan.left
+    (o,) = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == "AAAA"]
+    assert (o["orderType"], o["price"], o["orderLegCollection"][0]["instruction"]) == ("LIMIT", "42.55", "BUY")
+    assert "stopPrice" not in o
+    (oco,) = o["childOrderStrategies"]
+    assert oco["orderStrategyType"] == "OCO"
+    target, child = oco["childOrderStrategies"]
+    assert (target["orderType"], target["price"], target["orderLegCollection"][0]["instruction"]) == \
+        ("LIMIT", "44.61", "SELL")
+    assert (child["orderType"], child["stopPrice"], child["orderLegCollection"][0]["instruction"]) == \
+        ("STOP", "41.92", "SELL")
+    others = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] != "AAAA"]
+    assert {o["orderType"] for o in others} == {"STOP_LIMIT"}
+
+
+@pytest.mark.parametrize("price", [42.56, 42.60])
+def test_must_not_send_past_the_limit(rig, price):
+    """The last trade past AAAA's limit 42.55: a LIMIT there could only rest, so the pick is left."""
     arm(rig)
     rig.tape.prices["AAAA"] = price
     run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
     assert "AAAA" not in placed(rig) and len(rig.broker.placed) == 3
-    assert rig.plan.left["AAAA"] == H.LEFT_PAST_TRIGGER
+    assert rig.plan.left["AAAA"] == H.LEFT_PAST_LIMIT
     notes = [x for x in lines(rig, "leave") if x["ticker"] == "AAAA"]
     assert len(notes) == 1                          # said once
+
+
+def test_must_not_send_when_the_tape_ask_is_past_the_limit(rig):
+    """The last trade 42.54 is inside the limit 42.55, but the tape's ask is 42.57: break_entry
+    refuses on the ask, nothing goes, and the pick is left with the words."""
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.54
+    real = rig.tape.read
+
+    def read():
+        r = real()
+        for p in r["picks"]:
+            if p["symbol"] == "AAAA":
+                p["ask"] = 42.57
+        return r
+    rig.tape.read = read
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    assert "AAAA" not in placed(rig) and len(rig.broker.placed) == 3
+    assert "past this entry's limit: ask 42.57 is above 42.55" in rig.plan.left["AAAA"]
 
 
 def test_a_bound_reached_disarms(rig, monkeypatch):
@@ -931,26 +1011,41 @@ def test_one_cent_of_difference_is_not_a_disagreement(rig):
 
 # ---------------------------------------------------------------- a slow broker
 
-def test_slow_broker_still_one_at_a_time(rig):
+def test_slow_broker_the_four_go_in_one_burst_with_no_quote_first(rig):
+    """Change 1 and 2 of Ash's "do all 5": one reading, one burst of four sends, no Schwab quote
+    before them (the tape's price). It was one pick a reading, a quote and a POST each
+    (test_slow_broker_still_one_at_a_time)."""
     arm(rig)
     rig.broker.delay = 1.5
     run(rig, et(9, 31, 15), start=et(9, 31, 0.1))
     assert placed(rig) == NEAREST_FIRST
+    assert [c for c in rig.broker.calls if c[0] == "quote"] == []
+    (b,) = lines(rig, "burst")
+    assert b["picks"] == NEAREST_FIRST
+    (end,) = lines(rig, "burst_end")
+    assert end["acted"] == NEAREST_FIRST and end["errors"] == []
     times = [t for _, t in rig.broker.at]
     gaps = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
-    assert all(g >= 3.0 for g in gaps)                   # a quote and a POST each, never two at once
+    assert gaps == [1.5, 1.5, 1.5]                       # in_order: one POST apart on the fake clock
 
 
-def test_a_pick_that_crossed_its_trigger_while_waiting_is_not_sent(rig):
+def test_the_burst_sends_every_pick_on_the_one_reading(rig):
+    """The burst's picks all go on the reading that decided them (change 1 of Ash's "do all 5"): a
+    later price does not stop a send already decided. It was a new reading per send
+    (test_a_pick_that_crossed_its_trigger_while_waiting_is_not_sent); the order's own limit is the
+    guard now."""
     arm(rig)
     rig.broker.delay = 1.5
+    reads = []
+    real = rig.tape.read
+    rig.tape.read = lambda: reads.append(rig.clock.now()) or real()
 
     def hook(n):
         if n == 1:
-            rig.tape.prices["CCCC"] = 71.86             # through CCCC's trigger 71.85
+            rig.tape.prices["CCCC"] = 71.86             # through CCCC's trigger 71.85 after the reading
     rig.broker.after_place = hook
-    run(rig, et(9, 31, 15), start=et(9, 31, 0.1))
-    assert placed(rig) == ["DDDD", "AAAA", "BBBB"] and rig.plan.left["CCCC"] == H.LEFT_PAST_TRIGGER
+    run(rig, et(9, 31, 0.2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST and reads == [et(9, 31, 0.1)]
 
 
 def test_disarm_between_pick_2_and_3_stops_3_and_4(rig):
@@ -968,17 +1063,18 @@ def test_disarm_between_pick_2_and_3_stops_3_and_4(rig):
 
 def test_timeline_at_0_4_s_a_call(rig):
     """Brief 16's report: with the fake broker at 0.4 s a call, when each pick rests after 09:31:00.
-    Each send is the quote in break_entry.prepare (0.4 s) and the POST (0.4 s); the tape reading,
-    the engine and the desk take no fake time. The two status reads after a 201 run on their own
-    client and do not hold up the next send (fork PR #15)."""
+    Each send is the POST alone (0.4 s): no quote first since change 2 of Ash's "do all 5" (it was a
+    quote and a POST, 0.8 s, DDDD at 0.9 and CCCC at 3.3). burst.in_order runs them one after another
+    on the fake clock; burst.together starts them at once (tests/test_plan_burst.py). The two status
+    reads after a 201 run on their own client and do not hold up the next send (fork PR #15)."""
     arm(rig)
     rig.broker.delay = 0.4
     run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
     got = [(s, round((t - et(9, 31)).total_seconds(), 2)) for s, t in rig.broker.at]
-    assert got == [("DDDD", 0.9), ("AAAA", 1.7), ("BBBB", 2.5), ("CCCC", 3.3)]
+    assert got == [("DDDD", 0.5), ("AAAA", 0.9), ("BBBB", 1.3), ("CCCC", 1.7)]
     start = {x["ticker"]: x["t"] for x in lines(rig, "send_start")}
     answer = {x["ticker"]: x["t"] for x in lines(rig, "send_answer")}
-    assert start["DDDD"] == "2026-11-13T14:31:00.100Z" and answer["DDDD"] == "2026-11-13T14:31:00.900Z"
+    assert start["DDDD"] == "2026-11-13T14:31:00.100Z" and answer["DDDD"] == "2026-11-13T14:31:00.500Z"
 
 
 def test_steps_read_the_plan_view_before_the_tape_never_between_reading_and_send(rig):
@@ -1043,22 +1139,26 @@ def test_a_partial_refund_keeps_the_rest_of_the_reservation_and_its_time(rig):
     assert rig.plan._calls_used() == 0
 
 
-def test_a_quote_older_than_5_s_leaves_the_pick_for_the_day(rig, monkeypatch):
-    """break_entry.prepare refuses a Schwab quote older than MAX_QUOTE_AGE_MS (5 s, R-03) before any
-    order request. The plan does not try again: that pick is left (2026-11-13 11:00 ET probe: the
-    quote was up to 3.6 s old on COIN and 7.2 s on CRWD)."""
+def test_a_tape_quote_older_than_1_s_leaves_the_pick_for_the_day(rig):
+    """break_entry.prepare refuses the open tape's quote when it was more than TAPE_PRICE_MAX_AGE_MS
+    (1 s) old at the reading, before any order request, and the plan does not try again: that pick is
+    left. It was Schwab's quote and 5 s before change 2 of Ash's "do all 5"
+    (test_a_quote_older_than_5_s_leaves_the_pick_for_the_day; that rule still holds where the plan
+    falls back to Schwab's quote, tests/test_shared_quotes.py)."""
+    assert break_entry.TAPE_PRICE_MAX_AGE_MS == 1_000
     arm(rig)
-    real_quote = rig.trader.quote
+    real = rig.tape.read
 
-    def quote(sym, max_age=1.0):
-        q = real_quote(sym, max_age)
-        if sym == "DDDD":
-            q = {**q, "quote_time": _time.time() * 1000 - 6000}
-        return q
-    monkeypatch.setattr(rig.trader, "quote", quote)
+    def read():
+        r = real()
+        for p in r["picks"]:
+            if p["symbol"] == "DDDD":
+                p["quote_at"] = r["received"] - timedelta(seconds=1.2)
+        return r
+    rig.tape.read = read
     run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
     assert placed(rig) == ["AAAA", "BBBB", "CCCC"]
-    assert "quote is 6.0 s old" in rig.plan.left["DDDD"]
+    assert "The open tape's price is 1.20 s old" in rig.plan.left["DDDD"]
     assert rig.plan.orders_pick["DDDD"] == 0 and rig.plan.arming.is_armed(rig.clock.now())
     rec = rig.desk.records()["DDDD"]
     assert rec["state"] == plan_entries.NONE and rec["order_id"] is None and "Not sent" in rec["text"]
@@ -1926,6 +2026,7 @@ def with_flat(rig, wire=True):
     plan = X.register(app, rig.trader, Poller(), lambda r: None, env=ENV, tape=rig.tape,
                       usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.plan = plan
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     return flat
@@ -2086,20 +2187,23 @@ def test_flat_all_while_a_plan_cancel_holds_traders_lock(rig):
     assert sorted(rig.broker.cancelled) == sorted(ids.values()) and no_red(rig)
 
 
-def test_arm_is_refused_unless_the_size_stage_is_1_share(rig):
-    """The armed plan sends 1 share (break_entry.BREAK_MAX_SHARES) whatever Step 9's size stage says:
-    the Arm click is refused in words at any other stage (architect, 17:42 UTC)."""
-    want = ('The size stage is 25%. The armed plan sends 1 share only, so it arms only at the 1-share stage '
-            '(size.stage "1_share" in playbook.json).')
+def test_arm_above_1_share_needs_the_cover_watch(rig):
+    """Ash's pick "Full for clicks and Arm" (project thread, 2026-11-19 22:05:02 UTC): Arm takes the size
+    switch's stage, but above 1 share only with the cover watch on (desk.full_ok), as a click at Full.
+    It was: the armed plan sent 1 share only and Arm was refused at any other stage (architect, 17:42 UTC)."""
+    want = ("The size is 25%. Above 1 share the armed plan needs the cover watch (EDGE_TRADER_PLAN_FLAT=1); "
+            "set 1 share or turn the cover watch on.")
     rig.clock.t = et(9, 30, 0)
     rig.desk.stage = plan_size.parse_stage(0.25)
+    rig.desk.full_ok = False
     r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
     assert not r["ok"] and r["refusals"] == [want] and not rig.plan.arming.is_armed(rig.clock.now())
     assert rig.plan.panel(check=True)["refusals"] == [want]
     rig.desk.stage = plan_size.ONE_SHARE
     t = arm(rig)["terms"]
-    assert t["shares"] == 1 and "1 share, its stop attached." in t["will"][0]
-    assert "Send more than 1 share: the size stage is for your clicks only." in t["will_not"]
+    assert t["shares"] == 1 and t["stage"] == "1_share"
+    assert "1 share, its stop and a 5% target attached in one OCO." in t["will"][0]
+    assert "Send more than 1 share: set Full on the A1 page before Arm to size by the cards." in t["will_not"]
     assert "Act after a Flat all click: the click disarms it first, and Flat all does the cancels." in t["will_not"]
 
 
@@ -2109,8 +2213,8 @@ def test_a_desk_without_a_readable_stage_refuses_arm(rig):
     del rig.desk.stage
     r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
     assert not r["ok"] and not rig.plan.arming.is_armed(rig.clock.now())
-    assert r["refusals"] == ["The size stage is not readable (AttributeError). The armed plan sends 1 share only, so "
-                             "it arms only at the 1-share stage (size.stage \"1_share\" in playbook.json)."]
+    assert r["refusals"] == ["The size is not readable (AttributeError). Arm is refused until the 1 share / Full "
+                             "switch reads again."]
 
 
 class AppPoller:
@@ -2148,6 +2252,7 @@ def app_registers(rig, env, between=None):
     plan = X.register(app, rig.trader, poller, lambda r: None, env=env, tape=rig.tape,
                       usable=lambda r, now: T.usable(r, TAPE_RULES, now=now), out_dir=rig.tmp / "auto", start=False)
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.plan, rig.desk, rig.app_poller = plan, app.state.opening_plan_desk, poller
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     return app
@@ -2231,3 +2336,110 @@ def test_arm_and_disarm_refusals_are_recorded(rec):  # noqa: F811
     got = [(x["action"], x["code"]) for x in rec.lines("refusal")]
     assert got == [("opening_plan_arm", "arm_is_off_on_the_dashboard"), ("opening_plan_disarm", "demo_mode")]
     assert {"/api/opening-plan/arm", "/api/opening-plan/disarm"} <= netlog.ACTIONS
+
+
+# ---------------------------------------------------------------- Full on Arm (Ash, 2026-11-19 22:05:02 UTC)
+# Engine shares at risk 100 (not calm, RV20 12.3), by hand: DDDD short 100 / (10.40 - 9.99) = 243.9 -> 243;
+# AAAA long 100 / (42.49 - 41.92) = 175.4 -> 175; BBBB short 100 / (20.50 - 19.99) = 196.1 -> 196;
+# CCCC long 100 / (71.85 - 71.20) = 153.8 -> 153.
+CARDS = {"DDDD": {"short": 300}, "AAAA": {"long": 120}, "BBBB": {"short": 50}, "CCCC": {"long": None}}
+
+
+def full(rig):
+    rig.desk.stage, rig.desk.full_ok = plan_size.SWITCH["full"], True
+    rig.view.shares = CARDS
+
+
+def qty(o):
+    return o["orderLegCollection"][0]["quantity"]
+
+
+def exits(o):
+    """(target LIMIT, STOP) of the entry's one OCO, each with its price and quantity."""
+    (oco,) = o["childOrderStrategies"]
+    assert oco["orderStrategyType"] == "OCO"
+    t, s = oco["childOrderStrategies"]
+    return (t["orderType"], t["price"], qty(t)), (s["orderType"], s["stopPrice"], qty(s))
+
+
+def test_full_arm_sends_each_cards_shares_never_above_the_risks_and_with_the_5_percent_target(rig):
+    """Ash's pick "Full for clicks and Arm" (project thread, 2026-11-19 22:05:02 UTC): at Full the armed
+    plan sends the smaller of the card's shares and the risk's shares at the final range. A card with
+    no shares for the side (CCCC here) sends 1 share and the day log says why."""
+    full(rig)
+    t = arm(rig)["terms"]
+    assert t["shares"] == "Full" and t["stage"] == "full"
+    assert "Full: each card's shares (never more than the risk per pick buys" in t["will"][0]
+    assert rig.plan.panel()["size"] == "full"
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    got = {o["orderLegCollection"][0]["instrument"]["symbol"]: o for o in rig.broker.placed}
+    want = {"DDDD": (243, "9.50", "10.40"), "AAAA": (120, "44.61", "41.92"), "BBBB": (50, "19.00", "20.50"),
+            "CCCC": (1, "75.44", "71.20")}
+    for sym, (n, tgt, stop) in want.items():
+        o = got[sym]
+        assert qty(o) == n and o["orderType"] == "STOP_LIMIT"
+        assert exits(o) == (("LIMIT", tgt, n), ("STOP", stop, n))
+    starts = {x["ticker"]: x for x in lines(rig, "send_start")}
+    assert (starts["DDDD"]["shares"], starts["DDDD"]["plan_shares"], starts["DDDD"]["card_shares"]) == (243, 243, 300)
+    assert (starts["AAAA"]["shares"], starts["AAAA"]["card_shares"], starts["AAAA"]["size"]) == (120, 120, "full")
+    assert starts["CCCC"]["shares"] == 1 and starts["CCCC"]["card_shares"] is None
+    assert starts["CCCC"]["size_why"] == "the card shows no shares for this side: 1 share"
+    assert all(x["target"] == WANT_TARGET[x["ticker"]] for x in starts.values())
+    rows = {r["ticker"]: r for r in rig.desk.state()["rows"]}
+    assert rows["AAAA"]["target"]["sent"] == "44.61"
+
+
+def test_full_through_the_trigger_sends_the_cards_shares_as_a_limit_with_the_target(rig):
+    """Change 2 of "do all 5" at Full: AAAA through its trigger inside the limit goes as a LIMIT at 42.55
+    for the card's 120 shares, its target and stop for the same 120."""
+    full(rig)
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.50
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    (o,) = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == "AAAA"]
+    assert (o["orderType"], o["price"], qty(o)) == ("LIMIT", "42.55", 120)
+    assert exits(o) == (("LIMIT", "44.61", 120), ("STOP", "41.92", 120))
+
+
+def test_a_switch_to_1_share_after_a_full_arm_lowers_the_size(rig):
+    full(rig)
+    arm(rig)
+    rig.desk.stage = plan_size.ONE_SHARE
+    assert rig.plan.panel()["size"] == "1_share"
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST and {qty(o) for o in rig.broker.placed} == {1}
+
+
+def test_a_switch_to_full_after_a_1_share_arm_does_not_raise_it(rig):
+    rig.desk.full_ok = True
+    rig.view.shares = CARDS
+    t = arm(rig)["terms"]
+    assert t["shares"] == 1
+    rig.desk.stage = plan_size.SWITCH["full"]
+    assert rig.plan.panel()["size"] == "1_share"
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST and {qty(o) for o in rig.broker.placed} == {1}
+    assert [without_id(r) for r in rig.sent] == [want_req(s) for s in NEAREST_FIRST]
+
+
+def test_full_with_no_card_reading_sends_1_share_each(rig):
+    """No account reading: the cards have no shares (opening_plan/fit.py), so Full sends 1 share, never
+    the risk's shares on their own."""
+    full(rig)
+    rig.view.shares = {s: {"long": None, "short": None} for s in PICKS}
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert {qty(o) for o in rig.broker.placed} == {1}
+    assert {x["size_why"] for x in lines(rig, "send_start")} == {"the card shows no shares for this side: 1 share"}
+
+
+def test_the_day_bound_and_burst_are_unchanged_at_full(rig):
+    """orders_per_day 2 at Full: two picks go with their card's shares and the plan disarms, as at 1 share."""
+    from companion.plan_auto import arming as A
+    full(rig)
+    arm(rig)
+    rig.plan.armed_rules = A.ArmedRules(**{**rig.plan.armed_rules.__dict__, "orders_per_day": 2})
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert [qty(o) for o in rig.broker.placed] == [243, 120]
+    assert "orders per day (2) reached" in rig.plan.panel()["disarmed"]["why"]

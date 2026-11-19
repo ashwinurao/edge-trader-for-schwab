@@ -38,6 +38,7 @@ def started_with(rig, env, playbook=PB_RAW):
                       now=rig.clock.now, out_dir=rig.tmp / "auto",
                       hold_later=lambda sec, why: rig.holds.append((rig.clock.now(), sec, why)))
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     rig.plan = plan
     return rig
@@ -413,8 +414,10 @@ def test_click_flip_on_a_resting_chase_makes_the_short_entry_the_clicks(crig):
     assert r["flip"] == "" and r["flip_to"] == "short"
     f = rig.desk.flip("AAAA", r["send"]["short"])
     assert f["ok"] and f["cancel"]["status"] == "CANCELED" and rig.broker.cancelled == [chase_id]
+    # The click's flip carries Ash's 5% target (2026-11-18 23:46:05 UTC): 41.91 x 0.95 = 39.8145, up to 39.82.
     assert without_id(rig.sent[-1]) == {**want_req("AAAA"), "side": "SHORT", "trigger": "41.91", "limit": "41.85",
-                                        "stop": "42.48", "expected_limit": "41.85"}
+                                        "stop": "42.48", "expected_limit": "41.85", "targets": 1,
+                                        "target_price": "39.82", "expected_target": "39.82"}
     o = order_of(rig, "AAAA")[-1]
     assert (o["orderType"], o["stopPrice"], o["price"], o["orderLegCollection"][0]["instruction"]) == \
         ("STOP_LIMIT", "41.91", "41.85", "SELL_SHORT")

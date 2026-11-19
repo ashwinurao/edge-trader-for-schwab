@@ -14,7 +14,7 @@ from companion import plan_close, plan_flat, plan_side, trading
 from companion.store import Store
 from companion.trading import Trader
 from test_plan_entries import LONG, SHORT
-from test_plan_flat import FILL_TIME, expected, fr, mutating, place  # noqa: F401  (fr is a fixture)
+from test_plan_flat import FILL_TIME, expected, fr, mutating, place, plan_stop, plan_target  # noqa: F401  (fr is a fixture)
 
 FILLED_AT = datetime.fromisoformat(FILL_TIME.replace("+0000", "+00:00"))
 OTHER = "The plan does not take the other side of a name you trade. Nothing was sent."
@@ -29,8 +29,8 @@ def working(fr, oid, instruction, ticker="AAAA", qty=100, order_type="LIMIT"):
 
 
 def stop_of(fr, entry_id):
-    (ch,) = fr.broker.orders[entry_id]["childOrderStrategies"]       # the entry's one child: its stop
-    return ch
+    # The entry's stop, inside its one child (the OCO with the plan's 5% target since 2026-11-18).
+    return plan_stop(fr.broker.orders[entry_id])
 
 
 def row(fr, ticker="AAAA"):
@@ -188,6 +188,7 @@ def test_the_plans_shares_while_its_stop_works_and_after(fr):
     stop_of(fr, a)["status"] = "AWAITING_PARENT_ORDER"
     assert plan_side.plan_shares(rec(), orders()).state == plan_side.UNCLEAR
     stop_of(fr, a).update(status="FILLED", filledQuantity=1)
+    plan_target(fr.broker.orders[a])["status"] = "CANCELED"   # the OCO takes the 5% target
     ps = plan_side.plan_shares(rec(), orders())
     assert (ps.state, ps.held, ps.text) == (plan_side.STOPPED, 0.0, "The plan's stop sold its 1 share.")
     stop_of(fr, a).update(status="CANCELED", filledQuantity=0)
@@ -284,6 +285,7 @@ def test_the_plans_stop_filled_is_nothing(fr):
     a = place(fr, "AAAA")
     fr.broker.fill_entry(a)
     stop_of(fr, a).update(status="FILLED", filledQuantity=1)
+    plan_target(fr.broker.orders[a])["status"] = "CANCELED"   # the OCO takes the 5% target
     fr.broker.pos["AAAA"] = 100.0                                     # the user's own shares stay
     it = {x["ticker"]: x for x in fr.flat.items()}["AAAA"]
     assert (it["action"], it["text"]) == ("nothing", "Nothing: the plan's stop sold its 1 share.")
@@ -301,8 +303,11 @@ def test_no_shares_held_and_the_plans_stop_works_cancels_that_stop(fr):
     fr.broker.calls.clear()
     r = fr.flat.run(expected(items))
     assert r["ok"], r
-    assert mutating(fr) == [("cancel", stop)]
+    # The plan's 5% target goes too (2026-11-18): the fake, unlike an OCO, leaves it after the stop's cancel.
+    tgt = plan_target(fr.broker.orders[a])
+    assert mutating(fr) == [("cancel", stop), ("cancel", tgt["orderId"])]
     assert stop_of(fr, a)["status"] == "CANCELED" and fr.broker.orders[561]["status"] == "WORKING"
+    assert tgt["status"] == "CANCELED"
     assert {x["ticker"]: x for x in r["batch"]["rows"]}["AAAA"]["result"] == "done"
 
 
@@ -419,6 +424,7 @@ def test_the_stop_filling_before_its_cancel_says_so_and_sends_nothing_more(fr, m
     fr.broker.pos["AAAA"] = 0.0
     def fills_first(h, oid):
         stop_of(fr, a).update(status="FILLED", filledQuantity=1)
+        plan_target(fr.broker.orders[a])["status"] = "CANCELED"   # the OCO takes the 5% target
         fr.broker.calls.append(("cancel", oid))
         from test_trading import Resp
         return Resp(200)

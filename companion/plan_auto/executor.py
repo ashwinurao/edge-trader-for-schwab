@@ -60,10 +60,11 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import break_entry, plan_entries, plan_flat, plan_size
+from .. import break_entry, netlog, plan_entries, plan_flat, plan_size
 from ..opening_plan import engine
 from ..opening_plan.engine import ET
 from . import AUTO_FLAG, BUTTONS_FLAG, SCANNER_URL, enabled
+from . import burst, warm
 from .arming import Arming, Facts, armed_rules_from, refusals
 from .beside import ARM_TEXT as BESIDE_ARM_TEXT, Beside
 from .chase import ARM_NOT_TEXT as CHASE_ARM_NOT_TEXT, armed_with_chase, offers as chase_offers
@@ -201,9 +202,12 @@ class AutoPlan:
                  cooldown_left: Callable[[], float], env: Mapping[str, str] = os.environ,
                  registry: Optional[Registry] = None, now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  out_dir: Path = OUT_DIR, demo: bool = False, row_view: Optional[Callable[[], dict]] = None,
-                 hold_later: Optional[Callable[[float, str], None]] = None) -> None:
-        """`hold_later` is the poller's (Poller.hold_later, brief 24); None holds nothing."""
+                 hold_later: Optional[Callable[[float, str], None]] = None,
+                 fan_out: Optional[Callable[[list], list]] = None) -> None:
+        """`hold_later` is the poller's (Poller.hold_later, brief 24); None holds nothing. `fan_out`
+        runs the 09:31 burst's sends (burst.together, all at once; tests pass burst.in_order)."""
         self.desk, self.trader, self.tape, self._usable = desk, trader, tape, usable
+        self._fan_out = fan_out or burst.together
         self._hold_later = hold_later
         self._view, self._orders, self._orders_fresh, self._cooldown = view, orders, orders_fresh, cooldown_left
         self._row_view = row_view or view
@@ -248,6 +252,11 @@ class AutoPlan:
         self._last_send: Optional[datetime] = None
         self._may_send = True
         self._hold_at: Optional[float] = None   # monotonic time of the last hold_later, None when not holding
+        self._warmed_for: Optional[datetime] = None   # the arm (armed_at) whose warm-up ran (warm.py)
+        # The size stage at the Arm click (plan_size): the armed plan never sends above it, and the
+        # switch can only lower it while armed (armed_stage). Ash's pick "Full for clicks and Arm",
+        # project thread, 2026-11-19 22:05:02 UTC.
+        self._armed_stage: Any = plan_size.ONE_SHARE
         self._hold_from: Optional[float] = None
         self._busy_step = False
         self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
@@ -352,6 +361,12 @@ class AutoPlan:
                     fh.write(_no_dollars(json.dumps(row, default=str)) + "\n")
         except OSError:
             log.exception("armed plan: could not write its log")
+        # The network record names the send's Schwab calls by its ticket id (a cancel by its pick),
+        # from its start line to its answer line (netlog.name_calls; the open of 2026-11-19).
+        if event in ("send_start", "cancel_start"):
+            netlog.name_calls(fields.get("ticket_id") or f"{ticker}-cancel", "armed_plan")
+        elif event in ("send_answer", "cancel_answer"):
+            netlog.name_calls(None)
         if event == "send_start":
             # Every send of the plan (the break entry, and the later steps' flips and chases) logs this
             # line just before its Schwab call: the poller's hold runs to 60 s after the last one.
@@ -398,6 +413,14 @@ class AutoPlan:
             log.exception("armed plan: could not turn %s red", ticker)
         self.log("red", ticker, why=reason)
         self.leave(ticker, reason)
+
+    def armed_stage(self) -> Any:
+        """The stage the armed plan sends at now: the smaller of the stage at the Arm click and the
+        switch now (plan_size.smaller). 1 share when either cannot be read."""
+        try:
+            return plan_size.smaller(self._armed_stage, self.desk.stage)
+        except Exception:
+            return plan_size.ONE_SHARE
 
     def disarm(self, reason: str, for_day: bool = False) -> None:
         if self.arming.disarm(self._now(), reason, for_day=for_day):
@@ -719,7 +742,9 @@ class AutoPlan:
             return False
         self._poll_hold(now, snap)
         day = now.astimezone(ET).date()
-        if now < datetime.combine(day, self.armed_rules.act_from_et, tzinfo=ET):
+        act_from = datetime.combine(day, self.armed_rules.act_from_et, tzinfo=ET)
+        if now < act_from:
+            self._warm(now, act_from, snap)
             return False
         # Step 2's view first, then the tape, so nothing falls between the reading and the send
         # (architect's review, 2026-11-13 16:21 UTC). The view is the feed's last answer: the worker
@@ -771,6 +796,12 @@ class AutoPlan:
         if first:
             gone = {d["symbol"] for d in first}
             acts = first + [d for d in acts if d["symbol"] not in gone]
+        with self._lock:
+            left = dict(self.left)
+        acts = [d for d in acts if d["symbol"] not in left]
+        group = self._burst_group(acts)
+        if len(group) > 1 and self._burst_clear():
+            return self._burst(group, picks, er, view, t0, timing)
         for d in acts:
             sym = d["symbol"]
             with self._lock:
@@ -800,9 +831,109 @@ class AutoPlan:
             self.disarm(f"the fast watch ended at {self.armed_rules.watch_until_et:%H:%M} ET")
         return False
 
+    def _warm(self, now: datetime, act_from: datetime, snap: Mapping) -> None:
+        """Once per arm, warm_up_seconds_before act_from: one Schwab quotes read per pick on the trading
+        client, on their own threads, so the burst's sends find open connections (warm.py; Ash's go "do
+        all 5", change 3). Counted in the plan's calls bound like a send's quote."""
+        r = self.armed_rules
+        if self.demo or now < act_from - timedelta(seconds=r.warm_up_seconds_before):
+            return
+        key = snap.get("armed_at")
+        with self._lock:
+            if key is None or self._warmed_for == key:
+                return
+            self._warmed_for = key
+        picks = [str(p) for p in (snap.get("terms") or {}).get("picks") or [] if p]
+        if not picks or self.spend("*", calls=len(picks)):
+            return
+
+        def done(sym: str, ok: bool, why: str) -> None:
+            self.log("warm_up_answer", sym, ok=ok, **({"why": why} if why else {}))
+        self.log("warm_up", None, picks=picks, before_s=round((act_from - now).total_seconds(), 2))
+        warm.warm_up(self.trader, picks, done)
+
+    def interval(self) -> float:
+        """The worker's wait between readings: fast_every_seconds around act_from (change 4 of Ash's "do
+        all 5"), every_seconds otherwise, and never past act_from itself, so the first reading comes at
+        09:31:00."""
+        r, now = self.armed_rules, self._now()
+        act_from = datetime.combine(now.astimezone(ET).date(), r.act_from_et, tzinfo=ET)
+        since = (now - act_from).total_seconds()
+        wait = r.fast_every_seconds if r.fast_from_seconds <= since < r.fast_until_seconds else r.every_seconds
+        if since < 0:
+            wait = min(wait, -since)
+        return max(wait, 0.001)
+
+    def _burst_group(self, acts: list[dict]) -> list[dict]:
+        """The sends that go together (burst.py): when the step's first action is a would_place, every
+        would_place of this reading on another name. Cancels, flips, re-levels and chases keep their
+        one action per reading, and a would_place behind one of them waits for the next reading."""
+        if not acts or acts[0].get("kind") != "would_place" or self.registry.get("would_place", self.env) is None:
+            return []
+        group, seen = [], set()
+        for d in acts:
+            if d.get("kind") != "would_place":
+                break
+            if d["symbol"] not in seen:
+                seen.add(d["symbol"])
+                group.append(d)
+        return group
+
+    def _burst_clear(self) -> bool:
+        """Nothing the whole plan waits on: Trader's order lock is free and Schwab's order list is fresh.
+        Otherwise the step stays one pick at a time, as before the burst: the nearest pick tries, says
+        why it waits, and the worker waits one tick (no Schwab call is made either way)."""
+        try:
+            return bool(self.desk.burst_clear())
+        except Exception:
+            return False
+
+    def _burst(self, group: list[dict], picks: Mapping, er: Mapping, view: Mapping, t0: float,
+               timing: Mapping) -> bool:
+        """Run the group's sends at once, on one reading (Ash's go "do all 5", 2026-11-19 17:02:46 UTC,
+        change 1). Each is handlers.on_place with every check it had; the plan's bounds are taken under
+        its lock one pick at a time. True when any send acted (the next step comes at once)."""
+        if not self.armed():
+            return False
+        h = self.registry.get("would_place", self.env)
+        before = (self._mono() - t0) * 1000
+        if before > SLOW_STEP_MS:
+            for d in group:
+                self.log("slow_step", d["symbol"], kind=d["kind"], before_handler_ms=round(before, 1), **timing,
+                         reading_t=er["received"])
+        self.log("burst", None, picks=[d["symbol"] for d in group], before_handler_ms=round(before, 1), **timing,
+                 reading_t=er["received"])
+        with self._lock:
+            self._busy_step = False
+        fns = [(lambda d=d: h(Lane(self, d, picks[d["symbol"]], er, view=view))) for d in group]
+        with self._lock:
+            waited = dict(self.busy_picks)      # a wait said in this burst replaces its pick's entry
+        outcomes = self._fan_out(fns)
+        with self._lock:
+            busy, self._busy_step = self._busy_step, False
+        acted, error = False, None
+        for d, o in zip(group, outcomes):
+            if o.error is not None:
+                error = error or o.error
+                continue
+            with self._lock:
+                now_wait = self.busy_picks.get(d["symbol"])
+            if o.value and (now_wait is None or now_wait is waited.get(d["symbol"])):
+                acted = True
+                self._busy_over(d["symbol"])
+        self.log("burst_end", None, ms=round((self._mono() - t0) * 1000 - before, 1),
+                 acted=[d["symbol"] for d, o in zip(group, outcomes) if o.error is None and o.value],
+                 errors=[f"{d['symbol']}: {type(o.error).__name__}" for d, o in zip(group, outcomes)
+                         if o.error is not None])
+        if error is not None:
+            raise error                         # safe_step disarms for the day and shows why
+        # As in the one-at-a-time loop: a send that waited (a busy lock, an old order list) makes the
+        # worker wait one tick before the next reading; the picks that went are done.
+        return acted and not busy
+
     def safe_step(self) -> bool:
         try:
-            return self.step()
+            return netlog.naming(self.step)     # a step's own context: names in the record end with it
         except Exception as e:
             problem = f"{type(e).__name__}: {e}"[:300]
             if problem != self.problem:
@@ -816,7 +947,7 @@ class AutoPlan:
             acted = self.safe_step()
             if acted:
                 continue
-            self._wake.wait(self.armed_rules.every_seconds if self.arming.is_armed(self._now()) else IDLE_SECONDS)
+            self._wake.wait(self.interval() if self.arming.is_armed(self._now()) else IDLE_SECONDS)
             self._wake.clear()
 
     def start(self) -> None:
@@ -872,15 +1003,22 @@ class AutoPlan:
                      bounds_now=self.armed_rules.bounds(), dashboard_arm=dashboard_arm, risk=risk,
                      calm=calm if isinstance(calm, bool) else None, picks_today=picks_today, orders_fresh=fresh,
                      open_rows=open_rows, tape=tape, blocked_today=self.arming.blocked_today(now),
-                     size_stage=size_stage, flat_unwired=self.flat_unwired), view
+                     size_stage=size_stage, full_ok=bool(getattr(self.desk, "full_ok", False)),
+                     flat_unwired=self.flat_unwired), view
 
     def terms(self, view: Optional[Mapping] = None) -> dict:
         """What the Arm dialog lists: exactly what the plan will and will not do, and the bounds."""
         view = view if view is not None else (self._safe_view())
         kinds = self.registry.kinds(self.env)
+        stage = self._stage_now()
+        one = stage == plan_size.ONE_SHARE
+        size_name = "Full" if plan_size.switch_name(stage) == "full" else plan_size.label(stage)
+        size_words = (f"{break_entry.BREAK_MAX_SHARES} share" if one else
+                      f"{size_name}: {'' if size_name == 'Full' else size_name + ' of '}each card's shares (never more than the risk per pick buys "
+                      "at the final 09:30 range; 1 share when the card has no shares)")
         will = [f"From {self.armed_rules.act_from_et:%H:%M:%S} ET, once a pick's 09:30 bar is final on the open "
                 "tape: send Step 3's break entry on the side nearer the last trade, "
-                f"{break_entry.BREAK_MAX_SHARES} share, its stop attached.",
+                f"{size_words}, its stop and a {float(break_entry.TARGET_PCT) * 100:g}% target attached in one OCO.",
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
                 "Before each send: check the pick's row against the last OV picks answer this page or the shadow log "
                 f"fetched. With none from the last {self.rules_feed_stale:g} s, send on the open tape alone and say so "
@@ -902,13 +1040,24 @@ class AutoPlan:
                     "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",
                     "Take the other side of a name you trade by hand (your shares or working orders): that pick is "
                     "left to you. On your side it sends beside your trades; while your side is not clear it waits.",
-                    f"Send more than {break_entry.BREAK_MAX_SHARES} share: the size stage is for your clicks only.",
+                    (f"Send more than {break_entry.BREAK_MAX_SHARES} share: set Full on the A1 page before Arm "
+                     "to size by the cards." if one else
+                     "Send more than the size at this Arm: switching to 1 share later lowers it, switching up "
+                     "does not raise it."),
                     "Act after a Flat all click: the click disarms it first, and Flat all does the cancels.",
                     "Survive a restart: arming is in memory only."]
         return {"playbook": self.playbook_name, "picks": [r.get("ticker") for r in (view or {}).get("rows") or []],
-                "shares": break_entry.BREAK_MAX_SHARES, "risk": (view.get("risk") or {}).get("per_pick") if view else None,
+                "shares": break_entry.BREAK_MAX_SHARES if one else size_name,
+                "stage": plan_size.switch_name(stage), "stage_value": "1_share" if one else str(stage), "risk": (view.get("risk") or {}).get("per_pick") if view else None,
                 "calm": (view.get("calm") or {}).get("calm") if view else None, "handlers": kinds,
                 "will": will, "will_not": will_not, "bounds": self.armed_rules.bounds()}
+
+    def _stage_now(self) -> Any:
+        """The switch's stage now (what an Arm click would take), or 1 share when it cannot be read."""
+        try:
+            return plan_size.parse_stage(self.desk.stage)
+        except Exception:
+            return plan_size.ONE_SHARE
 
     def _safe_view(self) -> dict:
         try:
@@ -933,6 +1082,7 @@ class AutoPlan:
         except Exception:
             pass
         out = {"enabled": True, "demo": self.demo, "playbook": self.playbook_name, "armed": armed,
+               "size": plan_size.switch_name(self.armed_stage() if armed else self._stage_now()),
                "now_et": _et(now), "armed_at_et": _et(snap["armed_at"]), "until_et": _et(snap["until"]),
                "disarmed": {"at_et": _et(snap["disarmed_at"]), "why": snap["disarmed_why"]} if snap["disarmed_at"] else None,
                "blocked_today": self.arming.blocked_today(now), "bounds": self.armed_rules.bounds(), "used": used,
@@ -973,12 +1123,15 @@ class AutoPlan:
         self._roll_day(now)
         terms = self.terms(view)
         with self._lock:
+            # The stage the dialog's terms named, so the Arm sends at what Ash read.
+            sv = terms["stage_value"]
+            self._armed_stage = plan_size.parse_stage(sv if sv == plan_size.ONE_SHARE else Decimal(sv))
             self.risk, self.calm = facts.risk, facts.calm
             self.state, self.left, self.notes, self.known = None, {}, {}, {}
             self.problem = ""
         self.arming.arm(now, terms)
         self.log("arm", None, risk=facts.risk, calm=facts.calm, picks=terms["picks"], bounds=terms["bounds"],
-                 handlers=terms["handlers"])
+                 handlers=terms["handlers"], size=terms["stage"])
         log.warning("ARMED PLAN armed: %s, picks %s, risk %s, calm %s", self.playbook_name, terms["picks"],
                     facts.risk, facts.calm)
         self._wake.set()
