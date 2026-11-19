@@ -560,7 +560,8 @@ sends only on its click, and every click is checked on the server against its la
 sends what it showed; a difference refuses). Nothing is automatic.
 - **Place all 4** places each pick through Place's own checks, one at a time in rank order. A pick that
   is refused does not stop the others; a 429 from Schwab stops the rest
-  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`).
+  (`PlanDesk.place_all`, `POST /api/opening-plan/place-all`). Its sends share one Schwab quotes call,
+  as the armed plan's do (see the armed plan's sends below).
 - **Chase** (`PlanDesk.chase`, `POST /api/opening-plan/chase`): reads one Schwab quote; when the price is
   still past the entry it cancels the resting entry (if one rests) and waits until Schwab confirms it
   CANCELED with nothing filled, then sends a break entry with its trigger at the ask (long) or bid (short)
@@ -855,7 +856,15 @@ not confirm (the row turns red); a reached bound; ARM turned off on the dashboar
 error. A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
 pick and is never retried, and so does an entry Schwab rejects after accepting it (on 2026-11-13 a
 REJECTED came 4.0 s after the 201: "The stop price must be above the current ask…"); the row shows
-Schwab's reason. So does a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`):
+Schwab's reason. The plan's sends share one Schwab quotes call (Ash's card pick "One quote call for
+all 4", 2026-11-19 16:13:44 UTC): the first send's quote call asks for every pick of the reading, and
+the next sends use that answer while the app got it at most 2 seconds ago
+(`break_entry.SHARED_QUOTE_MAX_AGE_S`, a start number); older, the next send asks again for all of
+them. The call sits where the send's own quote call was, after every check before it, and the checks on
+the quote do not change. A failed shared call lets the send read its own quote, as before. On
+2026-11-19 each send's own quote took 0.57 to 1.69 s at 09:31 ET, one pick after the other. The
+ticket's own Break entry and a row's Place, Flip and Chase clicks still read a new quote each.
+A Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`) leaves the pick the same way:
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
 up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
 at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's

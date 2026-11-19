@@ -807,6 +807,9 @@ class PlanDesk:
         if len(picks) > 8:
             return {"ok": False, "error": "Too many picks in one click.", "results": []}
         seen, results, stopped = set(), [], ""
+        # One Schwab quotes call for all the picks, reused by their sends while young (Ash's card
+        # pick "One quote call for all 4", 2026-11-19 16:13:44 UTC; break_entry.shared_quotes).
+        names = [str(p.get("ticker") or "") for p in picks if isinstance(p, Mapping)]
         for p in picks:
             if not isinstance(p, Mapping):
                 results.append(self._refuse("", "A pick must be an object."))
@@ -820,7 +823,8 @@ class PlanDesk:
                 results.append(self._refuse(ticker, stopped))
                 continue
             try:
-                r = self.place(ticker, p.get("side"), p.get("expected"))
+                with break_entry.shared_quotes(names):
+                    r = self.place(ticker, p.get("side"), p.get("expected"))
             except Exception as e:                   # place reports its own errors; this is a bug
                 log.exception("place all: %s", ticker)
                 r = self._refuse(ticker, f"Error while placing ({e}). Check thinkorswim."[:300])

@@ -31,6 +31,7 @@ Request shape (Step 4 builds on it): `build_request(...)` returns the dict `Trad
 from __future__ import annotations
 
 import contextvars
+import logging
 import os
 import time
 import uuid
@@ -39,12 +40,20 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 
 from .bracket import Plan, _price, _to_tick, bracket_order, fmt, plan, tick
 
+log = logging.getLogger("companion.break_entry")
+
 FLAG = "EDGE_TRADER_BREAK_ENTRY"
 BREAK_MAX_SHARES = 1                 # test stage (brief 05); raising it needs Ash's go
 CAP_R = Decimal("0.15")              # default limit offset: 0.15 x risk per share (trigger to stop)
 CAP_MIN = Decimal("0.02")            # at least 2 cents
 CAP_MAX_PCT = Decimal("0.0015")      # at most 0.15% of the price (the 2-cent floor wins below $13.34)
 MAX_QUOTE_AGE_MS = 5_000             # R-03: the ticket has no quote-age rule, so this entry type gets one
+# The Opening plan's sends share one Schwab quotes call for all its picks (Ash's card pick "One quote
+# call for all 4", project thread, 2026-11-19 16:13:44 UTC). On 2026-11-19 each pick's own quote took
+# 0.57 to 1.69 s at 09:31 ET, one pick after the other. A pick may use the shared quote while we got it
+# at most this long ago (our clock); older, it reads its own, as before. MAX_QUOTE_AGE_MS still applies
+# to Schwab's own quote time. A start number, not approved by Ash on its own.
+SHARED_QUOTE_MAX_AGE_S = 2.0
 
 # Step 9 (brief 19): an Opening plan entry may go above BREAK_MAX_SHARES, but only by its size
 # stage's result (companion/plan_size.py), set by the server around the one send it wraps. A context
@@ -58,6 +67,10 @@ _plan_cap: contextvars.ContextVar = contextvars.ContextVar("break_entry_plan_cap
 # around the one send it wraps (PlanDesk.chase), never a request field: the ticket's own Break entry
 # still refuses a price already through its level.
 _click_chase: contextvars.ContextVar = contextvars.ContextVar("break_entry_click_chase", default=False)
+
+# The Opening plan's names whose quotes one Schwab call fetches together, set around one send
+# (shared_quotes). Empty: the send reads a new quote of its own, as the ticket's Break entry does.
+_shared_names: contextvars.ContextVar = contextvars.ContextVar("break_entry_shared_names", default=())
 CHASE_BUFFER = Decimal("0.001")      # Ash's 0.1%: the chase's limit past its trigger
 
 
@@ -84,6 +97,34 @@ def chase_levels(side: str, bid, ask) -> tuple[Decimal, Decimal]:
     trig = _to_tick(px, ROUND_CEILING if side == "LONG" else ROUND_FLOOR)
     buf = max((trig * CHASE_BUFFER / t).to_integral_value(rounding=ROUND_FLOOR) * t, t)
     return trig, (trig + buf if side == "LONG" else trig - buf)
+
+
+@contextmanager
+def shared_quotes(names):
+    """While inside, a break entry's quote comes from one Schwab quotes call for all of `names`
+    (Trader.share_quotes), reused by the next sends while we got it at most SHARED_QUOTE_MAX_AGE_S
+    ago. Set by the Opening plan's sends only (Place all, the armed plan), never a request field."""
+    token = _shared_names.set(tuple(str(n or "").upper().strip() for n in names or () if n))
+    try:
+        yield
+    finally:
+        _shared_names.reset(token)
+
+
+def _send_quote(trader, symbol: str) -> dict:
+    """The quote a break entry checks before its send: a new one, or inside shared_quotes the shared
+    call's (one call for the plan's names, Ash's card pick of 2026-11-19 16:13:44 UTC). The shared
+    call sits where the send's own quote call was, after every check before it, so a send refused
+    earlier makes no call. When it fails the send reads its own quote, as before."""
+    names = _shared_names.get()
+    if not names:
+        return trader.quote(symbol, max_age=0)
+    try:
+        trader.share_quotes(names, symbol, SHARED_QUOTE_MAX_AGE_S)
+    except Exception as e:
+        log.warning("break entry: the shared quote call failed (%s); %s reads its own", type(e).__name__, symbol)
+        return trader.quote(symbol, max_age=0)
+    return trader.quote(symbol, max_age=SHARED_QUOTE_MAX_AGE_S)
 
 
 @contextmanager
@@ -263,7 +304,7 @@ def prepare(trader, req: dict, now_ms: float | None = None) -> tuple[Plan | None
         return no("ticket is missing the displayed plan; review and click again")
     if qty > max_shares():
         return no(_cap_text() + ". Nothing was sent.")
-    q = trader.quote(req["symbol"], max_age=0)
+    q = _send_quote(trader, req["symbol"])
     if q.get("realtime") is not True:
         return no("Schwab's quote is not real-time, so the break level cannot be checked. Nothing was sent.")
     qt = q.get("quote_time")
