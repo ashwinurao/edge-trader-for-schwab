@@ -176,6 +176,21 @@ name are refused). It needs no account and sends no telemetry.
   rank 1; no picks by then means SPY only, and a note says which (`companion/open_probe.py`). Picks that come
   inside the window are quoted at once; picks that come before it wait for the window start, so Schwab is
   never asked outside the window.
+- **New-name previews, with the opening probe on** (2026-11-19, Ash's pick 14:19:00 UTC in the project
+  thread; `companion/new_name_previews.py`, off in `--demo`): from 09:00:30 to 09:25:00 ET, outside the
+  probe's own windows and the minute before each, it checks every 30 seconds for an Opening plan
+  preview pick whose long and short margin rates are not in the rate store yet. The first such name,
+  in rank order, gets one quote call and one long and one short Break preview, built exactly as the
+  probe builds them (100 shares, sends no order), so its estimated shares use its own rates within
+  about 30 seconds of joining the top 4 instead of waiting for the next probe window. Each name gets
+  at most one try a day, also when Schwab refuses the preview. That is 3 Schwab calls per new name:
+  at most 12 before the freeze when none of the four picks has a rate, and none when the probe already
+  previewed them. Its three calls ask the probe's budget at once (`PROBE_ROOM`), go whole or not at
+  all, and are counted in the 70 a minute; one that gives way waits for the next check
+  (`tests/test_new_name_previews_budget.py`: with no position open all four names are previewed, and
+  no poll is later than without it; with a position open it sends almost nothing, as the probe). Its
+  lines are the probe's preview lines with `via: "new_name"`. Any 429, or the app's 429 pause, stops
+  it for the day. Its times are in `companion/open_probe.json` under `new_names`.
 
 ### API keys
 
@@ -549,7 +564,28 @@ the day's four picks as cards in rank order (`companion/opening_plan/static/open
 - **Each card:** the ticker, its live price, ATR, the margin Schwab charges for the side ("2.5x", or
   "1.4x?" when no preview gave the name's rate), the shares, and a chart of 1-minute bars fixed from
   08:30 to 11:00 ET with the BUY and SELL levels (the side shown is solid, the other dashed), the STOP
-  once filled and the CHASE limit while a chase rests. Before 09:30 ET the card says "sizes at 09:31".
+  once filled and the CHASE limit while a chase rests. Before its 09:30 minute the card shows the
+  **estimated shares** below, marked EST; with no estimate it says "sizes at 09:31".
+- **Estimated shares before the 09:30 minute** (2026-11-19, Ash's pick 14:19:00 UTC in the project
+  thread, "Preview new names, reprice each minute"; `companion/opening_plan/estimate_fit.py`). Each
+  preview card from 09:00 ET, and each frozen card still waiting for its minute, shows "≈ ▲N ▼N": the
+  shares **Place all 4** would send for each side if the 09:30 minute came out typical. The typical
+  minute is a bar of 0.27 x ATR centred on the card's price (`size.estimate.first_minute_atr` in
+  `playbook.json`), so each entry sits about 0.13 x ATR past the price and the risk per share is about
+  0.27 x ATR. On OV's 2026 top 4 (835 picks, 2026-01-02 to 2026-10-30), from the 09:10 price the
+  09:30 minute's high was a median 0.13 x ATR above the price and its low 0.13 x ATR below it, and this
+  barely moves from 09:05 to 09:25. The card is then sized by the same rules as a real minute: the
+  risk per pick (the calm rule included), the ticket's caps, and the fit to the account (each side's
+  margin rate from this morning's previews, the margin under the gear for a side without one, the room
+  share and the live buying power check), all four cards together. The price is Edge Scanner's last
+  price in its preview, which it refreshes once a minute, so the estimate changes once a minute; after
+  the 09:25 freeze it is the frozen pick's price. The dotted bar shows how far the room cuts the
+  shares below what risk alone gives; the card's tooltip gives the usual range (the same sizing at a
+  wide 0.37 and a narrow 0.19 x ATR minute). Until any pick has real shares, the top meter shows the
+  estimate's use of the room, marked "≈ ... est". An estimate is never a size: nothing that sends an
+  order reads it, and a card sizes from its own 09:30 minute as soon as that minute is in. With no
+  risk set, no ATR or no price from Edge Scanner the card says why there is no estimate; with
+  buying power not known it shows no shares.
 - **One big button per card**, for what the pick needs now: **Flip** to the other side when the price
   crossed it while the entry rests; **Chase** when the price is past the entry with nothing filled;
   **Flatten** once filled. **Cancel** and **Take** are small beside it. Before any entry exists today

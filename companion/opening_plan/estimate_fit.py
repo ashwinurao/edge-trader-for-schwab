@@ -109,7 +109,8 @@ def apply(rows: list, trading_date: date, risk: Optional[Decimal], calm: Optiona
     head = heads["typical"]
     return {"state": head.get("state"), "used": head.get("used"), "per_row": head.get("per_row"),
             "live": head.get("live"), "scaled": head.get("scaled"), "text": head.get("text"),
-            "first_minute_atr": float(pb.estimate_first_minute_atr), "as_of_et": as_of_et}
+            "first_minute_atr": float(pb.estimate_first_minute_atr), "as_of_et": as_of_et,
+            "room_share": head.get("room_share"), "unknown_rate": head.get("unknown_rate")}
 
 
 def _et():
