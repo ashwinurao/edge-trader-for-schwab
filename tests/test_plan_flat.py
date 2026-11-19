@@ -266,12 +266,14 @@ def test_a_larger_or_opposite_position_is_refused_for_that_row(fr, held, why):
     assert it["action"] == "refuse" and why in it["text"] and "Close it on the dashboard" in it["text"]
 
 
-def test_a_partly_filled_entry_that_still_works_is_refused(fr):
+def test_a_partly_filled_entry_that_still_works_cancels_the_rest_then_closes(fr):
+    # Was refused until Ash's pick "Cancel the rest, then close" (2026-11-18 23:43:21 UTC, gap 1).
     fr.desk.stage = plan_size.parse_stage(0.25)
     a = fr.desk.place("AAAA", "LONG", {**LONG, "shares": 43})["order_id"]
     fr.broker.fill_entry(a, n=10, done=False)
     it = by_ticker(fr.flat.items())["AAAA"]
-    assert it["action"] == "refuse" and "10 shares filled and the rest still works" in it["text"]
+    assert (it["action"], it["order_id"], it["shares"]) == ("cancel_rest", a, 10.0)
+    assert "Cancel the rest of the long entry" in it["text"] and "close the plan's 10 shares" in it["text"]
 
 
 def test_fills_from_another_day_are_refused(fr):

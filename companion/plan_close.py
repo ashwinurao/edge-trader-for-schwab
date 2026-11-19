@@ -279,6 +279,76 @@ def _cancel(trader, symbol: str, stop_id: int, target_id=None) -> dict:
             "error": f"Schwab did not confirm the cancel of the plan's stop ({st}). Check thinkorswim now."}
 
 
+def cancel_rest_then_close(trader, symbol: str, side: str, entry_id: int, rec: dict) -> dict:
+    """Gap 1 before Full size (Ash's card pick "Cancel the rest, then close", project thread
+    2026-11-18 23:43:21 UTC): the plan's entry filled part and the rest still works. Under Trader's
+    lock, as one action: cancel the entry's unfilled rest, read it back until Schwab ends it, then
+    close the shares the plan filled by replacing the plan's stop (close_plan_shares' one PUT).
+
+    Ash, 23:45:24 UTC: "schwab will set stop only for the filled shares", so the stop the close
+    replaces is for the filled shares only. The close goes only when Schwab's answer shows the plan's
+    stop working for exactly the shares the entry filled (plan_side.plan_shares on the entry's own
+    tree, read after the cancel). Anything else sends no close and says what to do, in red."""
+    symbol = str(symbol or "").upper().strip()
+    return _locked(trader, symbol, lambda: _cancel_rest(trader, symbol, side, int(entry_id), rec))
+
+
+def _cancel_rest(trader, symbol: str, side: str, entry_id: int, rec: dict) -> dict:
+    from . import plan_side                          # plan_side imports nothing from here; kept local
+    client = trader._ensure()
+    blocked = trader._blocked(symbol, client)
+    if blocked:
+        return blocked
+    trader.store.log_action("close", symbol, entry_id, "SENDING", f"cancel the rest of the plan's entry {entry_id}")
+    log.warning("PLAN CANCEL REST %s entry %s, then close what filled", symbol, entry_id)
+    try:
+        c = trader._logged("cancel_order", lambda: client.cancel_order(trader._hash, entry_id))
+    except Exception as e:
+        trader.store.log_action("close", symbol, entry_id, "UNKNOWN", repr(e))
+        return {"ok": False, "symbol": symbol, "unresolved_close": True,
+                "error": "No answer from Schwab on the cancel of the entry's rest. It MAY still work: check "
+                         "thinkorswim now."}
+    if c.status_code == 429:
+        trader.store.log_action("close", symbol, entry_id, "RATE_LIMITED", c.text[:300])
+        return {"ok": False, "symbol": symbol,
+                "error": "Schwab throttled the cancel (HTTP 429): nothing was sent. The entry's rest still works."}
+    if c.status_code >= 500:
+        trader.store.log_action("close", symbol, entry_id, "UNKNOWN", f"HTTP {c.status_code} {c.text[:300]}")
+        return {"ok": False, "symbol": symbol, "unresolved_close": True,
+                "error": f"Schwab answered HTTP {c.status_code} to the cancel of the entry's rest. Check thinkorswim now."}
+    if c.status_code not in (200, 201):
+        trader.store.log_action("close", symbol, entry_id, "REJECTED", f"HTTP {c.status_code} {c.text[:300]}")
+        return {"ok": False, "symbol": symbol,
+                "error": f"Schwab refused the cancel (HTTP {c.status_code}): {c.text[:200]}. Nothing was closed. "
+                         "Check thinkorswim."}
+    tree: dict = {}
+    st = "UNCONFIRMED"
+    for _ in range(3):
+        time.sleep(0.35)
+        d = trader._logged("order_details", lambda: client.order_details(trader._hash, entry_id))
+        if d.status_code == 200:
+            tree = d.json() or {}
+            st = tree.get("status") or "UNCONFIRMED"
+            if st in TERMINAL:
+                break
+    if st not in ("CANCELED", "FILLED"):
+        trader.store.log_action("close", symbol, entry_id, "UNKNOWN", f"cancel of the rest not confirmed: {st}")
+        return {"ok": False, "symbol": symbol, "unresolved_close": True,
+                "error": f"Schwab did not confirm the cancel of the entry's rest ({st}). Nothing was closed. "
+                         "Check thinkorswim now."}
+    trader.store.log_action("close", symbol, entry_id, "DONE", f"the entry's rest ended {st}")
+    ps = plan_side.plan_shares({**rec, "order_id": entry_id, "side": side}, [tree])
+    head = ("The entry's rest is cancelled." if st == "CANCELED" else "The entry filled in full before the cancel.")
+    if ps.state != plan_side.HELD:
+        text = (f"{head} No close was sent: {ps.text or 'the plan has no working stop for its shares.'} "
+                f"Close the plan's {ps.filled:g} {symbol} in thinkorswim now.")
+        trader.store.log_action("close", symbol, entry_id, "CHECK", text[:300])
+        return {"ok": False, "symbol": symbol, "unresolved_close": False, "message": text, "error": text}
+    r = _close(trader, symbol, side, int(ps.stop_id), float(ps.filled), ps.target_id)
+    msg = f"{head} " + str(r.get("message") or r.get("error") or "")
+    return {**r, "message": msg, **({} if r.get("ok") else {"error": msg})}
+
+
 def check_trader(trader: Any) -> list[str]:
     """Trader's private names this file uses that are missing (an upstream sync renamed one)."""
     return [n for n in TRADER_NAMES if not hasattr(trader, n)]

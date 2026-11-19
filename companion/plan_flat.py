@@ -29,7 +29,11 @@ Flat all (Part A): one button ends the morning's plan trades.
   with shares held, fewer shares than the plan filled, the other side or anything unclear refuses.
 - It refuses: market closed, Schwab's order list or positions old, a 429 pause, a batch already
   running, a list that changed since the page showed it; per row: a name blocked by an unclear
-  order, a click still running, an entry partly filled and still working.
+  order, a click still running.
+- An entry that filled part while the rest still works (gap 1, Ash's pick "Cancel the rest, then
+  close", 2026-11-18 23:43:21 UTC): CANCEL_REST cancels the rest, reads it back until Schwab ends it,
+  then closes the plan's filled shares through the same one PUT on the plan's stop
+  (plan_close.cancel_rest_then_close), only while that stop works for exactly the filled shares.
 - It needs no ARM, and never turns ARM on: its cancels and closes only remove risk, and the
   dashboard's Cancel entry and Close need no ARM either. ARM turning off during a batch does not stop
   it. A restart turns ARM off, so this is the case where it matters (brief 27; Ash's "3 yes", project
@@ -88,7 +92,11 @@ STAND_OUT = timedelta(minutes=2)                # brief 19 A6: the button stands
 # with the plan's stop working every close is the plan's own; without it the row is refused.
 CANCEL, CLOSE, NOTHING, REFUSE = "cancel", "close", "nothing", "refuse"
 CLOSE_PLAN, CANCEL_STOP = "close_plan", "cancel_stop"
-CANCELS, CLOSES = (CANCEL, CANCEL_STOP), (CLOSE, CLOSE_PLAN)
+# Gap 1 before Full size (Ash's pick "Cancel the rest, then close", 2026-11-18 23:43:21 UTC): an entry
+# that filled part while the rest still works. plan_close.cancel_rest_then_close cancels the rest,
+# then closes the plan's filled shares; it runs with the closes.
+CANCEL_REST = "cancel_rest"
+CANCELS, CLOSES = (CANCEL, CANCEL_STOP), (CLOSE, CLOSE_PLAN, CANCEL_REST)
 # How a row of a batch ended.
 DONE, REFUSED, UNCLEAR, NOT_SENT = "done", "refused", "unclear", "not_sent"
 
@@ -104,7 +112,7 @@ CANCEL_REFUSED = ("Another order action is in progress", "Could not read the ord
                   "That contract is a leg", "Nothing to cancel", "The row's entry is now", "Demo mode")
 CLOSE_REFUSED = ("Regular hours only", "Another order action is in progress", "That contract is a leg",
                  "A previous ", "Cannot close", "Schwab refused the close", "Schwab throttled the close",
-                 "Schwab's position now shows")
+                 "Schwab's position now shows", "Schwab refused the cancel (HTTP")
 STOP_CANCEL_REFUSED = ("Regular hours only", "Another order action is in progress", "That contract is a leg",
                        "A previous ", "Schwab refused the cancel", "Schwab throttled the cancel",
                        "Schwab's position now shows", "Schwab's position could not be read")
@@ -333,9 +341,6 @@ class PlanFlat:
                 return refuse(f"Schwab shows the entry {status}. Check thinkorswim.")
             it.update(action=CANCEL, text=f"Cancel the unfilled {side.lower()} entry (order {oid}).")
         else:
-            if status in LIVE:
-                return refuse(f"{_sh(filled)} filled and the rest still works. Cancel the rest and close on "
-                              "the dashboard or in thinkorswim.")
             days = _fill_days(o)
             if days and days != {today}:
                 return refuse("The entry's fills are not from today. Use the dashboard.")
@@ -345,6 +350,23 @@ class PlanFlat:
                               f"the other side of the plan's {side.lower()} entry. Close it on the dashboard.")
             # Brief 25 rule D: only the plan's own shares, told apart by the plan's own stop (rule C).
             ps = plan_side.plan_shares(rec, orders)
+            if status in LIVE:
+                # Gap 1: the rest still works. Cancel it, then close what filled, only while the plan's
+                # stop works for the filled shares (Ash: Schwab sets the stop for the filled shares only).
+                if ps.state != plan_side.HELD:
+                    return refuse(f"{_sh(filled)} filled and the rest still works, and "
+                                  + (ps.text[0].lower() + ps.text[1:] if ps.text else "the plan's stop is not clear.")
+                                  + " Cancel the rest and close in thinkorswim.")
+                if abs(held) < filled - 1e-9:
+                    return refuse(f"The account holds {_sh(abs(held))} of {ticker}, fewer than the {filled:g} the plan's "
+                                  "entry filled. Close it in thinkorswim.")
+                it.update(action=CANCEL_REST, shares=filled,
+                          text=f"Cancel the rest of the {side.lower()} entry (order {oid}), then close the plan's "
+                               f"{_sh(filled)} at the market.")
+                if blocked is None or ticker in blocked:
+                    return refuse(f"An earlier {ticker} order's outcome is not confirmed. Check thinkorswim, then "
+                                  "press Resolve.")
+                return it
             if ps.state in (plan_side.STOPPED, plan_side.CLOSED):
                 it["text"] = "Nothing: " + ps.text[0].lower() + ps.text[1:]
                 return it
@@ -511,6 +533,13 @@ class PlanFlat:
             if err.startswith(STOP_CANCEL_REFUSED):
                 return REFUSED, err, False
             return UNCLEAR, err, False
+        if it["action"] == CANCEL_REST:
+            with self.desk._lock:
+                rec = dict(self.desk._load().get(ticker) or {})
+            if rec.get("order_id") != it["order_id"]:
+                return REFUSED, f"The row's entry is now order {rec.get('order_id')}, not {it['order_id']}. Look again.", False
+            r = plan_close.cancel_rest_then_close(self.trader, ticker, it["side"], it["order_id"], rec)
+            return self._closed(r)
         if it["action"] == CLOSE_PLAN:
             r = plan_close.close_plan_shares(self.trader, ticker, it["side"], it["order_id"], it["shares"],
                                              it.get("target_id"))
@@ -553,7 +582,8 @@ class PlanFlat:
         """Flat all for one pick (the A1 page's Flatten and Cancel stop, Ash's ask of 2026-11-18
         14:07:45 UTC: "once it is filled i need buttons to cancel and flatten"). The same list, checks
         and paths as Flat all (_item, _refusal, _one), for one row, and only when its action is one of
-        `actions`: Flatten is CLOSE_PLAN (close the plan's shares, which takes the place of its stop),
+        `actions`: Flatten is CLOSE_PLAN (close the plan's shares, which takes the place of its stop)
+        or CANCEL_REST (an entry still working after a part fill: cancel the rest, then close),
         Cancel stop is CANCEL_STOP (only when the account holds none of the name: a stop is never
         removed from shares that are held, CONTRIBUTING rule 2). `expected` is the row's item as the
         page showed it; any difference refuses. It holds new entries while it runs, like a batch."""
@@ -779,7 +809,7 @@ def register(app, trader, poller, guard, desk: plan_entries.PlanDesk, demo: bool
     @app.post("/api/opening-plan/flatten")
     async def opening_plan_flatten(request: Request):
         b = await body(request)
-        return await run_in_threadpool(flat.one, b.get("ticker"), b.get("expected"), (CLOSE_PLAN,))
+        return await run_in_threadpool(flat.one, b.get("ticker"), b.get("expected"), (CLOSE_PLAN, CANCEL_REST))
 
     @app.post("/api/opening-plan/cancel-stop")
     async def opening_plan_cancel_stop(request: Request):

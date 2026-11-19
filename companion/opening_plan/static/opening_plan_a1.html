@@ -237,7 +237,7 @@ function footer(row, e, side, lp, k) {
   if (k === "SENDING") return `<span class="wait">${ent.text || "Sending…"}</span>`;
   if (k === "FILLED") {
     const it = flatItem(t);
-    const canFlat = it && it.action === "close_plan", canStop = it && it.action === "cancel_stop";
+    const canFlat = it && (it.action === "close_plan" || it.action === "cancel_rest"), canStop = it && it.action === "cancel_stop";
     const flatWhy = !S.flat ? "Flatten needs EDGE_TRADER_PLAN_FLAT=1." : !it ? "Not on the list yet." : canFlat ? (S.flat.refusal || "") : (it.text || "Nothing to close now.");
     return `<button class="ob flatten" data-act="flatten" data-t="${t}" ${dis(flatWhy)}>Flatten ${typeof it?.shares === "number" ? it.shares : ""}</button>` +
            `<span class="sp"></span>${canStop ? `<button class="ib" data-act="cancelstop" data-t="${t}" ${dis(S.flat.refusal)}>Cancel stop</button>` : ""}${take}`;
