@@ -260,7 +260,12 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   "Preview, not locked. Picks freeze at 09:25 ET." A preview row has no 09:30 minute, no levels, no
   shares and no buttons, and nothing that places an order or the shadow log reads it as a pick. The
   opening probe previews its names (no order) only to learn each name's margin rate before the freeze. At the freeze the frozen picks replace it; a preview never shows beside them, after 09:25 ET
-  or for another day. The header's **Buying power** line shows Schwab's day-trading buying power, buying
+  or for another day. At 09:26 ET the OV picks module re-checks the frozen picks with bars that came in
+  late; the frozen picks always stand. The screen notes "The 09:26 re-check differs" only when the
+  difference touches the plan: a ranked-list change at rank 4 or above, OV's top picks, OV's earnings
+  data, or the earnings label of a name on the plan. A change further down the list is not shown, and
+  text the screen does not know is shown (`settled_difference_for_plan` in
+  `companion/opening_plan/plan.py`). The header's **Buying power** line shows Schwab's day-trading buying power, buying
   power and equity from the account read Edge Trader already makes every 5 seconds, with the time read.
   Missing, or older than 30 seconds, it says "not known", never a zero; with `--private` it is hidden. It
   is on the screen only, never in a log. `--demo` shows invented numbers; set `EDGE_TRADER_PLAN_DEMO_ET`
