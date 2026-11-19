@@ -12,6 +12,15 @@ Why: on 2026-11-18 the plan showed risk shares only (risk $500: AAOI 420, WULF 1
 1724), about 3.6 times equity in order value, which Schwab would have refused for buying power.
 plan.size() knows the risk only; the buying power cap (ET #38) was never merged.
 
+The split (Ash, 2026-11-19 22:33:09 UTC, on PR #49: "is it using the latest calculation of shares we
+discussed based on stop sizing..it should.."): the room is no longer cut into equal quarters. Every
+pick gets the same share of its risk shares: share = min(1, room / sum of each row's full need),
+need = risk shares x entry x rate at the row's dearer side, shares = floor(risk shares x share). So
+each pick's buying power is in proportion to what its $500 of risk needs, and a pick with a tighter
+stop (as a % of price) gets more. It beat equal quarters in every period tested (November 2026,
+2026, 2023-25, 2020-22: ov-research/nov_20k_backtest/allocation/README.md, rule "same % of risk for
+all"). The room was `4 x equity x room share / picks` per pick from 2026-11-18 to 2026-11-19.
+
 The numbers:
 - `LEVERAGE` 4: Schwab's buyingPower counts four dollars for each dollar of requirement, and its
   requirement for an order is the order value times the name's rate (1.0 to 2.8 seen, 2026-11-16 to
@@ -133,6 +142,7 @@ def apply(rows: list, account: Optional[Mapping], rates: Optional[Mapping], rank
     room_share = Decimal(room_share)
     unknown_rate = Decimal(unknown_rate)
     head = {"state": "NOT_KNOWN", "room_share": float(room_share), "unknown_rate": float(unknown_rate),
+            "share_of_risk": None,
             "unknown_leverage": float((LEVERAGE / unknown_rate).quantize(Decimal("0.01"))),
             "used": None, "risk_only_used": None, "live": None, "scaled": None, "per_row": {}, "text": ""}
     reserved = {str(t).upper() for t in reserved}
@@ -150,11 +160,10 @@ def apply(rows: list, account: Optional[Mapping], rates: Optional[Mapping], rank
             _no_room(r, why)
         return head
     room = LEVERAGE * equity * room_share                     # the plan's whole room, in buying power
-    per_pick = room / ranks
-    cost = {}                                                 # ticker -> {side: cost at its own rate}
+    # Pass 1: each side's rate, and what its full risk shares would cost.
+    sized = []                                                # (row, side name, entry, rate, risk shares)
     for r in fitted:
         name_rates = (rates or {}).get(str(r.get("ticker") or "").upper()) if isinstance(rates, Mapping) else None
-        row_cost = {}
         for s in SIDES:
             side = r[s]
             entry = _dec(side.get("entry"))
@@ -166,11 +175,25 @@ def apply(rows: list, account: Optional[Mapping], rates: Optional[Mapping], rank
             if not isinstance(risk_n, int) or isinstance(risk_n, bool) or entry is None or entry <= 0:
                 side.update(fit_shares=None, decided_by=None)
                 continue
-            fit_n = max(0, _floor(per_pick / (entry * used_rate)))
-            n = min(risk_n, fit_n)
-            side.update(fit_shares=fit_n, shares=n, decided_by="room" if fit_n < risk_n else "risk")
-            row_cost[s] = (Decimal(n) * entry * used_rate, Decimal(risk_n) * entry * used_rate)
-        cost[str(r.get("ticker") or "").upper()] = row_cost
+            sized.append((r, s, entry, used_rate, risk_n))
+    # Same share of its risk for every pick (Ash, 2026-11-19 22:33:09 UTC): each row needs its dearer
+    # side's full risk shares; when the rows together need more than the room, every side gets the
+    # same fraction of its risk shares, rounded down. So the room splits in proportion to what each
+    # pick's risk needs (1 / stop %), and the total never goes over it.
+    need_full = {}
+    for r, s, entry, used_rate, risk_n in sized:
+        t = str(r.get("ticker") or "").upper()
+        need_full[t] = max(need_full.get(t, Decimal(0)), Decimal(risk_n) * entry * used_rate)
+    total_full = sum(need_full.values(), Decimal(0))
+    share = min(Decimal(1), room / total_full) if total_full > 0 else Decimal(1)
+    head["share_of_risk"] = float(share.quantize(Decimal("0.0001")))
+    cost = {str(r.get("ticker") or "").upper(): {} for r in fitted}   # ticker -> {side: costs at its rate}
+    for r, s, entry, used_rate, risk_n in sized:
+        side = r[s]
+        fit_n = max(0, _floor(Decimal(risk_n) * share))
+        n = min(risk_n, fit_n)
+        side.update(fit_shares=fit_n, shares=n, decided_by="room" if fit_n < risk_n else "risk")
+        cost[str(r.get("ticker") or "").upper()][s] = (Decimal(n) * entry * used_rate, Decimal(risk_n) * entry * used_rate)
     # The live check: only the rows without an entry today, each at its dearer side.
     counted = balances_counted(account) if balances_counted else {"state": "NOT_KNOWN", "use": {}}
     open_rows = [r for r in fitted if str(r.get("ticker") or "").upper() not in reserved]

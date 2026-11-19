@@ -248,8 +248,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   high and the short entry one cent below the low, each with its stop at the other side, the risk per
   share, the shares for the risk per pick you type (rounded down, inside the ticket's 10,000-share and
   $250,000 caps), and which side the minute's close is nearer. On a calm SPY day (RV20 at or below
-  10.5) each row uses half the risk and says so; when the calm flag is not known it shows full and half
-  size side by side. A stop under 2% of daily ATR is marked, not changed. Every number shows its age, and
+  10.5) a row has no long shares and its shorts use the full risk (playbook `size.calm_rule`
+  `no_longs`: Ash's rule of 2026-11-17, applied since his go of 2026-11-19; it replaced half size on
+  both sides). When the calm flag is not known the row shows the full size and nothing sends. A stop under 2% of daily ATR is marked, not changed. Every number shows its age, and
   an old or failed answer from Edge Scanner shows as old, never as current. Without
   `EDGE_TRADER_PLAN_BUTTONS=1` and `EDGE_TRADER_BREAK_ENTRY=1` the screen has no order buttons: it places, changes and cancels nothing
   (with it, see "Place, Cancel and Flip on the plan rows" below). Its list, times and numbers are in
@@ -276,8 +277,8 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   long rates only (the demo's invented rates are in
   `companion/opening_plan/demo_feed.py`).
   Before the 09:30 minute there is no range, so each preview row, and each frozen row still waiting for
-  the minute, shows **estimated shares**, marked "estimate": the risk per pick you set (half on a calm
-  day) over a typical first minute of 0.27 x ATR, with the usual range at 0.37 and 0.19 x ATR, for
+  the minute, shows **estimated shares**, marked "estimate": the risk per pick you set (on a calm day the
+  shorts' full risk) over a typical first minute of 0.27 x ATR, with the usual range at 0.37 and 0.19 x ATR, for
   example "about 154, usually 112 to 219". Under it, "buying power allows N": for each of Schwab's
   buying power and day-trading buying power, a quarter of it over (the row's last price times this
   name's own margin rate), and the smaller of the two. The rate is Schwab's requirement over the
@@ -474,7 +475,7 @@ To run the plan over a whole morning again, replay Edge Scanner's opening-record
 
     python -m companion.opening_plan.replay 2026-11-13.jsonl --risk 100 --calm no --out decisions.jsonl
 
-`--risk` is the risk per pick in dollars before the calm half. `--calm` is `yes` when SPY RV20 was at
+`--risk` is the risk per pick in dollars. On a calm day the replay sends no longs and shorts at that risk. `--calm` is `yes` when SPY RV20 was at
 or below 10.5 that day (Edge Scanner's top-bar badge is red), `no` above it, or `unknown`, which
 places nothing. Without `--out` the lines go to the screen. A count by kind goes to the error stream,
 e.g. `would_place 4`.
@@ -514,7 +515,7 @@ day's file, 2026-11-13, says no).
 | `t` | When the data behind it was in hand: the recorder's `t1`, in UTC (14:31:00Z is 09:31:00 ET in winter). |
 | `kind` | `would_place`, `would_fill` (an estimate), `would_flip`, `would_relevel` (Step 7: the 09:30 bar moved the range by more than one cent), `would_cancel` or `no_action`. |
 | `symbol`, `why` | The pick, and the reason in words. |
-| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `range_disputed`, `stale_price`, `calm_unknown`, `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `relevel_refused`, `relevel_traded` (the new range's trigger has already traded, so the entry stays), `range_after_fill`, `after_watch`, `no_range` or `no_picks`. |
+| `code` | On `no_action` only: `waiting_for_range`, `range_not_final`, `range_disputed`, `stale_price`, `calm_unknown`, `calm_no_long` (calm day: nearer the high, waits for the low side), `calm_long_break` (calm day: the long trigger traded first, so no trade today; also on the `would_cancel` of a resting short), `calm_no_flip` (calm day: no flip to long), `no_risk`, `no_shares`, `zero_width_range`, `even`, `past_cap`, `flip_refused`, `relevel_refused`, `relevel_traded` (the new range's trigger has already traded, so the entry stays), `range_after_fill`, `after_watch`, `no_range` or `no_picks`. |
 | `side`, `trigger`, `limit`, `stop`, `shares` | The stop-limit entry: it triggers at `trigger`, buys (or sells short) no worse than `limit`, and its stop rests at `stop`. |
 | `cap`, `risk_per_share`, `flip_at` | `limit` minus `trigger`; `trigger` minus `stop`; the price that would flip it to the other side. |
 | `fill` | On `would_fill`: the trade price seen inside the order's band. |
@@ -584,18 +585,24 @@ sends what it showed; a difference refuses). Nothing is automatic.
   shares held: a stop is never cancelled under shares you hold (CONTRIBUTING.md rule 2). For held shares
   without the plan, use Take and thinkorswim.
 
-**Fit the account (`companion/opening_plan/fit.py`).** Each side's shares are the smaller of what the
-risk per pick gives and what the account's room gives:
-`floor((4 x equity x room share / 4 picks) / (entry x the name's rate))`. The rate is Schwab's for that
-name and side from this morning's previews (day-trading buying power first, then buying power); a name
-with no preview counts at the gear's margin (2.8 by default, the most Schwab charged 2026-11-16 to
-11-18). Then the rows without an entry today are scaled down together, rounded down, so their cost
+**Fit the account (`companion/opening_plan/fit.py`).** The account's room is `4 x equity x room
+share`. It is split by what each pick's risk needs, not in equal quarters (Ash, PR #49, 2026-11-19
+22:33:09 UTC): each row's full need is its dearer side's risk shares x entry x the name's rate. When
+the rows together need more than the room, every side gets the same share of its risk shares,
+`floor(risk shares x room / total need)`; otherwise every side keeps its risk shares. So a pick whose
+stop is tighter, as a % of price, gets more buying power. This beat equal quarters in every period
+tested (November 2026, 2026, 2023-25 and 2020-22; project research
+`ov-research/nov_20k_backtest/allocation/README.md`, rule "same % of risk for all"). The rate is
+Schwab's for that name and side from this morning's previews (day-trading buying power first, then
+buying power); a name with no preview counts at the gear's margin (2.8 by default, the most Schwab
+charged 2026-11-16 to 11-18). Then the rows without an entry today are scaled down together, rounded down, so their cost
 stays inside each buying power number Schwab reports. A number below 0 gives 0 shares. When the account
 or its buying power is not known, the row has no shares and says why: nothing is sent on a guess. The
 page shows shares and percents only, never a dollar amount, also with `--private`. Example with equity
-10,000 and the room at 100%: 10,000 a pick; AAAA long at 42.49 and Schwab's 1.6 gives 147 shares where
-risk alone gives 175 (`tests/test_opening_plan_a1.py`). The size stage still decides what is sent: 1
-share at the test stage.
+10,000 and the room at 100% (40,000), rate 1.0: four picks whose risk needs 20,000, 20,000, 10,000 and
+10,000 (60,000 in all) each get 40,000 / 60,000 = two thirds of their risk shares, 266 of 400, 666 of
+1,000, 66 of 100 and 666 of 1,000; equal quarters gave 200, 500, 100 and 1,000
+(`tests/test_opening_plan_a1.py`). The 1 share / Full switch still decides what is sent.
 
 **Place, Cancel and Flip on the plan rows (off by default).** With both `EDGE_TRADER_PLAN_BUTTONS=1`
 and `EDGE_TRADER_BREAK_ENTRY=1` as well, each Opening plan row gets four buttons
@@ -846,6 +853,15 @@ A card with no shares for the side (no account reading) sends 1 share, and the d
 line says why. While armed the plan sends at the smaller of the Arm's size and the switch now: a switch
 to 1 share lowers it, a switch to Full does not raise it (`AutoPlan.armed_stage`). The Armed plan panel
 shows the size it sends at.
+
+**Calm day on the armed plan (Ash, 2026-11-19 22:33:09 UTC: "It should use the shorts only plan on
+calm days").** On a calm SPY day the armed plan sends no long and never flips to long; shorts go at
+the full risk. A pick whose last trade is nearer the high waits until it is nearer the low. When the
+long trigger trades first, the first break was long: the pick is left for the day, and a resting short
+that has not triggered is cancelled (`engine.py`, codes `calm_no_long`, `calm_long_break`,
+`calm_no_flip`). This follows the research's calm rule, where a calm day's long break is no trade.
+Place, Place all 4 and Flip refuse a long on a calm day too ("Calm SPY day: no longs today, shorts
+only. No send.").
 
 Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through

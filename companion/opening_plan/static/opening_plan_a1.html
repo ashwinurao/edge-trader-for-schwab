@@ -409,6 +409,10 @@ function lines(v) {
   const out = [];
   if (v.state && v.state !== "OK" && v.message) out.push([v.message, v.state === "PREVIEW" ? "" : "bad"]);
   (v.notes || []).forEach(n => out.push([n, ""]));
+  // Calm SPY day (playbook size.calm_rule "no_longs", Ash's go 2026-11-19): said on the page itself.
+  const cm = v.calm || {};
+  if (cm.calm === true && (v.rows || []).length) out.push([`Calm SPY day (RV20 ${Number(cm.rv20).toFixed(2)}): no longs today, shorts at the full risk.`, ""]);
+  else if (cm.calm == null && cm.text && (v.rows || []).length) out.push([cm.text, "bad"]);
   if (S.entries && S.entries.orders_old) out.push([S.entries.orders_old, "bad"]);
   if (S.entries && S.entries.error) out.push([S.entries.error, "bad"]);
   if (v.fit && v.fit.state !== "OK" && v.fit.text && (v.rows || []).length) out.push([v.fit.text, "bad"]);

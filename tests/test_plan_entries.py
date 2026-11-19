@@ -223,6 +223,32 @@ def test_refused_when_the_calm_flag_is_unknown(rig):
     assert "Calm flag not known" in refuse(rig)
 
 
+# Calm day: no longs, shorts at the full risk (playbook size.calm_rule "no_longs"; Ash's rule of
+# 2026-11-17, applied on his go of 2026-11-19 22:33:09 UTC, "It should use the shorts only plan on
+# calm days").
+
+def test_a_calm_day_refuses_a_long_place(rig):
+    rig.view.rv = 9.8
+    assert refuse(rig) == plan_entries.CALM_NO_LONG
+    assert row(rig)["place"]["long"] == plan_entries.CALM_NO_LONG
+
+
+def test_a_calm_day_sends_a_short_at_the_full_risk(rig):
+    rig.view.rv = 9.8
+    assert row(rig)["send"]["short"] == {**SHORT, "plan_shares": 175}      # $100 / 0.57: not halved
+    r = rig.desk.place("AAAA", "SHORT", SHORT)
+    assert r["ok"], r
+    assert without_id(rig.sent[0]) == SHORT_CLICK_REQ
+
+
+def test_a_calm_day_refuses_a_flip_to_long(rig):
+    rig.view.rv = 9.8
+    assert rig.desk.place("AAAA", "SHORT", SHORT)["ok"]
+    r = rig.desk.flip("AAAA", LONG)
+    assert not r["ok"] and r["error"] == plan_entries.CALM_NO_LONG
+    assert len(rig.broker.placed) == 1 and rig.broker.cancelled == []
+
+
 def test_refused_when_the_name_is_blocked_by_an_unclear_order(rig):
     rig.trader.store.insert_ticket({"ticket_id": "older-ticket", "symbol": "AAAA", "side": "LONG", "qty": 1,
                                     "limit": "42.00", "stop": "41.00", "target": "", "risk": 1, "request": {}})

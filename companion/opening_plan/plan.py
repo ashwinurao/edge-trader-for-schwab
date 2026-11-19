@@ -14,9 +14,10 @@ Prices are whole cents: a long entry rounds up, a short entry down, and each sto
 from its entry, so a sub-penny high or low never puts a level inside the minute.
 
 Shares = floor(risk per pick / risk per share), inside bracket.py's caps (MAX_SHARES,
-MAX_NOTIONAL). On a calm SPY day (RV20 at or below the playbook's calm_rv20_max, Ash's rule of
-2026-11-12) the row uses calm_multiplier of the risk and says so. When the calm flag is not
-known, the row shows full and half size side by side and picks neither.
+MAX_NOTIONAL). On a calm SPY day (RV20 at or below the playbook's calm_rv20_max) the row has no
+long shares and its shorts use the full risk (playbook size.calm_rule "no_longs": Ash's rule of
+2026-11-17, applied on his go of 2026-11-19 22:33:09 UTC; it replaced half size on both sides).
+When the calm flag is not known, the row shows the full size and nothing sends.
 
 "An incomplete view never looks complete" (CONTRIBUTING.md rule 3): every number carries its age,
 an old answer is marked old, and a missing number is missing, never zero.
@@ -93,6 +94,9 @@ PREVIEW_LEVELS = ("atr", "pm_high", "pm_low", "last")
 BALANCES_OLD_AFTER_S = 30   # the account is read every 5 s (poller.py INTERVALS); start number
 ESTIMATE_SHOWS = ("range", "cautious", "none")     # playbook size.estimate.show (brief 22, Ash's card)
 ESTIMATE_ROW_STATES = (WAITING, NO_DATA, NO_LIVE)  # frozen rows with no first minute yet get an estimate
+# size.calm_rule: what a calm SPY day does. "no_longs": no long entries, shorts at the full risk
+# (Ash's rule of 2026-11-17, his go to apply it 2026-11-19 22:33:09 UTC). The only value.
+CALM_RULES = ("no_longs",)
 
 
 @dataclass(frozen=True)
@@ -106,7 +110,7 @@ class Playbook:
     offset: Decimal
     min_stop_atr: Decimal
     calm_rv20_max: Decimal
-    calm_multiplier: Decimal
+    calm_rule: str
     rv20_through_max_days: int
     flat_et: time
     picks_path: str
@@ -134,7 +138,7 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
             bar_start_et=time.fromisoformat(lvl["bar_start_et"]), bar_minutes=int(lvl["bar_minutes"]),
             offset=Decimal(str(ent["offset"])), min_stop_atr=Decimal(str(ent["min_stop_atr"])),
             calm_rv20_max=Decimal(str(size["calm_rv20_max"])),
-            calm_multiplier=Decimal(str(size["calm_multiplier"])),
+            calm_rule=str(size["calm_rule"]),
             rv20_through_max_days=int(size["rv20_through_max_days"]),
             flat_et=time.fromisoformat(ext["flat_et"]),
             picks_path=str(feed["picks_path"]), clock_path=str(feed["clock_path"]),
@@ -158,8 +162,10 @@ def load_playbook(path: Path = PLAYBOOK_FILE) -> Playbook:
         raise ValueError("playbook: Edge Scanner serves only the 09:30 ET one-minute bar")
     if not 1 <= pb.rank_from <= pb.rank_to:
         raise ValueError("playbook: ranks must run from 1 up")
-    if not (pb.offset > 0 and pb.min_stop_atr >= 0 and pb.calm_rv20_max > 0 and 0 < pb.calm_multiplier <= 1):
-        raise ValueError("playbook: offset and calm_rv20_max must be above 0, calm_multiplier in (0, 1]")
+    if not (pb.offset > 0 and pb.min_stop_atr >= 0 and pb.calm_rv20_max > 0):
+        raise ValueError("playbook: offset and calm_rv20_max must be above 0")
+    if pb.calm_rule not in CALM_RULES:
+        raise ValueError(f"playbook: size.calm_rule must be one of {', '.join(CALM_RULES)}")
     if min(pb.picks_every_seconds, pb.clock_every_seconds, pb.timeout_seconds,
            pb.stale_after_seconds, pb.clock_old_after_seconds) <= 0 or pb.rv20_through_max_days < 1:
         raise ValueError("playbook: feed times must be above 0")
@@ -254,16 +260,16 @@ def calm_reading(clock: Optional[Mapping], ok_at: Optional[datetime], error: str
     if clock is None or ok_at is None:
         why = f" ({error})" if error else ""
         out["text"] = (f"Calm flag not available: Edge Scanner's clock did not answer{why}. "
-                       "Both full and half size are shown; check the SPY RV20 badge in Edge Scanner.")
+                       "The full size is shown and nothing sends; check the SPY RV20 badge in Edge Scanner.")
         return out
     if (now - ok_at).total_seconds() > pb.clock_old_after_seconds:
         out["text"] = (f"Calm flag not available: Edge Scanner's clock last answered "
-                       f"{int((now - ok_at).total_seconds())} s ago. Both full and half size are shown.")
+                       f"{int((now - ok_at).total_seconds())} s ago. The full size is shown and nothing sends.")
         return out
     rv = to_dec((spy_rv or {}).get("rv20")) if isinstance(spy_rv, Mapping) else None
     if rv is None:
         out["text"] = ("Calm flag not available: Edge Scanner has no SPY RV20 yet. "
-                       "Both full and half size are shown.")
+                       "The full size is shown and nothing sends.")
         return out
     out["rv20"] = float(rv)
     out["es_calm_max"] = spy_rv.get("calm_max")
@@ -276,14 +282,15 @@ def calm_reading(clock: Optional[Mapping], ok_at: Optional[datetime], error: str
     today = now.astimezone(ET).date()
     if through_day is None or not 1 <= (today - through_day).days <= pb.rv20_through_max_days:
         out["text"] = (f"Calm flag not available: SPY RV20 {rv:.2f} runs through {through or 'an unknown day'}, "
-                       f"not the last session before today. Both full and half size are shown.")
+                       f"not the last session before today. The full size is shown and nothing sends.")
         return out
     out["calm"] = rv <= pb.calm_rv20_max
     if out["calm"]:
         out["text"] = (f"Calm SPY day: RV20 {rv:.2f} (through {through}) is at or below "
-                       f"{pb.calm_rv20_max}, so each row uses {pb.calm_multiplier:g} of the risk.")
+                       f"{pb.calm_rv20_max}: no longs, shorts at the full risk.")
     else:
-        out["text"] = f"Not a calm SPY day: RV20 {rv:.2f} (through {through}) is above {pb.calm_rv20_max}. Full size."
+        out["text"] = (f"Not a calm SPY day: RV20 {rv:.2f} (through {through}) is above {pb.calm_rv20_max}. "
+                       "Longs and shorts at the full risk.")
     return out
 
 
@@ -324,7 +331,7 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
                    "age_s": None, "unconfirmed": False, "text": ""},
            "long": None, "short": None, "rps": None, "nearer": None,
            "under_min_stop": None, "min_stop": None,
-           "shares": {"state": None, "used": None, "full": None, "half": None, "text": ""},
+           "shares": {"state": None, "used": None, "full": None, "text": ""},
            "estimate": None, "buying_power_note": None}
     bar = out["bar"]
     start = datetime.combine(trading_date, pb.bar_start_et, tzinfo=ET)
@@ -386,24 +393,28 @@ def build_row(row: Mapping, trading_date: date, now: datetime, risk: Optional[De
         return out
     if calm is None:
         full = {k: size(risk, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
-        half_risk = risk * pb.calm_multiplier
-        half = {k: size(half_risk, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
-        sh.update(state="CALM_UNKNOWN", full=_pair(full), half=_pair(half),
-                  text=f"Calm flag not known: full ${risk:,.2f} and {pb.calm_multiplier:g}x ${half_risk:,.2f} "
-                       "shown side by side.")
+        sh.update(state="CALM_UNKNOWN", full=_pair(full),
+                  text=f"Calm flag not known: full ${risk:,.2f} shown. On a calm day the plan sends no longs. "
+                       "Nothing sends until the flag is known.")
         for k in ("long", "short"):
-            out[k]["capped"] = full[k]["capped"] or half[k]["capped"]
+            out[k]["capped"] = full[k]["capped"]
         out["buying_power_note"] = buying_power_note(out, bp, pb, name_rates)
         return out
-    used = risk * pb.calm_multiplier if calm else risk
-    got = {k: size(used, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
+    # Calm day (size.calm_rule "no_longs", Ash's go 2026-11-19 22:33:09 UTC): no long shares, shorts
+    # at the full risk.
+    got = {k: size(risk, lv[k]["rps"], lv[k]["entry"]) for k in ("long", "short")}
+    if calm:
+        got["long"] = {"shares": 0, "capped": None}
+        out["long"]["calm_no_long"] = True
     for k in ("long", "short"):
         out[k]["shares"], out[k]["capped"] = got[k]["shares"], got[k]["capped"]
     sh.update(state="CALM" if calm else "FULL", used=_pair(got), text=(
-        f"Calm day: {pb.calm_multiplier:g}x ${risk:,.2f} = ${used:,.2f} at risk." if calm
-        else f"${used:,.2f} at risk."))
+        f"Calm day: no longs; shorts at ${risk:,.2f} at risk." if calm
+        else f"${risk:,.2f} at risk."))
     if all(got[k]["shares"] == 0 for k in ("long", "short")):
-        sh["text"] = f"${used:,.2f} is less than one share's risk (${lv['long']['rps']}): 0 shares."
+        sh["text"] = (f"Calm day: no longs, and ${risk:,.2f} is less than one short share's risk "
+                      f"(${lv['short']['rps']}): 0 shares." if calm else
+                      f"${risk:,.2f} is less than one share's risk (${lv['long']['rps']}): 0 shares.")
     out["buying_power_note"] = buying_power_note(out, bp, pb, name_rates)
     return out
 
@@ -726,13 +737,13 @@ def estimate_row(risk: Optional[Decimal], calm: Optional[bool], atr: Optional[De
     """A row's estimated shares before the 09:30 minute (brief 22). Its own key, row["estimate"],
     never a size: `kind` says "estimate" and nothing that sends reads it.
 
-    State FULL or CALM: `used` holds the estimate at the risk used (calm_multiplier of it on a calm
-    day). CALM_UNKNOWN: `full` and `half` side by side, as the rows do. MISSING: no ATR, no price or
+    State FULL or CALM: `used` holds the estimate at the full risk (on a calm day for the shorts
+    only: size.calm_rule "no_longs"). CALM_UNKNOWN: `full`, as the rows do. MISSING: no ATR, no price or
     no risk, said in `text`, never 0. OFF: size.estimate.show is "none". `bp_max` is bp_max() with
     the name's rates and no side (brief 31)."""
     mx = bp_max(bp, price, pb, name_rates)
     out = {"kind": "estimate", "show": pb.estimate_show, "state": None, "calm": calm,
-           "used": None, "full": None, "half": None, "bp_max": mx, "text": ""}
+           "used": None, "full": None, "bp_max": mx, "text": ""}
     if pb.estimate_show == "none":
         out.update(state="OFF", text="No share estimate before the 09:30 minute (playbook size.estimate.show is none).")
         return out
@@ -744,16 +755,12 @@ def estimate_row(risk: Optional[Decimal], calm: Optional[bool], atr: Optional[De
         out.update(state="MISSING", text=f"No estimate: {' and '.join(missing)}.")
         return out
     if calm is None:
-        half = risk * pb.calm_multiplier
         out.update(state="CALM_UNKNOWN", full=_estimate_at(risk, atr, price, mx["shares"], pb),
-                   half=_estimate_at(half, atr, price, mx["shares"], pb),
-                   text=f"Calm flag not known: estimates at full ${risk:,.2f} and {pb.calm_multiplier:g}x "
-                        f"${half:,.2f} side by side.")
+                   text=f"Calm flag not known: estimates at full ${risk:,.2f}. On a calm day the plan sends no longs.")
         return out
-    used = risk * pb.calm_multiplier if calm else risk
-    out.update(state="CALM" if calm else "FULL", used=_estimate_at(used, atr, price, mx["shares"], pb), text=(
-        f"Estimate. Calm day: {pb.calm_multiplier:g}x ${risk:,.2f} = ${used:,.2f} at risk." if calm
-        else f"Estimate. ${used:,.2f} at risk."))
+    out.update(state="CALM" if calm else "FULL", used=_estimate_at(risk, atr, price, mx["shares"], pb), text=(
+        f"Estimate. Calm day: shorts only, ${risk:,.2f} at risk." if calm
+        else f"Estimate. ${risk:,.2f} at risk."))
     return out
 
 
@@ -863,7 +870,7 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
                      "bar": f"{pb.bar_start_et:%H:%M} ET, {pb.bar_minutes} min",
                      "flat_et": f"{pb.flat_et:%H:%M}", "offset": float(pb.offset),
                      "min_stop_atr": float(pb.min_stop_atr), "calm_rv20_max": float(pb.calm_rv20_max),
-                     "calm_multiplier": float(pb.calm_multiplier),
+                     "calm_rule": pb.calm_rule,
                      "refresh_seconds": pb.picks_every_seconds},
         "now_et": now_et.strftime("%H:%M:%S"), "today_et": now_et.date().isoformat(),
         "state": OK, "message": "", "notes": [], "stale": False,

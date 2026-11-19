@@ -2443,3 +2443,37 @@ def test_the_day_bound_and_burst_are_unchanged_at_full(rig):
     run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
     assert [qty(o) for o in rig.broker.placed] == [243, 120]
     assert "orders per day (2) reached" in rig.plan.panel()["disarmed"]["why"]
+
+
+# ---------------------------------------------------------------- calm day: no longs, shorts full
+# Playbook size.calm_rule "no_longs": Ash's rule of 2026-11-17, applied on his go of 2026-11-19
+# 22:33:09 UTC ("It should use the shorts only plan on calm days"). It replaced half size on both sides.
+
+def test_a_calm_day_arm_sends_only_the_shorts(rig):
+    rig.view.rv = 9.8
+    arm(rig)
+    assert rig.plan.calm is True
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == ["DDDD", "BBBB"] and {qty(o) for o in rig.broker.placed} == {1}
+    assert {o["orderLegCollection"][0]["instruction"] for o in rig.broker.placed} == {"SELL_SHORT"}
+    assert rig.plan.order_for("AAAA", {"high": 42.48, "low": 41.92}, "long") is None
+
+
+def test_a_calm_day_full_arm_sends_the_shorts_at_the_full_risk(rig):
+    # Not halved: DDDD the smaller of its card's 300 and the risk's 243; BBBB its card's 50. The longs
+    # (AAAA, CCCC) send nothing.
+    rig.view.rv = 9.8
+    full(rig)
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    got = {o["orderLegCollection"][0]["instrument"]["symbol"]: qty(o) for o in rig.broker.placed}
+    assert got == {"DDDD": 243, "BBBB": 50}
+    starts = {x["ticker"]: x for x in lines(rig, "send_start")}
+    assert starts["DDDD"]["plan_shares"] == 243
+
+
+def test_place_auto_refuses_a_long_on_a_calm_day_even_if_asked(rig):
+    rig.view.rv = 9.8
+    o = engine.order_for("long", Decimal("42.48"), Decimal("41.92"), Decimal(100), rig.plan.rules)
+    r = rig.desk.place_auto("AAAA", "LONG", o, view=rig.view())
+    assert r.get("not_sent") and r["error"] == plan_entries.CALM_NO_LONG and rig.broker.placed == []

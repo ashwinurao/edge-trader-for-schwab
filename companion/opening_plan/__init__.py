@@ -9,7 +9,9 @@ Where the numbers in playbook.json come from:
 - list ranks 1-4, entry offset 0.01, stop at the other side, min stop 2% of ATR, flat 10:00 ET:
   the OR1 research (ov-research/opening_drive/engine.py, setups.py) and the UX page "OV Pick
   Orders" panel A1; the 2% minimum is a mark on the row only (architect, 2026-11-13).
-- calm RV20 at or below 10.5, half size: Ash's rule of 2026-11-12 (Edge Scanner scanner/spy_rv.py CALM_MAX).
+- calm RV20 at or below 10.5 (Edge Scanner scanner/spy_rv.py CALM_MAX), size.calm_rule "no_longs": no longs,
+  shorts at the full risk. Ash's rule of 2026-11-17, applied on his go of 2026-11-19 22:33:09 UTC
+  (it replaced half size on both sides, his rule of 2026-11-12).
 - 2 s picks spacing: Edge Scanner's own live refresh (scanner/ov_picks_live.py LIVE_SECONDS).
 - 60 s clock spacing: RV20 changes once a day (Edge Scanner's 03:30 ET refresh).
 - 1.5 s time limit, 6 s stale, 300 s old clock, RV20 through at most 4 days back: this PR's
