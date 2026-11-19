@@ -73,6 +73,19 @@ _click_chase: contextvars.ContextVar = contextvars.ContextVar("break_entry_click
 _shared_names: contextvars.ContextVar = contextvars.ContextVar("break_entry_shared_names", default=())
 CHASE_BUFFER = Decimal("0.001")      # Ash's 0.1%: the chase's limit past its trigger
 
+# The armed plan's sends check the open tape's price instead of asking Schwab first, and a price
+# already through the trigger but still inside the limit goes as a LIMIT at the limit (Ash's go "do
+# all 5", project thread, 2026-11-19 17:02:46 UTC, change 2: "let the limit guard the price"). On
+# 2026-11-19 each Schwab quote before a send took 0.57 to 1.69 s at 09:31 ET, and ASTS was refused
+# for being 1 cent through. The tape is Edge Scanner's Alpaca SIP snapshot, read by the plan just
+# before the send. Its quote may be at most this old when the plan read it (a start number, not
+# approved by Ash on its own). Set by the armed plan only (tape_price), never a request field.
+TAPE_PRICE_MAX_AGE_MS = 1_000
+_tape_price: contextvars.ContextVar = contextvars.ContextVar("break_entry_tape_price", default=None)
+# Set by the armed plan around each send (limit_guards), whatever price it checks: through the level
+# but not past the limit goes as a LIMIT at the limit, never refused for being through.
+_limit_guards: contextvars.ContextVar = contextvars.ContextVar("break_entry_limit_guards", default=False)
+
 
 @contextmanager
 def click_chase():
@@ -109,6 +122,31 @@ def shared_quotes(names):
         yield
     finally:
         _shared_names.reset(token)
+
+
+@contextmanager
+def limit_guards():
+    """While inside, a break entry whose price is already through its level but not past its limit is
+    sent as a LIMIT at the limit instead of being refused (change 2 of Ash's "do all 5"). Set by the
+    armed plan around one send (handlers.on_place); the ticket's own Break entry and the Opening plan's
+    clicks still refuse a price through the level."""
+    token = _limit_guards.set(True)
+    try:
+        yield
+    finally:
+        _limit_guards.reset(token)
+
+
+@contextmanager
+def tape_price(bid, ask, age_ms):
+    """While inside, a break entry checks this price (the open tape's bid and ask, `age_ms` old when
+    the plan read it) instead of a Schwab quote, and a price through its trigger but not past its limit
+    is sent as a LIMIT at the limit. Set by the armed plan around one send (handlers.on_place)."""
+    token = _tape_price.set({"bid": bid, "ask": ask, "age_ms": age_ms})
+    try:
+        yield
+    finally:
+        _tape_price.reset(token)
 
 
 def _send_quote(trader, symbol: str) -> dict:
@@ -244,6 +282,7 @@ def make_plan(req: dict, q: dict) -> Plan:
     if not long and lim > trig:
         return _bad(req, f"limit {fmt(lim)} must be at or below the break level {fmt(trig)}")
     bid, ask = q.get("bid"), q.get("ask")
+    through = False
     if _click_chase.get():
         # The Chase click: through the trigger is the point, but never past the limit, where the
         # order could only rest (Ash's "to see if we can get a fill").
@@ -251,6 +290,17 @@ def make_plan(req: dict, q: dict) -> Plan:
             return _bad(req, f"Price ran past the chase limit: ask {fmt(Decimal(str(ask)))} is above {fmt(lim)}.")
         if not long and bid is not None and Decimal(str(bid)) < lim:
             return _bad(req, f"Price ran past the chase limit: bid {fmt(Decimal(str(bid)))} is below {fmt(lim)}.")
+    # The armed plan's send (limit_guards, change 2 of Ash's "do all 5"): through the level but not past
+    # the limit goes as a LIMIT at the limit, which caps the fill; past the limit it could only rest,
+    # so it is refused.
+    elif _limit_guards.get() and long and ask is not None and Decimal(str(ask)) >= trig:
+        if Decimal(str(ask)) > lim:
+            return _bad(req, f"Price is past this entry's limit: ask {fmt(Decimal(str(ask)))} is above {fmt(lim)}.")
+        through = True
+    elif _limit_guards.get() and not long and bid is not None and Decimal(str(bid)) <= trig:
+        if Decimal(str(bid)) < lim:
+            return _bad(req, f"Price is past this entry's limit: bid {fmt(Decimal(str(bid)))} is below {fmt(lim)}.")
+        through = True
     # Long: the ask is already at or past the level, so a buy stop would trigger at once and could
     # fill anywhere up to the limit. No chase by click in this step: refuse.
     elif long and ask is not None and Decimal(str(ask)) >= trig:
@@ -276,7 +326,9 @@ def make_plan(req: dict, q: dict) -> Plan:
     p = plan(req.get("symbol") or "", side, st, 0, req.get("r") or 0, bid, ask, entry="limit",
              target_price=req.get("target_price"), stop_type="fixed", limit_price=fmt(lim),
              size_mode="qty", qty=req.get("qty"), target=req.get("targets", 0) not in (0, "0"))
-    p.entry, p.trigger = "break", trig
+    # Through the level inside limit_guards: the same entry as a LIMIT at the limit (bracket_order
+    # sends a STOP_LIMIT only for entry "break"); the trigger stays on the record.
+    p.entry, p.trigger = ("limit" if through else "break"), trig
     p.warnings = [w for w in p.warnings if not w.startswith("Your limit")]   # a break limit is above the ask by design
     if p.ok and p.qty > max_shares():
         p.errors.append(_cap_text() + ".")
@@ -304,11 +356,22 @@ def prepare(trader, req: dict, now_ms: float | None = None) -> tuple[Plan | None
         return no("ticket is missing the displayed plan; review and click again")
     if qty > max_shares():
         return no(_cap_text() + ". Nothing was sent.")
-    q = _send_quote(trader, req["symbol"])
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    tp = _tape_price.get()
+    if tp is not None:
+        # The armed plan's send: the open tape's price, no Schwab call (tape_price, change 2).
+        age = tp.get("age_ms")
+        if not isinstance(age, (int, float)) or age < 0 or age > TAPE_PRICE_MAX_AGE_MS:
+            said = f"{age / 1000:.2f} s old" if isinstance(age, (int, float)) else "without a time"
+            return no(f"The open tape's price is {said} (an armed send needs one under "
+                      f"{TAPE_PRICE_MAX_AGE_MS / 1000:g} s). Nothing was sent.")
+        q = {"bid": tp.get("bid"), "ask": tp.get("ask"), "realtime": True, "quote_time": now_ms - age,
+             "asset_type": "EQUITY"}
+    else:
+        q = _send_quote(trader, req["symbol"])
     if q.get("realtime") is not True:
         return no("Schwab's quote is not real-time, so the break level cannot be checked. Nothing was sent.")
     qt = q.get("quote_time")
-    now_ms = time.time() * 1000 if now_ms is None else now_ms
     if not isinstance(qt, (int, float)) or now_ms - qt > MAX_QUOTE_AGE_MS:
         age = f"{(now_ms - qt) / 1000:.1f} s old" if isinstance(qt, (int, float)) else "without a time"
         return no(f"Schwab's quote is {age} (a break entry needs one under {MAX_QUOTE_AGE_MS / 1000:g} s). "

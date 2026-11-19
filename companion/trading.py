@@ -28,7 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from . import break_entry, chase_entry, netlog, read_retry, schwab
+from . import break_entry, chase_entry, netlog, read_retry, schwab, send_gate
 from .bracket import EQUITY, MIN_STOP_TICKS, Plan, _to_tick, bracket_order, fmt, plan, put_call, tick, ticks_for
 from .orders import LIVE, TERMINAL, PendingOrder, pending_orders, stop_coverage, terminal_ids
 from .pnl import ET
@@ -356,7 +356,9 @@ class Trader:
         self.store = store
         self._client = None
         self._hash: str | None = None
-        self._send_lock = threading.Lock()
+        # A lock with per-name holds for the Opening plan's 09:31 burst only (companion/send_gate.py).
+        self._send_lock = send_gate.SendGate()
+        self._client_made = threading.Lock()  # the burst's sends may start together: one client, not two
         self._status_client = None          # the status reads' own client (_status_reader)
         self._status_made = threading.Lock()
         self._quote_cache: dict[str, tuple[float, dict]] = {}
@@ -368,20 +370,25 @@ class Trader:
         if self._client is not None and self.expected_hash and self._hash != self.expected_hash:
             raise RuntimeError("the dashboard switched accounts: restart the companion before trading")
         if self._client is None:
-            client = schwab.make_trading_client()
-            r = client.linked_accounts()
-            r.raise_for_status()
-            hashes = [a.get("hashValue") for a in r.json()]
-            if self.expected_hash:
-                if self.expected_hash not in hashes:
-                    raise RuntimeError("the account shown on the dashboard is not linked to this login")
-                self._hash = self.expected_hash
-            else:
-                if len(hashes) != 1:
-                    raise RuntimeError("several linked accounts and the dashboard has not picked one yet")
-                self._hash = hashes[0]
-            self._client = client
+            with self._client_made:
+                if self._client is None:
+                    self._make_client()
         return self._client
+
+    def _make_client(self) -> None:
+        client = schwab.make_trading_client()
+        r = client.linked_accounts()
+        r.raise_for_status()
+        hashes = [a.get("hashValue") for a in r.json()]
+        if self.expected_hash:
+            if self.expected_hash not in hashes:
+                raise RuntimeError("the account shown on the dashboard is not linked to this login")
+            self._hash = self.expected_hash
+        else:
+            if len(hashes) != 1:
+                raise RuntimeError("several linked accounts and the dashboard has not picked one yet")
+            self._hash = hashes[0]
+        self._client = client
 
     @property
     def armed(self) -> bool:
@@ -651,7 +658,10 @@ class Trader:
             t = pending[0]
             return {"ok": False, "error": f"Previous order ({t['symbol']} {t['qty']}) is not confirmed "
                     "yet. Check thinkorswim, then press Resolve.", "blocked_by": t["ticket_id"]}
-        if not self._send_lock.acquire(blocking=False):
+        # Inside the Opening plan's burst a send holds only its own name, so the plan's picks go to
+        # Schwab together; a click, Flat all or a cancel still excludes them all (send_gate.py).
+        burst = send_gate.in_burst()
+        if not (self._send_lock.try_name(name) if burst else self._send_lock.acquire(blocking=False)):
             return {"ok": False, "error": "Another submission is in progress."}
         state = {"sent": False}
         try:
@@ -664,7 +674,10 @@ class Trader:
             return {"ok": False, "status": "UNKNOWN", "ticket_id": ticket_id,
                     "error": "Error after sending. The order MAY be live: check thinkorswim."}
         finally:
-            self._send_lock.release()
+            if burst:
+                self._send_lock.release_name(name)
+            else:
+                self._send_lock.release()
             if state.get("read_after"):
                 try:                                  # its own thread: the answer does not wait
                     self._spawn(state["read_after"])

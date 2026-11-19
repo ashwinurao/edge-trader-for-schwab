@@ -38,6 +38,7 @@ def started_with(rig, env, playbook=PB_RAW):
                       now=rig.clock.now, out_dir=rig.tmp / "auto",
                       hold_later=lambda sec, why: rig.holds.append((rig.clock.now(), sec, why)))
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     rig.plan = plan
     return rig
