@@ -49,6 +49,7 @@ number at 0 beside one above 0 is left out and said. Still display only.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -814,6 +815,34 @@ def buying_power_note(row: Mapping, bp: Optional[Mapping], pb: Playbook,
             "rate_known": rate_known, "text": text}
 
 
+# The 09:26 re-check's sentence parts (ov-picks ov_picks/runner/morning.py compare_picks, joined
+# with "; "). Ash, project thread "Explain the 09:26 re-check mismatch", 2026-11-19 00:53:08 UTC:
+# "no need for that note on non-top 4 picks".
+_RANKED_LIST_PART = re.compile(r"^the re-check's ranked list differs from row (\d+):")
+_EARNINGS_LABEL_PART = re.compile(r"^(\S+)'s earnings label is ")
+
+
+def settled_difference_for_plan(text: Any, rank_to: int, tickers: set) -> Optional[str]:
+    """The parts of the 09:26 re-check's difference that touch the plan, or None when none does.
+
+    Dropped: a ranked-list difference whose first changed row is below rank_to (rows 1 to rank_to
+    are then the same in both lists), and an earnings label of a name the plan does not hold.
+    Every other part stays, and so does a part this code does not know (when unsure, show it).
+    No text at all keeps the note ("" here), since Edge Scanner said the re-check differs."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    kept = []
+    for part in text.split("; "):
+        m = _RANKED_LIST_PART.match(part)
+        if m and int(m.group(1)) > rank_to:
+            continue
+        m = _EARNINGS_LABEL_PART.match(part)
+        if m and m.group(1).upper() not in tickers:
+            continue
+        kept.append(part)
+    return "; ".join(kept) if kept else None
+
+
 def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_error: str,
                clock: Optional[Mapping], clock_ok_at: Optional[datetime], clock_error: str,
                risk: Optional[Decimal], now: datetime, pb: Playbook, account: Optional[Mapping] = None,
@@ -899,10 +928,13 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
         view["notes"].append("The picks are late: the first scan ran after 09:25 ET.")
     if day.get("warmup_state") == "NOT_READY":
         view["notes"].append(f"The module's warmup was not ready: {day.get('warmup_reason') or 'no reason given'}.")
-    if day.get("settled_state") == "SETTLED_DIFF":
-        view["notes"].append(f"The 09:26 re-check differs: {day.get('settled_difference') or ''}".strip())
     rows = [r for r in day.get("picks") or [] if isinstance(r, Mapping)
             and isinstance(r.get("rank"), int) and pb.rank_from <= r["rank"] <= pb.rank_to]
+    if day.get("settled_state") == "SETTLED_DIFF":
+        diff = settled_difference_for_plan(day.get("settled_difference"), pb.rank_to,
+                                           {str(r.get("ticker") or "").upper() for r in rows})
+        if diff is not None:
+            view["notes"].append(f"The 09:26 re-check differs: {diff}".strip())
     if not rows:
         view.update(state=NO_PICKS, message=f"No pick ranked {pb.rank_from} to {pb.rank_to} today.")
         return view
