@@ -78,7 +78,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
-from .. import plan_entries
+from .. import break_entry, plan_entries
 from . import CHASE_FLAG, switch_on
 
 Handler = Callable[["Lane"], bool]
@@ -276,7 +276,11 @@ def on_place(lane: Lane) -> bool:
     if not lane.armed():
         lane.refund(orders=1, calls=calls)
         return False
-    r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log)
+    # One Schwab quotes call for every pick of the reading, reused by the next picks' sends while
+    # young (Ash's card pick "One quote call for all 4", 2026-11-19 16:13:44 UTC; break_entry).
+    names = [str(p.get("symbol") or "") for p in lane.reading.get("picks") or [] if isinstance(p, Mapping)]
+    with break_entry.shared_quotes(names):
+        r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log)
     if r.get("not_sent"):
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
         # Schwab, so the order and calls go back.

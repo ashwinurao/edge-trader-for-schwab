@@ -479,7 +479,38 @@ class Trader:
             return hit[1]
         r = self._logged("ticket_quote", lambda: self._ensure().quotes([sym]))
         r.raise_for_status()
-        entry = (r.json() or {}).get(sym) or {}
+        out = self._quote_entry(sym, (r.json() or {}).get(sym) or {})
+        self._quote_cache[sym] = (time.monotonic(), out)
+        return out
+
+    def share_quotes(self, symbols, need: str, max_age: float) -> bool:
+        """One Schwab quotes call for several names, kept in the quote cache, so the Opening plan's
+        sends do not each wait for a quote of their own (Ash's card pick "One quote call for all 4",
+        2026-11-19 16:13:44 UTC; break_entry.shared_quotes). Nothing is sent when `need`'s cached
+        quote is younger than max_age. A name missing from the answer is cached as quote() caches it
+        (found False, not real-time), so its send refuses as it would on its own quote. True when a
+        call went out. Raises like quote()."""
+        need = str(need or "").upper().strip()
+        syms = list(dict.fromkeys(s for s in (str(x or "").upper().strip() for x in symbols) if s))
+        if need and need not in syms:
+            syms.insert(0, need)
+        if not syms:
+            return False
+        hit = self._quote_cache.get(need)
+        if hit and time.monotonic() - hit[0] < max_age:
+            return False
+        r = self._logged("ticket_quote", lambda: self._ensure().quotes(syms))
+        r.raise_for_status()
+        body = r.json() or {}
+        now = time.monotonic()
+        for sym in syms:
+            entry = body.get(sym) if isinstance(body, dict) else None
+            self._quote_cache[sym] = (now, self._quote_entry(sym, entry if isinstance(entry, dict) else {}))
+        return True
+
+    @staticmethod
+    def _quote_entry(sym: str, entry: dict) -> dict:
+        """One name's quote as quote() returns it, from Schwab's answer for that name."""
         q, ref = entry.get("quote") or {}, entry.get("reference") or {}
         asset = entry.get("assetMainType")
         underlying = ref.get("underlying") or (_occ_root(sym) if asset == "OPTION" else None)
@@ -496,7 +527,6 @@ class Trader:
                                                                          "expirationDay")) else None),
                "strike": ref.get("strikePrice"),
                "ticks": ticks_for(asset, underlying, penny if isinstance(penny, bool) else None)}
-        self._quote_cache[sym] = (time.monotonic(), out)
         return out
 
     def _ticks(self, symbol: str, asset: str | None, q: dict | None = None) -> str:
