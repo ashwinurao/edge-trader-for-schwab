@@ -83,6 +83,11 @@
   .ib { height: 30px; padding: 0 12px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--dim); font: 600 12.5px var(--sans); }
   .ib.take { color: var(--violet); border-color: rgba(167,139,250,.35); }
   .wait { color: var(--dim); font: 600 13px var(--mono); }
+  /* Estimated shares before the 09:30 bar (estimate_fit.py, Ash's pick 2026-11-19): dimmed, marked EST. */
+  .estn { font: 800 20px var(--mono); color: var(--text); opacity: .78; }
+  .estn i { font-style: normal; color: var(--faint); margin-right: 3px; }
+  .estsub { font: 600 10.5px var(--mono); color: var(--faint); }
+  .tag.EST { color: var(--dim); border: 1px dashed var(--faint); background: transparent; }
   .why { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .toast { position: fixed; right: 16px; bottom: 16px; max-width: 520px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
            padding: 10px 14px; font-size: 13px; box-shadow: 0 8px 24px #000a; display: none; z-index: 30; }
@@ -117,6 +122,7 @@
 const $ = id => document.getElementById(id);
 const S = { view: null, entries: null, flat: null, bars: {}, live: {}, charts: {}, busy: new Set(), barsAt: 0 };
 const f2 = v => (typeof v === "number" ? v.toFixed(2) : "—");
+const esc = t => String(t).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
 const ARW = { LONG: "▲", SHORT: "▼" };
 const OTHER = { LONG: "SHORT", SHORT: "LONG" };
 // lightweight-charts shows UTC: every time here is an ET wall time written as if it were UTC (bars.py et_epoch).
@@ -199,12 +205,14 @@ function card(row) {
 
 function header(row, e, side, lp, k) {
   const s = side ? row[side.toLowerCase()] : null;
+  const ef = row.estimate_fit && (row.estimate_fit.long || row.estimate_fit.short) ? row.estimate_fit : null;
   const prevClose = (() => { const b = (S.bars[row.ticker] || {}).bars || []; return b.length > 1 ? b[b.length - 2].close : null; })();
   const pxColor = lp && prevClose !== null ? (lp.px >= prevClose ? "var(--upT)" : "var(--downT)") : "var(--text)";
   const atr = typeof row.atr === "number" ? `<span class="chip">ATR ${f2(row.atr)}</span>` : "";
   let lev = "";
-  if (s && typeof s.leverage === "number")
-    lev = `<span class="chip${s.rate_known ? "" : " unk"}" title="${s.rate_known ? "Schwab's margin for this side, from this morning's preview" : "No preview for this side: the margin set under ⚙"}">${s.leverage.toFixed(1)}x${s.rate_known ? "" : "?"}</span>`;
+  const ls = s && typeof s.leverage === "number" ? s : (!s && ef ? [ef.long, ef.short].filter(x => x && !x.calm_no_long).sort((a, b) => a.leverage - b.leverage)[0] : null);
+  if (ls && typeof ls.leverage === "number")
+    lev = `<span class="chip${ls.rate_known ? "" : " unk"}" title="${ls.rate_known ? "Schwab's margin for this side, from this morning's preview" : "No preview for this side: the margin set under ⚙"}">${ls.leverage.toFixed(1)}x${ls.rate_known ? "" : "?"}</span>`;
   // The plan's 5% target once its order is sent (2026-11-18): 5% sits off the chart's price range.
   const ts = e && e.target && e.target.sent && (e.entry || {}).state === "SENT" ? e.target.sent : null;
   const tgt = ts ? `<span class="chip" title="The plan's target, in one OCO with its stop">TGT ${ts}</span>` : "";
@@ -217,13 +225,35 @@ function header(row, e, side, lp, k) {
     sh = `<div class="sh"><span class="shn ${side}">${ARW[side]} ${s.shares.toLocaleString()}</span>` +
          `<span class="mbw" title="${s.shares < risk ? "Cut by the account's room; risk alone gives " + risk : "Risk decides"}"><span class="mb"><u style="width:${w}%"></u></span><em>${s.shares < risk ? risk.toLocaleString() : ""}</em></span></div>`;
   } else {
-    const est = row.estimate && (row.estimate.used || row.estimate.full);
     const why = (row.shares || {}).text || "";
     sh = (row.bar || {}).state === "FINAL"
       ? `<div class="sh" title="${why.replace(/"/g, "&quot;")}"><span class="shn NONE">—</span></div>`
-      : `<div class="sh"><span class="wait">sizes at 09:31</span></div>`;
+      : ef ? estimateShares(ef) : `<div class="sh"><span class="wait" title="${esc((row.estimate_fit || {}).text || "")}">sizes at 09:31</span></div>`;
   }
-  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tgt}${tag}<span class="sp"></span>${sh}`;
+  const estTag = ef && !(s && typeof s.shares === "number") ? `<span class="tag EST" title="Estimate: a typical first minute of ${ef.first_minute_atr} x ATR around the price${ef.as_of_et ? " of " + ef.as_of_et + " ET" : ""}. Sizes for real at 09:31.">EST</span>` : "";
+  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tgt}${tag}${estTag}<span class="sp"></span>${sh}`;
+}
+
+// Layout B (Ash's pick on the card, 2026-11-19 16:05:53 UTC, "B: one number with range"): one number,
+// the smaller side's estimated shares, with the usual range (wide and narrow first minute) under it.
+function estimateShares(ef) {
+  // A calm day sends no longs (ET #55): the long side is left out of the number and the range.
+  const calm = !!(ef.long || {}).calm_no_long;
+  const l = calm ? {} : (ef.long || {}), sh = ef.short || {};
+  const num = x => typeof x === "number";
+  const n = [l.shares, sh.shares].filter(num);
+  if (!n.length) return `<div class="sh" title="${esc(ef.text || "")}"><span class="wait">sizes at 09:31</span></div>`;
+  const most = Math.min(...n);
+  const ends = i => [l, sh].map(x => (x.usually || [])[i]).filter(num);
+  const lo = ends(0).length ? Math.min(...ends(0)) : null, hi = ends(1).length ? Math.min(...ends(1)) : null;
+  const risk = Math.min(...[l.risk_shares, sh.risk_shares].filter(num).concat([Infinity]));
+  const cut = most < risk;
+  const rng = lo !== null && hi !== null && hi - lo >= 10 ? `usually ${lo.toLocaleString()}–${hi.toLocaleString()}` : (cut ? "room decides" : "");
+  const tip = (calm ? `Calm day: shorts only, ≈${num(sh.shares) ? sh.shares.toLocaleString() : "—"}. ` :
+               `Long ≈${num(l.shares) ? l.shares.toLocaleString() : "—"}, short ≈${num(sh.shares) ? sh.shares.toLocaleString() : "—"}. `) +
+              (cut ? `Cut by the account's room; risk alone gives ${risk.toLocaleString()}.` : "Risk decides.");
+  const sub = [`est${ef.as_of_et ? " " + ef.as_of_et : ""}`, rng].filter(Boolean).join(" · ");
+  return `<div class="sh" title="${esc(tip)}"><span class="estn"><i>≈</i>${most.toLocaleString()}</span><span class="estsub">${sub}</span></div>`;
 }
 
 function footer(row, e, side, lp, k) {
@@ -356,7 +386,10 @@ function topLine(v) {
   const risk = (v.risk || {}).per_pick;
   if (document.activeElement !== $("risk")) $("risk").value = risk || 0;
   $("riskV").textContent = typeof risk === "number" ? "$" + risk.toLocaleString() : "not set";
-  const fit = v.fit || {};
+  // Before any pick has real shares, the meter shows the estimate (estimate_fit.py), marked est.
+  const real = v.fit && typeof v.fit.used === "number" && v.fit.used > 0;
+  const est = !real && v.estimate_fit && typeof v.estimate_fit.used === "number" ? v.estimate_fit : null;
+  const fit = est ? { ...(v.fit || {}), ...est } : (v.fit || {});
   const gbar = $("gbar"); gbar.innerHTML = "";
   const tones = ["#5d7aa6", "#4f6a92", "#6c88b3", "#43597c"];
   rowsOf(v).forEach((r, i) => {
@@ -364,7 +397,7 @@ function topLine(v) {
     if (typeof p === "number" && p > 0) { const el = document.createElement("i"); el.style.width = Math.min(100, p * 100) + "%"; el.style.background = tones[i % 4]; gbar.appendChild(el); }
   });
   gbar.classList.toggle("over", typeof fit.live === "number" && fit.live > 1);
-  $("gl").innerHTML = typeof fit.used === "number" ? `${Math.round(fit.used * 100)}%<small>of room</small>` : `—<small>${fit.state === "NOT_KNOWN" ? "room not known" : "of room"}</small>`;
+  $("gl").innerHTML = typeof fit.used === "number" ? `${est ? "≈" : ""}${Math.round(fit.used * 100)}%<small>of room${est ? ", est" : ""}</small>` : `—<small>${fit.state === "NOT_KNOWN" ? "room not known" : "of room"}</small>`;
   $("gauge").title = fit.text || (typeof fit.risk_only_used === "number" ? `Risk alone would use ${Math.round(fit.risk_only_used * 100)}% of the room.` : "");
   if (document.activeElement !== $("room")) $("room").value = Math.round((fit.room_share ?? 1) * 100);
   $("roomV").textContent = Math.round((fit.room_share ?? 1) * 100) + "%";

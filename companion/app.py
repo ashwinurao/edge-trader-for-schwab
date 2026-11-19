@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, break_entry, fills_feed, netlog, open_probe, preview_rates
+from . import __version__, break_entry, fills_feed, netlog, new_name_previews, open_probe, preview_rates
 from .poller import Poller
 from .signin import SignIn
 from .trading import OCC_RE, Trader
@@ -90,6 +90,7 @@ async def lifespan(_app: FastAPI):
         from . import plan_flat as _plan_flat
         _plan_flat.start_watch(app)
     open_probe.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), rates=PREVIEW_RATES.add, budget=(poller.probe_gives_way, poller.note_probe_request), share=poller.set_quote_guest)  # briefs 09, 21, 23, 33, 34, off by default
+    new_name_previews.start(lambda: getattr(poller, "account_hash", None), poller.cooldown_left, PREVIEW_RATES, demo=DEMO, balances=lambda: open_probe.poller_balances(poller), budget=(poller.probe_gives_way, poller.note_probe_request))  # Ash's pick 2026-11-19, with the probe
     if not DEMO:
         import threading
         from . import update_check

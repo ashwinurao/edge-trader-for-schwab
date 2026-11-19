@@ -49,6 +49,7 @@ number at 0 beside one above 0 is left out and said. Still display only.
 """
 from __future__ import annotations
 
+import copy
 import json
 import re
 from dataclasses import dataclass
@@ -909,6 +910,8 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
             for r in pv["rows"]:
                 r["estimate"] = estimate_row(risk, view["calm"]["calm"], to_dec(r["atr"]), to_dec(r["last"]),
                                              view["buying_power"], pb, _name_rates(rates, r["ticker"]))
+            if fit is not None:
+                _estimate_fit(view, pv["rows"], now_et.date(), risk, pb, rates, fit, now, pv["as_of_et"][:5])
             if not pv["rows"]:
                 view["notes"].append(f"No name ranked {pb.rank_from} to {pb.rank_to} in the preview as of "
                                      f"{pv['as_of_et'][:5]} ET.")
@@ -952,8 +955,34 @@ def build_view(picks: Optional[Mapping], picks_ok_at: Optional[datetime], picks_
     if fit is not None:
         from . import fit as fit_mod
         acct = buying_power(fit.get("account"), now)
+        # Copies from before the fit (fit.apply writes the fitted shares into each side) for the
+        # estimate below, which fits the waiting rows beside these.
+        unfitted = [copy.deepcopy(b) for b in view["rows"] if b["bar"]["state"] not in ESTIMATE_ROW_STATES]
         view["fit"] = fit_mod.apply(view["rows"], acct, rates, pb.rank_to - pb.rank_from + 1,
                                     fit.get("room_share", fit_mod.ROOM_SHARE_DEFAULT),
                                     fit.get("unknown_rate", fit_mod.UNKNOWN_RATE_DEFAULT),
                                     fit.get("reserved") or (), balances_counted)
+        # Rows still waiting for their 09:30 bar get the estimate that Place all 4 would size
+        # (estimate_fit.py, Ash's pick 2026-11-19 14:19:00 UTC).
+        waiting = [{"rank": b.get("rank"), "ticker": b.get("ticker"), "atr": b.get("atr"),
+                    "last": _f(to_dec((a.get("levels") or {}).get("last"))) if isinstance(a.get("levels"), Mapping) else None,
+                    "_row": b}
+                   for a, b in zip(rows, view["rows"]) if b["bar"]["state"] in ESTIMATE_ROW_STATES]
+        if waiting:
+            _estimate_fit(view, waiting, trading_date, risk, pb, rates, fit, now, None, unfitted)
+            for w in waiting:
+                w["_row"]["estimate_fit"] = w.pop("estimate_fit", None)
+                w.pop("_row")
     return view
+
+
+def _estimate_fit(view: dict, rows: list, trading_date: date, risk: Optional[Decimal], pb: Playbook,
+                  rates: Optional[Mapping], fit: Mapping, now: datetime, as_of_et: Optional[str],
+                  fixed: list = ()) -> None:
+    """Each of `rows` gets row["estimate_fit"] and the view gets the meter's header (estimate_fit.py).
+    Display only: nothing that sends reads either key."""
+    from . import estimate_fit
+    view["estimate_fit"] = estimate_fit.apply(
+        rows, trading_date, risk, view["calm"]["calm"], pb, view["buying_power"], rates, fit,
+        buying_power(fit.get("account"), now), pb.rank_to - pb.rank_from + 1, build_row, balances_counted,
+        as_of_et=as_of_et, fixed=tuple(fixed))
