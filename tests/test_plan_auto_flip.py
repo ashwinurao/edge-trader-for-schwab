@@ -1953,6 +1953,7 @@ def frig(rig):  # noqa: F811
                       now=rig.clock.now, out_dir=rig.tmp / "auto",
                       hold_later=lambda sec, why: rig.holds.append((rig.clock.now(), sec, why)))
     plan._mono = rig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     rig.broker.locks = [plan._lock, rig.desk._lock, plan.arming._lock]
     working = []
 
@@ -2314,6 +2315,7 @@ def flat_all(frig):
                       start=False)
     assert plan is not None and plan.registry.get(flip.FLIP, plan.env) is not None
     plan._mono = frig.clock.mono
+    plan._fan_out = X.burst.in_order          # the burst's sends in order, on the fake clock
     frig.plan = plan
     frig.broker.locks = [plan._lock, frig.desk._lock, plan.arming._lock]
     return flat

@@ -113,6 +113,7 @@ class Poller:
         self._next = {k: 0.0 for k in INTERVALS}
         self._sent: deque[float] = deque()
         self._order_sent: deque[float] = deque()   # the order path's sends alone (brief 24)
+        self._order_lock = threading.Lock()
         self._hold_until = 0.0                     # hold_later: LATER polls give way until then
         self._skip_logged: dict[str, float] = {}   # one skip line per poll per interval
         self._urgent: frozenset[str] = frozenset() # LATER polls a stop-moving reader needs now
@@ -189,9 +190,12 @@ class Poller:
         now = time.monotonic()
         self._sent.append(now)
         if retry_after is None:       # the trader reports a 429 a second time, with its Retry-After
-            self._order_sent.append(now)
-            while self._order_sent and now - self._order_sent[0] >= 60:
-                self._order_sent.popleft()
+            # The Opening plan's burst sends from several threads at once (companion/send_gate.py):
+            # two prunes of the same deque must not race to pop its last item.
+            with self._order_lock:
+                self._order_sent.append(now)
+                while self._order_sent and now - self._order_sent[0] >= 60:
+                    self._order_sent.popleft()
         if retry_after is not None:
             wait = _retry_after(str(retry_after))
             self._cooldown_until = time.monotonic() + wait

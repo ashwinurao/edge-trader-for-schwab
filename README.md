@@ -789,13 +789,31 @@ the stage: the stage is for your clicks only, so Arm is refused at any other sta
 Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
 `Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
-attached. It sends one order at a time, the pick nearest its trigger first (in R), and reads the tape
-again before each send. It cancels a plan entry that has not filled in two cases: its trigger traded
+attached. When one reading gives several picks to send, it sends them all at once, each on its own
+thread (`companion/plan_auto/burst.py`; Ash's go "do all 5", project thread, 2026-11-19 17:02:46 UTC,
+change 1). Each send keeps every check it had, and the bounds are taken one pick at a time, so four
+picks never pass the day's 4 orders. Edge Trader's order lock has a hold per name for this burst only
+(`companion/send_gate.py`): your click, Flat all or a cancel still waits for the burst, and the burst
+waits for them. While the lock is held or Schwab's order list or positions are old, the plan stays one
+pick at a time as before. On 2026-11-19, one at a time, the fourth order reached Schwab 6.4 s after the
+bar closed. A send checks the open tape's bid and ask, which the plan already holds, instead of asking
+Schwab for a quote (change 2: "let the limit guard the price"); that quote took 0.57 to 1.69 s at
+09:31. The tape's quote may be at most 1 second old when the plan read it
+(`break_entry.TAPE_PRICE_MAX_AGE_MS`, a start number), or the pick is left for the day. A pick already
+through its trigger but not past its limit (the cap) goes as a LIMIT at the limit with the same stop
+attached, instead of being left: the limit caps the fill (ASTS was refused on 2026-11-19 for being
+1 cent through). Past the limit it is left to you, as before. Three seconds before 09:31:00
+(`armed.warm_up_seconds_before`) the plan makes one Schwab quotes read per pick on the trading
+client, all at once on their own threads, to open the connections the burst uses (change 3,
+`companion/plan_auto/warm.py`). They are counted in the calls bound, never hold the order lock, and a
+failed one changes nothing but its log line. From 09:30:59 to 09:31:03 the plan reads the tape every
+0.1 s (`armed.fast_every_seconds`, change 4), every 0.25 s otherwise, and its first reading comes at
+09:31:00 itself. It cancels a plan entry that has not filled in two cases: its trigger traded
 but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
 log's rule), and at the end of the fast watch (09:35 ET). Each cancel is one attempt per order and
 waits for Schwab to confirm. After the 09:35 cancels the plan disarms. It never exits, moves a stop or
 resends, and flips or chases only with that step's own switch (below). Without the capped chase
-(below), a pick whose price is already at or past its trigger is left to you.
+(below), a pick whose price is already past its limit is left to you.
 When the plan row's final 09:30 bar and the tape disagree by more than one cent on the trigger or the
 stop, that row turns red and nothing is sent for it. That row check uses the last OV picks answer the
 Opening plan screen or the shadow log fetched (each asks at most every 2 seconds), so the plan never
@@ -856,7 +874,8 @@ not confirm (the row turns red); a reached bound; ARM turned off on the dashboar
 error. A 429 from Schwab, or the app's own 429 pause, disarms it for the rest of the day. A 4xx leaves that
 pick and is never retried, and so does an entry Schwab rejects after accepting it (on 2026-11-13 a
 REJECTED came 4.0 s after the 201: "The stop price must be above the current ask…"); the row shows
-Schwab's reason. The plan's sends share one Schwab quotes call (Ash's card pick "One quote call for
+Schwab's reason. A pick the tape gives no bid and ask for falls back to Schwab's quote, and then the
+plan's sends share one Schwab quotes call (Ash's card pick "One quote call for
 all 4", 2026-11-19 16:13:44 UTC): the first send's quote call asks for every pick of the reading, and
 the next sends use that answer while the app got it at most 2 seconds ago
 (`break_entry.SHARED_QUOTE_MAX_AGE_S`, a start number); older, the next send asks again for all of
@@ -864,7 +883,7 @@ them. The call sits where the send's own quote call was, after every check befor
 the quote do not change. A failed shared call lets the send read its own quote, as before. On
 2026-11-19 each send's own quote took 0.57 to 1.69 s at 09:31 ET, one pick after the other. The
 ticket's own Break entry and a row's Place, Flip and Chase clicks still read a new quote each.
-A Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`) leaves the pick the same way:
+On that fallback a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE_MS`) leaves the pick the same way:
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
 up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
 at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's

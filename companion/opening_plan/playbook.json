@@ -195,6 +195,22 @@
       "value": 0.25,
       "note": "start number, not approved by Ash; how often the armed plan reads the open tape (brief 15 tape.every_seconds)"
     },
+    "warm_up_seconds_before": {
+      "value": 3.0,
+      "note": "start number, not approved by Ash on its own; Ash's go \"do all 5\" (project thread, 2026-11-19 17:02:46 UTC), change 3: one Schwab quotes read per pick this long before act_from_et opens the trading client's connections for the 09:31 burst (companion/plan_auto/warm.py)"
+    },
+    "fast_every_seconds": {
+      "value": 0.1,
+      "note": "start number, not approved by Ash on its own; change 4 of the same go: how often the armed plan reads the open tape from fast_from_seconds to fast_until_seconds around act_from_et (every_seconds otherwise)"
+    },
+    "fast_from_seconds": {
+      "value": -1.0,
+      "note": "start number; seconds from act_from_et where the fast reads start"
+    },
+    "fast_until_seconds": {
+      "value": 3.0,
+      "note": "start number; seconds from act_from_et where the fast reads end"
+    },
     "end_grace_seconds": {
       "value": 45,
       "note": "start number, not approved by Ash; a backstop: the watch-end cancels run from watch_until_et until this much later, then the arm ends. Sized from the worst case (architect's review, 2026-11-13 16:21 UTC): one confirmed cancel is up to about 6.7 s (a read, the cancel and ten read-backs 0.25 s apart at 0.35 s a call), so four take up to about 27 s"
