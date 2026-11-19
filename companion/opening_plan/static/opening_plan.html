@@ -85,7 +85,7 @@
   .dlg table { min-width: 0; margin: 10px 0 12px; }
   .dlg td { padding: 7px 8px; }
   .dlg .act { font: 600 13px var(--sans); white-space: nowrap; }
-  .dlg .act.cancel, .dlg .act.close, .dlg .act.close_plan, .dlg .act.cancel_stop { color: var(--amber); }
+  .dlg .act.cancel, .dlg .act.close, .dlg .act.close_plan, .dlg .act.cancel_stop, .dlg .act.cancel_rest { color: var(--amber); }
   .dlg .act.refuse { color: var(--red); }
   .dlg .act.nothing { color: var(--muted); }
   .dlg .row-btns { display: flex; gap: 10px; justify-content: flex-end; }
@@ -169,7 +169,8 @@ let auto = null, autoOff = false, autoMsg = null;
 // (EDGE_TRADER_PLAN_FLAT=1 with the plan buttons); a 404 means no Flat all button and no cover lines.
 let flat = null, flatOff = false, flatShown = null, flatBusy = false, flatSaid = null;
 const STEP = {cancel: "cancel the unfilled entry", close: "close", nothing: "nothing", refuse: "refused",
-  cancel_stop: "cancel the plan's stop"};                // brief 25: close_plan is worded in flatList
+  cancel_stop: "cancel the plan's stop",
+  cancel_rest: "cancel the entry's rest, then close the plan's filled shares"};                // brief 25: close_plan is worded in flatList
 const clicking = {}, said = {};
 const STALE_MS = 6000;   // the page's own check: no answer from Edge Trader for 6 s marks the view old
 
@@ -340,7 +341,7 @@ function flatButton() {
 
 function flatList() {
   const items = flatShown || [];
-  const work = items.filter(x => ["cancel", "close", "close_plan", "cancel_stop"].includes(x.action)).length;
+  const work = items.filter(x => ["cancel", "close", "close_plan", "cancel_stop", "cancel_rest"].includes(x.action)).length;
   const rows = items.map(x => `<tr><td class="n">${esc(x.rank ?? "–")}</td><td><span class="tk">${esc(x.ticker)}</span></td>
     <td class="act ${esc(x.action)}">${x.action === "close" ? `close ${sh(x.shares)} sh at the market` :
       x.action === "close_plan" ? `close the plan's ${sh(x.shares)} sh at the market` : esc(STEP[x.action] || x.action)}</td>
@@ -627,7 +628,7 @@ function renderAuto() {
     ${a.tape_note ? `<div class="mutline" style="margin-top:6px">${esc(a.tape_note)}</div>` : ""}
     ${a.row_check_text ? `<div class="warnline" id="auto-row-check" style="margin-top:6px">${esc(a.row_check_text)}</div>` : ""}
     ${autoMsg ? `<div class="${autoMsg.ok ? "mutline" : "badline"}" style="margin-top:6px">${esc(autoMsg.text)}</div>` : ""}
-    ${lines ? `<div class="lines">${lines}</div>` : `<div class="mutline" style="margin-top:6px">${a.armed ? "Waiting for 09:31:00 ET and a final 09:30 bar on the open tape." : "Nothing armed. Arm works 09:25:00 to 09:30:45 ET; the plan then sends by itself, 1 share a pick."}</div>`}`;
+    ${lines ? `<div class="lines">${lines}</div>` : `<div class="mutline" style="margin-top:6px">${a.armed ? "Waiting for 09:31:00 ET and a final 09:30 bar on the open tape." : "Nothing armed. Arm works 09:25:00 to 09:30:45 ET; the plan then sends by itself, " + (a.size === "full" ? "each card's shares (Full, set on the A1 page)." : "1 share a pick (set Full on the A1 page before Arm to size by the cards).")}</div>`}`;
   const arm = $("auto-arm"), dis = $("auto-disarm");
   if (arm) arm.onclick = openArm;
   if (dis) dis.onclick = disarm;

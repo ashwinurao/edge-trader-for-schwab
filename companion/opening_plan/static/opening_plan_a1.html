@@ -37,6 +37,11 @@
   .chip { font: 600 11.5px var(--mono); color: var(--dim); padding: 2px 7px; border-radius: 5px; background: var(--panel2); white-space: nowrap; }
   .chip.unk { background: transparent; border: 1px dashed var(--faint); }
   .chip.test { color: var(--warn); background: rgba(242,197,107,.1); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { height: 30px; padding: 0 12px; border: 0; background: transparent; color: var(--dim); font: 700 12.5px var(--sans); }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on[data-size="1_share"] { background: rgba(242,197,107,.14); color: var(--warn); }
+  .seg button.on[data-size="full"] { background: rgba(76,175,80,.16); color: var(--upT); }
   .sp { flex: 1; }
   .go { height: 40px; padding: 0 22px; border-radius: 9px; border: 0; background: var(--blue); color: #fff; font: 700 15px var(--sans); }
   .status { font: 600 13px var(--sans); color: var(--dim); display: flex; gap: 6px; align-items: center; }
@@ -91,7 +96,7 @@
   <span class="ctl" id="riskCtl"><span class="k">Risk</span><input type="range" id="risk" min="25" max="2000" step="25"><span class="v" id="riskV">—</span></span>
   <span class="gauge" id="gauge" title="How much of the account's room the plan's shares use if all 4 fill"><span class="gbar" id="gbar"></span><span class="gl" id="gl">—</span></span>
   <button class="gear" id="gearBtn" title="Room share and margin for a name with no preview">⚙</button>
-  <span id="stage"></span>
+  <span class="seg" id="sizeSeg" style="display:none" title="What each Place, Place all 4, Flip and Chase sends"><button data-size="1_share">1 share</button><button data-size="full">Full</button></span>
   <span class="sp"></span>
   <span class="status" id="status"></span>
   <button class="go" id="placeAll" disabled>Place all 4</button>
@@ -200,6 +205,9 @@ function header(row, e, side, lp, k) {
   let lev = "";
   if (s && typeof s.leverage === "number")
     lev = `<span class="chip${s.rate_known ? "" : " unk"}" title="${s.rate_known ? "Schwab's margin for this side, from this morning's preview" : "No preview for this side: the margin set under ⚙"}">${s.leverage.toFixed(1)}x${s.rate_known ? "" : "?"}</span>`;
+  // The plan's 5% target once its order is sent (2026-11-18): 5% sits off the chart's price range.
+  const ts = e && e.target && e.target.sent && (e.entry || {}).state === "SENT" ? e.target.sent : null;
+  const tgt = ts ? `<span class="chip" title="The plan's target, in one OCO with its stop">TGT ${ts}</span>` : "";
   const tags = { FILLED: "FILLED", FLIP: "OTHER SIDE", CHASE: "PAST ENTRY", WORK: "WORKING", TAKEN: "YOURS", STOP: "CHECK", SENDING: "SENDING" };
   const tag = tags[k] ? `<span class="tag ${k === "SENDING" ? "WORK" : k}">${tags[k]}</span>` : "";
   let sh;
@@ -215,7 +223,7 @@ function header(row, e, side, lp, k) {
       ? `<div class="sh" title="${why.replace(/"/g, "&quot;")}"><span class="shn NONE">—</span></div>`
       : `<div class="sh"><span class="wait">sizes at 09:31</span></div>`;
   }
-  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tag}<span class="sp"></span>${sh}`;
+  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tgt}${tag}<span class="sp"></span>${sh}`;
 }
 
 function footer(row, e, side, lp, k) {
@@ -232,7 +240,7 @@ function footer(row, e, side, lp, k) {
   if (k === "SENDING") return `<span class="wait">${ent.text || "Sending…"}</span>`;
   if (k === "FILLED") {
     const it = flatItem(t);
-    const canFlat = it && it.action === "close_plan", canStop = it && it.action === "cancel_stop";
+    const canFlat = it && (it.action === "close_plan" || it.action === "cancel_rest"), canStop = it && it.action === "cancel_stop";
     const flatWhy = !S.flat ? "Flatten needs EDGE_TRADER_PLAN_FLAT=1." : !it ? "Not on the list yet." : canFlat ? (S.flat.refusal || "") : (it.text || "Nothing to close now.");
     return `<button class="ob flatten" data-act="flatten" data-t="${t}" ${dis(flatWhy)}>Flatten ${typeof it?.shares === "number" ? it.shares : ""}</button>` +
            `<span class="sp"></span>${canStop ? `<button class="ib" data-act="cancelstop" data-t="${t}" ${dis(S.flat.refusal)}>Cancel stop</button>` : ""}${take}`;
@@ -321,7 +329,8 @@ function drawChart(row, side, k, day) {
   c.candles.setData(grid);
   c.vol.setData(data.map(b => ({ time: b.time, value: b.volume || 0, color: b.close >= b.open ? "#1d3528" : "#3a2427" })));
   const e = entryOf(row.ticker), ent = (e || {}).entry || {};
-  const key = JSON.stringify([row.long && row.long.entry, row.short && row.short.entry, side, k, e && e.click_chase, ent.filled]);
+  const tgt = e && e.target && e.target.sent && (ent.state === "SENT") ? Number(e.target.sent) : null;
+  const key = JSON.stringify([row.long && row.long.entry, row.short && row.short.entry, side, k, e && e.click_chase, ent.filled, tgt]);
   if (key !== c.key) {
     c.lines.forEach(l => c.candles.removePriceLine(l)); c.lines = [];
     const line = (price, color, title, style, w = 1) => c.lines.push(c.candles.createPriceLine({ price, color, lineWidth: w, lineStyle: style, axisLabelVisible: true, title }));
@@ -331,6 +340,8 @@ function drawChart(row, side, k, day) {
       line(row.long.entry, L ? "#4caf50" : "#4caf5066", L ? "BUY" : "", L ? LC.LineStyle.Solid : LC.LineStyle.Dashed, L ? 2 : 1);
       line(row.short.entry, Sh ? "#ef5350" : "#ef535066", Sh ? "SELL" : "", Sh ? LC.LineStyle.Solid : LC.LineStyle.Dashed, Sh ? 2 : 1);
       if (k === "FILLED" && side) line(row[side.toLowerCase()].stop, "#8597ad", "STOP", LC.LineStyle.Dotted);
+      // Ash's 5% target (2026-11-18 23:46:05 UTC): the target the plan's order carries, once sent.
+      if (tgt) line(tgt, "#26a69a", "TARGET", LC.LineStyle.Dotted);
       if (e && e.click_chase && ent.state === "SENT" && ent.resting) line(Number(e.click_chase.limit), "#ffa726", "CHASE", LC.LineStyle.Solid, 2);
     }
     c.key = key;
@@ -361,7 +372,13 @@ function topLine(v) {
   if (document.activeElement !== $("lev")) $("lev").value = lev.toFixed(1);
   $("levV").textContent = lev.toFixed(1) + "x";
   const ent = S.entries;
-  $("stage").innerHTML = ent && ent.size_stage === "1 share" ? `<span class="chip test" title="The size stage sends 1 share per pick until it is raised (playbook.json size.stage)">sends 1 share</span>` : "";
+  const seg = $("sizeSeg");
+  seg.style.display = ent ? "" : "none";
+  if (ent) seg.querySelectorAll("button").forEach(b => {
+    b.classList.toggle("on", b.dataset.size === ent.size_switch);
+    b.disabled = S.busy.has("size") || (b.dataset.size === "full" && !ent.size_full_ok);
+    if (b.dataset.size === "full") b.title = ent.size_full_ok ? "Each pick sends its full shares" : "Full needs Flat all and the cover watch on (EDGE_TRADER_PLAN_FLAT=1)";
+  });
 }
 
 function placeAllPicks(v) {
@@ -373,7 +390,7 @@ function placeAllPicks(v) {
     const sl = side.toLowerCase();
     if ((e.place || {})[sl] || !(e.send || {})[sl]) continue;
     const n = e.send[sl];
-    out.push({ ticker: row.ticker, side, expected: { trigger: n.trigger, stop: n.stop, shares: n.shares } });
+    out.push({ ticker: row.ticker, side, target: (e.target || {})[sl], expected: { trigger: n.trigger, stop: n.stop, shares: n.shares } });
   }
   return out;
 }
@@ -421,7 +438,7 @@ function render() {
   btn.textContent = picks.length && picks.length !== 4 ? `Place ${picks.length}` : "Place all 4";
   btn.disabled = !S.entries || !picks.length || S.busy.has("*");
   btn.title = !S.entries ? "The plan buttons are off (EDGE_TRADER_PLAN_BUTTONS=1 and EDGE_TRADER_BREAK_ENTRY=1)." :
-    picks.length ? picks.map(p => `${p.ticker} ${p.side.toLowerCase()} ${p.expected.trigger}, stop ${p.expected.stop}, ${p.expected.shares} sh`).join("\n") :
+    picks.length ? picks.map(p => `${p.ticker} ${p.side.toLowerCase()} ${p.expected.trigger}, stop ${p.expected.stop}, target ${p.target || "?"}, ${p.expected.shares} sh`).join("\n") :
     "Nothing to place: the 09:30 bar is not final, or every pick already has an entry or is refused.";
   btn.style.display = anyEntryToday() && !picks.length ? "none" : "";
   $("flatAll").style.display = S.flat ? "" : "none";
@@ -477,6 +494,18 @@ $("flatAll").addEventListener("click", async () => {
   const r = await post("/api/opening-plan/flat-all", { expected: items });
   toast(r.ok ? "Flat all done." : (r.error || "Flat all: not done."), !r.ok);
   await tick();
+});
+
+$("sizeSeg").addEventListener("click", async ev => {
+  const b = ev.target.closest("button[data-size]"); if (!b || b.disabled || b.classList.contains("on")) return;
+  const want = b.dataset.size;
+  if (want === "full" && !confirm("Send full size?\nEach Place, Place all 4, Flip and Chase sends the card's shares, not 1.")) return;
+  S.busy.add("size"); render();
+  try {
+    const r = await post("/api/opening-plan/size", { size: want });
+    if (!r.ok) toast(r.error || "Not changed.", true); else toast(want === "full" ? "Full size." : "1 share.");
+  } catch (err) { toast(String(err), true); }
+  finally { S.busy.delete("size"); await tick(); }
 });
 
 let riskT = 0;

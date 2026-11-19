@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from companion import break_entry, plan_entries, plan_size
 from companion.bracket import MAX_NOTIONAL, MAX_SHARES
-from test_plan_entries import BOTH, LONG, LONG_REQ, NOW, make_app, rig, row, without_id  # noqa: F401  (rig is a fixture)
+from test_plan_entries import BOTH, LONG, LONG_CLICK_REQ, LONG_REQ, NOW, make_app, rig, row, without_id  # noqa: F401  (rig is a fixture)
 
 
 # ---------------------------------------------------------------- the stage
@@ -38,12 +38,15 @@ def test_the_stage_note_points_at_the_readmes_list_before_any_stage_above_one_sh
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     assert "**Before any stage above 1 share.**" in readme
     section = readme.split("**Before any stage above 1 share.**", 1)[1].split("\n## ", 1)[0]
-    # Review 2: point 5, a stop under the research's minimum needs a rule Ash decides.
-    for point in ("1. Flat all handles", "2. Add stop covers", "3. Schwab's behavior",
-                  "4. The cover's grace", "5. A row whose stop is under the research's minimum"):
+    # The five points of reviews 1 and 2, each answered by Ash on 2026-11-18 (changed expectation:
+    # until then the list said what was still open and that Ash decides point 5).
+    for point in ("1. Flat all and Flatten handle", "2. Add stop covers", "3. Schwab's behavior",
+                  "4. The grace on a server clock", "5. A stop under the research's minimum"):
         assert point in section
-    assert "min_stop_atr" in section and "Ash decides" in section
-    assert "min_stop_atr" in raw["size"]["_stage_about"]
+    flat = " ".join(section.split())
+    assert flat.count("**Built**") == 2 and "Leave it, room cap limits it" in flat
+    assert "schwab will set stop only for the filled shares" in flat
+    assert "min_stop_atr" in section and "min_stop_atr" in raw["size"]["_stage_about"]
 
 
 @pytest.mark.parametrize("stage,want,why", [
@@ -156,11 +159,13 @@ def test_a_plan_entry_at_a_quarter_sends_43_shares(rig):
     res = rig.desk.place("AAAA", "LONG", {**LONG, "shares": 43})
     assert res["ok"], res
     (req,) = rig.sent
-    assert without_id(req) == {**LONG_REQ, "qty": 43, "expected_qty": 43}
+    assert without_id(req) == {**LONG_CLICK_REQ, "qty": 43, "expected_qty": 43}
     (order,) = rig.broker.placed
     assert order["orderLegCollection"][0]["quantity"] == 43
-    (stop,) = [k for oco in order["childOrderStrategies"] for k in (oco.get("childOrderStrategies") or [oco])]
-    assert stop["orderLegCollection"][0]["quantity"] == 43
+    # The stop and the 5% target, one OCO, each for all 43 shares.
+    exits = [k for oco in order["childOrderStrategies"] for k in (oco.get("childOrderStrategies") or [oco])]
+    assert sorted(k["orderType"] for k in exits) == ["LIMIT", "STOP"]
+    assert all(k["orderLegCollection"][0]["quantity"] == 43 for k in exits)
 
 
 def test_a_page_sent_share_count_is_ignored(rig):
