@@ -210,3 +210,4 @@ def test_the_page_draws_the_target_line():
     from pathlib import Path
     html = (Path(__file__).resolve().parents[1] / "companion/opening_plan/static/opening_plan_a1.html").read_text()
     assert '"TARGET"' in html and "e.target.sent" in html and "target ${p.target" in html
+    assert "TGT ${ts}" in html and "${lev}${tgt}${tag}" in html

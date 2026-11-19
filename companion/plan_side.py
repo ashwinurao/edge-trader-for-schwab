@@ -10,7 +10,9 @@ Ash's words, project thread "Review OV picks desk architecture":
 
 Schwab nets each name in the account: the plan's shares and the user's are one position. The plan's
 entry is a TRIGGER order with its own STOP child for the plan's quantity, and that child is the only
-thing that tells the plan's shares from the user's. This file reads both, and nothing else:
+thing that tells the plan's shares from the user's. Since 2026-11-18 a click's entry carries the plan's
+5% target too, in one OCO with that stop (break_entry.TARGET_PCT); plan_shares reports it (target_id).
+This file reads both, and nothing else:
 - plan_shares (rule C): the plan's shares are its entry's filled quantity for as long as its own
   stop works (the entry's child, followed through a replacement the same way Trader follows a
   ticket's tree, or a stop Add stop created for the row).

@@ -205,6 +205,9 @@ function header(row, e, side, lp, k) {
   let lev = "";
   if (s && typeof s.leverage === "number")
     lev = `<span class="chip${s.rate_known ? "" : " unk"}" title="${s.rate_known ? "Schwab's margin for this side, from this morning's preview" : "No preview for this side: the margin set under ⚙"}">${s.leverage.toFixed(1)}x${s.rate_known ? "" : "?"}</span>`;
+  // The plan's 5% target once its order is sent (2026-11-18): 5% sits off the chart's price range.
+  const ts = e && e.target && e.target.sent && (e.entry || {}).state === "SENT" ? e.target.sent : null;
+  const tgt = ts ? `<span class="chip" title="The plan's target, in one OCO with its stop">TGT ${ts}</span>` : "";
   const tags = { FILLED: "FILLED", FLIP: "OTHER SIDE", CHASE: "PAST ENTRY", WORK: "WORKING", TAKEN: "YOURS", STOP: "CHECK", SENDING: "SENDING" };
   const tag = tags[k] ? `<span class="tag ${k === "SENDING" ? "WORK" : k}">${tags[k]}</span>` : "";
   let sh;
@@ -220,7 +223,7 @@ function header(row, e, side, lp, k) {
       ? `<div class="sh" title="${why.replace(/"/g, "&quot;")}"><span class="shn NONE">—</span></div>`
       : `<div class="sh"><span class="wait">sizes at 09:31</span></div>`;
   }
-  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tag}<span class="sp"></span>${sh}`;
+  return `<span class="tk">${row.ticker}</span><span class="px" style="color:${pxColor}">${lp ? f2(lp.px) : "—"}</span>${atr}${lev}${tgt}${tag}<span class="sp"></span>${sh}`;
 }
 
 function footer(row, e, side, lp, k) {

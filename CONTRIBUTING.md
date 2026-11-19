@@ -119,7 +119,9 @@ What to add:
   Flip, Chase, Take; Flat all, Flatten, Cancel stop), each through `Trader.submit` or `Trader.cancel_entry`.
 - `companion/plan_side.py`, `companion/plan_close.py`: the Opening plan beside your own trades on the
   same name (brief 25): which side you are on, which shares are the plan's (told apart by the plan's
-  own stop), and Flat all's close of only the plan's shares, inside Trader's one-at-a-time lock.
+  own stop and its 5% target), and Flat all's close of only the plan's shares, inside Trader's
+  one-at-a-time lock: the close, cancelling a part-filled entry's rest before it, resizing the plan's
+  stop to every filled share, and cancelling a target Schwab left working.
 - `companion/app.py`: the local FastAPI server. `companion/static/index.html`: the whole UI.
 - `companion/floating.py`: the always-on-top windows (pywebview).
 

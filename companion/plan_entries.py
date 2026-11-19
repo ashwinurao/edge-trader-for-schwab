@@ -2178,7 +2178,8 @@ def demo_entries(env: Mapping[str, str] = os.environ) -> tuple[dict, list[dict]]
     With DEMO_NO_ENTRIES_ENV=1 there are none, so the A1 page shows the morning before Place all 4."""
     if env.get(DEMO_NO_ENTRIES_ENV) == "1":
         return {}, []
-    recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0},
+    recs = {"AAAA": {"state": SENT, "side": "LONG", "ticket_id": "demo-aaaa", "order_id": 9001, "flips": 0,
+                     "target": "44.61"},     # the 5% target of level 42.49 (break_entry.target_for)
             # Brief 25: CCCC's long filled 1 share and its stop works; 100 more were bought by hand.
             "CCCC": {"state": SENT, "side": "LONG", "ticket_id": "demo-cccc", "order_id": 9003, "flips": 0},
             "BBBB": {"state": RED, "side": "SHORT", "ticket_id": "demo-bbbb", "order_id": 9002, "flips": 1,
