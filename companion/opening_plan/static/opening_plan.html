@@ -180,8 +180,8 @@ function shares(r) {
   if (s.state === "SET_RISK") return `<span class="mut">set risk</span>`;
   if (s.state === "NO_LEVELS") return r.estimate ? estimateCell(r.estimate) : `<span class="mut">–</span>`;
   if (s.state === "CALM_UNKNOWN")
-    return `full ${pair(s.full)}<span class="sub">half ${pair(s.half)} · calm not known</span>`;
-  const tag = s.state === "CALM" ? `<span class="sub">half size: calm day</span>` : `<span class="sub">full size</span>`;
+    return `full ${pair(s.full)}<span class="sub">calm not known · no send</span>`;
+  const tag = s.state === "CALM" ? `<span class="sub">calm day: shorts only</span>` : `<span class="sub">full size</span>`;
   return `${pair(s.used)}${tag}`;
 }
 
@@ -445,8 +445,8 @@ function estimateCell(e) {
   if (e.state === "OFF") return `<span class="mut">–</span>${bpLine}`;
   if (e.state === "MISSING") return `<span class="tag est">estimate</span><span class="mut">none</span><span class="sub">${esc(e.text)}</span>${bpLine}`;
   const body = e.state === "CALM_UNKNOWN"
-    ? `${estSet(e.full, "full")}<div style="margin-top:4px">${estSet(e.half, "half")}</div><span class="sub">calm not known</span>`
-    : `${estSet(e.used)}<span class="sub">${e.state === "CALM" ? "half size: calm day" : "full size"}</span>`;
+    ? `${estSet(e.full, "full")}<span class="sub">calm not known</span>`
+    : `${estSet(e.used)}<span class="sub">${e.state === "CALM" ? "calm day: shorts only" : "full size"}</span>`;
   return `<span class="tag est">estimate</span>${body}${bpLine}`;
 }
 
@@ -483,7 +483,7 @@ function render(v, browserStale) {
   src.title = v.source.error ? `Last ask failed: ${v.source.error}` : `Last answer at ${v.source.ok_at_et || "–"} ET`;
   const c = v.calm || {};
   const calm = $("calm");
-  if (c.calm === true) { calm.className = "pill bad"; calm.textContent = `SPY RV20 ${c.rv20.toFixed(2)} · calm · half size`; }
+  if (c.calm === true) { calm.className = "pill bad"; calm.textContent = `SPY RV20 ${c.rv20.toFixed(2)} · calm · shorts only`; }
   else if (c.calm === false) { calm.className = "pill ok"; calm.textContent = `SPY RV20 ${c.rv20.toFixed(2)} · full size`; }
   else { calm.className = "pill warn"; calm.textContent = "calm flag not available"; }
   $("calm-txt").textContent = c.age_s != null && c.calm != null ? `RV20 read ${ago(c.age_s)}` : "";
@@ -532,7 +532,7 @@ function render(v, browserStale) {
   }
   $("foot").innerHTML = `Rule (research, opening_drive/engine.py): enter ${px(v.playbook.offset)} past the 09:30 ET minute's high or low; the stop is the other side.
     Shares = risk per pick ÷ risk per share, rounded down, inside the ticket's caps (10,000 shares, $250,000).
-    Calm SPY day (RV20 ≤ ${v.playbook.calm_rv20_max}): ${v.playbook.calm_multiplier}× the risk. Nearer side: which break the minute's close sits closer to.
+    Calm SPY day (RV20 ≤ ${v.playbook.calm_rv20_max}): no longs, shorts at the full risk. Nearer side: which break the minute's close sits closer to.
     ${entries ? `With the plan buttons on, each Place, Cancel or Flip button sends one request to Schwab when you click it, built from
     the server's own row (never this page's prices). Flip cancels first and places the other side only after Schwab confirms the cancel with nothing
     filled; otherwise the row turns red and nothing more is sent from it today. At most ${entries.max_flips} flips per row a day.
@@ -644,8 +644,8 @@ async function openArm() {
   const li = xs => (xs || []).map(x => `<li>${esc(x)}</li>`).join("");
   $("ovl").innerHTML = `<div class="ovl"><div class="dlg" role="dialog" aria-label="Arm the plan">
     <h3>Arm “${esc(t.playbook)}” for today?</h3>
-    <div class="mutline">Picks: <b>${esc((t.picks || []).join(", ") || "none")}</b> · <b>${esc(t.shares)} share each</b> ·
-      risk per pick ${t.risk == null ? "not set" : "$" + Number(t.risk).toFixed(2)} · calm flag ${t.calm == null ? "not known" : t.calm ? "calm (half size)" : "not calm (full size)"}</div>
+    <div class="mutline">Picks: <b>${esc((t.picks || []).join(", ") || "none")}</b> · <b>${t.shares === "Full" ? "Full size" : esc(t.shares) + " share each"}</b> ·
+      risk per pick ${t.risk == null ? "not set" : "$" + Number(t.risk).toFixed(2)} · calm flag ${t.calm == null ? "not known" : t.calm ? "calm (no longs, shorts full)" : "not calm (full size)"}</div>
     <div class="k">It will</div><ul>${li(t.will)}</ul>
     <div class="k">It will not</div><ul>${li(t.will_not)}</ul>
     <div class="k">Bounds (start numbers, not approved by Ash; playbook.json "armed")</div>

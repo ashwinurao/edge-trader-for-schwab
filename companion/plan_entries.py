@@ -105,6 +105,9 @@ CLICK_TAKES_ROW = "Yours since your click. The armed plan leaves this row for to
 # Trader's one order lock is held by a click, a ticket send or Flat all: nothing reached Schwab.
 # The armed plan checks it before claiming a row (architect's review 1 of fork PR #27, 2026-11-13
 # 16:45 UTC), so a busy lock writes no record, and the plan tries again one tick later.
+# Calm SPY day (playbook size.calm_rule "no_longs"): Ash's rule of 2026-11-17, applied on his go of
+# 2026-11-19 22:33:09 UTC ("It should use the shorts only plan on calm days").
+CALM_NO_LONG = "Calm SPY day: no longs today, shorts only. No send."
 TRADER_BUSY = "Another order action is running in Edge Trader (a click or Flat all). Nothing was sent; " \
               "the armed plan tries again on its next reading."
 
@@ -357,7 +360,9 @@ class PlanDesk:
                     if bar.get("state") == "SO_FAR" else bar.get("text") or "No final 09:30 minute yet.")
         calm = (view.get("calm") or {}).get("calm")
         if calm is None:
-            return "Calm flag not known: the row shows full and half size and does not choose. No send."
+            return "Calm flag not known: the plan can't tell if longs are allowed today. No send."
+        if calm and str(side).upper() == "LONG":
+            return CALM_NO_LONG
         if blocked is None:
             return "An earlier order's outcome is not confirmed. Check thinkorswim, then press Resolve on the dashboard."
         if ticker in blocked:
@@ -1153,6 +1158,9 @@ class PlanDesk:
             return self._refuse(ticker, "Demo mode: no orders and no Schwab calls.", not_sent=True)
         if side not in OTHER:
             return self._refuse(ticker, "Pick long or short.", not_sent=True)
+        if side == "LONG" and ((view or {}).get("calm") or {}).get("calm") is True:
+            # The engine never asks for a long on a calm day; this holds even if it did.
+            return self._refuse(ticker, CALM_NO_LONG, not_sent=True)
         if (self._burst_busy(ticker) if send_gate.in_burst() else self.trader_busy()):
             # Before the row is claimed: a busy lock writes and removes no SENDING record.
             return self._refuse(ticker, TRADER_BUSY, not_sent=True, again=True, busy=True)

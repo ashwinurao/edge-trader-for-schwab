@@ -27,7 +27,14 @@ in playbook.json "automatic", each a start number Ash has not approved):
   level, limit = trigger + cap, stop at the other side. cap = cap_r x risk per share, at most
   cap_max_pct_of_price % of the trigger, at least cap_min (the floor wins when they cross:
   a limit at the trigger itself does not fill on a fast break). Shares from the level's risk
-  per share (so a fill at the cap loses at most 1 + cap_r R), half on a calm day.
+  per share (so a fill at the cap loses at most 1 + cap_r R).
+- Calm SPY day (playbook size.calm_rule "no_longs": Ash's rule of 2026-11-17, applied on his go of
+  2026-11-19 22:33:09 UTC; it replaced half size on both sides): no long entry and no flip to
+  long; shorts at the full risk. A pick whose last trade is nearer the high waits (calm_no_long)
+  until it is nearer the low. Once the long trigger trades, the first break was long and the pick
+  is left for the day (calm_long_break): with nothing resting it places nothing, and a resting
+  short that has not triggered would cancel. This is the research's rule (ov-research
+  nov_20k_backtest/allocation/alloc.py: a calm day's long break is no trade).
 - Price already past the trigger but inside the cap: would place, and would fill (estimate).
   Past the cap: would place (the limit rests at the cap) and wait pullback_wait_seconds for a
   pullback to it, then would cancel.
@@ -80,6 +87,10 @@ WAITING_RANGE = "waiting_for_range"
 RANGE_NOT_FINAL = "range_not_final"
 ZERO_WIDTH = "zero_width_range"
 CALM_UNKNOWN = "calm_unknown"
+CALM_NO_LONG = "calm_no_long"              # calm day: nearer the high, waits for the low side
+CALM_LONG_BREAK = "calm_long_break"        # calm day: the long trigger traded first; no trade today
+CALM_NO_FLIP = "calm_no_flip"              # calm day: no flip to long; the short rests
+CALM_RULES = ("no_longs",)
 NO_RISK = "no_risk"
 STALE = "stale_price"
 EVEN = "even"
@@ -103,7 +114,7 @@ class Rules:
     rank_to: int
     bar_start_et: time
     offset: Decimal
-    calm_multiplier: Decimal
+    calm_rule: str
     range_final_wait_seconds: float
     cap_r: Decimal
     cap_min: Decimal
@@ -130,7 +141,7 @@ def rules_from(raw: Mapping) -> Rules:
             rank_from=int(raw["list"]["rank_from"]), rank_to=int(raw["list"]["rank_to"]),
             bar_start_et=time.fromisoformat(raw["level"]["bar_start_et"]),
             offset=Decimal(str(raw["entry"]["offset"])),
-            calm_multiplier=Decimal(str(raw["size"]["calm_multiplier"])),
+            calm_rule=str(raw["size"]["calm_rule"]),
             range_final_wait_seconds=float(v["range_final_wait_seconds"]),
             cap_r=Decimal(str(v["cap_r"])), cap_min=Decimal(str(v["cap_min"])),
             cap_max_pct_of_price=Decimal(str(v["cap_max_pct_of_price"])),
@@ -144,6 +155,8 @@ def rules_from(raw: Mapping) -> Rules:
         raise ValueError(f"playbook automatic: {type(e).__name__}: {e}") from e
     if r.bar_start_et != time(9, 30):
         raise ValueError("playbook automatic: only the 09:30 ET first minute is known")
+    if r.calm_rule not in CALM_RULES:
+        raise ValueError(f"playbook size.calm_rule must be one of {', '.join(CALM_RULES)}")
     if not (Decimal("0.5") < r.flip_line < 1 and 0 < r.cap_r and r.cap_min > 0 and r.max_flips >= 0
             and r.stale_after_seconds > 0 and r.pullback_wait_seconds > 0 and r.offset > 0
             and r.relevels_per_pick >= 0):
@@ -338,17 +351,27 @@ def _decide_pick(st: dict, out: list, pick: Mapping, reading: Mapping, day: date
         _say(st, out, sym, EVEN, f"the last trade {last} is exactly between the levels", now, seen)
         return
     side = "long" if up < down else "short"
-    risk_used = risk * rules.calm_multiplier if calm else risk
+    if calm and side == "long":
+        trig = order_for("long", high, low, risk, rules)["trigger"]
+        if last >= trig:
+            ps["state"] = DONE
+            _say(st, out, sym, CALM_LONG_BREAK, f"calm day: the first break was long (last {last} at or past "
+                 f"the long trigger {trig}); no longs on a calm day, so no order today", now, seen)
+        else:
+            _say(st, out, sym, CALM_NO_LONG, f"calm day: no longs; the last trade {last} is nearer the high, "
+                 "so the plan waits for it to be nearer the low", now, seen)
+        return
+    risk_used = risk                       # calm or not: shorts and (not calm) longs at the full risk
     o = order_for(side, high, low, risk_used, rules)
     if o["shares"] < 1:
         ps["state"] = DONE
         _say(st, out, sym, NO_SHARES, f"risk ${risk_used} is less than one share's risk (${o['rps']}); "
              "no order today", now, seen)
         return
-    ps.update(state=WORKING, order=o, high=high, low=low, risk_used=risk_used, triggered_at=None)
+    ps.update(state=WORKING, order=o, high=high, low=low, risk_used=risk_used, triggered_at=None, calm=calm)
     why = f"{side}: the last trade {last} is nearer the {'high' if side == 'long' else 'low'}"
     if calm:
-        why += f"; calm day, {rules.calm_multiplier:g}x the risk"
+        why += "; calm day: shorts only, full risk"
     _act(st, out, sym, "would_place", why, **_order_out(o), calm=calm, risk_used=_f(risk_used), **seen)
     if entry is None:
         _on_price(st, out, sym, ps, last, now, rules, seen)
@@ -385,7 +408,9 @@ def _follow(ps: dict, entry: Mapping, pick: Mapping, reading: Mapping, rules: Ru
     if "risk_used" not in ps:
         risk = _dec(reading.get("risk"))
         if risk is not None:
-            ps["risk_used"] = risk * rules.calm_multiplier if reading.get("calm") else risk
+            ps["risk_used"] = risk
+    if reading.get("calm") is not None:
+        ps["calm"] = reading.get("calm")
     ps.update(state=WORKING, high=high, low=low, flips=int(entry.get("flips") or 0),
               order={"side": side, "trigger": trig, "limit": lim, "stop": stop, "cap": abs(lim - trig),
                      "rps": rps, "shares": entry.get("shares"), "flip_at": flip_at})
@@ -437,6 +462,19 @@ def _on_price(st: dict, out: list, sym: str, ps: dict, last: Decimal, now: datet
                  f"rests there and waits {rules.pullback_wait_seconds:g} s for a pullback", now, seen)
         return
     if s * (last - o["flip_at"]) > 0:
+        return
+    if ps.get("calm") and o["side"] == "short":
+        # Calm day: no flip to long. Once the long trigger trades the first break was long: the
+        # short that has not triggered would cancel and the pick is left for the day.
+        long_trig = order_for("long", ps["high"], ps["low"], ps.get("risk_used") or Decimal(0), rules)["trigger"]
+        if last >= long_trig:
+            ps["state"] = DONE
+            _act(st, out, sym, "would_cancel", f"calm day: the first break was long (last {last} at or past "
+                 f"{long_trig}); no longs on a calm day, so the short entry is cancelled and the pick left",
+                 side=o["side"], code=CALM_LONG_BREAK, **seen)
+            return
+        _say(st, out, sym, CALM_NO_FLIP, f"price {last} crossed the flip line; calm day: no flip to long, "
+             "the short entry rests", now, seen)
         return
     # At or past the flip line, not yet triggered: flip, if any flips are left.
     if ps["flips"] >= rules.max_flips:

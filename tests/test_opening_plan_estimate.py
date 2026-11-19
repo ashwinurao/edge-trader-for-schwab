@@ -4,7 +4,8 @@ Display only. Fake answers, fake clock, no network. Every balance here is made u
 Hand-worked, from brief 22: ATR 2.40, risk $100, last 42.10, day-trading buying power $209,360.72.
 - typical first minute 0.27 x 2.40 = 0.648 a share: 100 / 0.648 = 154.3 -> 154 shares;
 - wide 0.37 x 2.40 = 0.888: 100 / 0.888 = 112.6 -> 112; narrow 0.19 x 2.40 = 0.456: 100 / 0.456 = 219.3 -> 219;
-- calm day, 0.5 x $100 = $50: 50 / 0.648 = 77.2 -> 77; 50 / 0.888 = 56.3 -> 56; 50 / 0.456 = 109.6 -> 109;
+- calm day: the shorts' full $100, so 154, 112 and 219 too (Ash's go 2026-11-19 22:33:09 UTC: no longs,
+  shorts full; was 0.5 x $100 = $50: 77, 56 and 109);
 - day-trading buying power: 209,360.72 / 4 ranks = 52,340.18 a pick; 52,340.18 / 42.10 = 1,243.2 -> 1,243 shares.
 
 Brief 31 (Ash's pick "Buying power with each name's rate", 2026-11-16 15:58:21 UTC) changes the
@@ -126,26 +127,26 @@ def test_the_estimate_at_full_size_is_about_154_usually_112_to_219():
     assert e["kind"] == "estimate" and e["state"] == "FULL" and e["show"] == "range"
     assert e["used"] == {"risk": 100.0, "about": 154, "fewer": 112, "more": 219, "headline": 154,
                          "limited_by": "estimate", "capped": None}
-    assert e["full"] is None and e["half"] is None
+    assert e["full"] is None and "half" not in e
     # Brief 31: the smaller of buying power (621) and day-trading buying power (1,243); was 1,243.
     assert e["bp_max"]["state"] == "OK" and e["bp_max"]["shares"] == 621
     assert e["bp_max"]["decided_by"] == "buying_power" and e["bp_max"]["rate_known"] is False
     assert e["text"] == "Estimate. $100.00 at risk."
 
 
-def test_the_estimate_on_a_calm_day_halves_the_risk_77_56_109():
+def test_the_estimate_on_a_calm_day_is_the_shorts_full_risk_154_112_219():
+    # Was half the risk, 77, 56 and 109, until Ash's go of 2026-11-19 22:33:09 UTC (no longs, shorts full).
     e = est(calm=True)
-    assert e["state"] == "CALM" and e["used"]["risk"] == 50.0
-    assert (e["used"]["about"], e["used"]["fewer"], e["used"]["more"]) == (77, 56, 109)
-    assert e["text"] == "Estimate. Calm day: 0.5x $100.00 = $50.00 at risk."
+    assert e["state"] == "CALM" and e["used"]["risk"] == 100.0
+    assert (e["used"]["about"], e["used"]["fewer"], e["used"]["more"]) == (154, 112, 219)
+    assert e["text"] == "Estimate. Calm day: shorts only, $100.00 at risk."
 
 
-def test_calm_flag_not_known_shows_full_and_half_side_by_side():
+def test_calm_flag_not_known_shows_the_full_estimate():
     e = est(calm=None)
-    assert e["state"] == "CALM_UNKNOWN" and e["used"] is None
+    assert e["state"] == "CALM_UNKNOWN" and e["used"] is None and "half" not in e
     assert (e["full"]["about"], e["full"]["fewer"], e["full"]["more"]) == (154, 112, 219)
-    assert (e["half"]["about"], e["half"]["fewer"], e["half"]["more"]) == (77, 56, 109)
-    assert e["text"] == "Calm flag not known: estimates at full $100.00 and 0.5x $50.00 side by side."
+    assert e["text"] == "Calm flag not known: estimates at full $100.00. On a calm day the plan sends no longs."
 
 
 def test_a_risk_above_what_buying_power_buys_is_limited_by_buying_power():
@@ -165,7 +166,7 @@ def test_cautious_shows_one_number_at_the_wide_minute_and_none_shows_no_estimate
     assert e["show"] == "cautious" and e["used"]["about"] == 112 and e["used"]["headline"] == 112
     assert e["used"]["fewer"] is None and e["used"]["more"] is None
     e = est(pb=dataclasses.replace(PB, estimate_show="none"))
-    assert e["state"] == "OFF" and e["used"] is e["full"] is e["half"] is None
+    assert e["state"] == "OFF" and e["used"] is e["full"] is None and "half" not in e
     assert e["text"] == "No share estimate before the 09:30 minute (playbook size.estimate.show is none)."
     assert e["bp_max"]["shares"] == 621                  # the buying power maximum still shows (brief 31; was 1,243)
 
@@ -189,7 +190,7 @@ def test_the_estimate_keeps_the_tickets_caps():
 def test_a_missing_number_gives_no_estimate_and_says_which_never_zero(risk, atr, price, text):
     e = est(risk=risk, atr=atr, price=price)
     assert e["state"] == "MISSING" and e["text"] == text
-    assert e["used"] is None and e["full"] is None and e["half"] is None
+    assert e["used"] is None and e["full"] is None and "half" not in e
 
 
 def test_no_risk_set_still_shows_what_buying_power_allows():
@@ -254,10 +255,11 @@ def test_frozen_rows_waiting_for_the_minute_carry_an_estimate_and_no_shares():
     assert v["state"] == P.OK
     for r in v["rows"]:
         assert r["bar"]["state"] == P.WAITING and r["estimate"]["state"] == "CALM"
-        assert (r["estimate"]["used"]["about"], r["estimate"]["used"]["fewer"], r["estimate"]["used"]["more"]) == (77, 56, 109)
+        # A calm day (9.8): the shorts' full risk since 2026-11-19 (was half: 77, 56, 109).
+        assert (r["estimate"]["used"]["about"], r["estimate"]["used"]["fewer"], r["estimate"]["used"]["more"]) == (154, 112, 219)
         # Nothing a size reads: Step 9's size stage and the buttons read these, and they stay empty.
         assert r["long"] is None and r["short"] is None and r["rps"] is None
-        assert r["shares"] == {"state": "NO_LEVELS", "used": None, "full": None, "half": None,
+        assert r["shares"] == {"state": "NO_LEVELS", "used": None, "full": None,
                                "text": "No levels yet, so no shares."}
 
 
@@ -372,7 +374,8 @@ def test_the_demo_shows_estimates_at_09_10_and_09_26_with_invented_buying_power(
         aaaa = next(r for r in rows if r["ticker"] == "AAAA")
         # The demo's AAAA is the brief's example: ATR 2.40, last 42.10, invented DTBP 209,360.72.
         used = aaaa["estimate"]["used"]
-        assert (used["about"], used["fewer"], used["more"]) == ((77, 56, 109) if want_state == "CALM" else (154, 112, 219))
+        # The calm demo day uses the shorts' full risk since 2026-11-19 (was half: 77, 56, 109).
+        assert (used["about"], used["fewer"], used["more"]) == (154, 112, 219)
         # Brief 31 (was 1,243): the demo's invented rate 1.6 for AAAA (demo_feed.DEMO_RATES).
         # 26,170.09 / (42.10 x 1.6 = 67.36) = 388.5 -> 388; day-trading 52,340.18 / 67.36 = 777.0 -> 777.
         assert aaaa["estimate"]["bp_max"]["shares"] == 388 and aaaa["estimate"]["bp_max"]["rate"] == 1.6

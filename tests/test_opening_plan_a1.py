@@ -46,18 +46,54 @@ def counted(dt):
 
 
 def test_the_room_caps_each_side_at_its_own_rate():
-    """Equity 10,000, room 100%: room 4 x 10,000 = 40,000, a quarter each = 10,000 a pick.
-    Long at Schwab's 1.6: floor(10,000 / (42.49 x 1.6) = 67.984) = 147, under risk's 175, so the room
-    decides. Short has no preview: 2.8, floor(10,000 / (41.91 x 2.8) = 117.348) = 85."""
+    """Equity 3,000, room 100%: room 4 x 3,000 = 12,000. Since Ash's go of 2026-11-19 22:33:09 UTC the
+    room is split by each pick's risk need, not in equal quarters (was: a quarter each, long 147,
+    short 85, at equity 10,000). The row's full need is its dearer side: long 175 x 42.49 x 1.6
+    (Schwab's rate) = 11,897.20; short has no preview, so 2.8: 175 x 41.91 x 2.8 = 20,535.90. Share =
+    12,000 / 20,535.90 = 0.58434; both sides floor(175 x 0.58434 = 102.26) = 102, so the room decides."""
+    r = row()
+    head = F.apply([r], {"state": "OK", "equity": 3000}, RATES, 4, balances_counted=counted(10 ** 9))
+    assert (r["long"]["shares"], r["long"]["decided_by"], r["long"]["rate"], r["long"]["rate_known"]) == \
+        (102, "room", 1.6, True)
+    assert (r["short"]["shares"], r["short"]["decided_by"], r["short"]["rate"], r["short"]["rate_known"]) == \
+        (102, "room", 2.8, False)
+    assert r["long"]["risk_shares"] == 175 and r["long"]["leverage"] == 2.5 and r["short"]["leverage"] == 1.43
+    # The meter: the dearer side, 102 x 41.91 x 2.8 = 11,969.496 of 12,000 = 0.9975.
+    assert head["state"] == "OK" and head["per_row"] == {"AAAA": 0.9975} and head["scaled"] is None
+    assert head["share_of_risk"] == 0.5843
+
+
+def test_the_room_splits_by_each_picks_risk_need_not_in_quarters():
+    """Ash, PR #49, 2026-11-19 22:33:09 UTC: "is it using the latest calculation of shares we discussed
+    based on stop sizing..it should..". Equity 10,000: room 40,000. Rate 1.0 everywhere.
+    Full needs (dearer side): A 400 x 50 = 20,000; B 1,000 x 20 = 20,000; C 100 x 100 = 10,000;
+    D 1,000 x 10 = 10,000; total 60,000. Share = 40,000 / 60,000 = 0.6667. Shares: A floor(266.67) =
+    266, B 666, C floor(66.67) = 66, D 666, both sides. Cost 13,300 + 13,320 + 6,600 + 6,660 =
+    39,880, inside 40,000. Equal quarters (10,000 each) would have been A 200, B 500, C 100, D 1,000:
+    C and D, whose risk needs less, got their full risk while A and B were cut harder."""
+    one = {"LONG": {"rates": {"dt": {"rate": 1.0}}}, "SHORT": {"rates": {"dt": {"rate": 1.0}}}}
+    rows = [row("A", 50, 49, 400), row("B", 20, 19.5, 1000), row("C", 100, 99, 100), row("D", 10, 9.8, 1000)]
+    head = F.apply(rows, ACCOUNT, {k: one for k in "ABCD"}, 4, balances_counted=counted(10 ** 9))
+    assert [(x["long"]["shares"], x["short"]["shares"]) for x in rows] == [(266, 266), (666, 666), (66, 66), (666, 666)]
+    assert all(x[s]["decided_by"] == "room" for x in rows for s in ("long", "short"))
+    assert head["share_of_risk"] == 0.6667 and head["used"] == 0.997          # 39,880 / 40,000
+
+
+def test_the_room_is_not_split_when_every_pick_fits_at_full_risk():
+    # Full needs 20,535.90 (dearer side, above) against a room of 40,000: every share stays.
     r = row()
     head = F.apply([r], ACCOUNT, RATES, 4, balances_counted=counted(10 ** 9))
-    assert (r["long"]["shares"], r["long"]["decided_by"], r["long"]["rate"], r["long"]["rate_known"]) == \
-        (147, "room", 1.6, True)
-    assert (r["short"]["shares"], r["short"]["decided_by"], r["short"]["rate"], r["short"]["rate_known"]) == \
-        (85, "room", 2.8, False)
-    assert r["long"]["risk_shares"] == 175 and r["long"]["leverage"] == 2.5 and r["short"]["leverage"] == 1.43
-    # The meter: the dearer side, 147 x 42.49 x 1.6 = 9,993.648 of 40,000 = 0.2498.
-    assert head["state"] == "OK" and head["per_row"] == {"AAAA": 0.2498} and head["scaled"] is None
+    assert (r["long"]["shares"], r["short"]["shares"], r["long"]["decided_by"]) == (175, 175, "risk")
+    assert head["share_of_risk"] == 1.0
+
+
+def test_a_calm_day_row_needs_only_its_short_side():
+    # Calm day: the long side has 0 shares (plan.py), so only the short's need counts: 175 x 41.91 x
+    # 2.8 = 20,535.90 against 12,000 (equity 3,000): the same 0.58434, short 102, long stays 0.
+    r = row()
+    r["long"]["shares"] = 0
+    F.apply([r], {"state": "OK", "equity": 3000}, RATES, 4, balances_counted=counted(10 ** 9))
+    assert (r["long"]["shares"], r["short"]["shares"]) == (0, 102)
 
 
 def test_risk_decides_when_it_is_the_smaller():
@@ -67,23 +103,25 @@ def test_risk_decides_when_it_is_the_smaller():
 
 
 def test_the_room_share_and_the_unknown_rate_settings():
-    """Room 50%: 5,000 a pick. Long floor(5,000 / 67.984) = 73. Unknown rate 1.0: short
-    floor(5,000 / 41.91) = 119, then risk's 175 is larger, so 119."""
-    r = row()
+    """Room 50%: 20,000. Unknown rate 1.0. Risk shares 400: long 400 x 42.49 x 1.6 = 27,193.60, short
+    400 x 41.91 x 1.0 = 16,764: dearer 27,193.60. Share 20,000 / 27,193.60 = 0.73547, both sides
+    floor(294.19) = 294."""
+    r = row(risk_shares=400)
     F.apply([r], ACCOUNT, RATES, 4, room_share=Decimal("0.5"), unknown_rate=Decimal("1"),
             balances_counted=counted(10 ** 9))
-    assert r["long"]["shares"] == 73 and r["short"]["shares"] == 119
+    assert r["long"]["shares"] == 294 and r["short"]["shares"] == 294
 
 
 def test_the_live_check_scales_rows_without_an_entry():
-    """Buying power left 5,000 against a need of 9,993.648 (the dearer side): factor 0.50032.
-    Long floor(147 x 0.50032) = 73, short floor(85 x 0.50032) = 42. A reserved row is not scaled."""
+    """Room 40,000; two rows each needing 20,535.90: share 40,000 / 41,071.80 = 0.97390, so 170 each
+    side. Buying power left 5,000 against the open row's need 170 x 41.91 x 2.8 = 19,949.16: factor
+    0.25064. Long and short floor(170 x 0.25064) = 42. A reserved row is not scaled."""
     a, b = row("AAAA"), row("BBBB")
     head = F.apply([a, b], ACCOUNT, {**RATES, "BBBB": RATES["AAAA"]}, 4, reserved=["BBBB"],
                    balances_counted=counted(5000))
-    assert (a["long"]["shares"], a["short"]["shares"], a["long"]["decided_by"]) == (73, 42, "live")
-    assert (b["long"]["shares"], b["short"]["shares"]) == (147, 85)
-    assert head["scaled"] == 0.5003
+    assert (a["long"]["shares"], a["short"]["shares"], a["long"]["decided_by"]) == (42, 42, "live")
+    assert (b["long"]["shares"], b["short"]["shares"]) == (170, 170)
+    assert head["scaled"] == 0.2506
 
 
 def test_buying_power_below_zero_gives_zero_shares():
@@ -144,7 +182,12 @@ def test_the_plan_view_fits_with_the_accounts_own_numbers():
     v = P.build_view(answer([pick(1, "AAAA", 42.48, 41.92, 42.37)]), NOW, "", clock, NOW, "", Decimal(100), NOW,
                      P.load_playbook(), rates=RATES, fit={"account": acct, **F.stored(_Store()), "reserved": []})
     r = v["rows"][0]
-    assert v["fit"]["state"] == "OK" and r["long"]["shares"] == 147 and r["short"]["shares"] == 85
+    # Risk $100 / 0.57 = 175 each side; the dearer need 175 x 41.91 x 2.8 = 20,535.90 fits the
+    # 40,000 room (share 1), but the live check's buying power 20,000 is less: factor 20,000 /
+    # 20,535.90 = 0.97390, floor(175 x 0.97390) = 170 each side. (Equal quarters gave 147 and 85
+    # until 2026-11-19.)
+    assert v["fit"]["state"] == "OK" and r["long"]["shares"] == 170 and r["short"]["shares"] == 170
+    assert v["fit"]["share_of_risk"] == 1.0 and r["long"]["decided_by"] == "live"
 
 
 class _Store:

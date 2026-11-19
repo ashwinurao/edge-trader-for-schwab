@@ -66,7 +66,9 @@ def view(rows=None, risk=None, now=None, picks=None, picks_age=0.5, picks_error=
 def test_playbook_holds_the_research_rule_and_ashs_calm_rule():
     assert (PB.name, PB.rank_from, PB.rank_to) == ("OV OR1 shares", 1, 4)
     assert (PB.offset, PB.min_stop_atr, PB.flat_et.isoformat()) == (Decimal("0.01"), Decimal("0.02"), "10:00:00")
-    assert (PB.calm_rv20_max, PB.calm_multiplier) == (Decimal("10.5"), Decimal("0.5"))
+    # Calm rule: no longs, shorts full (Ash 2026-11-17; applied on his go 2026-11-19 22:33:09 UTC).
+    # Was calm_multiplier 0.5 (half size on both sides).
+    assert (PB.calm_rv20_max, PB.calm_rule) == (Decimal("10.5"), "no_longs")
     assert PB.timeout_seconds < PB.picks_every_seconds == 2
 
 
@@ -162,13 +164,15 @@ def test_final_row_full_size():
     assert r["shares"]["state"] == "FULL" and r["shares"]["used"] == {"long": 438, "short": 438}
 
 
-def test_calm_day_halves_the_risk():
-    # RV20 9.80 through the prior session: calm. $250 x 0.5 = $125; $125 / 0.57 = 219.3 -> 219.
+def test_calm_day_has_no_longs_and_full_shorts():
+    # RV20 9.80 through the prior session: calm. No longs; shorts at the full $250: $250 / 0.57 =
+    # 438.6 -> 438 (was half size on both sides, 219 / 219, until Ash's go of 2026-11-19).
     v = view([pick(1, "AAAA", 42.48, 41.92, 42.37)], risk=250, clk=clock(9.8))
-    assert v["calm"]["calm"] is True
+    assert v["calm"]["calm"] is True and "no longs" in v["calm"]["text"]
     r = v["rows"][0]
-    assert r["shares"]["state"] == "CALM" and r["shares"]["used"] == {"long": 219, "short": 219}
-    assert "0.5x $250.00 = $125.00" in r["shares"]["text"]
+    assert r["shares"]["state"] == "CALM" and r["shares"]["used"] == {"long": 0, "short": 438}
+    assert (r["long"]["shares"], r["long"]["calm_no_long"], r["short"]["shares"]) == (0, True, 438)
+    assert r["shares"]["text"] == "Calm day: no longs; shorts at $250.00 at risk."
 
 
 def test_calm_is_at_or_below_10_5():
@@ -176,14 +180,15 @@ def test_calm_is_at_or_below_10_5():
     assert view(clk=clock(10.51))["calm"]["calm"] is False
 
 
-def test_calm_unknown_shows_full_and_half_side_by_side():
-    # The clock never answered: full 438 (above), half 219.
+def test_calm_unknown_shows_the_full_size_only():
+    # The clock never answered: full 438 (above). No half any more (Ash's go 2026-11-19).
     v = P.build_view(answer([pick(1, "AAAA", 42.48, 41.92, 42.37)]), et(9, 31, 9), "", None, None,
                      "URLError: timed out", Decimal("250"), et(9, 31, 10), PB)
     assert v["calm"]["calm"] is None and "did not answer" in v["calm"]["text"]
     s = v["rows"][0]["shares"]
     assert s["state"] == "CALM_UNKNOWN" and s["used"] is None
-    assert s["full"] == {"long": 438, "short": 438} and s["half"] == {"long": 219, "short": 219}
+    assert s["full"] == {"long": 438, "short": 438} and "half" not in s
+    assert "nothing sends" in v["calm"]["text"].lower() and "no longs" in s["text"]
 
 
 @pytest.mark.parametrize("clk,age", [
@@ -211,7 +216,8 @@ def test_no_risk_set_shows_set_risk_not_zero():
 
 
 def test_row_under_the_minimum_keeps_its_stop_and_is_marked():
-    r = view([pick(2, "BBBB", 18.46, 18.46, 18.46, atr=0.95)], risk=250, clk=clock(9.8))["rows"][0]
+    # Not a calm day (12.3), so the long side has shares (on a calm day it has none since 2026-11-19).
+    r = view([pick(2, "BBBB", 18.46, 18.46, 18.46, atr=0.95)], risk=250, clk=clock(12.3))["rows"][0]
     assert r["under_min_stop"] is True
     assert (r["long"]["stop"], r["long"]["research_stop"], r["short"]["research_stop"]) == (18.46, 18.45, 18.47)
     assert r["long"]["shares"] == 10_000 and "share limit" in r["long"]["capped"]

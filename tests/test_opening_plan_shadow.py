@@ -99,9 +99,54 @@ def test_even_price_waits_for_the_next_trade():
     assert got[1]["side"] == "long"
 
 
-def test_calm_day_halves_the_shares():
-    _, got = run([reading("09:31:00.200", pick(49.80, "09:31:00.100"), calm=True)])
-    assert got[0]["shares"] == 50 and got[0]["risk_used"] == 50.5 and got[0]["calm"] is True
+# Calm day (playbook size.calm_rule "no_longs"): Ash's rule of 2026-11-17, applied on his go of
+# 2026-11-19 22:33:09 UTC ("It should use the shorts only plan on calm days"). It replaced half size
+# on both sides: the old test here expected a long of 50 shares at $50.50.
+
+def test_calm_day_shorts_go_at_the_full_risk():
+    # 49.20 is nearer the low: short, $101 / 1.01 = 100 shares (not halved).
+    _, got = run([reading("09:31:00.200", pick(49.20, "09:31:00.100"), calm=True)])
+    assert kinds(got) == [("would_place", None)]
+    assert (got[0]["side"], got[0]["shares"], got[0]["risk_used"], got[0]["calm"]) == ("short", 100, 101.0, True)
+    assert got[0]["why"].endswith("calm day: shorts only, full risk")
+
+
+def test_calm_day_nearer_the_high_waits_then_shorts_when_nearer_the_low():
+    _, got = run([reading("09:31:00.200", pick(49.80, "09:31:00.100"), calm=True),
+                  reading("09:31:01.000", pick(49.70, "09:31:00.900"), calm=True),     # said once
+                  reading("09:31:02.000", pick(49.30, "09:31:01.900"), calm=True)])
+    assert kinds(got) == [("no_action", "calm_no_long"), ("would_place", None)]
+    assert (got[1]["side"], got[1]["trigger"], got[1]["shares"]) == ("short", 48.99, 100)
+
+
+def test_calm_day_a_first_break_long_leaves_the_pick():
+    # The long trigger 50.01 trades before any short: no trade today (the research's calm rule).
+    state, got = run([reading("09:31:00.200", pick(49.80, "09:31:00.100"), calm=True),
+                      reading("09:31:01.000", pick(50.01, "09:31:00.900"), calm=True),
+                      reading("09:31:02.000", pick(48.90, "09:31:01.900"), calm=True)])
+    assert kinds(got) == [("no_action", "calm_no_long"), ("no_action", "calm_long_break")]
+    assert state["picks"]["AAAA"]["state"] == "DONE"
+    # Already through the long trigger at 09:31: the same.
+    _, got = run([reading("09:31:00.200", pick(50.05, "09:31:00.100"), calm=True)])
+    assert kinds(got) == [("no_action", "calm_long_break")]
+
+
+def test_calm_day_no_flip_to_long_and_a_long_break_cancels_the_short():
+    # Short placed at 49.20; 49.70 is past the short's flip line 49.60: no flip on a calm day, said
+    # once. 50.01 is the long trigger: the first break was long, so the untriggered short would cancel.
+    state, got = run([reading("09:31:00.200", pick(49.20, "09:31:00.100"), calm=True),
+                      reading("09:31:01.000", pick(49.70, "09:31:00.900"), calm=True),
+                      reading("09:31:01.500", pick(49.75, "09:31:01.400"), calm=True),
+                      reading("09:31:02.000", pick(50.01, "09:31:01.900"), calm=True),
+                      reading("09:31:03.000", pick(48.90, "09:31:02.900"), calm=True)])
+    assert kinds(got) == [("would_place", None), ("no_action", "calm_no_flip"), ("would_cancel", "calm_long_break")]
+    assert got[2]["side"] == "short"
+    assert state["picks"]["AAAA"]["state"] == "DONE"
+
+
+def test_not_calm_still_takes_longs_at_the_full_risk():
+    _, got = run([reading("09:31:00.200", pick(49.80, "09:31:00.100"), calm=False)])
+    assert (got[0]["side"], got[0]["shares"], got[0]["risk_used"], got[0]["calm"]) == ("long", 100, 101.0, False)
 
 
 def test_already_past_the_trigger_inside_the_cap_places_and_fills():
