@@ -52,8 +52,12 @@ path (Trader.move_stop), with that path's refusals, and it needs ARM. That path 
 when the position has none, for the whole position; when part is covered it would move the working
 stop instead, so a partly covered row refuses and says to set the rest in thinkorswim. Nothing is
 added automatically.
-The grace is measured when the page asks (GET /api/opening-plan/flat, every 2 s), not by a server
-clock: with the page closed no row turns red (README, "Before any stage above 1 share").
+The grace runs on a server clock (gap 2, Ash's pick of 2026-11-18 23:43:51 UTC): a thread looks at
+the cover every WATCH_SECONDS in regular hours (start_watch, started by companion/app.py), so the grace
+counts from when the server first saw the shares uncovered, with or without the page open. The page's
+GET /api/opening-plan/flat reads the same timer. Since gap 2, a row whose one plan stop is for fewer
+shares than the plan filled gets Add stop as a resize of that stop (and its target) to every filled
+share (plan_close.resize_plan_exits), not a refusal.
 
 Not confirmed at Schwab: whether the attached stop starts on the first partial fill of the entry.
 No lock of this file is held across a Schwab call.
@@ -100,6 +104,8 @@ CANCELS, CLOSES = (CANCEL, CANCEL_STOP), (CLOSE, CLOSE_PLAN, CANCEL_REST)
 # How a row of a batch ended.
 DONE, REFUSED, UNCLEAR, NOT_SENT = "done", "refused", "unclear", "not_sent"
 
+# The cover watch's server clock (gap 2): how often the server looks, with or without the page.
+WATCH_SECONDS = 1.0
 THROTTLED = "Not sent: Schwab is throttling (HTTP 429). Use the dashboard once the pause ends."
 # PlanDesk's hold while a batch runs (architect's review 1 of Step 9, 2026-11-13): Place, Flip and
 # the automatic sends of Steps 6 to 8 refuse with this; Cancel stays allowed.
@@ -205,6 +211,8 @@ class PlanFlat:
         self._lock = threading.Lock()        # only the flags below; never held across a Schwab call
         self._running = False
         self._uncovered: dict[str, float] = {}
+        self._watch: Optional[threading.Thread] = None     # the cover watch's server clock (start_watch)
+        self._watch_stop: Optional[threading.Event] = None
         self._mem: Optional[dict] = {} if demo else None
         # Called first in every batch, before the list is rebuilt. Step 6 wires it to its Disarm, so
         # no automatic send starts once Flat all is clicked (architect's review 1 of Step 9).
@@ -655,7 +663,7 @@ class PlanFlat:
                 continue
             # The plan's shares, at most what the account holds on that side; its own stop's cover.
             held = min(ps.filled, abs(held_acct))
-            covered = min(ps.stop_qty, held) if ps.state == plan_side.HELD else 0.0
+            covered = min(ps.stop_qty, held) if ps.state == plan_side.HELD or ps.stop_short else 0.0
             if covered >= held - 1e-9:
                 self._uncovered.pop(ticker, None)
                 out[ticker] = {"state": "covered", "red": False, "held": held, "covered": covered,
@@ -674,12 +682,42 @@ class PlanFlat:
                 if refusal is None:
                     refusal = self._refusal(need_arm=True)
                 more = abs(held_acct) - held
-                c["add_stop"] = refusal or (
-                    f"You hold {more:g} more {ticker} than the plan's {held:g}: the dashboard's stop path would "
-                    "cover yours too. Set the plan's stop in thinkorswim." if more > 1e-9 else
-                    self._add_stop_refusal(ticker, "PARTIAL" if covered > 1e-9 else "NO_STOP", stop))
+                if ps.stop_short and covered > 1e-9:
+                    # Gap 2: resize the plan's own stop (and target) to every filled share; only the
+                    # plan's orders change, so the user's shares beside them do not matter here.
+                    c.update(resize=True, stop_id=ps.stop_id, target_id=ps.target_id, filled=ps.filled, side=ps.side)
+                    c["add_stop"] = refusal or ("" if abs(held_acct) >= ps.filled - 1e-9 else
+                                                f"The account holds {abs(held_acct):g} {ticker}, fewer than the plan's "
+                                                f"{ps.filled:g}. Set the stop in thinkorswim.")
+                else:
+                    c["add_stop"] = refusal or (
+                        f"You hold {more:g} more {ticker} than the plan's {held:g}: the dashboard's stop path would "
+                        "cover yours too. Set the plan's stop in thinkorswim." if more > 1e-9 else
+                        self._add_stop_refusal(ticker, "PARTIAL" if covered > 1e-9 else "NO_STOP", stop))
             out[ticker] = c
         return out
+
+    def watch(self, stop: threading.Event, every: float = WATCH_SECONDS) -> None:
+        """Gap 2's server clock (Ash's pick of 2026-11-18 23:43:51 UTC: "the 3 s check runs on the
+        server"): look at the cover every `every` seconds in regular hours, so the grace counts from
+        when the server first saw the shares uncovered, also with the page closed. Reads only what the
+        poller already holds; sends nothing."""
+        from .trading import market_open
+        while not stop.wait(every):
+            try:
+                if market_open():
+                    self.cover()
+            except Exception:
+                log.exception("opening plan cover watch")
+
+    def start_watch(self) -> Optional[threading.Thread]:
+        if self.demo or self._watch is not None:
+            return None
+        self._watch_stop = threading.Event()
+        self._watch = threading.Thread(target=self.watch, args=(self._watch_stop,), name="opening-plan-cover",
+                                       daemon=True)
+        self._watch.start()
+        return self._watch
 
     def _add_stop_refusal(self, ticker: str, prot: str, stop: Any) -> str:
         if prot == "PARTIAL":
@@ -713,6 +751,15 @@ class PlanFlat:
         if _num(exp.get("shares")) != c["uncovered"] or str(exp.get("stop")) != str(c["stop"]):
             return {"ok": False, "ticker": ticker,
                     "error": f"The row changed: now {c['uncovered']:g} uncovered shares, stop {c['stop']}. Look again."}
+        if c.get("resize"):
+            # Gap 2 (Ash's pick "Resize the plan's stop to all shares", 2026-11-18 23:43:51 UTC): one
+            # replace of the plan's working stop, set to every share the plan filled.
+            log.warning("OPENING PLAN add stop %s: resize the plan's stop %s to %s shares", ticker, c["stop_id"], c["filled"])
+            r = plan_close.resize_plan_exits(self.trader, ticker, c["side"], c["stop_id"], c.get("target_id"),
+                                             c["filled"])
+            if r.get("ok"):
+                self._uncovered.pop(ticker, None)
+            return {**r, "ticker": ticker}
         log.warning("OPENING PLAN add stop %s: %s shares at %s", ticker, c["uncovered"], c["stop"])
         since = datetime.now(timezone.utc).isoformat()
         r = self.trader.move_stop(ticker, c["stop"], self._orders(), set(self._terminal()))
@@ -745,6 +792,12 @@ class PlanFlat:
         except Exception as e:
             out["error"] = out["error"] or f"The stop cover could not be read ({e})."[:300]
         return out
+
+
+def start_watch(app) -> Optional[threading.Thread]:
+    """Start the cover watch's server clock when Flat all is on (companion/app.py lifespan)."""
+    flat = getattr(getattr(app, "state", None), "opening_plan_flat", None)
+    return flat.start_watch() if isinstance(flat, PlanFlat) else None
 
 
 def register(app, trader, poller, guard, desk: plan_entries.PlanDesk, demo: bool = False,

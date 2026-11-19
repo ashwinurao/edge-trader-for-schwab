@@ -79,7 +79,14 @@ class FlatBroker(PlanBroker):
         self.calls.append(("replace", oid))
         if oid in self.no_answer_replace:
             raise TimeoutError("no answer")
-        return super().replace_order(h, oid, body)
+        r = super().replace_order(h, oid, body)
+        if r.status_code in (200, 201) and body.get("orderType") != "MARKET" and body.get("orderLegCollection"):
+            # A resting replacement takes the body's share count (gap 2's resize), on its own legs.
+            new = self._find(int(r.headers["Location"].rsplit("/", 1)[-1]))
+            n = float(body["orderLegCollection"][0]["quantity"])
+            new["quantity"] = n
+            new["orderLegCollection"] = [{**lg, "quantity": n} for lg in new.get("orderLegCollection") or []]
+        return r
 
     def account_details(self, h, fields=None):
         self._tick()

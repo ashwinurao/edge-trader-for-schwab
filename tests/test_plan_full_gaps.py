@@ -142,3 +142,129 @@ def test_the_pages_offer_flatten_for_cancel_rest():
     root = Path(__file__).resolve().parents[1] / "companion/opening_plan/static"
     assert 'it.action === "cancel_rest"' in (root / "opening_plan_a1.html").read_text()
     assert "cancel_rest:" in (root / "opening_plan.html").read_text()
+
+
+# ---------------------------------------------------------------- gap 2: one stop for every filled share
+
+def _short_stop(fr):
+    """A 43-share entry filled 10 (its stop and target for 10), then 5 more before the rest was
+    cancelled, and Schwab left the stop at 10: 5 of the plan's 15 shares have no stop."""
+    a = _part(fr)
+    fr.broker.orders[a].update(status="CANCELED", filledQuantity=15.0)
+    fr.broker.pos["AAAA"] = 15.0
+    return a
+
+
+def test_a_stop_for_part_of_the_filled_shares_is_resized_by_add_stop(fr):
+    """Ash's pick "Resize the plan's stop to all shares" (2026-11-18 23:43:51 UTC)."""
+    a = _short_stop(fr)
+    stop, tgt = plan_stop(fr.broker.orders[a])["orderId"], plan_target(fr.broker.orders[a])["orderId"]
+    fr.flat.cover()
+    fr.mono[0] = 5.0
+    c = fr.flat.cover()["AAAA"]
+    assert c["red"] and (c["held"], c["covered"], c["uncovered"]) == (15.0, 10.0, 5.0)
+    assert c["text"] == "5 of 15 shares have no stop." and c["add_stop"] == ""
+    fr.broker.calls.clear()
+    n0 = len(fr.broker.placed)
+    r = fr.flat.add_stop("AAAA", {"shares": 5, "stop": c["stop"]})
+    assert r["ok"], r
+    assert mutating(fr) == [("replace", stop), ("replace", tgt)]       # the stop first, no new order
+    assert len(fr.broker.placed) == n0
+    (body_stop, body_tgt) = [b for _, b in fr.broker.replaced[-2:]]
+    assert (body_stop["orderType"], body_stop["stopPrice"], body_stop["orderLegCollection"][0]["quantity"]) == ("STOP", "41.92", 15)
+    assert (body_tgt["orderType"], body_tgt["price"], body_tgt["orderLegCollection"][0]["quantity"]) == ("LIMIT", "44.61", 15)
+    assert r["message"] == "The plan's stop now covers all 15 shares the plan filled."
+    assert fr.flat.cover()["AAAA"]["state"] == "covered"
+    ps = __import__("companion.plan_side", fromlist=["x"]).plan_shares(fr.desk._load()["AAAA"], list(fr.broker.orders.values()))
+    assert ps.state == "held" and ps.stop_qty == 15.0
+
+
+def test_the_resize_refuses_when_the_account_holds_fewer_than_the_plan_filled(fr):
+    _short_stop(fr)
+    fr.broker.pos["AAAA"] = 12.0
+    fr.flat.cover()
+    fr.mono[0] = 5.0
+    c = fr.flat.cover()["AAAA"]
+    assert c["red"] and "fewer than the plan's 15" in c["add_stop"]
+    fr.broker.calls.clear()
+    assert not fr.flat.add_stop("AAAA", {"shares": c["uncovered"], "stop": c["stop"]})["ok"]
+    assert mutating(fr) == []
+
+
+def test_a_throttled_resize_changes_nothing(fr, monkeypatch):
+    from test_trading import Resp
+    a = _short_stop(fr)
+    fr.flat.cover()
+    fr.mono[0] = 5.0
+    c = fr.flat.cover()["AAAA"]
+    monkeypatch.setattr(type(fr.broker), "replace_order", lambda self, h, oid, body: Resp(429, {"Retry-After": "30"}, "x"))
+    r = fr.flat.add_stop("AAAA", {"shares": c["uncovered"], "stop": c["stop"]})
+    assert not r["ok"] and "HTTP 429" in r["error"]
+    assert plan_stop(fr.broker.orders[a])["quantity"] == 10
+
+
+def test_the_resize_needs_arm(fr):
+    _short_stop(fr)
+    fr.flat.cover()
+    fr.mono[0] = 5.0
+    fr.trader.arm(False)
+    c = fr.flat.cover()["AAAA"]
+    assert "ARM is off" in c["add_stop"]
+
+
+# ---------------------------------------------------------------- gap 2: the server clock
+
+def test_the_cover_timer_starts_without_the_page(fr):
+    import threading
+    import time
+    a = place_one(fr)
+    fr.broker.fill_entry(a, stop_live=False)
+    ev = threading.Event()
+    t = threading.Thread(target=fr.flat.watch, args=(ev, 0.01), daemon=True)
+    t.start()
+    deadline = time.time() + 2
+    while "AAAA" not in fr.flat._uncovered and time.time() < deadline:
+        time.sleep(0.01)
+    ev.set()
+    t.join(2)
+    assert "AAAA" in fr.flat._uncovered and not t.is_alive()
+
+
+def test_the_server_clock_looks_only_in_regular_hours(fr, monkeypatch):
+    import threading
+    from companion import trading
+    a = place_one(fr)
+    fr.broker.fill_entry(a, stop_live=False)
+    monkeypatch.setattr(trading, "market_open", lambda now=None: False)
+    ev = threading.Event()
+    seen = []
+    monkeypatch.setattr(fr.flat, "cover", lambda: seen.append(1))
+    t = threading.Thread(target=fr.flat.watch, args=(ev, 0.01), daemon=True)
+    t.start()
+    ev.wait(0.1)
+    ev.set()
+    t.join(2)
+    assert seen == []
+
+
+def test_start_watch_starts_once_and_never_in_demo(fr):
+    th = fr.flat.start_watch()
+    try:
+        assert th is not None and th.daemon and fr.flat.start_watch() is None
+    finally:
+        fr.flat._watch_stop.set()
+        th.join(3)
+    fr.flat.demo, fr.flat._watch = True, None
+    assert fr.flat.start_watch() is None
+
+
+def test_the_app_starts_the_server_clock():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "companion/app.py").read_text()
+    assert "_plan_flat.start_watch(app)" in src
+
+
+def place_one(fr):
+    r = fr.desk.place("AAAA", "LONG", LONG)
+    assert r["ok"], r
+    return r["order_id"]

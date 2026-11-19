@@ -162,6 +162,7 @@ class PlanShares:
     stop_qty: float = 0.0
     stop_price: Optional[float] = None
     target_id: Optional[int] = None     # the plan's working LIMIT target (its 5% target, in one OCO with the stop)
+    stop_short: bool = False            # UNCLEAR only: the plan's one working stop is for fewer shares than filled
     fill_at: Optional[datetime] = None  # the entry's last fill time
     ids: set = field(default_factory=set)
     text: str = ""
@@ -260,6 +261,10 @@ def plan_shares(rec: Mapping, orders: list[dict]) -> PlanShares:
         if q is None or abs(q - filled) > EPS:
             out.state, out.text = UNCLEAR, (f"The plan's stop is for {q if q is not None else '?'} shares, not the "
                                             f"{filled:g} its entry filled. Check thinkorswim.")
+            if q is not None and EPS < q < filled:
+                # Gap 2 (Ash's pick "Resize the plan's stop to all shares", 2026-11-18 23:43:51 UTC): the
+                # cover watch's Add stop resizes this one stop to every filled share (plan_close.resize_plan_exits).
+                out.stop_id, out.stop_qty, out.stop_price, out.stop_short = live[0], q, _f(n.get("stopPrice")), True
             return out
         out.state, out.stop_id, out.stop_qty = HELD, live[0], q
         out.stop_price = _f(n.get("stopPrice"))
