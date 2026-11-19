@@ -436,6 +436,23 @@ def test_four_picks_go_out_one_at_a_time_nearest_first_each_exactly_the_break_en
     assert [x["ticker"] for x in lines(rig, "send_start")] == NEAREST_FIRST
 
 
+def test_the_record_names_each_armed_send_by_its_ticket(rig, rec):  # noqa: F811
+    """The open of 2026-11-19: the armed plan's Schwab calls had no id and purpose "other", so they
+    matched their pick only by time. Each send's calls now carry its ticket id (the auto log's
+    send_start line) and purpose armed_plan, and the record stops naming them after send_answer."""
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    starts = lines(rig, "send_start")
+    assert [x["ticker"] for x in starts] == NEAREST_FIRST
+    places = [c for c in rec.lines("call") if c["endpoint"] == "place_order"]
+    assert [c["req"] for c in places] == [x["ticket_id"] for x in starts]
+    assert {c["purpose"] for c in places} == {"armed_plan"}
+    assert netlog._req.get() is None and netlog._purpose.get() is None
+    with netlog.call("schwab", "account_details"):
+        pass
+    assert rec.lines("call")[-1]["req"] is None and rec.lines("call")[-1]["purpose"] == "other"
+
+
 def test_nothing_before_act_from(rig):
     arm(rig)
     reads = rig.tape.reads                               # the Arm click checks the tape answers
