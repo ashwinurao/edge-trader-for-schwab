@@ -578,9 +578,11 @@ the day's four picks as cards in rank order (`companion/opening_plan/static/open
   0.27 x ATR. On OV's 2026 top 4 (835 picks, 2026-01-02 to 2026-10-30), from the 09:10 price the
   09:30 minute's high was a median 0.13 x ATR above the price and its low 0.13 x ATR below it, and this
   barely moves from 09:05 to 09:25. The card is then sized by the same rules as a real minute: the
-  risk per pick (the calm rule included), the ticket's caps, and the fit to the account (each side's
-  margin rate from this morning's previews, the margin under the gear for a side without one, the room
-  share and the live buying power check), all four cards together. The price is Edge Scanner's last
+  risk per pick (on a calm day no longs, so the number is the short's), the ticket's caps, and the fit
+  to the account (each side's margin rate from this morning's previews, the margin under the gear for
+  a side without one, the room share, every pick the same share of its risk shares, and the live
+  buying power check), all four cards together; after 09:30 a card still waiting is fitted beside the
+  cards that already have their minute. The price is Edge Scanner's last
   price in its preview, which it refreshes once a minute, so the estimate changes once a minute; after
   the 09:25 freeze it is the frozen pick's price. Under the number, "est HH:MM" and "usually L–H": the
   same sizing at a wide 0.37 and a narrow 0.19 x ATR minute. When the two ends are less than 10 shares

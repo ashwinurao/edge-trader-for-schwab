@@ -210,7 +210,7 @@ function header(row, e, side, lp, k) {
   const pxColor = lp && prevClose !== null ? (lp.px >= prevClose ? "var(--upT)" : "var(--downT)") : "var(--text)";
   const atr = typeof row.atr === "number" ? `<span class="chip">ATR ${f2(row.atr)}</span>` : "";
   let lev = "";
-  const ls = s && typeof s.leverage === "number" ? s : (!s && ef ? [ef.long, ef.short].filter(Boolean).sort((a, b) => a.leverage - b.leverage)[0] : null);
+  const ls = s && typeof s.leverage === "number" ? s : (!s && ef ? [ef.long, ef.short].filter(x => x && !x.calm_no_long).sort((a, b) => a.leverage - b.leverage)[0] : null);
   if (ls && typeof ls.leverage === "number")
     lev = `<span class="chip${ls.rate_known ? "" : " unk"}" title="${ls.rate_known ? "Schwab's margin for this side, from this morning's preview" : "No preview for this side: the margin set under ⚙"}">${ls.leverage.toFixed(1)}x${ls.rate_known ? "" : "?"}</span>`;
   // The plan's 5% target once its order is sent (2026-11-18): 5% sits off the chart's price range.
@@ -237,7 +237,9 @@ function header(row, e, side, lp, k) {
 // Layout B (Ash's pick on the card, 2026-11-19 16:05:53 UTC, "B: one number with range"): one number,
 // the smaller side's estimated shares, with the usual range (wide and narrow first minute) under it.
 function estimateShares(ef) {
-  const l = ef.long || {}, sh = ef.short || {};
+  // A calm day sends no longs (ET #55): the long side is left out of the number and the range.
+  const calm = !!(ef.long || {}).calm_no_long;
+  const l = calm ? {} : (ef.long || {}), sh = ef.short || {};
   const num = x => typeof x === "number";
   const n = [l.shares, sh.shares].filter(num);
   if (!n.length) return `<div class="sh" title="${esc(ef.text || "")}"><span class="wait">sizes at 09:31</span></div>`;
@@ -247,7 +249,8 @@ function estimateShares(ef) {
   const risk = Math.min(...[l.risk_shares, sh.risk_shares].filter(num).concat([Infinity]));
   const cut = most < risk;
   const rng = lo !== null && hi !== null && hi - lo >= 10 ? `usually ${lo.toLocaleString()}–${hi.toLocaleString()}` : (cut ? "room decides" : "");
-  const tip = `Long ≈${num(l.shares) ? l.shares.toLocaleString() : "—"}, short ≈${num(sh.shares) ? sh.shares.toLocaleString() : "—"}. ` +
+  const tip = (calm ? `Calm day: shorts only, ≈${num(sh.shares) ? sh.shares.toLocaleString() : "—"}. ` :
+               `Long ≈${num(l.shares) ? l.shares.toLocaleString() : "—"}, short ≈${num(sh.shares) ? sh.shares.toLocaleString() : "—"}. `) +
               (cut ? `Cut by the account's room; risk alone gives ${risk.toLocaleString()}.` : "Risk decides.");
   const sub = [`est${ef.as_of_et ? " " + ef.as_of_et : ""}`, rng].filter(Boolean).join(" · ");
   return `<div class="sh" title="${esc(tip)}"><span class="estn"><i>≈</i>${most.toLocaleString()}</span><span class="estsub">${sub}</span></div>`;

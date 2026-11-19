@@ -13,7 +13,8 @@ half the typical first minute, low = price - half of it (playbook size.estimate.
 bar were final (entries, stops, the 2% ATR stop note, the calm day, the ticket's caps), and all the
 rows go through fit.apply together (each name's margin rate from this morning's previews, the
 unknown rate, the room share, the live check). So the estimate is what Place all 4 would send if
-the bar came out typical. The same is done at the wide and narrow first minute (0.37 and 0.19 x
+the bar came out typical, with the sizing of ET #55 (2026-11-19): every pick the same share of its
+risk shares, and on a calm day no longs (the long side has 0 shares and `calm_no_long`). The same is done at the wide and narrow first minute (0.37 and 0.19 x
 ATR) for the "usually L to H" range.
 
 Why centred: on OV's 2026 top 4 (835 picks, 2026-01-02 to 2026-10-30, Alpaca SIP 1-minute bars),
@@ -30,6 +31,7 @@ never in a row's sides or shares, so nothing that sends an order reads it.
 """
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Callable, Mapping, Optional
@@ -59,12 +61,16 @@ def _dec(v) -> Optional[Decimal]:
 
 def apply(rows: list, trading_date: date, risk: Optional[Decimal], calm: Optional[bool], pb, bp,
           rates: Optional[Mapping], fit: Mapping, account: Optional[Mapping], ranks: int,
-          build_row: Callable, balances_counted: Callable, as_of_et: Optional[str] = None) -> Optional[dict]:
+          build_row: Callable, balances_counted: Callable, as_of_et: Optional[str] = None,
+          fixed: tuple = ()) -> Optional[dict]:
     """Put row["estimate_fit"] on every row of `rows` (dicts with ticker, rank, atr and last) and
     return the header for the page's meter, or None when no row could be estimated.
 
     `build_row`, `balances_counted` are plan.py's (passed in, so this file imports nothing of it).
-    `fit` is build_view's fit argument; `account` is plan.buying_power() of fit["account"]."""
+    `fit` is build_view's fit argument; `account` is plan.buying_power() of fit["account"].
+    `fixed`: the day's rows that already have their own 09:30 bar, as build_row made them (before
+    any fit). They are fitted beside the estimated ones (copies, so their own numbers stay), because since ET #55 each pick's share of
+    the room depends on what all the picks need."""
     bar_end = datetime.combine(trading_date, pb.bar_start_et, tzinfo=_et()) + timedelta(minutes=pb.bar_minutes)
     mults = {"typical": pb.estimate_first_minute_atr, "wide": pb.estimate_wide_atr,
              "narrow": pb.estimate_narrow_atr}
@@ -85,6 +91,8 @@ def apply(rows: list, trading_date: date, risk: Optional[Decimal], calm: Optiona
             built[k].append(build_row(src, trading_date, bar_end, risk, calm, pb, bp, rates))
     if not usable:
         return None
+    for k in KINDS:
+        built[k].extend(copy.deepcopy(list(fixed)))
     heads = {k: fit_mod.apply(built[k], account, rates, ranks, fit.get("room_share", fit_mod.ROOM_SHARE_DEFAULT),
                               fit.get("unknown_rate", fit_mod.UNKNOWN_RATE_DEFAULT), fit.get("reserved") or (),
                               balances_counted) for k in KINDS}
@@ -102,7 +110,7 @@ def apply(rows: list, trading_date: date, risk: Optional[Decimal], calm: Optiona
                 out[s] = {"shares": ts.get("shares"), "risk_shares": ts.get("risk_shares"),
                           "decided_by": ts.get("decided_by"), "entry": ts.get("entry"), "stop": ts.get("stop"),
                           "leverage": ts.get("leverage"), "rate_known": ts.get("rate_known"),
-                          "usually": [lo, hi]}
+                          "calm_no_long": bool(ts.get("calm_no_long")), "usually": [lo, hi]}
             if all(not isinstance(out[s]["shares"], int) for s in SIDES):
                 out["state"] = (sh.get("state") if sh.get("state") == "FIT_NOT_KNOWN" else "NOT_KNOWN")
         r["estimate_fit"] = out
@@ -110,7 +118,8 @@ def apply(rows: list, trading_date: date, risk: Optional[Decimal], calm: Optiona
     return {"state": head.get("state"), "used": head.get("used"), "per_row": head.get("per_row"),
             "live": head.get("live"), "scaled": head.get("scaled"), "text": head.get("text"),
             "first_minute_atr": float(pb.estimate_first_minute_atr), "as_of_et": as_of_et,
-            "room_share": head.get("room_share"), "unknown_rate": head.get("unknown_rate")}
+            "room_share": head.get("room_share"), "unknown_rate": head.get("unknown_rate"),
+            "share_of_risk": head.get("share_of_risk")}
 
 
 def _et():
