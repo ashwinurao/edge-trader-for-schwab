@@ -5,5 +5,11 @@
   "previews": ["09:05:30", "09:06:00", "09:06:30", "09:07:00", "09:15:30", "09:16:00", "09:16:30", "09:17:00", "09:27:00", "09:27:30", "09:28:00", "09:28:30", "09:29:30", "09:30:02", "09:31:02", "09:32:00", "09:33:00", "09:35:00"],
   "preview_shares": 100,
   "max_previews_per_time": 2,
-  "max_previews_per_window": 24
+  "max_previews_per_window": 24,
+  "new_names": {
+    "_about": "companion/new_name_previews.py, Ash's pick 2026-11-19 14:19:00 UTC (\"Preview new names, reprice each minute\"): from `from` to `until` ET, outside the windows above, every `every_s` seconds, the first preview pick with no margin rate for both sides gets one quote and one long and short preview, once a day. The times and every_s are start numbers, not approved by Ash.",
+    "from": "09:00:30",
+    "until": "09:25:00",
+    "every_s": 30
+  }
 }
