@@ -18,8 +18,9 @@ These decide most review questions:
    allowed in this fork by Ash on 2026-11-09, fork PR #12): when the app-watched stop fires, the app
    sends that spread's close once, only while it runs, never retried. The armed plan (OV entries
    Step 6, `companion/plan_auto/`, `EDGE_TRADER_PLAN_AUTO=1`), armed for one day by the user's Arm
-   click that shows its bounds: from 09:31 ET it sends that day's Opening plan break entries at 1 share,
-   all picks of one reading at once (one hold per name on Trader's order lock, `companion/send_gate.py`;
+   click that shows its bounds and size: from 09:31 ET it sends that day's Opening plan break entries
+   at the size of that click (1 share, or at Full each card's shares, never above the risk's shares;
+   Ash's pick "Full for clicks and Arm", 2026-11-19 22:05:02 UTC) with the 5% target and the stop, all picks of one reading at once (one hold per name on Trader's order lock, `companion/send_gate.py`;
    Ash's go "do all 5", 2026-11-19 17:02:46 UTC), a pick through its trigger but inside its limit as a
    LIMIT at the limit, and cancels one that has not filled after the pullback wait or at the end of the
    fast watch, once per order. With its own switch on (`EDGE_TRADER_PLAN_AUTO_FLIP=1`, Step 7,

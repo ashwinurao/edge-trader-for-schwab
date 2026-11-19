@@ -253,6 +253,10 @@ class AutoPlan:
         self._may_send = True
         self._hold_at: Optional[float] = None   # monotonic time of the last hold_later, None when not holding
         self._warmed_for: Optional[datetime] = None   # the arm (armed_at) whose warm-up ran (warm.py)
+        # The size stage at the Arm click (plan_size): the armed plan never sends above it, and the
+        # switch can only lower it while armed (armed_stage). Ash's pick "Full for clicks and Arm",
+        # project thread, 2026-11-19 22:05:02 UTC.
+        self._armed_stage: Any = plan_size.ONE_SHARE
         self._hold_from: Optional[float] = None
         self._busy_step = False
         self.row_check = ""                     # the code of why the row check is skipped now ("" when it runs)
@@ -409,6 +413,14 @@ class AutoPlan:
             log.exception("armed plan: could not turn %s red", ticker)
         self.log("red", ticker, why=reason)
         self.leave(ticker, reason)
+
+    def armed_stage(self) -> Any:
+        """The stage the armed plan sends at now: the smaller of the stage at the Arm click and the
+        switch now (plan_size.smaller). 1 share when either cannot be read."""
+        try:
+            return plan_size.smaller(self._armed_stage, self.desk.stage)
+        except Exception:
+            return plan_size.ONE_SHARE
 
     def disarm(self, reason: str, for_day: bool = False) -> None:
         if self.arming.disarm(self._now(), reason, for_day=for_day):
@@ -991,15 +1003,22 @@ class AutoPlan:
                      bounds_now=self.armed_rules.bounds(), dashboard_arm=dashboard_arm, risk=risk,
                      calm=calm if isinstance(calm, bool) else None, picks_today=picks_today, orders_fresh=fresh,
                      open_rows=open_rows, tape=tape, blocked_today=self.arming.blocked_today(now),
-                     size_stage=size_stage, flat_unwired=self.flat_unwired), view
+                     size_stage=size_stage, full_ok=bool(getattr(self.desk, "full_ok", False)),
+                     flat_unwired=self.flat_unwired), view
 
     def terms(self, view: Optional[Mapping] = None) -> dict:
         """What the Arm dialog lists: exactly what the plan will and will not do, and the bounds."""
         view = view if view is not None else (self._safe_view())
         kinds = self.registry.kinds(self.env)
+        stage = self._stage_now()
+        one = stage == plan_size.ONE_SHARE
+        size_name = "Full" if plan_size.switch_name(stage) == "full" else plan_size.label(stage)
+        size_words = (f"{break_entry.BREAK_MAX_SHARES} share" if one else
+                      f"{size_name}: {'' if size_name == 'Full' else size_name + ' of '}each card's shares (never more than the risk per pick buys "
+                      "at the final 09:30 range; 1 share when the card has no shares)")
         will = [f"From {self.armed_rules.act_from_et:%H:%M:%S} ET, once a pick's 09:30 bar is final on the open "
                 "tape: send Step 3's break entry on the side nearer the last trade, "
-                f"{break_entry.BREAK_MAX_SHARES} share, its stop attached.",
+                f"{size_words}, its stop and a {float(break_entry.TARGET_PCT) * 100:g}% target attached in one OCO.",
                 "Before each send: a new tape reading and a new decision for that pick; nearest to its trigger first.",
                 "Before each send: check the pick's row against the last OV picks answer this page or the shadow log "
                 f"fetched. With none from the last {self.rules_feed_stale:g} s, send on the open tape alone and say so "
@@ -1021,13 +1040,24 @@ class AutoPlan:
                     "Act on a row after your Place, Flip or Cancel click on it: that row is yours for today.",
                     "Take the other side of a name you trade by hand (your shares or working orders): that pick is "
                     "left to you. On your side it sends beside your trades; while your side is not clear it waits.",
-                    f"Send more than {break_entry.BREAK_MAX_SHARES} share: the size stage is for your clicks only.",
+                    (f"Send more than {break_entry.BREAK_MAX_SHARES} share: set Full on the A1 page before Arm "
+                     "to size by the cards." if one else
+                     "Send more than the size at this Arm: switching to 1 share later lowers it, switching up "
+                     "does not raise it."),
                     "Act after a Flat all click: the click disarms it first, and Flat all does the cancels.",
                     "Survive a restart: arming is in memory only."]
         return {"playbook": self.playbook_name, "picks": [r.get("ticker") for r in (view or {}).get("rows") or []],
-                "shares": break_entry.BREAK_MAX_SHARES, "risk": (view.get("risk") or {}).get("per_pick") if view else None,
+                "shares": break_entry.BREAK_MAX_SHARES if one else size_name,
+                "stage": plan_size.switch_name(stage), "stage_value": "1_share" if one else str(stage), "risk": (view.get("risk") or {}).get("per_pick") if view else None,
                 "calm": (view.get("calm") or {}).get("calm") if view else None, "handlers": kinds,
                 "will": will, "will_not": will_not, "bounds": self.armed_rules.bounds()}
+
+    def _stage_now(self) -> Any:
+        """The switch's stage now (what an Arm click would take), or 1 share when it cannot be read."""
+        try:
+            return plan_size.parse_stage(self.desk.stage)
+        except Exception:
+            return plan_size.ONE_SHARE
 
     def _safe_view(self) -> dict:
         try:
@@ -1052,6 +1082,7 @@ class AutoPlan:
         except Exception:
             pass
         out = {"enabled": True, "demo": self.demo, "playbook": self.playbook_name, "armed": armed,
+               "size": plan_size.switch_name(self.armed_stage() if armed else self._stage_now()),
                "now_et": _et(now), "armed_at_et": _et(snap["armed_at"]), "until_et": _et(snap["until"]),
                "disarmed": {"at_et": _et(snap["disarmed_at"]), "why": snap["disarmed_why"]} if snap["disarmed_at"] else None,
                "blocked_today": self.arming.blocked_today(now), "bounds": self.armed_rules.bounds(), "used": used,
@@ -1092,12 +1123,15 @@ class AutoPlan:
         self._roll_day(now)
         terms = self.terms(view)
         with self._lock:
+            # The stage the dialog's terms named, so the Arm sends at what Ash read.
+            sv = terms["stage_value"]
+            self._armed_stage = plan_size.parse_stage(sv if sv == plan_size.ONE_SHARE else Decimal(sv))
             self.risk, self.calm = facts.risk, facts.calm
             self.state, self.left, self.notes, self.known = None, {}, {}, {}
             self.problem = ""
         self.arming.arm(now, terms)
         self.log("arm", None, risk=facts.risk, calm=facts.calm, picks=terms["picks"], bounds=terms["bounds"],
-                 handlers=terms["handlers"])
+                 handlers=terms["handlers"], size=terms["stage"])
         log.warning("ARMED PLAN armed: %s, picks %s, risk %s, calm %s", self.playbook_name, terms["picks"],
                     facts.risk, facts.calm)
         self._wake.set()

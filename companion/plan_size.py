@@ -85,6 +85,17 @@ def load_stage(path: Path = PLAYBOOK_FILE) -> Stage:
     return parse_stage(value)
 
 
+def smaller(a: Stage, b: Stage) -> Stage:
+    """The stage that sends fewer shares: "1_share" below every fraction, then the smaller fraction.
+    The armed plan sends at the smaller of the stage it was armed at and the switch now, so a switch
+    to 1 share after Arm lowers its size and a switch to Full after Arm does not raise it (Ash's pick
+    "Full for clicks and Arm", project thread, 2026-11-19 22:05:02 UTC)."""
+    a, b = parse_stage(a), parse_stage(b)
+    if a == ONE_SHARE or b == ONE_SHARE:
+        return ONE_SHARE
+    return min(a, b)
+
+
 def label(stage: Stage) -> str:
     """How the page names a stage: "1 share" or "25%"."""
     stage = parse_stage(stage)

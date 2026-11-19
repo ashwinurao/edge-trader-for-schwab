@@ -106,6 +106,7 @@ class View:
     def __init__(self, clock):
         self.clock, self.rv, self.risk = clock, 12.3, 100
         self.bars = {s: (v[1], v[2], v[3]) for s, v in PICKS.items()}
+        self.shares = {}                   # {ticker: {"long": n, "short": n}}: the cards' fitted shares
 
     def __call__(self):
         now = self.clock.now()
@@ -113,8 +114,13 @@ class View:
         rows = [{**r, "first_minute": {**r["first_minute"]}} for r in rows]
         clock = {"spy_rv": None if self.rv is None else
                  {"rv20": self.rv, "through": "2026-11-12", "calm": self.rv <= 10.5, "calm_max": 10.5}}
-        return P.build_view(answer(rows), now - timedelta(seconds=0.5), "", clock, now - timedelta(seconds=10), "",
-                            P.parse_risk(self.risk), now, P.load_playbook())
+        v = P.build_view(answer(rows), now - timedelta(seconds=0.5), "", clock, now - timedelta(seconds=10), "",
+                         P.parse_risk(self.risk), now, P.load_playbook())
+        for r in v.get("rows") or []:
+            for side, n in (self.shares.get(r.get("ticker")) or {}).items():
+                if isinstance(r.get(side), dict):
+                    r[side] = {**r[side], "shares": n}
+        return v
 
 
 class Broker(PlanBroker):
@@ -248,13 +254,23 @@ def lines(rig, event=None):
     return [x for x in rows if event is None or x["event"] == event]
 
 
+# The 5% targets, by hand: DDDD short 9.99 x 0.95 = 9.4905 -> 9.50 (rounded up for a short), AAAA long
+# 42.49 x 1.05 = 44.6145 -> 44.61, BBBB short 19.99 x 0.95 = 18.9905 -> 19.00, CCCC long 71.85 x 1.05 =
+# 75.4425 -> 75.44 (break_entry.target_for).
+WANT_TARGET = {"DDDD": "9.50", "AAAA": "44.61", "BBBB": "19.00", "CCCC": "75.44"}
+
+
 def want_req(sym, shares=1):
     side, trig, lim, stop = WANT[sym]
     risk = PICKS[sym]
     o = engine.order_for(side.lower(), Decimal(str(risk[1])), Decimal(str(risk[2])), Decimal(100),
                          engine.rules_from(PB_RAW))
-    req = break_entry.build_request(sym, side, o["trigger"], o["stop"], shares, cap=o["cap"])
+    # Every plan order carries Ash's 5% target in one OCO with the stop (2026-11-18 23:46:05 UTC); the
+    # armed send too since his pick "Full for clicks and Arm" (2026-11-19 22:05:02 UTC).
+    req = break_entry.build_request(sym, side, o["trigger"], o["stop"], shares, cap=o["cap"],
+                                    target=break_entry.target_for(side, o["trigger"]))
     assert (req["trigger"], req["limit"], req["stop"]) == (trig, lim, stop)   # the hand-worked numbers
+    assert req["target_price"] == WANT_TARGET[sym]                             # hand-worked: 5% from the trigger
     return {k: v for k, v in req.items() if k != "ticket_id"}
 
 
@@ -913,7 +929,11 @@ def test_through_the_trigger_inside_the_limit_goes_as_a_limit_at_the_limit(rig, 
     (o,) = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == "AAAA"]
     assert (o["orderType"], o["price"], o["orderLegCollection"][0]["instruction"]) == ("LIMIT", "42.55", "BUY")
     assert "stopPrice" not in o
-    (child,) = o["childOrderStrategies"]
+    (oco,) = o["childOrderStrategies"]
+    assert oco["orderStrategyType"] == "OCO"
+    target, child = oco["childOrderStrategies"]
+    assert (target["orderType"], target["price"], target["orderLegCollection"][0]["instruction"]) == \
+        ("LIMIT", "44.61", "SELL")
     assert (child["orderType"], child["stopPrice"], child["orderLegCollection"][0]["instruction"]) == \
         ("STOP", "41.92", "SELL")
     others = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] != "AAAA"]
@@ -2167,20 +2187,23 @@ def test_flat_all_while_a_plan_cancel_holds_traders_lock(rig):
     assert sorted(rig.broker.cancelled) == sorted(ids.values()) and no_red(rig)
 
 
-def test_arm_is_refused_unless_the_size_stage_is_1_share(rig):
-    """The armed plan sends 1 share (break_entry.BREAK_MAX_SHARES) whatever Step 9's size stage says:
-    the Arm click is refused in words at any other stage (architect, 17:42 UTC)."""
-    want = ('The size stage is 25%. The armed plan sends 1 share only, so it arms only at the 1-share stage '
-            '(size.stage "1_share" in playbook.json).')
+def test_arm_above_1_share_needs_the_cover_watch(rig):
+    """Ash's pick "Full for clicks and Arm" (project thread, 2026-11-19 22:05:02 UTC): Arm takes the size
+    switch's stage, but above 1 share only with the cover watch on (desk.full_ok), as a click at Full.
+    It was: the armed plan sent 1 share only and Arm was refused at any other stage (architect, 17:42 UTC)."""
+    want = ("The size is 25%. Above 1 share the armed plan needs the cover watch (EDGE_TRADER_PLAN_FLAT=1); "
+            "set 1 share or turn the cover watch on.")
     rig.clock.t = et(9, 30, 0)
     rig.desk.stage = plan_size.parse_stage(0.25)
+    rig.desk.full_ok = False
     r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
     assert not r["ok"] and r["refusals"] == [want] and not rig.plan.arming.is_armed(rig.clock.now())
     assert rig.plan.panel(check=True)["refusals"] == [want]
     rig.desk.stage = plan_size.ONE_SHARE
     t = arm(rig)["terms"]
-    assert t["shares"] == 1 and "1 share, its stop attached." in t["will"][0]
-    assert "Send more than 1 share: the size stage is for your clicks only." in t["will_not"]
+    assert t["shares"] == 1 and t["stage"] == "1_share"
+    assert "1 share, its stop and a 5% target attached in one OCO." in t["will"][0]
+    assert "Send more than 1 share: set Full on the A1 page before Arm to size by the cards." in t["will_not"]
     assert "Act after a Flat all click: the click disarms it first, and Flat all does the cancels." in t["will_not"]
 
 
@@ -2190,8 +2213,8 @@ def test_a_desk_without_a_readable_stage_refuses_arm(rig):
     del rig.desk.stage
     r = rig.plan.click_arm({"playbook": rig.plan.playbook_name, "bounds": rig.plan.armed_rules.bounds()})
     assert not r["ok"] and not rig.plan.arming.is_armed(rig.clock.now())
-    assert r["refusals"] == ["The size stage is not readable (AttributeError). The armed plan sends 1 share only, so "
-                             "it arms only at the 1-share stage (size.stage \"1_share\" in playbook.json)."]
+    assert r["refusals"] == ["The size is not readable (AttributeError). Arm is refused until the 1 share / Full "
+                             "switch reads again."]
 
 
 class AppPoller:
@@ -2313,3 +2336,110 @@ def test_arm_and_disarm_refusals_are_recorded(rec):  # noqa: F811
     got = [(x["action"], x["code"]) for x in rec.lines("refusal")]
     assert got == [("opening_plan_arm", "arm_is_off_on_the_dashboard"), ("opening_plan_disarm", "demo_mode")]
     assert {"/api/opening-plan/arm", "/api/opening-plan/disarm"} <= netlog.ACTIONS
+
+
+# ---------------------------------------------------------------- Full on Arm (Ash, 2026-11-19 22:05:02 UTC)
+# Engine shares at risk 100 (not calm, RV20 12.3), by hand: DDDD short 100 / (10.40 - 9.99) = 243.9 -> 243;
+# AAAA long 100 / (42.49 - 41.92) = 175.4 -> 175; BBBB short 100 / (20.50 - 19.99) = 196.1 -> 196;
+# CCCC long 100 / (71.85 - 71.20) = 153.8 -> 153.
+CARDS = {"DDDD": {"short": 300}, "AAAA": {"long": 120}, "BBBB": {"short": 50}, "CCCC": {"long": None}}
+
+
+def full(rig):
+    rig.desk.stage, rig.desk.full_ok = plan_size.SWITCH["full"], True
+    rig.view.shares = CARDS
+
+
+def qty(o):
+    return o["orderLegCollection"][0]["quantity"]
+
+
+def exits(o):
+    """(target LIMIT, STOP) of the entry's one OCO, each with its price and quantity."""
+    (oco,) = o["childOrderStrategies"]
+    assert oco["orderStrategyType"] == "OCO"
+    t, s = oco["childOrderStrategies"]
+    return (t["orderType"], t["price"], qty(t)), (s["orderType"], s["stopPrice"], qty(s))
+
+
+def test_full_arm_sends_each_cards_shares_never_above_the_risks_and_with_the_5_percent_target(rig):
+    """Ash's pick "Full for clicks and Arm" (project thread, 2026-11-19 22:05:02 UTC): at Full the armed
+    plan sends the smaller of the card's shares and the risk's shares at the final range. A card with
+    no shares for the side (CCCC here) sends 1 share and the day log says why."""
+    full(rig)
+    t = arm(rig)["terms"]
+    assert t["shares"] == "Full" and t["stage"] == "full"
+    assert "Full: each card's shares (never more than the risk per pick buys" in t["will"][0]
+    assert rig.plan.panel()["size"] == "full"
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    got = {o["orderLegCollection"][0]["instrument"]["symbol"]: o for o in rig.broker.placed}
+    want = {"DDDD": (243, "9.50", "10.40"), "AAAA": (120, "44.61", "41.92"), "BBBB": (50, "19.00", "20.50"),
+            "CCCC": (1, "75.44", "71.20")}
+    for sym, (n, tgt, stop) in want.items():
+        o = got[sym]
+        assert qty(o) == n and o["orderType"] == "STOP_LIMIT"
+        assert exits(o) == (("LIMIT", tgt, n), ("STOP", stop, n))
+    starts = {x["ticker"]: x for x in lines(rig, "send_start")}
+    assert (starts["DDDD"]["shares"], starts["DDDD"]["plan_shares"], starts["DDDD"]["card_shares"]) == (243, 243, 300)
+    assert (starts["AAAA"]["shares"], starts["AAAA"]["card_shares"], starts["AAAA"]["size"]) == (120, 120, "full")
+    assert starts["CCCC"]["shares"] == 1 and starts["CCCC"]["card_shares"] is None
+    assert starts["CCCC"]["size_why"] == "the card shows no shares for this side: 1 share"
+    assert all(x["target"] == WANT_TARGET[x["ticker"]] for x in starts.values())
+    rows = {r["ticker"]: r for r in rig.desk.state()["rows"]}
+    assert rows["AAAA"]["target"]["sent"] == "44.61"
+
+
+def test_full_through_the_trigger_sends_the_cards_shares_as_a_limit_with_the_target(rig):
+    """Change 2 of "do all 5" at Full: AAAA through its trigger inside the limit goes as a LIMIT at 42.55
+    for the card's 120 shares, its target and stop for the same 120."""
+    full(rig)
+    arm(rig)
+    rig.tape.prices["AAAA"] = 42.50
+    run(rig, et(9, 31, 3), start=et(9, 31, 0.1))
+    (o,) = [o for o in rig.broker.placed if o["orderLegCollection"][0]["instrument"]["symbol"] == "AAAA"]
+    assert (o["orderType"], o["price"], qty(o)) == ("LIMIT", "42.55", 120)
+    assert exits(o) == (("LIMIT", "44.61", 120), ("STOP", "41.92", 120))
+
+
+def test_a_switch_to_1_share_after_a_full_arm_lowers_the_size(rig):
+    full(rig)
+    arm(rig)
+    rig.desk.stage = plan_size.ONE_SHARE
+    assert rig.plan.panel()["size"] == "1_share"
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST and {qty(o) for o in rig.broker.placed} == {1}
+
+
+def test_a_switch_to_full_after_a_1_share_arm_does_not_raise_it(rig):
+    rig.desk.full_ok = True
+    rig.view.shares = CARDS
+    t = arm(rig)["terms"]
+    assert t["shares"] == 1
+    rig.desk.stage = plan_size.SWITCH["full"]
+    assert rig.plan.panel()["size"] == "1_share"
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST and {qty(o) for o in rig.broker.placed} == {1}
+    assert [without_id(r) for r in rig.sent] == [want_req(s) for s in NEAREST_FIRST]
+
+
+def test_full_with_no_card_reading_sends_1_share_each(rig):
+    """No account reading: the cards have no shares (opening_plan/fit.py), so Full sends 1 share, never
+    the risk's shares on their own."""
+    full(rig)
+    rig.view.shares = {s: {"long": None, "short": None} for s in PICKS}
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert {qty(o) for o in rig.broker.placed} == {1}
+    assert {x["size_why"] for x in lines(rig, "send_start")} == {"the card shows no shares for this side: 1 share"}
+
+
+def test_the_day_bound_and_burst_are_unchanged_at_full(rig):
+    """orders_per_day 2 at Full: two picks go with their card's shares and the plan disarms, as at 1 share."""
+    from companion.plan_auto import arming as A
+    full(rig)
+    arm(rig)
+    rig.plan.armed_rules = A.ArmedRules(**{**rig.plan.armed_rules.__dict__, "orders_per_day": 2})
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert [qty(o) for o in rig.broker.placed] == [243, 120]
+    assert "orders per day (2) reached" in rig.plan.panel()["disarmed"]["why"]

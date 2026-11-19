@@ -1137,10 +1137,13 @@ class PlanDesk:
             return False
 
     def place_auto(self, ticker: str, side: str, o: Mapping, pick: Optional[Mapping] = None,
-                   view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None) -> dict:
+                   view: Optional[Mapping] = None, log: Optional[Callable[..., None]] = None,
+                   stage: Any = plan_size.ONE_SHARE) -> dict:
         """Place's twin for the armed plan: Step 3's break entry from the open tape's final range.
-        `o` is engine.order_for of that range (trigger, stop, cap, shares); shares are capped by
-        BREAK_MAX_SHARES. `view` is Step 2's view from the feed's last answer (the executor's);
+        `o` is engine.order_for of that range (trigger, stop, cap, shares). At the 1-share `stage`
+        shares are capped by BREAK_MAX_SHARES; above it (_auto_shares) they are the card's shares at
+        that stage, never more than `o`'s. The entry carries the 5% target in one OCO with the stop,
+        as a click's does. `view` is Step 2's view from the feed's last answer (the executor's);
         this twin never asks Edge Scanner, and None or {} means no row check. Answers Trader.submit's
         dict, plus `not_sent` when no request left (then `again` and `busy`: Trader's own lock was
         busy, so the pick may try on a later reading)."""
@@ -1177,7 +1180,7 @@ class PlanDesk:
                     {"why": f"the side rule said {side_rule}", "side_rule": side_rule, "side": side.lower()}
                 return self._refuse(ticker, why, not_sent=True, again=bool(wait), this_name=wait == WAIT_NAME,
                                     side_rule=side_rule, log_fields=logged)
-            shares = min(int(o["shares"]), break_entry.BREAK_MAX_SHARES)
+            shares, card, size_why = self._auto_shares(view, ticker, side, o, stage)
             if shares < 1:
                 return self._refuse(ticker, f"0 shares for the {side.lower()} side at this risk.", not_sent=True)
             red = self._row_disagrees(view, ticker, side, o)
@@ -1187,7 +1190,12 @@ class PlanDesk:
                                             "thinkorswim for it today.")
                 return self._refuse(ticker, red, not_sent=True, red=True)
             try:
-                req = break_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, cap=o["cap"])
+                # Ash, project thread "Redesign the opening plan as one-click placement", 2026-11-18
+                # 23:46:05 UTC: every plan order is a trigger bracket with a target 5% from its entry
+                # and the stop. The armed send joins the clicks (pick "Full for clicks and Arm",
+                # 2026-11-19 22:05:02 UTC).
+                req = break_entry.build_request(ticker, side, o["trigger"], o["stop"], shares, cap=o["cap"],
+                                                target=break_entry.target_for(side, o["trigger"]))
             except ValueError as e:
                 return self._refuse(ticker, f"Could not build the order: {e}", not_sent=True)
             sent_at = self._now().isoformat(timespec="milliseconds")
@@ -1196,10 +1204,12 @@ class PlanDesk:
             self._put(ticker, state=SENDING, side=side, ticket_id=req["ticket_id"], order_id=None, origin="auto",
                       kind="break", range=rng, sent_at=sent_at, flips=int(rec.get("flips") or 0),
                       sent={"ticket_id": req["ticket_id"], "trigger": req["trigger"], "limit": req["limit"],
-                            "stop": req["stop"], "shares": shares},
+                            "stop": req["stop"], "target": req.get("target_price"), "shares": shares},
+                      target=req.get("target_price"),
                       text=f"Sending the {side.lower()} break entry (armed plan).")
         log("send_start", side=side.lower(), trigger=req["trigger"], limit=req["limit"], stop=req["stop"],
-            shares=shares, plan_shares=int(o["shares"]), ticket_id=req["ticket_id"])
+            target=req.get("target_price"), shares=shares, plan_shares=int(o["shares"]), card_shares=card,
+            size=plan_size.switch_name(stage), size_why=size_why, ticket_id=req["ticket_id"])
         logging.getLogger("companion.plan_auto").warning(
             "ARMED PLAN %s %s break: trigger %s limit %s stop %s, %s sh", side, ticker, req["trigger"],
             req["limit"], req["stop"], shares)
@@ -1216,6 +1226,32 @@ class PlanDesk:
                     self._save(recs)
             return {**r, "not_sent": True, "again": again, "busy": again}
         return r
+
+    def _auto_shares(self, view: Optional[Mapping], ticker: str, side: str, o: Mapping,
+                     stage: Any) -> tuple[int, Optional[int], str]:
+        """(shares to send, the card's shares or None, why) for an armed send at `stage`.
+
+        1 share: min(o's shares, BREAK_MAX_SHARES), as before. Above it (Ash's pick "Full for clicks
+        and Arm", project thread, 2026-11-19 22:05:02 UTC): the stage of the smaller of the card's
+        shares (the row Ash sees, fitted to the account, opening_plan/fit.py) and o's shares (risk per
+        pick over the final range's risk per share), inside the ticket's limits (plan_size.shares). A
+        card with no shares for this side (no row, or no account reading) sends 1 share and says so:
+        the plan never sizes above what the page showed."""
+        plan_n = int(o["shares"])
+        one = min(plan_n, break_entry.BREAK_MAX_SHARES)
+        try:
+            stage = plan_size.parse_stage(stage)
+        except ValueError:
+            return one, None, "the size stage is not readable: 1 share"
+        if stage == plan_size.ONE_SHARE:
+            return one, None, ""
+        row = self._find_row(view or {}, ticker)
+        s = row.get(side.lower()) if row is not None else None
+        card = s.get("shares") if isinstance(s, Mapping) else None
+        if isinstance(card, bool) or not isinstance(card, int) or card < 0:
+            return one, None, "the card shows no shares for this side: 1 share"
+        n, why = plan_size.shares(min(plan_n, card), stage, price=o["trigger"])
+        return n, card, why
 
     def cancel_auto(self, ticker: str, why: str = "", log: Optional[Callable[..., None]] = None,
                     log_fields: Optional[Mapping] = None) -> dict:

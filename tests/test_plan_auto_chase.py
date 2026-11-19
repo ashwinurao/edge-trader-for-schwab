@@ -260,7 +260,9 @@ def test_switch_off_inside_the_limit_step_6_sends_a_limit_at_the_limit(rig):
     assert rig.host.left == {} and rig.quotes == ["AAAA"]
     (order,) = rig.broker.placed
     assert (order["orderType"], order["price"], order.get("stopPrice")) == ("LIMIT", "42.55", None)
-    (stop,) = order["childOrderStrategies"]
+    (oco,) = order["childOrderStrategies"]
+    target, stop = oco["childOrderStrategies"]                 # the 5% target and the stop in one OCO
+    assert (target["orderType"], target["price"]) == ("LIMIT", "44.61")
     assert (stop["orderType"], stop["stopPrice"]) == ("STOP", "41.92")
     (req,) = rig.sent
     assert (req["entry"], req["trigger"], req["limit"]) == ("break", "42.49", "42.55")

@@ -624,8 +624,9 @@ bracket: the stop-limit entry, then one OCO of a LIMIT target and the STOP, each
 (`break_entry.TARGET_PCT`, `target_for`): long at trigger x 1.05, short at trigger x 0.95, on the
 stock's grid, rounded toward the entry. A chase counts from its own trigger (the ask or bid it chases).
 Example: long trigger 42.49 gives 44.61 (44.6145 rounded down); short trigger 41.91 gives 39.82. This
-replaces Ash's earlier "no target" (2026-11-18 13:40 UTC). The armed plan's sends (Steps 6 to 8)
-still carry no target. When the target fills, the OCO cancels the stop and the row says "The
+replaces Ash's earlier "no target" (2026-11-18 13:40 UTC). The armed plan's break entry carries the
+same target since Ash's pick "Full for clicks and Arm" (project thread, 2026-11-19 22:05:02 UTC); its
+flip and chase (Steps 7 and 8, off) still carry none. When the target fills, the OCO cancels the stop and the row says "The
 plan's target closed its N shares." A target that filled only part, or that still works after the
 plan's shares closed, turns the row unclear. Flatten, Flat all and Cancel stop read the plan's target
 after the close or the stop's cancel and cancel it if Schwab left it working (the OCO normally takes
@@ -713,7 +714,8 @@ to fit the account by `fit.py`). It is saved in the settings table (`opening_pla
 read back at start, and it replaces the playbook's stage while set. Full asks you to confirm, needs
 Flat all and the cover watch on (`EDGE_TRADER_PLAN_FLAT=1`), and changes nothing already sent: it
 applies to the next Place, Place all 4, Flip or Chase. A click the page showed at the other size is
-refused (the page sends the shares it showed). The armed plan still arms only at 1 share. The gaps under
+refused (the page sends the shares it showed). The armed plan takes the switch at the Arm click (below,
+"The armed plan"). The gaps under
 "Before any stage above 1 share" below are answered (gaps 1 and 2 built, 3 and 4 from Ash's own
 words and picks); read them before you switch to Full.
 
@@ -823,22 +825,32 @@ cancels orders without a click on each order (CONTRIBUTING rule 1, third excepti
 (`companion/plan_auto/`).
 
 The switch alone sends nothing. You arm it for the day with **Arm…** on the Opening plan page, from
-09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, 1 share each, the risk per pick and
+09:25:00 to 09:30:45 ET. The dialog shows the playbook, the picks, the size (1 share each, or Full), the
+risk per pick and
 the calm flag, what the plan will and will not do, and its bounds. **Arm with these bounds** is refused,
 with every reason listed, when: it is not a market day or outside that window; ARM is off on the
 dashboard; the risk per pick is not set; the calm flag is not known; Edge Scanner has no plan for today
 or its answer is old; Schwab's order list is old; a row already has an entry; the open tape does not
 answer; the bounds or the playbook changed since the dialog showed them; the plan was disarmed for
-the day; the size stage (`size.stage`, above) is not 1 share or cannot be read; or Flat all is on
+the day; the size cannot be read, or it is above 1 share without the cover watch
+(`EDGE_TRADER_PLAN_FLAT=1`); or Flat all is on
 (`EDGE_TRADER_PLAN_FLAT=1`) but the armed plan found no Flat all to wire its Disarm to, so a Flat all
-click would not disarm it (Edge Trader's log says so at start). The armed plan sends 1 share whatever
-the stage: the stage is for your clicks only, so Arm is refused at any other stage ("The size stage is
-25%. The armed plan sends 1 share only, so it arms only at the 1-share stage").
+click would not disarm it (Edge Trader's log says so at start).
+
+**Size of the armed sends (Ash's pick "Full for clicks and Arm", project thread, 2026-11-19 22:05:02
+UTC).** The Arm click takes the 1 share / Full switch as it is then. At 1 share each send is 1 share
+(`break_entry.BREAK_MAX_SHARES`). At Full each send is the smaller of the card's shares (what the A1 card
+shows, fitted to the account by `fit.py`) and the risk per pick over the final range's risk per share,
+inside the ticket's share and notional limits (`plan_entries.PlanDesk._auto_shares`, `plan_size.shares`).
+A card with no shares for the side (no account reading) sends 1 share, and the day log's `send_start`
+line says why. While armed the plan sends at the smaller of the Arm's size and the switch now: a switch
+to 1 share lowers it, a switch to Full does not raise it (`AutoPlan.armed_stage`). The Armed plan panel
+shows the size it sends at.
 
 Once armed, from 09:31:00 ET, each time a pick's 09:30 ET bar is final on Edge Scanner's open tape, the
 plan sends the same break entry the row's Place button sends (`companion/plan_entries.py`, through
-`Trader.submit`): the side nearer the last trade, 1 share (`break_entry.BREAK_MAX_SHARES`), the stop
-attached. When one reading gives several picks to send, it sends them all at once, each on its own
+`Trader.submit`): the side nearer the last trade, at the size above, the stop and the 5% target attached
+in one OCO. When one reading gives several picks to send, it sends them all at once, each on its own
 thread (`companion/plan_auto/burst.py`; Ash's go "do all 5", project thread, 2026-11-19 17:02:46 UTC,
 change 1). Each send keeps every check it had, and the bounds are taken one pick at a time, so four
 picks never pass the day's 4 orders. Edge Trader's order lock has a hold per name for this burst only

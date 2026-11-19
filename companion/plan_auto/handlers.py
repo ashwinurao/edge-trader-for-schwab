@@ -80,7 +80,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional, Protocol, Union
 
-from .. import break_entry, plan_entries
+from .. import break_entry, plan_entries, plan_size
 from . import CHASE_FLAG, switch_on
 
 Handler = Callable[["Lane"], bool]
@@ -180,6 +180,16 @@ class Lane:
     @property
     def entry(self) -> dict:
         return dict(self.pick.get("entry") or {"state": "none"})
+
+    @property
+    def stage(self) -> Any:
+        """The size stage of this send (executor.AutoPlan.armed_stage). A host without one (the
+        flip's and chase's test hosts) sends 1 share, as before."""
+        fn = getattr(self.host, "armed_stage", None)
+        try:
+            return fn() if callable(fn) else plan_size.ONE_SHARE
+        except Exception:
+            return plan_size.ONE_SHARE
 
     @property
     def bounds(self) -> dict:
@@ -307,7 +317,8 @@ def on_place(lane: Lane) -> bool:
     # young (Ash's card pick "One quote call for all 4", 2026-11-19 16:13:44 UTC; break_entry).
     names = [str(p.get("symbol") or "") for p in lane.reading.get("picks") or [] if isinstance(p, Mapping)]
     with break_entry.shared_quotes(names), break_entry.limit_guards(), _tape_price(lane):
-        r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log)
+        r = lane.desk.place_auto(ticker, side.upper(), o, pick=lane.pick, view=lane.view, log=lane.log,
+                                 stage=lane.stage)
     if r.get("not_sent"):
         # Refused before any request left (Trader's own lock, the desk's checks): nothing reached
         # Schwab, so the order and calls go back.
