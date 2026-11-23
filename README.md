@@ -96,14 +96,15 @@ name are refused). It needs no account and sends no telemetry.
   the end of the watch (at the latest 09:35:45 ET). Before each send it also checks the pick's row against the
   last OV picks answer that the Opening plan screen or the shadow log fetched. It never asks Edge Scanner's
   picks route itself.
-- **The Opening plan's charts, only while its screen is open** (with `EDGE_SCANNER_URL` set, never in
-  `--demo`): Schwab's price history (`price_history`, 1-minute bars of today from 08:30 ET, on the
-  read-only client) for the four picks, at most one call per pick a minute, and only when the page
-  asks. The calls count in the app's limit of 70 a minute and give way like the opening probe: none
-  while the last 60 seconds hold 54 calls or more, while the armed plan's hold runs, in the 429 pause,
-  or from 09:29:30 to 09:33:00 ET, when the page draws the live minutes from the prices Edge Trader
-  already holds (`companion/opening_plan/bars.py`). A 429 answer starts the app's pause. Each call writes
-  a netlog `call` line (purpose `plan_bars`). The chart library (TradingView's lightweight-charts 4.2.3,
+- **The Opening plan's charts, only while its A1 screen is open** (with `EDGE_SCANNER_URL` set, never in
+  `--demo`): Edge Scanner's `GET /api/v2/ov-picks/plan-bars` for the four picks, every 2 s, one ask at a
+  time with a 3 s time limit, over the LAN (`companion/opening_plan/bars.py`). Edge Scanner answers with
+  today's 1-minute Alpaca bars from 08:30 to 11:00 ET and the forming minute (its `scanner/plan_bars.py`).
+  The charts make no Schwab call, so they never queue in front of the poller's order-list read. After a
+  failed ask the next waits 5 s, then 10, 20, 40, 60, and the chart keeps its last bars with the error.
+  Each ask writes a netlog `call` line (vendor `edge_scanner`). Until 2026-11-23 these bars came from
+  Schwab's price history on the poller's client; on that day its HTTP 500s held the order list up to a
+  minute old and the plan refused to send. The chart library (TradingView's lightweight-charts 4.2.3,
   Apache-2.0) is in the repo and served by Edge Trader; the page loads nothing from the internet.
 - **Schwab's quote streamer, unless you set `EDGE_TRADER_QUOTE_STREAM=off`** (never in `--demo`): one
   websocket to the streamer address Schwab names in `userPreference` (read once per start), with
@@ -573,7 +574,7 @@ the day's four picks as cards in rank order (`companion/opening_plan/static/open
   and chase picks, **Place all 4**, **Flat all**, and **Details** (the table).
 - **Each card:** the ticker, its live price, ATR, the margin Schwab charges for the side ("2.5x", or
   "1.4x?" when no preview gave the name's rate), the shares, and a chart of 1-minute bars fixed from
-  08:30 to 11:00 ET with the BUY and SELL levels (the side shown is solid, the other dashed), the STOP
+  08:30 to 11:00 ET (Alpaca's, through Edge Scanner, updated every 2 s, the forming minute included) with the BUY and SELL levels (the side shown is solid, the other dashed), the STOP
   once filled, the TARGET line (in range once the price nears it; the header's "TGT" chip names it as
   soon as the entry is sent), and the CHASE limit while a chase rests. Before its 09:30 minute the card shows the
   **estimated shares** below, marked EST; with no estimate it says "sizes at 09:31".
