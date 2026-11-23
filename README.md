@@ -110,9 +110,9 @@ name are refused). It needs no account and sends no telemetry.
   `LEVELONE_EQUITIES` quotes for the stocks the app marks (open positions and working orders) and, in
   the opening probe's windows, the day's Opening plan symbols. It asks for quote fields only (bid, ask,
   last, volume, close, change, mark, quote and trade times); it never sends, changes or cancels an order. Its own
-  Schwab client allows only what schwabdev's stream reads (the tokens and the streamer info). Default
-  `shadow`: the REST quotes call still feeds every mark, and once a minute a netlog `stream` line says
-  how the stream compared (`companion/quote_stream.py`). See "Schwab's quote stream" below.
+  Schwab client allows only what schwabdev's stream reads (the tokens and the streamer info). While it
+  is live and has every symbol, its quotes are the marks and the REST quotes call is not made
+  (`companion/quote_stream.py`). See "Schwab's quote stream" below.
 - **Opening probe, only if you set `EDGE_TRADER_OPEN_PROBE=1`** (off by default, never in `--demo`):
   around the open it reads Schwab quotes and previews Break orders, and **sends no order**. Its own
   Schwab client allows only `quotes` and `preview_order`; every other call raises an error. Windows are ET,
@@ -1317,18 +1317,18 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
   (`STALE_AFTER_S`). Quiet for 60 seconds (`RESTART_AFTER_S`) while wanted: the stream is stopped and
   started again after 30, 60, 120, then 300 seconds (`RETRY_S`). A refused login or a failed start waits
   the same way.
-- **`shadow` (default):** the REST quotes call runs as before, every 3 seconds, and feeds every mark.
-  Once a minute a netlog `stream` line (`event: "minute"`) gives: live or not, the counts (messages,
-  heartbeats, quotes, restarts, errors), `lead` (per symbol: how much newer the stream's quote time was
-  than the REST answer's, median and min in ms), `lag` (per symbol: how late the stream's quotes arrived
-  after their quote time, median and 90th percentile in ms; the REST side is the `data_age_ms` of the
-  poller's and the probe's quotes calls) and `missing` (symbols REST had and the stream did not).
-  Start, stop and error lines say what happened.
-- **`on`:** while the stream is live, has a quote for every symbol the poller marks, and no opening
+- **`on` (default; Ash, project thread, 2026-11-23 21:14:58 UTC: "no need for shadow mode"):** while
+  the stream is live, has a quote for every symbol the poller marks, and no opening
   probe symbol is waiting to ride in the REST call (brief 34), the stream's quotes are the marks
   (`via: "stream"`), looked at every second, and no REST quotes call is made, so it costs nothing of
   the 70 calls a minute. Otherwise the REST call runs as before, every 3 seconds and inside the budget.
   The marks are still "fresh" by the same rule as before (`Poller._fresh`).
+- **The netlog:** once a minute a `stream` line (`event: "minute"`) gives: live or not, the counts
+  (messages, heartbeats, quotes, restarts, errors), `lag` (per symbol: how late the stream's quotes
+  arrived after their quote time, median and 90th percentile in ms; the REST side is the `data_age_ms`
+  of the poller's and the probe's quotes calls), `lead` (whenever a REST quotes call ran too: per
+  symbol, how much newer the stream's quote time was, median and min in ms) and `missing` (symbols
+  REST had and the stream did not). Start, stop and error lines say what happened.
 - **What does not change:** orders, the order list, the account, the quote read before a send and the
   opening probe stay on REST. The stream never sends, changes or cancels an order.
 - **Off:** `EDGE_TRADER_QUOTE_STREAM=off` opens no stream; the app then polls quotes as before.
@@ -1350,7 +1350,7 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
 | `EDGE_TRADER_PLAN_DEMO_RV20` | `--demo` only: the SPY RV20 the demo's Opening plan reads (e.g. `12.3` for a day that is not calm). Default: 9.80, a calm day. |
 | `EDGE_TRADER_NO_EARLY_STATUS` | `1` turns off the two order status reads right after a new entry is sent. |
 | `EDGE_TRADER_NETLOG` | `0` turns off the network record in `data/netlog/` (answers, calls, waits, routes, refusals, lag) and its threads. On by default. |
-| `EDGE_TRADER_QUOTE_STREAM` | Schwab's quote stream: `shadow` (default) runs it beside the REST quotes call and only compares the two; `on` takes the marks from it while it is live and has a quote for every symbol, so the REST quotes call is not made; `off` opens no stream. |
+| `EDGE_TRADER_QUOTE_STREAM` | Schwab's quote stream: `on` (default) takes the marks from it while it is live and has a quote for every symbol, so the REST quotes call is not made; `off` opens no stream and polls quotes over REST as before. |
 | `EDGE_TRADER_OPEN_PROBE` | `1` turns on the opening probe: Schwab quotes and Break order previews around the open, timed in `data/netlog/`. It sends no order. Off by default. |
 | `EDGE_TRADER_OPEN_PROBE_WINDOWS`, `EDGE_TRADER_OPEN_PROBE_PREVIEWS` | For a test run at another time: the probe's windows (`10:20:00-10:25:00`, comma separated) and preview times (`10:21:00,10:22:00`), ET. Default: `companion/open_probe.json`. |
 | `EDGE_TRADER_PLAN_BUTTONS` | `1`, together with `EDGE_TRADER_BREAK_ENTRY=1` and `EDGE_SCANNER_URL`, puts Place / Cancel / Flip buttons on the Opening plan rows. Off by default. |
@@ -1392,7 +1392,7 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
 - **No stop at entry:** a trade sent without a stop gets its R from the first stop you set from the
   app once Schwab shows it working (a stop set in thinkorswim does not count).
 - **One stream per Schwab user:** Schwab allows one streamer connection per user. Edge Trader opens one
-  for quotes (`EDGE_TRADER_QUOTE_STREAM`, default `shadow`), so another app on the same Schwab login
+  for quotes (`EDGE_TRADER_QUOTE_STREAM`, default `on`), so another app on the same Schwab login
   that opens the streamer can disconnect it, or be disconnected. Set `EDGE_TRADER_QUOTE_STREAM=off` if another app needs the stream.
   Orders, the order list and the account are always REST, and the app keeps its own requests well
   under Schwab's limits.

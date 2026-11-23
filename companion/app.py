@@ -70,12 +70,12 @@ class DemoPoller:
 poller = DemoPoller() if DEMO else Poller(lane=os.environ.get("EDGE_TRADER_ORDER_LANE", "1").strip() != "0")
 trader = Trader(poller.store)
 # Schwab's quote stream (companion/quote_stream.py; Ash's pick 2026-11-23 20:44:39 UTC). Default
-# "shadow": it runs and is compared with the REST quotes, which still feed every mark.
+# "on" (default): its quotes are the marks while it covers every symbol; "off": no stream.
 from . import quote_stream as _quote_stream
 if not DEMO and _quote_stream.mode() != "off":
     poller.stream, poller.stream_mode = _quote_stream.QuoteStream(_quote_stream.schwab_stream_maker()), _quote_stream.mode()
-    # The fill doorbell on the same stream (Poller.ring): in "on" an order event reads the order list
-    # at once; in "shadow" the events are only written to the netlog.
+    # The fill doorbell on the same stream (Poller.ring): an order or fill event reads the order list
+    # and the account at once.
     poller.stream.doorbell = poller.ring
 poller.trader = trader
 trader.on_request = poller.note_external_request

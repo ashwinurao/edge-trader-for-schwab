@@ -1,9 +1,9 @@
 """Schwab's quote stream (companion/quote_stream.py) and the poller's use of it.
 
 Ash's pick "Stream quotes + fill doorbell" (project thread, 2026-11-23 20:44:39 UTC) ends REST only
-for quotes. These tests pin what the stream may and may not do: in "shadow" it never replaces a REST
-call, in "on" it stands in for the quotes call only while it is live and has a full quote for every
-symbol, and the order list and the account never come from it. Nothing reaches the network: a fake
+for quotes; "on" is the default (Ash, 21:14:58 UTC: "no need for shadow mode"). These tests pin what
+the stream may and may not do: it stands in for the quotes call only while it is live and has a full
+quote for every symbol, and the order list and the account never come from it. Nothing reaches the network: a fake
 stream stands in for schwabdev's Stream, and the poller runs on test_poller_loop's fake clock.
 """
 import json
@@ -279,8 +279,8 @@ def test_the_minute_line_compares_with_rest_and_says_how_late_quotes_came():
     assert again["lead"] == {} and again["lag"] == {} and again["missing"] == [] and again["quotes"] == 0
 
 
-@pytest.mark.parametrize("value, want", [(None, "shadow"), ("", "shadow"), ("off", "off"), (" ON ", "on"),
-                                         ("shadow", "shadow"), ("yes", "shadow")])
+@pytest.mark.parametrize("value, want", [(None, "on"), ("", "on"), ("off", "off"), (" OFF ", "off"),
+                                         ("on", "on"), ("shadow", "on"), ("yes", "on")])
 def test_mode_reads_the_switch(value, want):
     env = {} if value is None else {qs_mod.ENV_VAR: value}
     assert qs_mod.mode(env) == want
@@ -319,8 +319,8 @@ def _feed(q, *syms):
     q.receive(data(*(full(s, bid=20.0, ask=20.02) for s in syms)))
 
 
-def test_shadow_keeps_every_rest_quotes_call_and_the_rest_marks(rig):
-    q, streams = _stream_on_poller(rig, "shadow")
+def test_a_mode_other_than_on_keeps_every_rest_quotes_call_and_the_rest_marks(rig):
+    q, streams = _stream_on_poller(rig, "off")
     run(rig, 0.5)
     _feed(q, "BRVO")
     later = rig.clock.mono

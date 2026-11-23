@@ -8,12 +8,12 @@ poller asking every 3 s. Ash, same thread, 19:53 UTC: "ignore the other app, it 
 connection" (Schwab allows one streamer per login).
 
 The mode is EDGE_TRADER_QUOTE_STREAM:
-- "shadow" (the default until a measured open): the stream runs beside the REST quotes call, which
-  still feeds every mark. Once a minute a netlog `stream` line says how the two compared: per symbol,
-  how much newer the stream's quote time was than REST's, and which symbols had no stream quote.
-- "on": while the stream is live and has a quote for every symbol the poller needs, those quotes are
-  the marks and the REST quotes call is not made. Otherwise the REST call runs as before, every 3 s.
+- "on" (the default; Ash, project thread, 2026-11-23 21:14:58 UTC: "no need for shadow mode"): while
+  the stream is live and has a quote for every symbol the poller needs, those quotes are the marks and
+  the REST quotes call is not made. Otherwise the REST call runs as before, every 3 s.
 - "off": no stream.
+Once a minute a netlog `stream` line says how the stream did: per symbol, how late its quotes arrived
+and, whenever a REST quotes call ran too, how much newer the stream's quote time was than REST's.
 
 Live means: logged in, and a message (data or Schwab's heartbeat) within STALE_AFTER_S. A symbol
 counts only once the stream sent its first full quote after it was asked for. The stream never
@@ -47,8 +47,8 @@ from . import netlog
 log = logging.getLogger("companion.quote_stream")
 
 ENV_VAR = "EDGE_TRADER_QUOTE_STREAM"
-MODES = ("off", "shadow", "on")
-DEFAULT_MODE = "shadow"
+MODES = ("off", "on")
+DEFAULT_MODE = "on"
 SERVICE = "LEVELONE_EQUITIES"
 # Symbol, bid, ask, last, total volume, close, net change, mark, quote time, trade time, net percent
 # change (schwabdev translate.py LEVELONE_EQUITIES: the field number is the name's place in its list).
@@ -93,7 +93,7 @@ class QuoteStream:
         self._quotes: dict[str, dict] = {}        # symbol -> merged quote (REST field names)
         self._full: set[str] = set()              # symbols whose first full quote came after asking
         self._counts = {"messages": 0, "heartbeats": 0, "quotes": 0, "activity": 0, "restarts": 0, "errors": 0}
-        self._compare: dict[str, list[float]] = {}   # shadow: symbol -> stream minus REST quote time, ms
+        self._compare: dict[str, list[float]] = {}   # symbol -> stream minus REST quote time, ms
         self._missing: set[str] = set()
         self._lag: dict[str, list[float]] = {}       # symbol -> arrival time minus Schwab's quote time, ms
         self._rest: dict[str, dict] = {}             # symbol -> the last REST quotes entry for it
@@ -274,7 +274,7 @@ class QuoteStream:
         qt = c.get("34")
         if isinstance(qt, (int, float)) and not isinstance(qt, bool):
             # How late a new quote reaches us. The REST side of this is the probe's and the poller's
-            # data_age_ms (companion/netlog.py), so a shadow open compares the two from the netlog.
+            # data_age_ms (companion/netlog.py), so an open's netlog compares the two.
             self._lag.setdefault(sym, []).append(self._wall() * 1000 - qt)
         for k, name in _MAP.items():
             v = c.get(k)
@@ -337,7 +337,7 @@ class QuoteStream:
                     self._missing.add(sym)
 
     def maybe_summary(self) -> Optional[dict]:
-        """Once a minute, one netlog `stream` line: live or not, counts, and the shadow comparison
+        """Once a minute, one netlog `stream` line: live or not, counts, the comparison with REST
         (per symbol: n, median and min of stream minus REST quote time in ms), and per symbol how
         late its quotes arrived (n, median and 90th percentile of arrival minus quote time, ms).
         Returns the line."""

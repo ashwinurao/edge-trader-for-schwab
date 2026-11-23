@@ -88,9 +88,9 @@ def test_an_event_without_a_type_still_rings():
 
 # ---- the poller ---------------------------------------------------------------------------------
 
-def test_in_shadow_a_ring_moves_nothing(rig):
+def test_a_ring_outside_mode_on_moves_nothing(rig):
     run(rig, 0.5)
-    rig.p.stream_mode = "shadow"
+    rig.p.stream_mode = "off"
     before = dict(rig.p._next)
     assert rig.p.ring("OrderFillCompleted") is False and rig.p._next == before
 

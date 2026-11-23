@@ -150,7 +150,7 @@ class Poller:
         self._rebuild_lock = threading.RLock()     # one rebuild at a time, from either thread
         self.guests = quote_guests.Guests()        # brief 34: symbols that ride in the quotes call
         # Schwab's quote stream (companion/quote_stream.py, Ash's pick 2026-11-23 20:44:39 UTC), set by
-        # the app. "shadow": it runs beside the REST quotes call and is only compared; "on": its quotes
+        # the app. "on": its quotes
         # are the marks while it covers every symbol, and the REST call waits.
         self.stream = None
         self.stream_mode = "off"
@@ -484,7 +484,7 @@ class Poller:
         elif name == "quotes":
             syms = self._quote_symbols()
             if self.stream is not None:
-                # The opening probe's pick names too, so a shadow open measures the stream on them.
+                # The opening probe's pick names too, so the netlog measures the stream on them.
                 self._stream_want(sorted(set(syms) | set(self.guests.wanted())))
             if syms:
                 if self._stream_marks(syms):
@@ -914,8 +914,8 @@ class Poller:
     def ring(self, msg_type: str = "") -> bool:
         """The fill doorbell (Ash's pick 2026-11-23 20:44:39 UTC): Schwab's stream says an order or
         fill changed. Make the order list and the account due now (or at the end of RING_GAP_S after
-        the last ring) and wake the lane. Only in mode "on"; in "shadow" the stream only writes the
-        event to the netlog. Runs on the stream's thread and never waits. True when it moved a read."""
+        the last ring) and wake the lane. Only in mode "on" (with "off" there is no stream). Runs on the
+        stream's thread and never waits. True when it moved a read."""
         if self.stream_mode != "on":
             return False
         now = time.monotonic()
