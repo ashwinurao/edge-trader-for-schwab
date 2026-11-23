@@ -162,3 +162,7 @@ def test_the_report_holds_no_symbol_or_price(report):
     text = json.dumps(report)
     for word in ("AAA", "BBB", "20.5", "SIM"):
         assert word not in text.replace("SIMULATED", "")
+
+
+def test_a_run_name_becomes_a_file_name_windows_accepts():
+    assert sr._safe("on+drop 10:05:00/20") == "on_drop_10_05_00_20"

@@ -564,6 +564,12 @@ class SimEvent:
         return self.is_set()
 
 
+def _safe(name: str) -> str:
+    """A run's name as a file name: Windows refuses ":" and "/" splits a folder (2026-11-23, the
+    first run on Ash's PC stopped at "on+drop 10:05:00/20")."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
 def _pcts(xs: list[float]) -> Optional[dict]:
     if not xs:
         return None
@@ -709,7 +715,7 @@ class Sim:
         work = Path(tempfile.mkdtemp(prefix="stream-replay-", dir=self.workdir))
         try:
             with _patched(self.clock, self.schwab):
-                p = Poller(Store(work / f"{self.name}.db"), lane=True)
+                p = Poller(Store(work / f"{_safe(self.name)}.db"), lane=True)
                 p._stop, p._wake = SimEvent(self), SimEvent(self)
                 if self.with_stream:
                     q = QuoteStream(self.hub.make, mono=self.clock.monotonic, background_start=False,
