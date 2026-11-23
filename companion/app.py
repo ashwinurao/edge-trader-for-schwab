@@ -444,9 +444,9 @@ try:
     from .opening_plan import routes as _plan_routes
 except ImportError:
     _plan_routes = None
-# The A1 charts' 1-minute bars (companion/opening_plan/bars.py): budgeted like the opening probe.
-# poller.client is the read-only client (schwab._ALLOWED); the order client has no price_history.
-_plan_bars = None if (DEMO or _plan_routes is None) else _plan_routes.bars_source(poller)
+# The A1 charts' 1-minute bars (companion/opening_plan/bars.py): Edge Scanner's Alpaca bars, never a
+# Schwab call, so they can't hold up the poller's order-list read (2026-11-23).
+_plan_bars = None if (DEMO or _plan_routes is None) else _plan_routes.bars_source()
 FEATURES = _plan_routes.register(app, trader.store, _guard, demo=DEMO, snapshot=poller.snapshot, private=PRIVATE, bars=_plan_bars, rates=PREVIEW_RATES) if _plan_routes else []
 FEATURES += _feature_routes.register(app, trader, poller, _guard, demo=DEMO) if _feature_routes else []
 # Place / Cancel / Flip on the plan rows (Step 4): only with EDGE_TRADER_PLAN_BUTTONS=1,

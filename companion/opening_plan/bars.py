@@ -1,25 +1,26 @@
-"""One-minute bars for the Opening plan's charts: Schwab's price history from 08:30 ET.
+"""One-minute bars for the Opening plan's charts: Edge Scanner's Alpaca bars from 08:30 ET, every 2 s.
 
-Ash's go: the card "Start building the A1 Opening plan in Edge Trader?", pick "Yes, all in one go"
-(project thread "Redesign the opening plan as one-click placement", 2026-11-18 20:00:20 UTC). The
-message above that card names this source: 1-min bars from 08:30, read from Schwab's price
-history, a call already on Edge Trader's allowed list (companion/schwab.py _ALLOWED). His ask
-(2026-11-18 14:07:45 UTC): "a normal TradingView chart same as scanner with 1 min bars..and the
-chart view is fixed 8:30 - 11:00am ET".
+Ash, project thread "Fix stale pick list blocking Arm", 2026-11-23 20:18:45 UTC: "so let's move
+charts over to alpaca, that's for certain, i want charts to update every 2 secs". Until then these
+bars came from Schwab's price history on the poller's own Schwab client. schwabdev sends one
+request at a time per client, so on 2026-11-23, when price history answered HTTP 500 after about
+5 s from 09:27 ET and the page asked again every 15 s per name, the poller's order-list read
+waited 10 to 16 s behind them: "Schwab's order list is old", nothing was sent and Arm stayed off.
+The charts now make no Schwab call at all.
 
-Display only: no click reads these bars. The calls stay inside the 70 a minute (companion/poller.py):
-- one call per pick, only when the page asks and that pick's bars are older than `refresh_s`;
-- each call asks the budget first and gives way like the opening probe (Poller.probe_gives_way,
-  brief 33): it never sends while the minute is busy, in the 429 pause or while a hold holds;
-- none in the quiet window around the open (`quiet_et`, 09:29:30 to 09:33:00 ET by default), when
-  the clicks and the probe need the minute. The page draws the live minutes from the prices Edge
-  Trader already holds (the rows' price line) and the 09:30 bar from Edge Scanner's row;
-- a 429 starts the app's own pause (Poller.note_external_request) and stops these reads for it.
-Each call counts in the 60 s window (Poller.note_probe_request) and writes a netlog line.
+Display only: no click and no armed send reads these bars.
+- One GET of Edge Scanner's /api/v2/ov-picks/plan-bars (scanner/plan_bars.py) for all names asked,
+  over the LAN through feed.http_get (EDGE_SCANNER_URL, the Opening plan's one network read), with
+  a short time limit (TIMEOUT_S). Edge Scanner reads Alpaca REST and caches 2 s.
+- At most one ask out at a time and at most one every MIN_SPACING_S: callers that come sooner, or
+  while an ask runs, get the last answer at once. Only while the page asks.
+- After a failed ask the next one waits BACKOFF_S (5 s, then 10, 20, 40, 60) and the last good bars
+  stay, with the error and their age.
 
-What an answer looks like: {ticker: {"bars": [{time, open, high, low, close, volume}], "at_et",
-"age_s", "error"}}. `time` is seconds since 1970 of the bar's ET minute written as if it were UTC,
-so the chart's axis reads ET (lightweight-charts shows UTC). An old or missing answer says so.
+What an answer looks like: {"quiet": false, "refresh_s": 2, "bars": {ticker: {"bars": [{time, open,
+high, low, close, volume, forming?}], "at_et", "age_s", "error"}}}. `time` is seconds since 1970 of
+the bar's ET minute written as if it were UTC, so the chart's axis reads ET (lightweight-charts
+shows UTC). `forming` marks the minute that is still open. An old or missing answer says so.
 """
 from __future__ import annotations
 
@@ -29,21 +30,25 @@ import time as _time
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping, Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
-
-from .. import netlog
 
 log = logging.getLogger("companion.opening_plan.bars")
 ET = ZoneInfo("America/New_York")
+
+ROUTE = "/api/v2/ov-picks/plan-bars"      # Edge Scanner, scanner/plan_bars.py
+REFRESH_S = 2.0                            # Ash, 2026-11-23 20:18:45 UTC: "every 2 secs"
+MIN_SPACING_S = 1.5                        # Edge Scanner caches 2 s: a sooner ask gets the same bars
+TIMEOUT_S = 3.0
+BACKOFF_S = (5.0, 10.0, 20.0, 40.0, 60.0)
+MAX_NAMES = 8
 
 
 @dataclass(frozen=True)
 class Settings:
     from_et: time = time(8, 30)
     to_et: time = time(11, 0)
-    refresh_s: float = 60.0
-    quiet_from_et: time = time(9, 29, 30)
-    quiet_to_et: time = time(9, 33, 0)
+    refresh_s: float = REFRESH_S
 
 
 def et_epoch(dt: datetime) -> int:
@@ -52,141 +57,104 @@ def et_epoch(dt: datetime) -> int:
     return int(et.replace(tzinfo=timezone.utc).timestamp())
 
 
-def parse_candles(body: Any, day, s: Settings) -> list[dict]:
-    """Schwab's {"candles": [{open, high, low, close, volume, datetime ms}]} as chart bars, only the
-    day's minutes from `from_et` to `to_et`, oldest first. A candle that is not a bar is dropped."""
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def chart_bars(rows: Any) -> list[dict]:
+    """Edge Scanner's bars ({t: seconds since 1970 UTC, open, high, low, close, volume, forming?}) as
+    chart bars on the ET clock, oldest first. A row that is not a bar is dropped."""
     out = []
-    candles = body.get("candles") if isinstance(body, Mapping) else None
-    for c in candles or []:
-        if not isinstance(c, Mapping):
+    for b in rows if isinstance(rows, list) else []:
+        if not isinstance(b, Mapping) or not _num(b.get("t")):
             continue
-        try:
-            at = datetime.fromtimestamp(float(c["datetime"]) / 1000, timezone.utc).astimezone(ET)
-            o, h, l, cl = (float(c[k]) for k in ("open", "high", "low", "close"))
-        except (KeyError, TypeError, ValueError):
+        o, h, l, c = (b.get(k) for k in ("open", "high", "low", "close"))
+        if not all(_num(x) for x in (o, h, l, c)) or not (h >= max(o, c) and l <= min(o, c) and l > 0):
             continue
-        if at.date() != day or not s.from_et <= at.time() <= s.to_et:
-            continue
-        if not (h >= max(o, cl) and l <= min(o, cl) and l > 0):
-            continue
-        v = c.get("volume")
-        out.append({"time": et_epoch(at), "open": o, "high": h, "low": l, "close": cl,
-                    "volume": float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0})
-    out.sort(key=lambda b: b["time"])
+        bar = {"time": et_epoch(datetime.fromtimestamp(b["t"], timezone.utc)), "open": float(o), "high": float(h),
+               "low": float(l), "close": float(c), "volume": float(b["volume"]) if _num(b.get("volume")) else 0.0}
+        if b.get("forming") is True:
+            bar["forming"] = True
+        out.append(bar)
+    out.sort(key=lambda x: x["time"])
     return out
 
 
 class Bars:
-    """The cache and the budgeted reads. `client` returns the poller's read-only Schwab client
-    (or None); `gives_way(need)` and `count()` are Poller.probe_gives_way and note_probe_request;
-    `pause(retry_after)` starts the app's 429 pause; `cooldown()` is its time left."""
+    """The charts' bars from Edge Scanner. `get(url, timeout)` is feed.http_get (tests pass a fake);
+    `now` returns an aware datetime, `mono` a monotonic second count."""
 
-    def __init__(self, client: Callable[[], Any], gives_way: Callable[[int], Optional[str]],
-                 count: Callable[[], None], pause: Callable[[Any], None], cooldown: Callable[[], float],
+    def __init__(self, base_url: str, get: Callable[[str, float], Any],
                  now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 settings: Settings = Settings(), mono: Callable[[], float] = _time.monotonic) -> None:
-        self._client, self._gives_way, self._count, self._pause = client, gives_way, count, pause
-        self._cooldown, self._now, self.s, self._mono = cooldown, now, settings, mono
-        self._lock = threading.Lock()              # the cache only; never held across a Schwab call
-        self._cache: dict[str, dict] = {}          # ticker -> {"bars", "ok_mono", "ok_at", "error", "day"}
-        self._busy: set[str] = set()
+                 mono: Callable[[], float] = _time.monotonic, settings: Settings = Settings()) -> None:
+        self._base, self._get, self._now, self._mono, self.s = base_url.rstrip("/"), get, now, mono, settings
+        self._lock = threading.Lock()              # the cache only; never held across the GET
+        self._busy = False
+        self._names: tuple = ()
+        self._body: Optional[dict] = None          # Edge Scanner's last good answer
+        self._ok_at: Optional[datetime] = None
+        self._tried: Optional[float] = None
+        self._fails = 0
+        self._error = ""
 
-    def quiet(self, now: Optional[datetime] = None) -> bool:
-        t = (now or self._now()).astimezone(ET).time()
-        return self.s.quiet_from_et <= t < self.s.quiet_to_et
-
-    def _due(self, ticker: str, day) -> bool:
-        c = self._cache.get(ticker)
-        if c is None or c.get("day") != day or c.get("ok_mono") is None:
-            return c is None or c.get("tried_mono") is None or self._mono() - c["tried_mono"] >= self.s.refresh_s / 4
-        return self._mono() - c["ok_mono"] >= self.s.refresh_s
+    def _due(self, names: tuple) -> bool:
+        if self._tried is None or names != self._names:
+            return True
+        wait = BACKOFF_S[min(self._fails, len(BACKOFF_S)) - 1] if self._fails else MIN_SPACING_S
+        return self._mono() - self._tried >= wait
 
     def read(self, tickers: Iterable[str]) -> dict:
-        """The bars for these names, fetching at most the ones that are due (one call each)."""
-        now = self._now()
-        day = now.astimezone(ET).date()
-        names = [str(t).upper() for t in tickers if t][:8]
-        for t in names:
-            with self._lock:
-                go = t not in self._busy and self._due(t, day)
-                if go:
-                    self._busy.add(t)
+        """The bars for these names: Edge Scanner's last answer, asked again when due."""
+        names = tuple(dict.fromkeys(str(t).strip().upper() for t in tickers if str(t).strip()))[:MAX_NAMES]
+        with self._lock:
+            go = bool(names) and not self._busy and self._due(names)
             if go:
-                try:
-                    self._fetch(t, now)
-                finally:
-                    with self._lock:
-                        self._busy.discard(t)
-        out = {}
-        with self._lock:
-            for t in names:
-                c = self._cache.get(t) or {}
-                ok_at = c.get("ok_at") if c.get("day") == day else None
-                out[t] = {"bars": list(c.get("bars") or []) if ok_at else [],
-                          "at_et": ok_at.astimezone(ET).strftime("%H:%M:%S") if ok_at else None,
-                          "age_s": round((now - ok_at).total_seconds(), 1) if ok_at else None,
-                          "error": c.get("error") or ("" if ok_at else "No bars yet.")}
-        return {"quiet": self.quiet(now), "refresh_s": self.s.refresh_s, "bars": out}
+                self._busy, self._tried = True, self._mono()
+                if names != self._names:
+                    self._names, self._body, self._ok_at, self._fails, self._error = names, None, None, 0, ""
+        if go:
+            try:
+                self._ask(names)
+            finally:
+                with self._lock:
+                    self._busy = False
+        return self._view(names)
 
-    def _note(self, t: str, now: datetime, **kw) -> None:
-        with self._lock:
-            c = self._cache.setdefault(t, {})
-            c.update(kw, tried_mono=self._mono())
-            if "ok_at" in kw:
-                c["day"] = now.astimezone(ET).date()
-
-    def _fetch(self, t: str, now: datetime) -> None:
-        if self.quiet(now):
-            self._note(t, now, error="")           # keeps what it has; the page draws the live minutes
-            return
-        if self._cooldown() > 0:
-            self._note(t, now, error="Schwab asked Edge Trader to pause (429). Bars wait.")
-            return
-        client = self._client()
-        if client is None:
-            self._note(t, now, error="Not signed in to Schwab yet.")
-            return
-        why = None
+    def _ask(self, names: tuple) -> None:
+        url = f"{self._base}{ROUTE}?tickers={quote(','.join(names), safe=',')}"
         try:
-            why = self._gives_way(1)
-        except Exception:
-            why = "budget_error"
-        if why:
-            with netlog.call("schwab", "price_history", "plan_bars") as call:
-                call.skip(why)
-            self._note(t, now, error="")
+            body = self._get(url, TIMEOUT_S)
+            if not isinstance(body, Mapping) or not isinstance(body.get("bars"), Mapping):
+                raise ValueError("not a bars answer")
+        except Exception as e:
+            with self._lock:
+                self._fails += 1
+                self._error = (f"Edge Scanner's chart bars did not come ({type(e).__name__}). "
+                               "The chart keeps its last bars and asks again shortly.")
             return
-        self._count()
-        et = now.astimezone(ET)
-        start = datetime.combine(et.date(), self.s.from_et, tzinfo=ET)
-        end = min(et, datetime.combine(et.date(), self.s.to_et, tzinfo=ET)) + timedelta(minutes=1)
-        with netlog.call("schwab", "price_history", "plan_bars", clients=(client,)) as call:
-            call.sending()
-            try:
-                r = client.price_history(t, periodType="day", period=1, frequencyType="minute", frequency=1,
-                                         startDate=start, endDate=end, needExtendedHoursData=True)
-            except Exception as e:
-                call.failed(e)
-                self._note(t, now, error=f"Schwab's price history failed ({type(e).__name__}).")
-                return
-            call.returned(r)
-            if r.status_code == 429:
-                try:
-                    self._pause(r.headers.get("Retry-After") or "10")
-                except Exception:
-                    log.exception("could not start the 429 pause")
-                self._note(t, now, error="Schwab answered 429. Bars wait for the pause.")
-                return
-            if r.status_code != 200:
-                self._note(t, now, error=f"Schwab's price history answered HTTP {r.status_code}.")
-                return
-            try:
-                body = r.json()
-            except ValueError:
-                self._note(t, now, error="Schwab's price history answer did not read.")
-                return
-        bars = parse_candles(body, et.date(), self.s)
-        self._note(t, now, bars=bars, ok_mono=self._mono(), ok_at=now, error="")
+        at = None
+        try:
+            at = datetime.fromisoformat(str(body.get("at"))) if body.get("at") else None
+        except ValueError:
+            at = None
+        with self._lock:
+            self._body, self._fails = dict(body), 0
+            self._ok_at = at or self._now()
+            # Edge Scanner's own Alpaca read can fail while it still answers: say so on every name.
+            self._error = str(body.get("error") or "")
+
+    def _view(self, names: tuple) -> dict:
+        now = self._now()
+        with self._lock:
+            body, ok_at, error = self._body, self._ok_at, self._error
+        out = {}
+        for t in names:
+            rows = ((body or {}).get("bars") or {}).get(t) if body else None
+            out[t] = {"bars": chart_bars(rows) if ok_at else [],
+                      "at_et": ok_at.astimezone(ET).strftime("%H:%M:%S") if ok_at else None,
+                      "age_s": round((now - ok_at).total_seconds(), 1) if ok_at else None,
+                      "error": error or ("" if ok_at else "No bars yet.")}
+        return {"quiet": False, "refresh_s": self.s.refresh_s, "bars": out}
 
 
 # ---- demo (`python -m companion --demo`) ------------------------------------------------------
