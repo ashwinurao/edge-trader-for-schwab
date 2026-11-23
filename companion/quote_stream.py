@@ -1,4 +1,5 @@
-"""Schwab quotes from the streamer (LEVELONE_EQUITIES), for the poller's marks.
+"""Schwab quotes from the streamer (LEVELONE_EQUITIES), for the poller's marks, and the fill
+doorbell (ACCT_ACTIVITY), which reads the order list at once when Schwab says an order changed.
 
 Ash's pick "Stream quotes + fill doorbell" on the card "Which Schwab data setup should I build after
 the charts?" (project thread, 2026-11-23 20:44:39 UTC). It ends CONTRIBUTING rule 5, REST only, for
@@ -18,6 +19,11 @@ Live means: logged in, and a message (data or Schwab's heartbeat) within STALE_A
 counts only once the stream sent its first full quote after it was asked for. The stream never
 sends, changes or cancels an order: its client allows only what schwabdev's Stream reads (the
 tokens and the streamer info). The order list and the account stay on REST (companion/poller.py LANE).
+
+The fill doorbell (PR 3): with `doorbell` set, the stream also asks ACCT_ACTIVITY. Each event calls
+it with Schwab's message type only. The poller (Poller.ring) then makes the order list and the account
+due at once, inside the budget; the event itself is never taken as the order's state, which only the
+REST order list says (CONTRIBUTING rule 5).
 
 What Schwab sends (schwabdev 4.0.0 stream.py; translate.py names the fields):
 - {"response": [{"service": "ADMIN", "command": "LOGIN", "content": {"code": 0, "msg": ...}}]}
@@ -54,6 +60,7 @@ RESTART_AFTER_S = 60.0     # not live this long while wanted: stop and start the
 SUMMARY_EVERY_S = 60.0     # one netlog `stream` line a minute
 RETRY_S = (30.0, 60.0, 120.0, 300.0)   # after a failed start or a stop, wait this long before starting again
 MAX_SYMBOLS = 200          # the poller's own cap on the quotes call
+ACTIVITY = "ACCT_ACTIVITY"  # the fill doorbell (PR 3 of Ash's pick): order and fill events, no prices
 
 
 def is_stock(symbol: str) -> bool:
@@ -85,7 +92,7 @@ class QuoteStream:
         self._subs: set[str] = set()
         self._quotes: dict[str, dict] = {}        # symbol -> merged quote (REST field names)
         self._full: set[str] = set()              # symbols whose first full quote came after asking
-        self._counts = {"messages": 0, "heartbeats": 0, "quotes": 0, "restarts": 0, "errors": 0}
+        self._counts = {"messages": 0, "heartbeats": 0, "quotes": 0, "activity": 0, "restarts": 0, "errors": 0}
         self._compare: dict[str, list[float]] = {}   # symbol -> stream minus REST quote time, ms
         self._missing: set[str] = set()
         self._lag: dict[str, list[float]] = {}       # symbol -> arrival time minus Schwab's quote time, ms
@@ -94,6 +101,9 @@ class QuoteStream:
         self._retry_at = 0.0
         self._fails = 0                            # starts that failed or stopped in a row
         self.error = ""
+        # The fill doorbell: called with Schwab's message type (e.g. "OrderFillCompleted") on each
+        # ACCT_ACTIVITY event, on the stream's thread. Set by the app; None: no ACCT_ACTIVITY asked.
+        self.doorbell: Optional[Callable[[str], None]] = None
 
     # ---- the connection ---------------------------------------------------------------------
 
@@ -148,7 +158,14 @@ class QuoteStream:
             self._stream, self._started_at, self._logged_in = stream, self._mono(), False
             self._last_msg, self._subs = None, set()
             self._full.clear()
-        netlog.emit("stream", vendor="schwab", event="start", service=SERVICE)
+        netlog.emit("stream", vendor="schwab", event="start", service=SERVICE,
+                    activity=self.doorbell is not None)
+        if self.doorbell is not None:
+            # schwabdev keeps the ask and sends it after each login, again after a reconnect.
+            try:
+                stream.send(stream.account_activity())
+            except Exception as e:
+                self._note_error(f"account activity ask failed: {type(e).__name__}")
         # schwabdev's start waits up to 4 s for its loop; the poller's loop must not. Asks sent before
         # the login are kept by schwabdev and sent once it is logged in.
         if self._background:
@@ -206,6 +223,7 @@ class QuoteStream:
         if not isinstance(msg, dict):
             return
         now = self._mono()
+        rings: list[str] = []
         with self._lock:
             self._last_msg = now
             self._counts["messages"] += 1
@@ -224,10 +242,27 @@ class QuoteStream:
             if msg.get("notify"):
                 self._counts["heartbeats"] += 1
             for d in msg.get("data") or []:
-                if not isinstance(d, dict) or d.get("service") != SERVICE:
+                if not isinstance(d, dict):
+                    continue
+                if d.get("service") == ACTIVITY:
+                    for c in d.get("content") or []:
+                        # Field 2 is the message type. Fields 1 (the account number) and 3 (the
+                        # order's details) are never kept or written anywhere (CLAUDE.md).
+                        t = c.get("2") if isinstance(c, dict) else None
+                        rings.append(str(t)[:40] if t else "unknown")
+                    self._counts["activity"] += len(d.get("content") or [])
+                    continue
+                if d.get("service") != SERVICE:
                     continue
                 for c in d.get("content") or []:
                     self._merge(c)
+        for t in rings:
+            netlog.emit("stream", vendor="schwab", event="activity", msg_type=t)
+            if self.doorbell is not None:
+                try:
+                    self.doorbell(t)
+                except Exception:
+                    log.exception("the fill doorbell raised")
 
     def _merge(self, c: Any) -> None:
         if not isinstance(c, dict) or not c.get("key"):

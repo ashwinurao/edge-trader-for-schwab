@@ -64,6 +64,8 @@ These decide most review questions:
    "ignore the other app, it wont use this schwab connection". Upstream's rule was REST only (Schwab
    allows one streamer per user and another app may hold it). A stream quote stands in for a REST
    quote only while the stream is live and has a full quote for every symbol; anything else is REST.
+   The stream's `ACCT_ACTIVITY` events only make the REST order list read sooner (`Poller.ring`); the
+   order's state always comes from REST.
 6. **Local first.** The server listens on `127.0.0.1` only. A new network call needs an issue first.
 7. **Small and focused.** One pull request, one change.
 
