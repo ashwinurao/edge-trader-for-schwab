@@ -204,7 +204,9 @@ Keys live in `.env` on your machine, which is never committed. Do not share or c
   and target, protection (FULL, PARTIAL, NO STOP SEEN) and P&L at the stop; working orders including
   brackets and GTC orders; closed trades and realized P&L from your fills; a health light (LIVE,
   STALE, DISCONNECTED) that disables every order button when data is not current. The account and
-  order list are read every 5 s, marks every 3 s and fills every 10 s. While a ticket window has
+  order list are read every 5 s on a Schwab connection and thread of their own (the order lane,
+  2026-11-23: no other read can hold them up; `EDGE_TRADER_ORDER_LANE=0` reads them in the main loop
+  as before), marks every 3 s and fills every 10 s. While a ticket window has
   focus or after a click, marks come every 6 s instead of 3, so the account and order list keep
   their pace within the app's limit of 70 Schwab calls a minute (`MAX_PER_MIN`,
   `companion/poller.py`). The opening probe's calls count in that limit and give way first, and in its
@@ -950,6 +952,8 @@ again on each reading until the list is fresh or the watch ends. If the 09:35 ca
 waiting when the arm ends (45 seconds after 09:35), the plan disarms with "the end of the fast watch
 passed; N entries were not cancelled because Schwab's order list was old", and the red banner lists
 them. On 2026-11-13, while order calls ran, the poller read the order list only every 12 to 19 seconds.
+On 2026-11-23 failing chart calls on the poller's one Schwab connection kept it about a minute old; since
+then the order list and the account have their own connection and thread (the order lane above).
 A filled entry is yours to manage, as with a click. Your own Place, Flip or Cancel click on a row makes
 that row yours for the rest of the day, whatever the plan did on it before: the row says "Yours since
 your click. The armed plan leaves this row for today." and the plan never sends or cancels on it again.
