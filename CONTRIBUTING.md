@@ -58,7 +58,12 @@ These decide most review questions:
 4. **When unsure, refuse.** An order with an unclear outcome blocks further orders for that symbol
    until Schwab confirms it or the user presses Resolve. An option counts as its underlying
    (`trading._name`), so an unclear option also blocks the stock and its other contracts.
-5. **REST only.** Never open Schwab's streamer: Schwab allows one per user and another app may hold it.
+5. **REST for orders, the order list and the account.** Schwab's streamer is used for quotes only
+   (`companion/quote_stream.py`, `EDGE_TRADER_QUOTE_STREAM`, default `on`): Ash's pick "Stream
+   quotes + fill doorbell", project thread, 2026-11-23 20:44:39 UTC, after his words at 19:53 UTC:
+   "ignore the other app, it wont use this schwab connection". Upstream's rule was REST only (Schwab
+   allows one streamer per user and another app may hold it). A stream quote stands in for a REST
+   quote only while the stream is live and has a full quote for every symbol; anything else is REST.
 6. **Local first.** The server listens on `127.0.0.1` only. A new network call needs an issue first.
 7. **Small and focused.** One pull request, one change.
 

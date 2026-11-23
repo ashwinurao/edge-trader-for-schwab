@@ -76,6 +76,7 @@ DETAILS_PER_SWEEP = 3
 
 INTERVALS = {"account": 5, "orders_today": 5, "orders_sweep": 30, "transactions": 10,
              "quotes": 3, "corrections": 600, "hours": 1800}
+STREAM_MARKS_S = 1.0       # marks from Schwab's quote stream (quote_stream.py, mode "on"): looked at every second
 
 # The order list's own lane (2026-11-23): the account and today's order list are read on their own
 # Schwab client and thread, so no other read can hold them up. schwabdev sends one request at a time
@@ -140,6 +141,12 @@ class Poller:
         self._throttle_lock = threading.Lock()     # the lane and the main loop share one limiter
         self._rebuild_lock = threading.RLock()     # one rebuild at a time, from either thread
         self.guests = quote_guests.Guests()        # brief 34: symbols that ride in the quotes call
+        # Schwab's quote stream (companion/quote_stream.py, Ash's pick 2026-11-23 20:44:39 UTC), set by
+        # the app. "on": its quotes
+        # are the marks while it covers every symbol, and the REST call waits.
+        self.stream = None
+        self.stream_mode = "off"
+        self._streamed_pass = False                # this quotes pass skipped the budget for the stream
         self._cooldown_until = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()       # set by a sign-in from the dashboard
@@ -468,19 +475,66 @@ class Poller:
                 return False
         elif name == "quotes":
             syms = self._quote_symbols()
+            if self.stream is not None:
+                # The opening probe's pick names too, so the netlog measures the stream on them.
+                self._stream_want(sorted(set(syms) | set(self.guests.wanted())))
             if syms:
+                if self._stream_marks(syms):
+                    # Ash's pick 2026-11-23: the stream's quotes are the marks; no REST call.
+                    self._streamed_pass = False
+                    data = self.stream.quotes(syms)
+                    self.quotes = data
+                    self.store.save_quotes({k: v for k, v in data.items() if isinstance(v, dict)})
+                    self._ok(name)
+                    return True
                 # Brief 34: guest symbols ride in this one call (companion/quote_guests.py). `went`
                 # tells a call that failed from one the limiter held back (not sent: no backoff).
+                if self._streamed_pass:
+                    # The loop let this pass skip the budget for the stream, which stopped covering
+                    # since. No REST call without the budget: the next pass (1 s) asks it as usual.
+                    self._streamed_pass = False
+                    return False
                 ask, plan = self.guests.ask(syms, time.monotonic())
                 went = []
                 data = self._call(name, lambda: went.append(1) or self.client.quotes(ask))
                 data = self.guests.answer(data, plan, time.monotonic(), datetime.now(timezone.utc), bool(went))
                 if not isinstance(data, dict):
                     return False
+                if self.stream is not None:
+                    self._stream_rest(data)
                 self.quotes = data
                 self.store.save_quotes({k: v for k, v in data.items() if isinstance(v, dict)})
         self._ok(name)
         return True
+
+    # ---- the quote stream (companion/quote_stream.py) --------------------------------------------
+
+    def _stream_want(self, syms: list[str]) -> None:
+        try:
+            self.stream.want(syms)
+            self.stream.maybe_summary()
+        except Exception:
+            log.exception("quote stream: want failed")
+
+    def _stream_marks(self, syms) -> bool:
+        """The stream's quotes stand in for the REST call: mode "on", live, every symbol covered,
+        and no guest wants a ride (brief 34: the opening probe's symbols ride only in a REST call,
+        which then keeps its 3 s pace and its place in the budget)."""
+        if self.stream is None or self.stream_mode != "on" or not syms or self.guests.wanted():
+            return False
+        try:
+            return self.stream.covers(syms)
+        except Exception:
+            log.exception("quote stream: covers failed")
+            return False
+
+    def _stream_rest(self, data: dict) -> None:
+        """Hand the stream each REST answer: it keeps the fields the stream does not send
+        (`realtime`, `reference`) and compares the two quote times."""
+        try:
+            self.stream.note_rest(data)
+        except Exception:
+            log.exception("quote stream: note_rest failed")
 
     def _follow(self, order_ids: list[int]) -> None:
         """Orders that left the working set: fetch their final state once."""
@@ -810,6 +864,8 @@ class Poller:
                     # Keep serving cached data, clearly stale; never trigger an interactive login.
                     self.status = f"Schwab login expiring: {schwab.signin_hint()}"
                     self.client = None
+                    if self.stream is not None:
+                        self.stream.close()
                     self._publish_status()
                     self._auth_wait(60)
                     continue
@@ -819,9 +875,14 @@ class Poller:
                     if self.lane and name in LANE:
                         continue                       # read by _run_lane on its own client
                     if time.monotonic() >= self._next[name]:
-                        if self._give_way(name):      # brief 24: asked again on the next pass
+                        # Marks from the quote stream make no Schwab call: nothing to give way to.
+                        streamed = name == "quotes" and self._stream_marks(self._quote_symbols())
+                        self._streamed_pass = streamed
+                        if not streamed and self._give_way(name):      # brief 24: asked again on the next pass
                             continue
-                        self._next[name] = time.monotonic() + every
+                        # Every second only while the stream supplies the marks; a REST quotes call
+                        # keeps its 3 s, so the 70 a minute never pays for the faster pace.
+                        self._next[name] = time.monotonic() + (STREAM_MARKS_S if streamed else every)
                         self._later = (name not in poll_budget.FIRST and name not in self._urgent
                                        and not self._goes_first(name))
                         try:

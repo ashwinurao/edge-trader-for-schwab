@@ -69,6 +69,11 @@ class DemoPoller:
 # 2026-11-23); EDGE_TRADER_ORDER_LANE=0 reads them in the main loop as before.
 poller = DemoPoller() if DEMO else Poller(lane=os.environ.get("EDGE_TRADER_ORDER_LANE", "1").strip() != "0")
 trader = Trader(poller.store)
+# Schwab's quote stream (companion/quote_stream.py; Ash's pick 2026-11-23 20:44:39 UTC). Default
+# "on" (default): its quotes are the marks while it covers every symbol; "off": no stream.
+from . import quote_stream as _quote_stream
+if not DEMO and _quote_stream.mode() != "off":
+    poller.stream, poller.stream_mode = _quote_stream.QuoteStream(_quote_stream.schwab_stream_maker()), _quote_stream.mode()
 poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
