@@ -108,7 +108,8 @@ What to add:
 
 - `companion/schwab.py`: the Schwab clients (built on [Schwabdev](https://github.com/tylerebowers/Schwabdev)),
   each with an allowlist of the API methods it may call.
-- `companion/poller.py`: the one polling thread and its request budget.
+- `companion/poller.py`: the polling threads and their shared request budget: the main loop, and the
+  order lane (the account and today's order list on their own Schwab client, `LANE`).
 - `companion/view.py`, `companion/orders.py`, `companion/pnl.py`: dashboard state, order trees, the FIFO ledger.
 - `companion/bracket.py`: sizing and the bracket order. `companion/trading.py`: every order action.
 - `companion/break_entry.py`: the Break entry (a stop-limit entry with its stop attached, OV entries

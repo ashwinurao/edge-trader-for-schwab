@@ -1,4 +1,9 @@
-"""The one background poller. REST only (Schwab allows one streamer per user; another app may own it).
+"""The background poller. REST only (Schwab allows one streamer per user; another app may own it).
+
+Two threads share one limiter: the main loop reads everything below in turn, except the account and
+today's order list, which the order lane (`LANE`, `_run_lane`) reads on a Schwab client of its own,
+so a slow or failing read in the main loop never holds them up (2026-11-23). With
+EDGE_TRADER_ORDER_LANE=0 the main loop reads them too, as before.
 
 Request schedule, per minute (Schwab allows about 120 for everything, shared with any other app
 using the same Schwab login):
@@ -73,6 +78,16 @@ INTERVALS = {"account": 5, "orders_today": 5, "orders_sweep": 30, "transactions"
              "quotes": 3, "corrections": 600, "hours": 1800}
 STREAM_MARKS_S = 1.0       # marks from Schwab's quote stream (quote_stream.py, mode "on"): looked at every second
 
+# The order list's own lane (2026-11-23): the account and today's order list are read on their own
+# Schwab client and thread, so no other read can hold them up. schwabdev sends one request at a time
+# per client, and the main loop reads one endpoint after another: on 2026-11-23 failing chart calls
+# on the shared client kept orders_today about a minute old and the Opening plan refused to send.
+# Ash's pick "Stream quotes + fill doorbell" (project thread, 2026-11-23 20:44:39 UTC) keeps these two
+# on REST as the truth that gates every send. EDGE_TRADER_ORDER_LANE=0 puts them back in the main loop.
+LANE = ("account", "orders_today")
+LANE_TIMEOUT_S = 5.0       # a lane read waits at most this long for Schwab (orders: max 3.8 s seen, 2026-11-13)
+LANE_TICK_S = 0.25         # how often the lane looks whether a read is due
+
 
 def _retry_after(value: str | None) -> float:
     if not value:
@@ -87,9 +102,13 @@ def _retry_after(value: str | None) -> float:
 
 
 class Poller:
-    def __init__(self, store: Store | None = None):
+    def __init__(self, store: Store | None = None, lane: bool = False):
         self.store = store or Store()
         self.client = None
+        self.lane = lane                  # account and orders_today on their own client and thread (LANE)
+        self._lane_client = None
+        self._lane_thread: threading.Thread | None = None
+        self._lane_kick = threading.Event()   # wakes the lane at once (the fill doorbell, a later PR)
         self.account_hash: str | None = None
         self.account: dict | None = None
         self.orders_today: dict[int, dict] = {}
@@ -118,7 +137,9 @@ class Poller:
         self._hold_until = 0.0                     # hold_later: LATER polls give way until then
         self._skip_logged: dict[str, float] = {}   # one skip line per poll per interval
         self._urgent: frozenset[str] = frozenset() # LATER polls a stop-moving reader needs now
-        self._later = False                        # a LATER poll is running: its calls never wait
+        self._tl = threading.local()               # per thread: is a LATER poll running (`_later`)
+        self._throttle_lock = threading.Lock()     # the lane and the main loop share one limiter
+        self._rebuild_lock = threading.RLock()     # one rebuild at a time, from either thread
         self.guests = quote_guests.Guests()        # brief 34: symbols that ride in the quotes call
         # Schwab's quote stream (companion/quote_stream.py, Ash's pick 2026-11-23 20:44:39 UTC), set by
         # the app. "on": its quotes
@@ -132,6 +153,16 @@ class Poller:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
+    @property
+    def _later(self) -> bool:
+        """A LATER poll is running on this thread: its calls never wait in the limiter (brief 24).
+        Per thread, so the lane's reads never inherit the main loop's flag."""
+        return getattr(self._tl, "later", False)
+
+    @_later.setter
+    def _later(self, value: bool) -> None:
+        self._tl.later = value
+
     # ---- lifecycle -----------------------------------------------------
 
     def start(self) -> None:
@@ -139,10 +170,14 @@ class Poller:
             return
         self._thread = threading.Thread(target=self._run, name="schwab-poller", daemon=True)
         self._thread.start()
+        if self.lane and not (self._lane_thread and self._lane_thread.is_alive()):
+            self._lane_thread = threading.Thread(target=self._run_lane, name="schwab-order-lane", daemon=True)
+            self._lane_thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
+        self._lane_kick.set()
 
     def wake(self) -> None:
         """A new Schwab login was saved: connect now instead of after the auth wait."""
@@ -175,6 +210,22 @@ class Poller:
         """Block until a request fits under MAX_PER_MIN and any 429 cooldown is over. With
         may_wait False (a LATER poll, brief 24) return False at once instead of waiting."""
         while not self._stop.is_set():
+            if self._throttle_once():
+                return True
+            if not may_wait:
+                return False
+            self._stop.wait(min(self._throttle_wait(), 1.0))
+        return True
+
+    def _throttle_wait(self) -> float:
+        now = time.monotonic()
+        return max(self._cooldown_until - now,
+                   (self._sent[0] + 60 - now) if len(self._sent) >= MAX_PER_MIN else 0, 0.0) or 0.05
+
+    def _throttle_once(self) -> bool:
+        """Count one send now if the minute and any 429 pause allow it. Under a lock: the lane and
+        the main loop may ask at the same moment, and both must not take the 70th place."""
+        with self._throttle_lock:
             now = time.monotonic()
             # A send counts for 60 s, then leaves: `>=` matches the wait below (sent[0] + 60 - now).
             # With `>`, a send exactly 60 s old stayed in the count while the wait read 0, and every
@@ -186,10 +237,7 @@ class Poller:
             if wait <= 0:
                 self._sent.append(now)
                 return True
-            if not may_wait:
-                return False
-            self._stop.wait(min(wait, 1.0))
-        return True
+            return False
 
     def note_external_request(self, retry_after=None) -> None:
         """Order traffic from the trader: counted in the same per-minute window (without blocking
@@ -283,10 +331,10 @@ class Poller:
         with netlog.call("schwab", name, "poller") as call:
             call.skip(why)
 
-    def _call(self, name: str, fn):
+    def _call(self, name: str, fn, client=None):
         """One HTTP request. Returns parsed JSON, or None on any failure (never raises). Its waits,
         wire time and outcome also go to data/netlog/ (netlog.py): a record only."""
-        with netlog.call("schwab", name, "poller", clients=(self.client,)) as call:
+        with netlog.call("schwab", name, "poller", clients=(client or self.client,)) as call:
             return self._call_logged(name, fn, call)
 
     def _call_logged(self, name: str, fn, call):
@@ -377,18 +425,20 @@ class Poller:
         et_midnight = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
         return (et_midnight - timedelta(hours=6)).astimezone(timezone.utc)
 
-    def _poll(self, name: str) -> bool:
+    def _poll(self, name: str, client=None) -> bool:
+        """One read. `client` is the lane's own client for the LANE reads, else the main one."""
         h = self.account_hash
+        c = client or self.client
         now = datetime.now(timezone.utc)
         if name == "account":
-            data = self._call(name, lambda: self.client.account_details(h, fields="positions"))
+            data = self._call(name, lambda: c.account_details(h, fields="positions"), c)
             if not isinstance(data, dict) or "securitiesAccount" not in data:
                 return False
             self.account = data
             self.store.save_positions(data)
             self._record_prev_session(data)
         elif name == "orders_today":
-            data = self._call(name, lambda: self.client.account_orders(h, self._session_start_utc(), now))
+            data = self._call(name, lambda: c.account_orders(h, self._session_start_utc(), now), c)
             if not isinstance(data, list):
                 return False
             self.store.save_orders(data)
@@ -586,6 +636,19 @@ class Poller:
     # ---- loop ------------------------------------------------------------
 
     def _rebuild(self) -> None:
+        """Build the dashboard state. One at a time: the lane and the main loop both rebuild."""
+        with self._rebuild_lock:
+            self._rebuild_locked()
+
+    def _rebuild_or_say(self) -> None:
+        try:
+            self._rebuild()
+        except Exception as e:
+            log.exception("rebuild failed")
+            self.status = f"display not updating: {e!r}"[:200]
+            self._publish_status()
+
+    def _rebuild_locked(self) -> None:
         since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
         day = session_day(datetime.now(timezone.utc), "EQUITY").isoformat()
         txns = self.store.transactions_since(since)
@@ -809,6 +872,8 @@ class Poller:
 
                 changed = False
                 for name, every in INTERVALS.items():
+                    if self.lane and name in LANE:
+                        continue                       # read by _run_lane on its own client
                     if time.monotonic() >= self._next[name]:
                         # Marks from the quote stream make no Schwab call: nothing to give way to.
                         streamed = name == "quotes" and self._stream_marks(self._quote_symbols())
@@ -828,18 +893,55 @@ class Poller:
                         finally:
                             self._later = False
                 if changed:
-                    try:
-                        self._rebuild()
-                    except Exception as e:
-                        log.exception("rebuild failed")
-                        self.status = f"display not updating: {e!r}"[:200]
-                        self._publish_status()
+                    self._rebuild_or_say()
             except Exception as e:   # the thread must never die silently
                 log.exception("poller loop error")
                 self.status = f"poller error: {e!r}"[:200]
                 self._publish_status()
                 self._stop.wait(5)
             self._stop.wait(0.5)
+
+    # ---- the order list's own lane (LANE) ---------------------------------
+
+    def _run_lane(self) -> None:
+        """The account and today's order list, every 5 s, on their own client and thread. The main
+        loop connects and owns the login: while it has no client, the lane waits."""
+        while not self._stop.is_set():
+            try:
+                busy = self._lane_pass()
+            except Exception:              # the thread must never die silently
+                log.exception("order lane error")
+                busy = False
+            self._lane_kick.wait(LANE_TICK_S if busy else 1.0)
+            self._lane_kick.clear()
+
+    def _lane_pass(self) -> bool:
+        """One look at the LANE reads that are due. False only when the lane's client could not be
+        made (the lane then looks again in 1 s); until the main loop is connected it just waits."""
+        if self.client is None or not self.account_hash:
+            self._lane_client = None           # signed out or expiring: a new client after sign-in
+            return True
+        if self._lane_client is None:
+            try:
+                self._lane_client = schwab.make_client(timeout=LANE_TIMEOUT_S)
+            except Exception as e:
+                for name in LANE:
+                    self.fresh[name]["error"] = f"order lane: {e!r}"[:200]
+                log.warning("order lane could not make its Schwab client: %r", e)
+                return False
+        changed = False
+        for name in LANE:
+            if time.monotonic() < self._next[name] or self._give_way(name):
+                continue
+            self._next[name] = time.monotonic() + INTERVALS[name]
+            try:
+                changed |= self._poll(name, client=self._lane_client)
+            except Exception as e:
+                self.fresh[name]["error"] = repr(e)[:200]
+                log.exception("poll %s failed", name)
+        if changed:
+            self._rebuild_or_say()
+        return True
 
     def _publish_status(self) -> None:
         with self._lock:
