@@ -121,7 +121,7 @@ class Poller:
         self._later = False                        # a LATER poll is running: its calls never wait
         self.guests = quote_guests.Guests()        # brief 34: symbols that ride in the quotes call
         # Schwab's quote stream (companion/quote_stream.py, Ash's pick 2026-11-23 20:44:39 UTC), set by
-        # the app. "shadow": it runs beside the REST quotes call and is only compared; "on": its quotes
+        # the app. "on": its quotes
         # are the marks while it covers every symbol, and the REST call waits.
         self.stream = None
         self.stream_mode = "off"
@@ -426,7 +426,7 @@ class Poller:
         elif name == "quotes":
             syms = self._quote_symbols()
             if self.stream is not None:
-                # The opening probe's pick names too, so a shadow open measures the stream on them.
+                # The opening probe's pick names too, so the netlog measures the stream on them.
                 self._stream_want(sorted(set(syms) | set(self.guests.wanted())))
             if syms:
                 if self._stream_marks(syms):
