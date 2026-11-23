@@ -65,7 +65,9 @@ class DemoPoller:
     def set_quote_guest(self, wants, take): pass
 
 
-poller = DemoPoller() if DEMO else Poller()
+# The account and order list on their own Schwab client and thread (companion/poller.py LANE,
+# 2026-11-23); EDGE_TRADER_ORDER_LANE=0 reads them in the main loop as before.
+poller = DemoPoller() if DEMO else Poller(lane=os.environ.get("EDGE_TRADER_ORDER_LANE", "1").strip() != "0")
 trader = Trader(poller.store)
 poller.trader = trader
 trader.on_request = poller.note_external_request
