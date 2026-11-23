@@ -87,6 +87,12 @@ STREAM_MARKS_S = 1.0       # marks from Schwab's quote stream (quote_stream.py, 
 LANE = ("account", "orders_today")
 LANE_TIMEOUT_S = 5.0       # a lane read waits at most this long for Schwab (orders: max 3.8 s seen, 2026-11-13)
 LANE_TICK_S = 0.25         # how often the lane looks whether a read is due
+# The fill doorbell (quote_stream.py ACCT_ACTIVITY, mode "on"): an order or fill event makes LANE due at
+# once. One fill is several events, so rings within RING_GAP_S of the last one share one read at the gap's
+# end; at most RING_MAX_PER_MIN rings a minute move a read (each is 2 calls, so at most 12 calls a minute
+# on top of the 5 s reads, and every read still gives way like any poller read). More: the 5 s reads.
+RING_GAP_S = 1.0
+RING_MAX_PER_MIN = 6
 
 
 def _retry_after(value: str | None) -> float:
@@ -108,7 +114,9 @@ class Poller:
         self.lane = lane                  # account and orders_today on their own client and thread (LANE)
         self._lane_client = None
         self._lane_thread: threading.Thread | None = None
-        self._lane_kick = threading.Event()   # wakes the lane at once (the fill doorbell, a later PR)
+        self._lane_kick = threading.Event()   # wakes the lane at once (the fill doorbell, ring())
+        self._ring_lock = threading.Lock()
+        self._rings: list[float] = []         # monotonic times of the rings that moved a read
         self.account_hash: str | None = None
         self.account: dict | None = None
         self.orders_today: dict[int, dict] = {}
@@ -902,6 +910,31 @@ class Poller:
             self._stop.wait(0.5)
 
     # ---- the order list's own lane (LANE) ---------------------------------
+
+    def ring(self, msg_type: str = "") -> bool:
+        """The fill doorbell (Ash's pick 2026-11-23 20:44:39 UTC): Schwab's stream says an order or
+        fill changed. Make the order list and the account due now (or at the end of RING_GAP_S after
+        the last ring) and wake the lane. Only in mode "on"; in "shadow" the stream only writes the
+        event to the netlog. Runs on the stream's thread and never waits. True when it moved a read."""
+        if self.stream_mode != "on":
+            return False
+        now = time.monotonic()
+        with self._ring_lock:
+            self._rings = [t for t in self._rings if now - t < 60]
+            last = self._rings[-1] if self._rings else None
+            due = now if last is None else max(now, last + RING_GAP_S)
+            # A read already due by then covers this ring (several events of one fill share it).
+            moved = (any(self._next[n] > due for n in LANE)
+                     and len(self._rings) < RING_MAX_PER_MIN)
+            if moved:
+                for n in LANE:
+                    self._next[n] = min(self._next[n], due)
+                self._rings.append(due)
+        if moved:
+            netlog.emit("stream", vendor="schwab", event="ring", msg_type=str(msg_type)[:40],
+                        in_ms=round((due - now) * 1000))
+            self._lane_kick.set()
+        return moved
 
     def _run_lane(self) -> None:
         """The account and today's order list, every 5 s, on their own client and thread. The main

@@ -74,6 +74,9 @@ trader = Trader(poller.store)
 from . import quote_stream as _quote_stream
 if not DEMO and _quote_stream.mode() != "off":
     poller.stream, poller.stream_mode = _quote_stream.QuoteStream(_quote_stream.schwab_stream_maker()), _quote_stream.mode()
+    # The fill doorbell on the same stream (Poller.ring): in "on" an order event reads the order list
+    # at once; in "shadow" the events are only written to the netlog.
+    poller.stream.doorbell = poller.ring
 poller.trader = trader
 trader.on_request = poller.note_external_request
 trader.cooldown_left = poller.cooldown_left
