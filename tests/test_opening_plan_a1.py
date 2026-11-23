@@ -1,5 +1,5 @@
 """The A1 Opening plan (Ash's go 2026-11-18 20:00:20 UTC): the fit-the-account rule, the charts'
-1-minute bars, Place all 4, Take control, Chase, and one pick's Flatten and Cancel stop.
+1-minute bars (from Edge Scanner since 2026-11-23), Place all 4, Take control, Chase, and one pick's Flatten and Cancel stop.
 
 Against the fake broker of tests/test_trading.py (through tests/test_plan_flat.py's four-row rig):
 nothing here talks to Schwab or Edge Scanner. The rows are tests/test_plan_entries.py's: AAAA's
@@ -222,28 +222,47 @@ def test_the_risk_call_saves_the_two_settings_only_when_sent(tmp_path):
 
 
 # ---------------------------------------------------------------- the charts' bars (bars.py)
+# From Edge Scanner's Alpaca bars every 2 s, never Schwab (Ash, 2026-11-23 20:18:45 UTC). These replace
+# the tests of the Schwab price-history source (its budget, quiet window and 429 pause), which is gone.
 
 DAY = datetime(2026, 11, 13, tzinfo=ET).date()
+BASE = "http://192.168.1.10:8772"
 
 
-def ms(h, m):
-    return datetime(2026, 11, 13, h, m, tzinfo=ET).timestamp() * 1000
+def utc_s(h, m):
+    return int(datetime(2026, 11, 13, h, m, tzinfo=ET).timestamp())
 
 
-def candle(h, m, o=10.0, hi=10.2, lo=9.9, c=10.1, v=500):
-    return {"datetime": ms(h, m), "open": o, "high": hi, "low": lo, "close": c, "volume": v}
+def es_bar(h, m, o=10.0, hi=10.2, lo=9.9, c=10.1, v=500, **kw):
+    return {"t": utc_s(h, m), "open": o, "high": hi, "low": lo, "close": c, "volume": v, **kw}
 
 
-def test_parse_keeps_the_days_minutes_from_0830_to_1100_oldest_first():
-    body = {"candles": [candle(9, 1), candle(8, 29), candle(8, 30), candle(11, 1), candle(11, 0),
-                        {**candle(9, 2), "high": 9.0},              # high under the open: not a bar
-                        {**candle(9, 3), "low": 0},                 # a low of 0: not a bar
-                        {**candle(9, 4), "open": "x"}, "junk",
-                        {**candle(9, 5), "datetime": ms(9, 5) - 86_400_000}]}   # the day before
-    out = B.parse_candles(body, DAY, B.Settings())
-    assert [b["time"] for b in out] == [B.et_epoch(datetime(2026, 11, 13, h, m, tzinfo=ET))
-                                        for h, m in ((8, 30), (9, 1), (11, 0))]
-    assert out[0] == {"time": out[0]["time"], "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 500.0}
+class Scanner:
+    """A fake Edge Scanner for feed.http_get's (url, timeout) signature."""
+    def __init__(self, body=None, raises=None):
+        self.body, self.raises, self.calls = body, raises, []
+
+    def __call__(self, url, timeout):
+        self.calls.append((url, timeout))
+        if self.raises:
+            raise self.raises
+        return self.body
+
+
+class BarsRig:
+    def __init__(self, scanner, at=time(9, 45, 10)):
+        self.scanner = scanner
+        self.now = datetime.combine(DAY, at, tzinfo=ET).astimezone(timezone.utc)
+        self.mono = 100.0
+        self.bars = B.Bars(BASE + "/", scanner, now=lambda: self.now, mono=lambda: self.mono)
+
+    def step(self, s):
+        self.mono += s
+        self.now += timedelta(seconds=s)
+
+
+def answer(bars, at="2026-11-13T14:45:10+00:00", error=""):
+    return {"v": 1, "at": at, "age_s": 0.0, "ttl_s": 2.0, "error": error, "bars": bars}
 
 
 def test_the_chart_clock_is_et_wall_time_written_as_utc():
@@ -251,101 +270,108 @@ def test_the_chart_clock_is_et_wall_time_written_as_utc():
     assert datetime.fromtimestamp(B.et_epoch(at), timezone.utc).strftime("%H:%M") == "09:30"
 
 
-class Hist:
-    def __init__(self, status=200, body=None, headers=None, raises=None):
-        self.status, self.body, self.headers, self.raises = status, body, headers or {}, raises
-        self.calls = []
-
-    def price_history(self, symbol, **kw):
-        self.calls.append((symbol, kw))
-        if self.raises:
-            raise self.raises
-        return Resp(self.status, self.headers, "", ) if self.body is None else _J(self.status, self.body, self.headers)
-
-
-class _J:
-    def __init__(self, status, body, headers):
-        self.status_code, self._b, self.headers, self.text = status, body, headers, ""
-
-    def json(self):
-        return self._b
+def test_scanner_bars_become_chart_bars_on_the_et_clock_oldest_first():
+    rows = [es_bar(9, 44), es_bar(8, 30), es_bar(9, 45, forming=True),
+            {**es_bar(9, 2), "high": 9.0},              # high under the open: not a bar
+            {**es_bar(9, 3), "low": 0},                 # a low of 0: not a bar
+            {**es_bar(9, 4), "open": "x"}, "junk", {"open": 1}]
+    out = B.chart_bars(rows)
+    et = lambda h, m: B.et_epoch(datetime(2026, 11, 13, h, m, tzinfo=ET))
+    assert [b["time"] for b in out] == [et(8, 30), et(9, 44), et(9, 45)]
+    assert out[0] == {"time": et(8, 30), "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "volume": 500.0}
+    assert out[-1]["forming"] is True and "forming" not in out[1]
+    assert B.chart_bars(None) == [] and B.chart_bars({"t": 1}) == []
 
 
-class BarsRig:
-    def __init__(self, client, at=time(9, 20), gives=None):
-        self.client, self.gives, self.counted, self.paused, self.cool = client, gives, 0, [], 0.0
-        self.now = datetime.combine(DAY, at, tzinfo=ET).astimezone(timezone.utc)
-        self.mono = 100.0
-        self.bars = B.Bars(lambda: self.client, lambda need: self.gives, self._count, self.paused.append,
-                           lambda: self.cool, now=lambda: self.now, mono=lambda: self.mono)
-
-    def _count(self):
-        self.counted += 1
-
-
-def test_one_counted_call_per_name_then_the_cache():
-    h = Hist(body={"candles": [candle(9, 1)]})
-    rg = BarsRig(h)
-    out = rg.bars.read(["aaaa"])
-    assert len(h.calls) == 1 and rg.counted == 1
-    sym, kw = h.calls[0]
-    assert sym == "AAAA" and kw["frequencyType"] == "minute" and kw["frequency"] == 1
-    assert kw["startDate"] == datetime(2026, 11, 13, 8, 30, tzinfo=ET)
-    assert kw["endDate"] == datetime(2026, 11, 13, 9, 21, tzinfo=ET)
+def test_one_ask_for_all_names_then_every_1_5_s_at_most():
+    sc = Scanner(answer({"AAAA": [es_bar(9, 44)], "BBBB": []}))
+    rg = BarsRig(sc)
+    out = rg.bars.read(["aaaa", "BBBB", "aaaa"])
+    assert sc.calls == [(BASE + "/api/v2/ov-picks/plan-bars?tickers=AAAA,BBBB", B.TIMEOUT_S)]
     assert len(out["bars"]["AAAA"]["bars"]) == 1 and out["bars"]["AAAA"]["error"] == ""
-    rg.mono += 59
-    rg.bars.read(["AAAA"])
-    assert len(h.calls) == 1                     # inside refresh_s: the cache
-    rg.mono += 1
-    rg.bars.read(["AAAA"])
-    assert len(h.calls) == 2
+    assert out["bars"]["AAAA"]["at_et"] == "09:45:10" and out["refresh_s"] == 2.0 and out["quiet"] is False
+    rg.step(1.4)
+    assert rg.bars.read(["AAAA", "BBBB"])["bars"]["AAAA"]["age_s"] == 1.4
+    assert len(sc.calls) == 1                      # sooner than 1.5 s: the last answer
+    rg.step(0.1)
+    rg.bars.read(["AAAA", "BBBB"])
+    assert len(sc.calls) == 2
 
 
-def test_no_call_when_the_budget_says_give_way():
-    h = Hist(body={"candles": []})
-    rg = BarsRig(h, gives="minute_busy")
-    out = rg.bars.read(["AAAA"])
-    assert h.calls == [] and rg.counted == 0 and out["bars"]["AAAA"]["bars"] == []
-
-
-def test_no_call_in_the_quiet_window_around_the_open():
-    h = Hist(body={"candles": []})
+def test_asks_through_the_open_with_no_quiet_window():
+    # Where the old Schwab source must NOT call (09:29:30 to 09:33:00 ET), Alpaca bars come every 2 s.
     for at in (time(9, 29, 30), time(9, 31), time(9, 32, 59)):
-        rg = BarsRig(h, at=at)
-        out = rg.bars.read(["AAAA"])
-        assert out["quiet"] is True
-    assert h.calls == []
-    assert BarsRig(h, at=time(9, 33)).bars.read(["AAAA"])["quiet"] is False and len(h.calls) == 1
+        sc = Scanner(answer({"AAAA": []}))
+        out = BarsRig(sc, at=at).bars.read(["AAAA"])
+        assert len(sc.calls) == 1 and out["quiet"] is False
 
 
-def test_no_call_during_the_429_pause_or_signed_out():
-    h = Hist(body={"candles": []})
-    rg = BarsRig(h)
-    rg.cool = 5.0
-    assert "429" in rg.bars.read(["AAAA"])["bars"]["AAAA"]["error"] and h.calls == []
-    rg2 = BarsRig(None)
-    assert "Not signed in" in rg2.bars.read(["AAAA"])["bars"]["AAAA"]["error"]
+def test_a_failed_ask_keeps_the_last_bars_says_so_and_backs_off():
+    sc = Scanner(answer({"AAAA": [es_bar(9, 44)]}))
+    rg = BarsRig(sc)
+    rg.bars.read(["AAAA"])
+    sc.raises = TimeoutError("slow")
+    rg.step(2)
+    out = rg.bars.read(["AAAA"])["bars"]["AAAA"]
+    assert "Edge Scanner's chart bars did not come (TimeoutError)" in out["error"]
+    assert len(out["bars"]) == 1 and out["age_s"] == 2.0
+    n = len(sc.calls)
+    rg.step(4.9)
+    rg.bars.read(["AAAA"])
+    assert len(sc.calls) == n                      # 5 s after the first failure, not 1.5
+    rg.step(0.1)
+    rg.bars.read(["AAAA"])
+    assert len(sc.calls) == n + 1                  # second failure: then 10 s
+    rg.step(9.9)
+    rg.bars.read(["AAAA"])
+    assert len(sc.calls) == n + 1
+    sc.raises = None
+    rg.step(0.1)
+    out = rg.bars.read(["AAAA"])["bars"]["AAAA"]
+    assert out["error"] == "" and len(sc.calls) == n + 2
+    rg.step(1.5)
+    rg.bars.read(["AAAA"])
+    assert len(sc.calls) == n + 3                  # healthy again: every 1.5 s
 
 
-def test_a_429_starts_the_apps_pause():
-    h = Hist(status=429, body={}, headers={"Retry-After": "30"})
-    rg = BarsRig(h)
-    out = rg.bars.read(["AAAA"])
-    assert rg.paused == ["30"] and "429" in out["bars"]["AAAA"]["error"]
+def test_a_bad_answer_counts_as_a_failure():
+    rg = BarsRig(Scanner({"nothing": 1}))
+    out = rg.bars.read(["AAAA"])["bars"]["AAAA"]
+    assert "ValueError" in out["error"] and out["bars"] == [] and out["at_et"] is None
 
 
-def test_a_failed_call_keeps_no_bars_and_says_so():
-    rg = BarsRig(Hist(raises=TimeoutError("slow")))
-    assert "TimeoutError" in rg.bars.read(["AAAA"])["bars"]["AAAA"]["error"]
-    rg = BarsRig(Hist(status=500, body={}))
-    assert "HTTP 500" in rg.bars.read(["AAAA"])["bars"]["AAAA"]["error"]
+def test_edge_scanners_own_alpaca_failure_is_shown_with_its_last_bars():
+    rg = BarsRig(Scanner(answer({"AAAA": [es_bar(9, 44)]}, at="2026-11-13T14:45:00+00:00",
+                                error="Alpaca's bars request failed (RuntimeError). The chart keeps its last bars.")))
+    out = rg.bars.read(["AAAA"])["bars"]["AAAA"]
+    assert "Alpaca's bars request failed" in out["error"] and len(out["bars"]) == 1
+    assert out["at_et"] == "09:45:00" and out["age_s"] == 10.0
 
 
-def test_at_most_eight_names_a_read():
-    h = Hist(body={"candles": []})
-    rg = BarsRig(h)
+def test_an_ask_in_flight_gives_the_last_answer_at_once():
+    sc = Scanner(answer({"AAAA": [es_bar(9, 44)]}))
+    rg = BarsRig(sc)
+    rg.bars.read(["AAAA"])
+    rg.step(2)
+    rg.bars._busy = True
+    assert len(rg.bars.read(["AAAA"])["bars"]["AAAA"]["bars"]) == 1 and len(sc.calls) == 1
+
+
+def test_new_names_ask_at_once_and_drop_the_old_names_bars():
+    sc = Scanner(answer({"AAAA": [es_bar(9, 44)]}))
+    rg = BarsRig(sc)
+    rg.bars.read(["AAAA"])
+    sc.body = answer({"CCCC": []})
+    out = rg.bars.read(["CCCC"])
+    assert len(sc.calls) == 2 and out["bars"] == {"CCCC": {"bars": [], "at_et": "09:45:10", "age_s": 0.0, "error": ""}}
+
+
+def test_at_most_eight_names_and_none_without_names():
+    sc = Scanner(answer({}))
+    rg = BarsRig(sc)
+    assert rg.bars.read([""])["bars"] == {} and sc.calls == []
     rg.bars.read([f"T{i}" for i in range(12)])
-    assert len(h.calls) == 8
+    assert sc.calls[0][0].endswith("tickers=" + ",".join(f"T{i}" for i in range(8)))
 
 
 def test_the_bars_route_never_calls_without_a_source(tmp_path):
@@ -356,9 +382,9 @@ def test_the_bars_route_never_calls_without_a_source(tmp_path):
     assert set(body["bars"]) == {"AAAA", "BBBB"} and body["bars"]["AAAA"]["error"] == "No bar source."
 
 
-def test_the_bars_read_is_on_the_read_only_client_and_never_on_the_order_client():
-    from companion import schwab
-    assert "price_history" in schwab._ALLOWED and "price_history" not in schwab._TRADING
+def test_the_charts_make_no_schwab_call():
+    src = Path(B.__file__).read_text()
+    assert "price_history" not in src and "import schwab" not in src and "poller" not in src.lower().split("display only")[1]
 
 
 # ---------------------------------------------------------------- the page and the vendored library
@@ -626,28 +652,12 @@ def test_the_netlog_knows_the_new_clicks():
         assert f"/api/opening-plan/{a}" in netlog.ACTIONS
 
 
-def test_the_apps_bars_source_uses_the_pollers_read_client_and_budget():
-    class Poller:
-        def __init__(self):
-            self.client, self.asked, self.counted, self.paused = Hist(status=429, body={}, headers={"Retry-After": "7"}), [], 0, []
-
-        def probe_gives_way(self, need=1, ahead=None):
-            self.asked.append(need)
-            return None
-
-        def note_probe_request(self):
-            self.counted += 1
-
-        def note_external_request(self, retry_after=None):
-            self.paused.append(retry_after)
-
-        def cooldown_left(self):
-            return 0.0
-    p = Poller()
-    src = R.bars_source(p)
-    src._now = lambda: datetime(2026, 11, 13, 9, 20, tzinfo=ET).astimezone(timezone.utc)
+def test_the_apps_bars_source_reads_edge_scanner_and_needs_its_address():
+    sc = Scanner(answer({"AAAA": [es_bar(9, 44)]}))
+    src = R.bars_source({"EDGE_SCANNER_URL": BASE}, get=sc)
     src.read(["AAAA"])
-    assert p.asked == [1] and p.counted == 1 and p.paused == ["7"] and len(p.client.calls) == 1
+    assert sc.calls[0][0] == BASE + "/api/v2/ov-picks/plan-bars?tickers=AAAA"
+    assert R.bars_source({}, get=sc) is None and R.bars_source({"EDGE_SCANNER_URL": "nope"}, get=sc) is None
 
 
 # ---------------------------------------------------------------- the size switch (Ash, 2026-11-18 22:34:51 UTC)

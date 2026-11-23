@@ -116,7 +116,7 @@ What to add:
   cancels its own resting entry when the user takes the other side of that name). It sends and cancels only
   through `companion/plan_entries.py` and so through `Trader.submit` and `Trader.cancel_entry`.
 - `companion/opening_plan/`: the Opening plan. `plan.py` builds the view, `fit.py` fits each row's
-  shares to the account, `bars.py` reads the charts' 1-minute bars inside the call budget, `routes.py`
+  shares to the account, `bars.py` reads the charts' 1-minute bars from Edge Scanner (Alpaca, no Schwab call), `routes.py`
   serves the A1 page (`static/opening_plan_a1.html`), the table (`static/opening_plan.html`) and the
   vendored chart library (`static/vendor/`, see its `VENDORED.md`). It imports no order code.
 - `companion/plan_entries.py`, `companion/plan_flat.py`: the plan's clicks (Place, Place all 4, Cancel,
