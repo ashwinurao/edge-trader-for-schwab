@@ -109,7 +109,8 @@ name are refused). It needs no account and sends no telemetry.
   websocket to the streamer address Schwab names in `userPreference` (read once per start), with
   `LEVELONE_EQUITIES` quotes for the stocks the app marks (open positions and working orders) and, in
   the opening probe's windows, the day's Opening plan symbols. It asks for quote fields only (bid, ask,
-  last, volume, close, change, mark, quote and trade times); it never sends, changes or cancels an order. Its own
+  last, volume, close, change, mark, quote and trade times), and `ACCT_ACTIVITY` (order and fill events,
+  used only as a signal to read the order list); it never sends, changes or cancels an order. Its own
   Schwab client allows only what schwabdev's stream reads (the tokens and the streamer info). While it
   is live and has every symbol, its quotes are the marks and the REST quotes call is not made
   (`companion/quote_stream.py`). See "Schwab's quote stream" below.
@@ -1329,6 +1330,14 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
   of the poller's and the probe's quotes calls), `lead` (whenever a REST quotes call ran too: per
   symbol, how much newer the stream's quote time was, median and min in ms) and `missing` (symbols
   REST had and the stream did not). Start, stop and error lines say what happened.
+- **The fill doorbell:** the same stream asks `ACCT_ACTIVITY`. Each order or fill event makes the
+  REST order list and account reads due at once (`Poller.ring`) and wakes their lane, instead of waiting
+  up to 5 seconds. The event is only a signal: the order's state still comes from the REST order list.
+  One fill sends several events, so events within 1 second of the last ring share one read at the end
+  of that second (`RING_GAP_S`), and at most 6 rings a minute move a read (`RING_MAX_PER_MIN`, so at
+  most 12 extra calls a minute); each read still gives way in the budget like any poller read. The
+  netlog gets an `activity` line per event (Schwab's message type only; the account number and the
+  order's details are never written) and a `ring` line per moved read.
 - **What does not change:** orders, the order list, the account, the quote read before a send and the
   opening probe stay on REST. The stream never sends, changes or cancels an order.
 - **Off:** `EDGE_TRADER_QUOTE_STREAM=off` opens no stream; the app then polls quotes as before.
