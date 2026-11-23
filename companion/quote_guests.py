@@ -129,6 +129,16 @@ class Guests:
             return
         self._off(now, why)
 
+    def wanted(self) -> tuple[str, ...]:
+        """The guest's symbols now, upper case, for the quote stream to subscribe (quote_stream.py,
+        Ash's pick 2026-11-23). No side effect: a guest that raises gives ()."""
+        if self._wants is None:
+            return ()
+        try:
+            return tuple(s for s in (str(x or "").upper().strip() for x in (self._wants() or ())) if s)
+        except Exception:
+            return ()
+
     def ask(self, own: list[str], now: float) -> tuple[list[str], Optional[tuple]]:
         """(the symbols for the poller's call; the plan for `answer`, None when no guest rides)."""
         if not own or self._wants is None:
