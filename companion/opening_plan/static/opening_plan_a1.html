@@ -321,7 +321,7 @@ function chartFor(t) {
 }
 
 function noteLive(t, px, epochMin) {
-  // The live minutes the page builds from the prices it sees (bars.py: none is fetched around the open).
+  // The live minutes the page builds from the prices it sees, between two bars answers (bars.py).
   if (typeof px !== "number") return;
   const m = (S.live[t] = S.live[t] || {});
   const b = m[epochMin];
@@ -571,16 +571,25 @@ async function tick() {
     if (v) S.view = v;
     S.entries = en && en.rows ? en : null;
     S.flat = fl && fl.items ? fl : null;
-    const names = rowsOf(S.view).map(r => r.ticker);
-    if (names.length && Date.now() - S.barsAt > 15000) {
-      S.barsAt = Date.now();
-      getJSON("/api/opening-plan/bars?tickers=" + names.join(","), 8000).then(b => { if (b && b.bars) { S.bars = b.bars; render(); } }).catch(() => {});
-    }
     render();
   } catch (err) { /* the next tick tries again; an old view keeps its own age line */ }
 }
+// The charts' bars every 2 s (Ash, 2026-11-23 20:18:45 UTC), from Edge Scanner's Alpaca bars (bars.py):
+// one ask at a time, so a slow answer never stacks asks up.
+let barsBusy = false;
+async function barsTick() {
+  const names = rowsOf(S.view).map(r => r.ticker);
+  if (!names.length || barsBusy) return;
+  barsBusy = true; S.barsAt = Date.now();
+  try {
+    const b = await getJSON("/api/opening-plan/bars?tickers=" + names.join(","), 4000);
+    if (b && b.bars) { S.bars = b.bars; render(); }
+  } catch (err) { /* the old bars stay; the next ask comes in 2 s */ }
+  finally { barsBusy = false; }
+}
 tick();
 setInterval(tick, 1500);
+setInterval(barsTick, 2000);
 </script>
 </body>
 </html>

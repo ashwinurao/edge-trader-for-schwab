@@ -21,8 +21,8 @@ risk per pick's own call (POST /api/opening-plan/risk), still the package's only
 (app.state.opening_plan_desk, companion/plan_entries.py), read without a lock of this file.
 
 The A1 page (2026-11-18) is `/opening-plan`; the earlier table is `/opening-plan/table`, its Details.
-GET /api/opening-plan/bars serves the charts' 1-minute bars (bars.py, built by bars_source on the
-poller's read-only client and budget). The chart library is vendored (static/vendor/VENDORED.md) and
+GET /api/opening-plan/bars serves the charts' 1-minute bars (bars.py, built by bars_source from
+Edge Scanner's Alpaca bars; no Schwab call). The chart library is vendored (static/vendor/VENDORED.md) and
 served from disk by name, never from a CDN.
 """
 from __future__ import annotations
@@ -76,12 +76,15 @@ def account_reading(snapshot: Optional[Callable[[], Mapping]], private: bool) ->
         return None
 
 
-def bars_source(poller):
-    """The charts' bars (bars.py) on the poller's read-only client and its budget: they give way
-    like the opening probe (Poller.probe_gives_way), count in its 60 s window and start its 429 pause."""
+def bars_source(env: Mapping[str, str] = os.environ, get: Get = http_get):
+    """The charts' bars (bars.py) from Edge Scanner's Alpaca bars, over the LAN (EDGE_SCANNER_URL),
+    or None when it is not set or not valid. No Schwab call (Ash, 2026-11-23 20:18:45 UTC)."""
     from .bars import Bars
-    return Bars(lambda: getattr(poller, "client", None), poller.probe_gives_way, poller.note_probe_request,
-                lambda ra: poller.note_external_request(retry_after=ra), poller.cooldown_left)
+    from .feed import check_base_url
+    try:
+        return Bars(check_base_url(env.get(ENV_VAR)), get)
+    except ValueError:
+        return None
 
 
 def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.environ,
@@ -229,7 +232,7 @@ def register(app, store, guard, demo: bool = False, env: Mapping[str, str] = os.
 
     @app.get("/api/opening-plan/bars")
     def opening_plan_bars(tickers: str = ""):
-        """The charts' 1-minute bars from 08:30 ET (bars.py): display only, budgeted, cached."""
+        """The charts' 1-minute bars from 08:30 ET (bars.py): display only, from Edge Scanner, cached."""
         names = [t.strip().upper() for t in tickers.split(",") if t.strip()][:8]
         if demo and not url:
             from .bars import demo_bars
