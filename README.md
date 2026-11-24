@@ -1342,6 +1342,22 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
 - **What does not change:** orders, the order list, the account, the quote read before a send and the
   opening probe stay on REST. The stream never sends, changes or cancels an order.
 - **Off:** `EDGE_TRADER_QUOTE_STREAM=off` opens no stream; the app then polls quotes as before.
+- **Replay a recorded day:** `python -m companion.stream_replay --db <copy of companion.db> --day
+  YYYY-MM-DD --start 09:50 --end 11:00 [--drop 10:05:00/20] [--stall 10:30:00/45]` runs the real
+  poller, quote stream and fill doorbell on a fake clock over the day's saved quotes, order changes
+  and account changes, with the stream off and on (and once per drop or stall), and checks what they
+  did: every mark is a quote Schwab sent, at most 70 calls in any 60 s, the order list never stale,
+  order changes seen sooner with the doorbell, a silent stream's quotes stop being the marks within
+  30 s. It opens the database read only, reaches no network and prints counts and milliseconds only.
+  The stream's messages are made from the 3 s REST samples at an assumed lag (`--lag-ms`, default 300),
+  so it checks what the code does, not how fast Schwab's stream is (`companion/stream_replay.py`).
+  With `--ticks <file>` it streams Alpaca SIP quotes and trades instead, each at its exchange time
+  plus the lag (`--every-ms` limits how often one symbol is sent; Schwab's real rate is not measured
+  yet), and it lines Schwab's saved quote times up with Alpaca's (same bid and ask at Schwab's
+  quoteTime, and the offset to the nearest match). Schwab keeps no tick history, so the ticks come
+  from `scripts/alpaca_ticks.py` (GET only, standard library, keys from the environment, never
+  printed); `--list-symbols <file>` writes the window's symbols for it. The tick file is market data
+  only and stays in `.logs/`.
 
 ## Configuration
 
