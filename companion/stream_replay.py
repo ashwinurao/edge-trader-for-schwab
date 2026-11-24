@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
+from .quote_stream import QUIET_QUOTES_S, STALE_AFTER_S, regular_hours
+
 ET_ZONE = ZoneInfo("America/New_York")
 STEP_S = 0.05          # the fake clock's step: stream messages and the lane's wake-ups land this close
 SAMPLE_S = 0.25        # how often the marks and freshness are looked at
@@ -957,6 +959,7 @@ class Sim:
                 first = next((t for t, n in self.schwab.calls if n == "quotes" and t >= o.start), None)
                 last = self.silent_last.get(id(o))
                 outs.append({"kind": o.kind, "seconds": round(o.end - o.start, 1),
+                             "regular_hours": regular_hours(o.start),
                              # How long the silent stream's last quotes stayed the marks.
                              "stream_marks_for_s": round(last - o.start + SAMPLE_S, 2) if last else 0.0,
                              "first_rest_quotes_after_s": round(first - o.start, 2) if first else None})
@@ -993,9 +996,11 @@ def checks(results: list[dict]) -> list[dict]:
             f"{on['marks']['went_back']} vs {off['marks']['went_back']}")
     for r in results:
         for o in r.get("outages") or []:
-            # quote_stream.STALE_AFTER_S: a silent stream's quotes are the marks for at most 30 s.
-            add(f"{r['run']}: a silent stream's quotes stop being the marks within 31 s",
-                o["stream_marks_for_s"] <= 31,
+            # In regular hours QUIET_QUOTES_S (5 s, Ash's pick 2026-11-24 03:33:54 UTC), else
+            # STALE_AFTER_S (30 s), plus one second for the poller's next look.
+            limit = (QUIET_QUOTES_S if o.get("regular_hours") else STALE_AFTER_S) + 1
+            add(f"{r['run']}: a silent stream's quotes stop being the marks within {limit:.0f} s",
+                o["stream_marks_for_s"] <= limit,
                 f"stream marks for {o['stream_marks_for_s']} s of {o['seconds']} s silent; first REST quotes "
                 f"call {o['first_rest_quotes_after_s']} s after it went quiet")
     return out

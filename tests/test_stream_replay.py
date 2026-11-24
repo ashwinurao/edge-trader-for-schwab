@@ -131,25 +131,24 @@ def test_the_fill_reaches_the_order_list_at_the_doorbell(report):
     assert on["fresh"]["orders_today_stale"] == 0
 
 
-def test_a_20_s_drop_keeps_the_last_quotes_until_the_new_login(report):
-    """Pinned: the receiver hears nothing of a dropped connection, so for a drop shorter than
-    STALE_AFTER_S the last quotes stay the marks until schwabdev's new login and full quotes,
-    with no REST call. Reported to Ash with the first replay."""
+def test_a_20_s_drop_hands_the_marks_to_rest_after_5_quiet_seconds(report):
+    """Was pinned at 20 s (the last quotes stayed the marks until schwabdev's new login). Ash's pick
+    "Fall back after 5 s of no quotes" (2026-11-24 03:33:54 UTC) changed it: in regular hours REST
+    takes over 5 s after the last quote, and the stream again after the new login."""
     r = next(r for r in report["runs"] if r["run"].startswith("on+drop"))
     (o,) = r["outages"]
-    assert o["kind"] == "drop" and 19 <= o["stream_marks_for_s"] <= 20.5
-    assert o["first_rest_quotes_after_s"] is None
+    assert o["kind"] == "drop" and o["regular_hours"] and 4.5 <= o["stream_marks_for_s"] <= 6
+    assert 4.5 <= o["first_rest_quotes_after_s"] <= 6
     assert r["stream"]["logins"] == 2 and r["marks"]["invented"] == 0
 
 
-def test_a_silent_stream_keeps_its_last_marks_until_stale_after_s(report):
-    """Pinned: a stream that goes silent without closing keeps serving its last quotes for up to
-    STALE_AFTER_S (30 s), then REST takes over. Reported to Ash with the first replay."""
+def test_a_silent_stream_hands_the_marks_to_rest_after_5_quiet_seconds(report):
+    """Was pinned at 30 s (STALE_AFTER_S); 5 s since Ash's pick of 2026-11-24 03:33:54 UTC."""
     r = next(r for r in report["runs"] if r["run"].startswith("on+stall"))
     (o,) = r["outages"]
-    assert 29 <= o["first_rest_quotes_after_s"] <= 31 and 29 <= o["stream_marks_for_s"] <= 31
+    assert 4.5 <= o["first_rest_quotes_after_s"] <= 6 and 4.5 <= o["stream_marks_for_s"] <= 6
     assert r["stream"]["marks_while_silent"] > 0
-    assert r["stream"]["age_while_silent_ms"]["max"] > 25_000
+    assert r["stream"]["age_while_silent_ms"]["max"] < 10_000
 
 
 def test_the_replay_leaves_the_poller_module_as_it_found_it(report):

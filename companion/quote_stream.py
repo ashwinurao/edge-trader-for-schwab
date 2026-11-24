@@ -15,7 +15,11 @@ The mode is EDGE_TRADER_QUOTE_STREAM:
 Once a minute a netlog `stream` line says how the stream did: per symbol, how late its quotes arrived
 and, whenever a REST quotes call ran too, how much newer the stream's quote time was than REST's.
 
-Live means: logged in, and a message (data or Schwab's heartbeat) within STALE_AFTER_S. A symbol
+Live means: logged in, and a message (data or Schwab's heartbeat) within STALE_AFTER_S. In regular
+hours the stream also covers the marks only while some quote arrived within QUIET_QUOTES_S (Ash's
+pick "Fall back after 5 s of no quotes", project thread, 2026-11-24 03:33:54 UTC): the replay of
+2026-11-23 (companion/stream_replay.py, PR #60) showed a silent stream kept its last prices as the
+marks for up to 30 s. A symbol
 counts only once the stream sent its first full quote after it was asked for. The stream never
 sends, changes or cancels an order: its client allows only what schwabdev's Stream reads (the
 tokens and the streamer info). The order list and the account stay on REST (companion/poller.py LANE).
@@ -40,7 +44,9 @@ import logging
 import os
 import threading
 import time as _time
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 from . import netlog
 
@@ -57,6 +63,11 @@ _MAP = {"1": "bidPrice", "2": "askPrice", "3": "lastPrice", "8": "totalVolume", 
         "18": "netChange", "33": "mark", "34": "quoteTime", "35": "tradeTime", "42": "netPercentChange"}
 STALE_AFTER_S = 30.0       # no message for this long (Schwab's heartbeat comes about every 10-20 s): not live
 RESTART_AFTER_S = 60.0     # not live this long while wanted: stop and start the stream again
+# Regular hours: no quote for any symbol this long and the REST call takes the marks back until quotes
+# flow again (Ash's pick, 2026-11-24 03:33:54 UTC). With a few names held at the open some quote comes
+# every second; a thin name alone may cost the REST call (3 s, as before the stream) while it is quiet.
+QUIET_QUOTES_S = 5.0
+_ET = ZoneInfo("America/New_York")
 SUMMARY_EVERY_S = 60.0     # one netlog `stream` line a minute
 RETRY_S = (30.0, 60.0, 120.0, 300.0)   # after a failed start or a stop, wait this long before starting again
 MAX_SYMBOLS = 200          # the poller's own cap on the quotes call
@@ -68,6 +79,13 @@ def is_stock(symbol: str) -> bool:
     ("AAPL  261120C00150000"), futures start with "/" and indexes with "$": those stay on REST."""
     s = str(symbol or "")
     return bool(s) and " " not in s and s[0] not in "/$"
+
+
+def regular_hours(wall: float) -> bool:
+    """9:30 to 16:00 ET on a weekday, as companion/trading.py market_open (holidays are not known
+    here: on one, no quote comes and the REST call keeps the marks, as before the stream)."""
+    et = datetime.fromtimestamp(wall, timezone.utc).astimezone(_ET)
+    return et.weekday() < 5 and 9 * 60 + 30 <= et.hour * 60 + et.minute < 16 * 60
 
 
 def mode(env=None) -> str:
@@ -89,10 +107,12 @@ class QuoteStream:
         self._started_at: Optional[float] = None
         self._logged_in = False
         self._last_msg: Optional[float] = None
+        self._last_quote: Optional[float] = None   # the last LEVELONE quote for any symbol (QUIET_QUOTES_S)
         self._subs: set[str] = set()
         self._quotes: dict[str, dict] = {}        # symbol -> merged quote (REST field names)
         self._full: set[str] = set()              # symbols whose first full quote came after asking
-        self._counts = {"messages": 0, "heartbeats": 0, "quotes": 0, "activity": 0, "restarts": 0, "errors": 0}
+        self._counts = {"messages": 0, "heartbeats": 0, "quotes": 0, "activity": 0, "restarts": 0, "errors": 0,
+                        "quiet": 0}            # quiet: covers() refused for QUIET_QUOTES_S, once per ask
         self._compare: dict[str, list[float]] = {}   # symbol -> stream minus REST quote time, ms
         self._missing: set[str] = set()
         self._lag: dict[str, list[float]] = {}       # symbol -> arrival time minus Schwab's quote time, ms
@@ -256,6 +276,8 @@ class QuoteStream:
                     continue
                 for c in d.get("content") or []:
                     self._merge(c)
+                if d.get("content"):
+                    self._last_quote = now
         for t in rings:
             netlog.emit("stream", vendor="schwab", event="activity", msg_type=t)
             if self.doorbell is not None:
@@ -314,9 +336,19 @@ class QuoteStream:
         return out
 
     def covers(self, symbols: Iterable[str]) -> bool:
-        """Live, with a full quote for every one of these symbols."""
+        """Live, with a full quote for every one of these symbols, and in regular hours some quote
+        within QUIET_QUOTES_S."""
         syms = {str(s).upper() for s in symbols if s}
-        return bool(syms) and self.live() and syms <= set(self.quotes(syms))
+        if not (bool(syms) and self.live() and syms <= set(self.quotes(syms))):
+            return False
+        if regular_hours(self._wall()):
+            with self._lock:
+                quiet = self._last_quote is None or self._mono() - self._last_quote > QUIET_QUOTES_S
+                if quiet:
+                    self._counts["quiet"] += 1
+            if quiet:
+                return False
+        return True
 
     def note_rest(self, rest: dict) -> None:
         """A REST quotes answer: kept per symbol for quotes(), and compared: per symbol, how much
