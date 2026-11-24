@@ -1319,6 +1319,12 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
   (`STALE_AFTER_S`). Quiet for 60 seconds (`RESTART_AFTER_S`) while wanted: the stream is stopped and
   started again after 30, 60, 120, then 300 seconds (`RETRY_S`). A refused login or a failed start waits
   the same way.
+- **Quiet in regular hours:** from 9:30 to 16:00 ET the stream's quotes are the marks only while some
+  quote (for any symbol) arrived in the last 5 seconds (`QUIET_QUOTES_S`; Ash's pick "Fall back after
+  5 s of no quotes", project thread, 2026-11-24 03:33:54 UTC). Otherwise the REST quotes call takes the
+  marks back, every 3 seconds as before the stream, until quotes flow again. The replay of 2026-11-23
+  showed that a silent stream kept its last prices as the marks for up to 30 seconds. The minute line
+  counts these looks as `quiet`.
 - **`on` (default; Ash, project thread, 2026-11-23 21:14:58 UTC: "no need for shadow mode"):** while
   the stream is live, has a quote for every symbol the poller marks, and no opening
   probe symbol is waiting to ride in the REST call (brief 34), the stream's quotes are the marks
@@ -1348,7 +1354,7 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
   and account changes, with the stream off and on (and once per drop or stall), and checks what they
   did: every mark is a quote Schwab sent, at most 70 calls in any 60 s, the order list never stale,
   order changes seen sooner with the doorbell, a silent stream's quotes stop being the marks within
-  30 s. It opens the database read only, reaches no network and prints counts and milliseconds only.
+  6 s in regular hours (31 s outside them). It opens the database read only, reaches no network and prints counts and milliseconds only.
   The stream's messages are made from the 3 s REST samples at an assumed lag (`--lag-ms`, default 300),
   so it checks what the code does, not how fast Schwab's stream is (`companion/stream_replay.py`).
   With `--ticks <file>` it streams Alpaca SIP quotes and trades instead, each at its exchange time

@@ -412,3 +412,57 @@ def test_a_pass_the_stream_stopped_covering_makes_no_rest_call_outside_the_budge
     assert rig.p._poll("quotes") is False
     assert rig.schwab.count("quotes") == before and rig.p._streamed_pass is False
     assert rig.p._poll("quotes") is True and rig.schwab.count("quotes") == before + 1
+
+
+# ---- the quiet rule (Ash's pick "Fall back after 5 s of no quotes", 2026-11-24 03:33:54 UTC) -------
+
+RTH = 1_795_444_200.0          # 2026-11-23 09:30 ET, a Monday
+EVENING = RTH + 8 * 3600       # 17:30 ET
+
+
+def covered_stream(wall):
+    mono = Mono()
+    q, _, _ = make(mono=mono, wall=lambda: wall)
+    q.want(["AAPL"])
+    q.receive(LOGIN_OK)
+    q.note_rest({"AAPL": {"realtime": True, "quote": {"quoteTime": 1}}})
+    q.receive(data(full("AAPL")))
+    return q, mono
+
+
+def test_in_regular_hours_five_quiet_seconds_hand_the_marks_back_to_rest():
+    q, mono = covered_stream(RTH + 60)
+    assert q.covers(["AAPL"])
+    mono.t += 4.9
+    q.receive(HEARTBEAT)                      # the connection is fine, the quotes stopped
+    assert q.covers(["AAPL"])
+    mono.t += 0.2
+    assert q.live() and not q.covers(["AAPL"])
+    q.receive(data({"key": "AAPL", "1": 10.01}))   # one changed field is a quote again
+    assert q.covers(["AAPL"])
+    mono.t += 60
+    assert q.maybe_summary()["quiet"] == 1
+
+
+def test_a_quote_of_any_symbol_keeps_the_stream_on():
+    q, mono = covered_stream(RTH + 60)
+    q.want(["AAPL", "MSFT"])
+    q.receive(data(full("MSFT")))
+    q.note_rest({"MSFT": {"realtime": True, "quote": {"quoteTime": 1}}})
+    mono.t += 4
+    q.receive(data({"key": "MSFT", "2": 10.03}))
+    mono.t += 4                                # AAPL quiet 8 s, MSFT 4 s
+    assert q.covers(["AAPL", "MSFT"])
+
+
+def test_outside_regular_hours_only_the_30_s_rule_applies():
+    q, mono = covered_stream(EVENING)
+    mono.t += 20
+    q.receive(HEARTBEAT)
+    assert q.covers(["AAPL"])
+
+
+def test_regular_hours_follow_et():
+    assert qs_mod.regular_hours(RTH) and not qs_mod.regular_hours(RTH - 1)
+    assert qs_mod.regular_hours(RTH + 6.5 * 3600 - 1) and not qs_mod.regular_hours(RTH + 6.5 * 3600)
+    assert not qs_mod.regular_hours(RTH - 2 * 86400)         # Saturday
