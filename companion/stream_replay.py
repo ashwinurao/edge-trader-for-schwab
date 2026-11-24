@@ -214,6 +214,10 @@ class Day:
             elif s < t0:
                 latest_before[oid] = status
         keep = today | {o for o, st in latest_before.items() if st not in TERMINAL}
+        # The live poller starts with every order id its database ever saw finished (Poller.terminal),
+        # which hides Schwab's frozen WORKING copies of old filled legs. The replay's poller starts on
+        # an empty database, so it gets the same ids here.
+        self.terminal_before = {o for o, st in latest_before.items() if st in TERMINAL}
         self.versions: dict[int, list[Version]] = {}
         children: set[int] = set()
         for oid in sorted(keep):
@@ -880,6 +884,7 @@ class Sim:
         try:
             with _patched(self.clock, self.schwab):
                 p = Poller(Store(work / f"{_safe(self.name)}.db"), lane=True)
+                p.terminal |= self.day.terminal_before
                 p._stop, p._wake = SimEvent(self), SimEvent(self)
                 if self.with_stream:
                     q = QuoteStream(self.hub.make, mono=self.clock.monotonic, background_start=False,

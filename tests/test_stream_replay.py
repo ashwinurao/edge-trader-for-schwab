@@ -249,3 +249,19 @@ def test_an_option_held_keeps_every_mark_on_rest_and_the_replay_says_why(tmp_pat
     assert on["marks"]["from_stream_pct"] == 0
     assert on["stream"]["looks"].get("not a stock (option, index or future)", 0) > 0
     assert on["stream"]["symbols_per_reason"]["not a stock (option, index or future)"] == 1
+
+
+def test_orders_finished_before_the_window_count_as_finished(tmp_path):
+    """A frozen WORKING copy of an order the database saw filled earlier must not add its symbol to
+    the marks (Poller.terminal), as on the live server."""
+    import sqlite3
+    db = tmp_path / "c.db"
+    build_db(db)
+    con = sqlite3.connect(db)
+    old = {"orderId": 9, "status": "FILLED", "orderType": "LIMIT", "quantity": 1,
+           "enteredTime": sch(T0 - 2 * 86400), "orderLegCollection": leg("ZZZ")}
+    con.execute("insert into order_versions values (?,?,?,?,?)", (9, iso(T0 - 2 * 86400), "FILLED", "h9", json.dumps(old)))
+    con.commit()
+    con.close()
+    day = sr.load(db, DAY, "10:00", "10:02")
+    assert day.terminal_before == {9}
