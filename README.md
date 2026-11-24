@@ -1351,6 +1351,13 @@ pushes a quote when it changes. `companion/quote_stream.py` holds the stream, `c
   30 s. It opens the database read only, reaches no network and prints counts and milliseconds only.
   The stream's messages are made from the 3 s REST samples at an assumed lag (`--lag-ms`, default 300),
   so it checks what the code does, not how fast Schwab's stream is (`companion/stream_replay.py`).
+  With `--ticks <file>` it streams Alpaca SIP quotes and trades instead, each at its exchange time
+  plus the lag (`--every-ms` limits how often one symbol is sent; Schwab's real rate is not measured
+  yet), and it lines Schwab's saved quote times up with Alpaca's (same bid and ask at Schwab's
+  quoteTime, and the offset to the nearest match). Schwab keeps no tick history, so the ticks come
+  from `scripts/alpaca_ticks.py` (GET only, standard library, keys from the environment, never
+  printed); `--list-symbols <file>` writes the window's symbols for it. The tick file is market data
+  only and stays in `.logs/`.
 
 ## Configuration
 

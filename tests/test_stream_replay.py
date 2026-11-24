@@ -48,15 +48,16 @@ def build_db(path):
     # AAA is held all along; its quote changes every second, REST saw it every 3 s.
     for i in range(-30, 300, 3):
         t = T0 + i
-        qt = int((t - 0.4) * 1000)
-        p = 10 + 0.01 * (i // 3)
-        con.execute("insert into quotes values (?,?,?,?,?,?,?,?)", (iso(t), "AAA", p, p + 0.02, p, p + 0.01, 1000 + i, str(qt)))
+        qt = round((t - 0.4) * 1000)
+        p = round(10 + 0.01 * (i // 3), 2)
+        con.execute("insert into quotes values (?,?,?,?,?,?,?,?)",
+                    (iso(t), "AAA", p, round(p + 0.02, 2), p, round(p + 0.01, 2), 1000 + i, str(qt)))
     # BBB is bought at 10:01:30.2 (an order entered 10:01:00); REST records it from 10:01:03.
     for i in range(63, 300, 3):
         t = T0 + i
-        p = 20 + 0.01 * (i // 3)
+        p = round(20 + 0.01 * (i // 3), 2)
         con.execute("insert into quotes values (?,?,?,?,?,?,?,?)",
-                    (iso(t), "BBB", p, p + 0.02, p, p + 0.01, 500 + i, str(int((t - 0.3) * 1000))))
+                    (iso(t), "BBB", p, round(p + 0.02, 2), p, round(p + 0.01, 2), 500 + i, str(round((t - 0.3) * 1000))))
     stop = {"orderId": 1, "status": "WORKING", "orderType": "STOP", "stopPrice": 9.0, "quantity": 1,
             "enteredTime": sch(T0 - 86400), "orderLegCollection": leg("AAA", "SELL", "CLOSING")}
     con.execute("insert into order_versions values (?,?,?,?,?)", (1, iso(T0 - 86400 + 2), "WORKING", "h1", json.dumps(stop)))
@@ -166,3 +167,85 @@ def test_the_report_holds_no_symbol_or_price(report):
 
 def test_a_run_name_becomes_a_file_name_windows_accepts():
     assert sr._safe("on+drop 10:05:00/20") == "on_drop_10_05_00_20"
+
+
+# ---- Alpaca ticks in place of the saved REST quotes (Ash, 2026-11-23 23:55:03 UTC) ----------------
+
+def write_ticks(path):
+    """Ticks that agree with build_db's REST rows: a quote every 0.2 s, the price stepping every
+    3 s exactly where REST saw it step, and a trade with each quote."""
+    import gzip
+    lines = []
+    for sym, base, first, back in (("AAA", 10.0, -30, 0.4), ("BBB", 20.0, 60.1, 0.3)):
+        for n in range(int((300 - first) / 0.2)):
+            t = T0 + first + n * 0.2
+            step = round((t - T0 + back) * 1000) // 3000
+            p = round(base + 0.01 * step, 2)
+            tn = int(round(t * 1e9))
+            lines.append({"s": sym, "k": "q", "t": tn, "bp": p, "ap": round(p + 0.02, 2)})
+            lines.append({"s": sym, "k": "t", "t": tn + 1000, "p": round(p + 0.01, 2), "z": 100})
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        for x in lines:
+            f.write(json.dumps(x) + "\n")
+
+
+@pytest.fixture(scope="module")
+def ticked(tmp_path_factory):
+    d = tmp_path_factory.mktemp("ticks")
+    db, ticks = d / "companion.db", d / "ticks.jsonl.gz"
+    build_db(db)
+    write_ticks(ticks)
+    fast = sr.replay(db, DAY, "10:00", "10:03", lag_ms=300, workdir=d, ticks=ticks)
+    slow = sr.replay(db, DAY, "10:00", "10:03", lag_ms=300, workdir=d, ticks=ticks, every_ms=2000)
+    return fast, slow
+
+
+def test_schwab_saved_quotes_line_up_with_the_ticks(ticked):
+    m = ticked[0]["match"]
+    assert m["schwab_quotes"] > 90
+    assert m["same_nbbo_at_quote_time_pct"] == 100.0 and m["same_nbbo_within_2s_pct"] == 100.0
+    assert abs(m["alpaca_minus_schwab_ms"]["p50"]) <= 200
+
+
+def test_ticks_streamed_give_younger_marks_than_rest_and_none_invented(ticked):
+    fast, _ = ticked
+    off, on = run_of(fast, "off"), run_of(fast, "on")
+    assert fast["quotes_from"] == "alpaca ticks"
+    assert off["marks"]["invented"] == 0 and on["marks"]["invented"] == 0
+    assert on["marks"]["from_stream_pct"] > 90
+    # The poller looks at the stream once a second (STREAM_MARKS_S), REST every 3 s.
+    assert on["marks"]["age_ms"]["p50"] < 1500 < off["marks"]["age_ms"]["p50"]
+    assert [c for c in fast["checks"] if not c["ok"]] == []
+
+
+def test_a_slower_stream_gives_older_marks(ticked):
+    fast, slow = ticked
+    assert run_of(slow, "on")["marks"]["age_ms"]["p50"] > run_of(fast, "on")["marks"]["age_ms"]["p50"]
+
+
+def test_the_window_symbols_come_from_quotes_orders_and_positions(tmp_path):
+    db = tmp_path / "c.db"
+    build_db(db)
+    assert sr.load(db, DAY, "10:00", "10:04").symbols() == ["AAA", "BBB"]
+
+
+def test_an_option_held_keeps_every_mark_on_rest_and_the_replay_says_why(tmp_path):
+    """Pinned (2026-11-23 replay of the day): Poller._stream_marks asks the stream to cover EVERY
+    symbol, and the stream never carries option symbols, so one option held keeps all marks on
+    REST. Reported to Ash with the first replay."""
+    import sqlite3
+    db = tmp_path / "c.db"
+    build_db(db)
+    con = sqlite3.connect(db)
+    acct = account("AAA")
+    acct["securitiesAccount"]["positions"].append(
+        {"instrument": {"symbol": "AAA   261218C00010000", "assetType": "OPTION"}, "longQuantity": 1,
+         "shortQuantity": 0, "averagePrice": 1.0, "marketValue": 100.0})
+    con.execute("update position_snapshots set payload = ?", (json.dumps(acct),))
+    con.commit()
+    con.close()
+    rep = sr.replay(db, DAY, "10:00", "10:02", lag_ms=300, workdir=tmp_path)
+    on = run_of(rep, "on")
+    assert on["marks"]["from_stream_pct"] == 0
+    assert on["stream"]["looks"].get("not a stock (option, index or future)", 0) > 0
+    assert on["stream"]["symbols_per_reason"]["not a stock (option, index or future)"] == 1

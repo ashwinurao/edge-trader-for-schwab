@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import gzip
 import json
 import os
 import shutil
@@ -95,7 +96,7 @@ def _num(v):
         return None
 
 
-@dataclass
+@dataclass(slots=True)
 class Quote:
     seen: float
     qt: Optional[int]
@@ -165,9 +166,11 @@ def _ro(path) -> sqlite3.Connection:
 class Day:
     """The recorded rows, and what Schwab would have answered at any moment from them."""
 
-    def __init__(self, con: sqlite3.Connection, t0: float, t1: float, lag_s: float):
+    def __init__(self, con: sqlite3.Connection, t0: float, t1: float, lag_s: float,
+                 ticks: Optional[Path] = None):
         from .orders import TERMINAL
         self.t0, self.t1, self.lag = t0, t1, lag_s
+        self.tick_span: dict[str, tuple[float, float]] = {}
         # Quotes: identical answers collapse into the first time REST saw them.
         self.rows: dict[str, list[Quote]] = {}
         self.seen: dict[str, list[float]] = {}
@@ -191,6 +194,11 @@ class Day:
             self.keys.setdefault(sym, set()).add(q.key())
         for sym in self.rows:
             self.rows[sym].sort(key=lambda q: q.avail)
+        # Schwab's own REST quotes stay for the timestamp match (match()) when ticks replace them.
+        self.recorded = {sym: [q for q in rs if t0 <= q.seen < t1] for sym, rs in self.rows.items()}
+        self.raw: dict[str, tuple[list[float], list, list]] = {}
+        if ticks is not None:
+            self._load_ticks(ticks)
         self._avail = {s: [q.avail for q in rs] for s, rs in self.rows.items()}
 
         # Orders: every order seen today, and every older one still working when the window opens.
@@ -264,6 +272,112 @@ class Day:
             prev_seen, prev_eff = seen, eff
         self._snap_eff = [e for e, _ in self.snaps]
 
+    def _load_ticks(self, path: Path) -> None:
+        """Alpaca SIP quotes and trades (scripts/alpaca_ticks.py) in place of the 3 s REST samples: each
+        symbol's state (bid, ask, last trade, volume since the file starts) after every tick, kept once
+        per STEP_S (the fake clock cannot tell ticks closer than that apart), with Schwab's quoteTime
+        as the exchange time of the last quote."""
+        by: dict[str, list[tuple]] = {}
+        opener = gzip.open if str(path).endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    x = json.loads(line)
+                    by.setdefault(x["s"], []).append((int(x["t"]), x["k"], x))
+                except (ValueError, KeyError, TypeError):
+                    continue
+        self.rows, self.seen, self.keys = {}, {}, {}
+        for sym, evs in by.items():
+            evs.sort(key=lambda e: (e[0], e[1]))
+            bid = ask = last = None
+            qt, vol = None, 0.0
+            rows: list[Quote] = []
+            rt, rb, ra = [], [], []
+            bucket = None
+            for t_ns, kind, x in evs:
+                t = t_ns / 1e9
+                if kind == "q":
+                    bid, ask, qt = _num(x.get("bp")), _num(x.get("ap")), t_ns // 1_000_000
+                    rt.append(t)
+                    rb.append(bid)
+                    ra.append(ask)
+                else:
+                    last = _num(x.get("p")) or last
+                    vol += _num(x.get("z")) or 0.0
+                if qt is None:
+                    continue
+                q = Quote(t, qt, bid, ask, last, last, vol, t + self.lag)
+                b = int(t / STEP_S)
+                if rows and b == bucket:
+                    rows[-1] = q
+                else:
+                    rows.append(q)
+                bucket = b
+            if rows:
+                self.rows[sym] = rows
+                self.keys[sym] = {q.key() for q in rows}
+                self.tick_span[sym] = (rows[0].seen, rows[-1].seen)
+                self.raw[sym] = (rt, rb, ra)
+
+    def symbols(self) -> list[str]:
+        """Every symbol the poller can need in the window: recorded quotes, order legs, positions."""
+        out = set(self.recorded) | set(self.rows)
+        for vs in self.versions.values():
+            for v in vs:
+                stack = [v.payload]
+                while stack:
+                    o = stack.pop()
+                    for leg in o.get("orderLegCollection") or []:
+                        sym = ((leg or {}).get("instrument") or {}).get("symbol")
+                        if sym:
+                            out.add(sym)
+                    stack.extend(c for c in o.get("childOrderStrategies") or [] if isinstance(c, dict))
+        for _, acct in self.snaps:
+            for pos in (acct.get("securitiesAccount") or {}).get("positions") or []:
+                sym = (pos.get("instrument") or {}).get("symbol")
+                if sym:
+                    out.add(sym)
+        from .quote_stream import is_stock
+        return sorted(x for x in out if is_stock(x))
+
+    def match(self) -> Optional[dict]:
+        """Schwab's saved REST quotes against Alpaca's ticks: is Alpaca's NBBO at Schwab's quoteTime
+        the same bid and ask, and how far from Schwab's quoteTime is the nearest Alpaca quote with that
+        bid and ask (Alpaca minus Schwab, ms). Also how old Schwab's REST quote was when it arrived."""
+        if not self.raw:
+            return None
+        n = same = near = 0
+        offs, ages = [], []
+        for sym, rows in self.recorded.items():
+            raw = self.raw.get(sym)
+            if not raw:
+                continue
+            rt, rb, ra = raw
+            for q in rows:
+                if not q.qt or q.bid is None or q.ask is None:
+                    continue
+                n += 1
+                ages.append(q.seen * 1000 - q.qt)
+                at = q.qt / 1000
+                # Schwab's quoteTime is whole ms: an Alpaca quote anywhere inside that ms counts.
+                i = bisect.bisect_right(rt, at + 0.001) - 1
+                if i >= 0 and rb[i] == q.bid and ra[i] == q.ask:
+                    same += 1
+                lo, hi = bisect.bisect_left(rt, at - 2), bisect.bisect_right(rt, at + 2)
+                best = None
+                for j in range(lo, hi):
+                    if rb[j] == q.bid and ra[j] == q.ask and (best is None or abs(rt[j] - at) < abs(best)):
+                        best = rt[j] - at
+                if best is not None:
+                    near += 1
+                    offs.append(best * 1000)
+        if not n:
+            return {"schwab_quotes": 0}
+        return {"schwab_quotes": n, "same_nbbo_at_quote_time_pct": round(100 * same / n, 1),
+                "same_nbbo_within_2s_pct": round(100 * near / n, 1),
+                "alpaca_minus_schwab_ms": _pcts(offs), "abs_offset_ms": _pcts([abs(x) for x in offs]),
+                "schwab_rest_quote_age_ms": _pcts(ages)}
+
     # ---- what Schwab had at time t ----
 
     def quote_at(self, sym: str, t: float) -> Optional[Quote]:
@@ -278,10 +392,16 @@ class Day:
         return self.rows[sym][bisect.bisect_right(av, a):bisect.bisect_right(av, b)] if av else []
 
     def recorded_near(self, sym: str, t: float) -> bool:
-        """The poller was recording this symbol around t (it records only names it holds or works)."""
+        """The poller was recording this symbol around t (it records only names it holds or works).
+        With ticks: inside the ticks' span."""
+        if self.tick_span:
+            a, b = self.tick_span.get(sym, (1.0, 0.0))
+            return a <= t <= b + 60
         ss = self.seen.get(sym) or []
+        # A row seen in the GAP_S before t: before the poller (re)started recording a name, the
+        # newest row can be from long before, which Schwab would not have answered then.
         i = bisect.bisect_left(ss, t - GAP_S)
-        return i < len(ss) and ss[i] <= t + GAP_S
+        return i < len(ss) and ss[i] <= t
 
     def version_at(self, oid: int, t: float) -> Optional[Version]:
         i = bisect.bisect_right(self._eff.get(oid) or [], t)
@@ -417,6 +537,7 @@ class SimStream:
         self.logged_in = self.stopped = self.dropped = False
         self.sent: dict[str, Quote] = {}
         self.full_due: dict[str, Optional[float]] = {}
+        self.next_send: dict[str, float] = {}
         self.cursor = hub.clock.time()
         self.last_hb = 0.0
 
@@ -467,8 +588,9 @@ def _content(sym: str, q: Quote, before: Optional[Quote]) -> dict:
 class StreamHub:
     """Schwab's side of the streamer: what the active SimStream receives, tick by tick."""
 
-    def __init__(self, day: Day, clock: SimClock, outages: Iterable[Outage] = ()):
+    def __init__(self, day: Day, clock: SimClock, outages: Iterable[Outage] = (), every_s: float = 0.0):
         self.day, self.clock, self.lag = day, clock, day.lag
+        self.every = every_s                   # at most one update per symbol this often (Schwab conflates)
         self.outages = list(outages)
         self.events = day.activity()
         self._ev_t = [t for t, _ in self.events]
@@ -519,16 +641,17 @@ class StreamHub:
                     s.sent[k] = q
                     del s.full_due[k]
         for k in sorted(s.subs):
-            if k not in s.sent:
+            # Only the newest state goes out, at most once per `every` for each symbol.
+            if k not in s.sent or t < s.next_send.get(k, 0.0):
                 continue
-            for q in self.day.quotes_between(k, s.cursor, t):
-                prev = s.sent[k]
-                if prev.qt and q.qt and q.qt < prev.qt:
-                    continue                   # the streamer never sends an older quote
-                c = _content(k, q, prev)
-                s.sent[k] = q
-                if len(c) > 1:
-                    msgs.append(c)
+            q, prev = self.day.quote_at(k, t), s.sent[k]
+            if q is None or q is prev or (prev.qt and q.qt and q.qt < prev.qt):
+                continue                       # the streamer never sends an older quote
+            c = _content(k, q, prev)
+            s.sent[k] = q
+            if len(c) > 1:
+                msgs.append(c)
+                s.next_send[k] = t + self.every
         if msgs:
             s.receiver(json.dumps({"data": [{"service": "LEVELONE_EQUITIES", "timestamp": int(t * 1000),
                                              "content": msgs}]}))
@@ -615,14 +738,15 @@ def _patched(clock: SimClock, fake: SimSchwab):
 
 
 class Sim:
-    def __init__(self, day: Day, name: str, stream: bool, outages=(), workdir: Optional[Path] = None):
+    def __init__(self, day: Day, name: str, stream: bool, outages=(), workdir: Optional[Path] = None,
+                 every_s: float = 0.0):
         from .poller import LANE_TICK_S
         self.day, self.name, self.with_stream = day, name, stream
         self.t0, self.t1 = day.t0, day.t1
         self.measure_from = day.t0 + WARMUP_S
         self.clock = SimClock(day.t0)
         self.schwab = SimSchwab(day, self.clock)
-        self.hub = StreamHub(day, self.clock, outages) if stream else None
+        self.hub = StreamHub(day, self.clock, outages, every_s) if stream else None
         self.workdir = workdir
         self.lane_tick = LANE_TICK_S
         self.lane_next = 0.0
@@ -636,7 +760,10 @@ class Sim:
         self.age: list[float] = []
         self.behind: list[float] = []
         self.silent_age: list[float] = []
-        self.silent_last: dict[int, float] = {}    # outage -> the last look that found stream marks
+        self.silent_last: dict[int, float] = {}
+        self.why: dict[str, int] = {}               # looks: covered, or the first reason it was not
+        self.why_syms: dict[str, set] = {}          # reason -> the symbols (only their count is reported)
+        self.ring_capped = 0    # outage -> the last look that found stream marks
         self.last_qt: dict[str, int] = {}
 
     def advance(self, seconds: float) -> None:
@@ -680,6 +807,8 @@ class Sim:
         syms = p._quote_symbols()
         m["quotes_stale"] += bool(syms) and not p._fresh("quotes")
         silent = self.hub.outage_at(t) if self.hub is not None else None
+        if self.hub is not None and syms:
+            self._why_not_covered(syms)
         for s in syms:
             truth = self.day.quote_at(s, t)
             if truth is None or not self.day.recorded_near(s, t):
@@ -708,6 +837,41 @@ class Sim:
                     self.silent_age.append(t * 1000 - qt)
                     self.silent_last[id(silent)] = t
 
+    def _ring(self, p, kind: str) -> None:
+        from .poller import RING_MAX_PER_MIN
+        now = self.clock.monotonic()
+        if len([x for x in p._rings if now - x < 60]) >= RING_MAX_PER_MIN:
+            self.ring_capped += 1
+        self.rings.append(p.ring(kind))
+
+    def _why_not_covered(self, syms) -> None:
+        """When the stream does not stand in for the REST quotes call, the first reason, per look, and
+        how many distinct symbols had each reason (counts only)."""
+        from .quote_stream import is_stock
+        q = self.p.stream
+        if q.covers(syms):
+            self.why["covered"] = self.why.get("covered", 0) + 1
+            return
+        if self.p.guests.wanted():
+            reason = "a probe guest rides in REST"
+        elif not q.live():
+            reason = "stream not live"
+        else:
+            reason, bad = None, None
+            with q._lock:
+                for s in syms:
+                    u = str(s).upper()
+                    r = ("not a stock (option, index or future)" if not is_stock(u)
+                         else "no full stream quote yet" if u not in q._full
+                         else "REST never answered real time" if (q._rest.get(u) or {}).get("realtime") is not True
+                         else None)
+                    if r:
+                        reason, bad = r, u
+                        break
+            reason = reason or "other"
+            self.why_syms.setdefault(reason, set()).add(bad)
+        self.why[reason] = self.why.get(reason, 0) + 1
+
     def run(self) -> dict:
         from .poller import Poller
         from .quote_stream import QuoteStream
@@ -720,7 +884,7 @@ class Sim:
                 if self.with_stream:
                     q = QuoteStream(self.hub.make, mono=self.clock.monotonic, background_start=False,
                                     wall=self.clock.time)
-                    q.doorbell = lambda kind: self.rings.append(p.ring(kind))
+                    q.doorbell = lambda kind: self._ring(p, kind)
                     p.stream, p.stream_mode = q, "on"
                 self.p = p
                 p._run()
@@ -769,7 +933,8 @@ class Sim:
                       "age_ms": _pcts(self.age), "behind_newest_ms": _pcts(self.behind),
                       "current_pct": round(100 * sum(1 for b in self.behind if b <= 0) / len(self.behind), 1)
                       if self.behind else None},
-            "orders": {"changes_measured": len(lag), "not_seen": missed, "seen_after_ms": _pcts(lag)},
+            "orders": {"changes_measured": len(lag), "not_seen": missed, "seen_after_ms": _pcts(lag),
+                       "within_1s_pct": round(100 * sum(1 for x in lag if x <= 1000) / len(lag), 1) if lag else None},
             "fresh": {"checks": m["checks"], "orders_today_stale": m["orders_today_stale"],
                       "orders_stale": m["orders_stale"], "account_stale": m["account_stale"],
                       "quotes_stale": m["quotes_stale"]},
@@ -777,6 +942,9 @@ class Sim:
         if self.hub is not None:
             out["stream"] = {"starts": self.hub.starts, "logins": self.hub.logins,
                              "rings": len(self.rings), "rings_moved_a_read": sum(self.rings),
+                             "rings_over_the_minute_cap": self.ring_capped,
+                             "looks": dict(sorted(self.why.items())),
+                             "symbols_per_reason": {k: len(v) for k, v in sorted(self.why_syms.items())},
                              "marks_while_silent": m["stream_marks_while_silent"],
                              "age_while_silent_ms": _pcts(self.silent_age)}
             outs = []
@@ -812,8 +980,9 @@ def checks(results: list[dict]) -> list[dict]:
         if a and b:
             add("on: order changes reach the order list sooner than off", b["p50"] < a["p50"],
                 f"median {b['p50']} ms vs {a['p50']} ms, worst {b['max']} vs {a['max']} ms")
+        # 50 ms: the two runs look at slightly different moments (the doorbell moves the lane's reads).
         add("on: marks no older than off", (on["marks"]["age_ms"] or {}).get("p50", 0)
-            <= (off["marks"]["age_ms"] or {}).get("p50", 0),
+            <= (off["marks"]["age_ms"] or {}).get("p50", 0) + 50,
             f"median age {(on['marks']['age_ms'] or {}).get('p50')} ms vs {(off['marks']['age_ms'] or {}).get('p50')} ms")
         add("on: marks step back no more often than off", on["marks"]["went_back"] <= off["marks"]["went_back"],
             f"{on['marks']['went_back']} vs {off['marks']['went_back']}")
@@ -840,21 +1009,27 @@ def _outage(day: str, kind: str, text: str) -> Outage:
     return Outage(kind, t, t + float(secs or 20))
 
 
-def replay(db, day: str, start: str, end: str, lag_ms: float = 300, drops=(), stalls=(),
-           workdir: Optional[Path] = None) -> dict:
-    t0, t1 = _at(day, start), _at(day, end)
+def load(db, day: str, start: str, end: str, lag_ms: float = 300, ticks=None) -> Day:
     con = _ro(db)
     try:
-        data = Day(con, t0, t1, lag_ms / 1000)
+        return Day(con, _at(day, start), _at(day, end), lag_ms / 1000, Path(ticks) if ticks else None)
     finally:
         con.close()
-    runs = [Sim(data, "off", False, workdir=workdir), Sim(data, "on", True, workdir=workdir)]
+
+
+def replay(db, day: str, start: str, end: str, lag_ms: float = 300, drops=(), stalls=(),
+           workdir: Optional[Path] = None, ticks=None, every_ms: float = 0.0) -> dict:
+    data = load(db, day, start, end, lag_ms, ticks)
+    ev = every_ms / 1000
+    runs = [Sim(data, "off", False, workdir=workdir), Sim(data, "on", True, workdir=workdir, every_s=ev)]
     for kind, items in (("drop", drops), ("stall", stalls)):
         for text in items:
             o = _outage(day, kind, text)
-            runs.append(Sim(data, f"on+{kind} {text}", True, [o], workdir=workdir))
+            runs.append(Sim(data, f"on+{kind} {text}", True, [o], workdir=workdir, every_s=ev))
     results = [r.run() for r in runs]
     return {"day": day, "window_et": [start, end], "lag_ms": lag_ms,
+            "quotes_from": "alpaca ticks" if ticks else "saved schwab REST quotes", "stream_every_ms": every_ms,
+            "match": data.match(),
             "recorded": {"symbols": len(data.rows), "quote_rows": sum(len(v) for v in data.rows.values()),
                          "orders": len(data.versions),
                          "order_changes": sum(len(v) for v in data.versions.values()),
@@ -864,7 +1039,11 @@ def replay(db, day: str, start: str, end: str, lag_ms: float = 300, drops=(), st
 
 def _text(rep: dict) -> str:
     lines = [f"Stream replay {rep['day']} {rep['window_et'][0]}-{rep['window_et'][1]} ET, stream lag {rep['lag_ms']} ms",
-             "recorded: " + ", ".join(f"{k} {v}" for k, v in rep["recorded"].items()), ""]
+             "recorded: " + ", ".join(f"{k} {v}" for k, v in rep["recorded"].items()),
+             f"quotes from: {rep.get('quotes_from')}, stream sends a symbol at most every {rep.get('stream_every_ms')} ms"]
+    if rep.get("match"):
+        lines.append("schwab vs alpaca: " + ", ".join(f"{k} {v}" for k, v in rep["match"].items()))
+    lines.append("")
     for r in rep["runs"]:
         lines.append(f"[{r['run']}]  {r['minutes']} min")
         lines.append(f"  calls: max {r['calls']['max_any_60s']} in any 60 s; per min "
@@ -875,7 +1054,7 @@ def _text(rep: dict) -> str:
                      f"{mk['invented']}, went back {mk['went_back']}, no mark {mk['no_mark']}")
         o = r["orders"]
         lines.append(f"  order changes: {o['changes_measured']} measured, seen after {o['seen_after_ms']}, "
-                     f"not seen {o['not_seen']}")
+                     f"within 1 s {o['within_1s_pct']}%, not seen {o['not_seen']}")
         f = r["fresh"]
         lines.append(f"  stale looks of {f['checks']}: orders_today {f['orders_today_stale']}, orders "
                      f"{f['orders_stale']}, account {f['account_stale']}, quotes {f['quotes_stale']}")
@@ -883,7 +1062,8 @@ def _text(rep: dict) -> str:
             s = r["stream"]
             lines.append(f"  stream: starts {s['starts']}, logins {s['logins']}, rings {s['rings']} "
                          f"(moved a read {s['rings_moved_a_read']}), marks while silent {s['marks_while_silent']} "
-                         f"age {s['age_while_silent_ms']}")
+                         f"age {s['age_while_silent_ms']}, rings over the 6/min cap {s['rings_over_the_minute_cap']}")
+            lines.append(f"  stream cover, per look: {s['looks']}; symbols per reason {s['symbols_per_reason']}")
         for x in r.get("outages") or []:
             lines.append(f"  {x['kind']} {x['seconds']} s: stream marks kept {x['stream_marks_for_s']} s, first REST "
                          f"quotes call {x['first_rest_quotes_after_s']} s after it went quiet")
@@ -902,9 +1082,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--lag-ms", type=float, default=300.0, help="the stream's assumed delay after Schwab's quote time")
     ap.add_argument("--drop", action="append", default=[], help="HH:MM:SS/seconds: the connection drops")
     ap.add_argument("--stall", action="append", default=[], help="HH:MM:SS/seconds: the stream goes silent")
+    ap.add_argument("--ticks", help="Alpaca ticks (scripts/alpaca_ticks.py) to stream instead of the saved quotes")
+    ap.add_argument("--every-ms", type=float, default=0.0,
+                    help="the stream sends a symbol at most this often (Schwab's real rate is not measured yet)")
+    ap.add_argument("--list-symbols", help="only write the window's symbols to this file (for the tick fetch)")
     ap.add_argument("--out", help="write the full report as JSON here")
     a = ap.parse_args(argv)
-    rep = replay(a.db, a.day, a.start, a.end, a.lag_ms, a.drop, a.stall)
+    if a.list_symbols:
+        syms = load(a.db, a.day, a.start, a.end, a.lag_ms).symbols()
+        Path(a.list_symbols).write_text("\n".join(syms) + "\n", encoding="utf-8")
+        print(f"{len(syms)} symbols written")
+        return 0
+    rep = replay(a.db, a.day, a.start, a.end, a.lag_ms, a.drop, a.stall, ticks=a.ticks, every_ms=a.every_ms)
     if a.out:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         Path(a.out).write_text(json.dumps(rep, indent=1), encoding="utf-8")
