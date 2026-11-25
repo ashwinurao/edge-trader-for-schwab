@@ -944,8 +944,9 @@ class PlanDesk:
     def chase(self, ticker: str, side: str, expected: Any) -> dict:
         """Chase (Ash, 2026-11-18 14:01:28 UTC): the price is past the entry and nothing filled, so
         cancel the resting entry (if one rests), confirm it with nothing filled, and send a
-        stop-limit at the price with a 0.1% limit (break_entry.chase_levels), its stop still the
-        09:30 minute's other side. "Chase again" is the same click on the chase order. Shares: the
+        LIMIT 0.1% past the price (break_entry.chase_levels; a stop-limit at the price if the price
+        is back inside it by the send, break_entry.make_plan), its stop still the 09:30 minute's
+        other side. "Chase again" is the same click on the chase order. Shares: the
         plan's shares for the side, made smaller so the dollar risk does not grow (the stop is
         farther away), never more; then the size stage (1 share at the test stage).
         `expected` is {"stop", "shares"} as the page showed the side."""

@@ -110,7 +110,8 @@ def target_for(side: str, entry) -> Decimal:
 @contextmanager
 def click_chase():
     """While inside, a break entry may go with the price already through its trigger, as long as
-    the price is still inside its limit (the Chase click, companion/plan_entries.py)."""
+    the price is still inside its limit (the Chase click, companion/plan_entries.py). At or through
+    its trigger it goes as a LIMIT at the limit with its stop attached (make_plan)."""
     token = _click_chase.set(True)
     try:
         yield
@@ -320,6 +321,13 @@ def make_plan(req: dict, q: dict) -> Plan:
             return _bad(req, f"Price ran past the chase limit: ask {fmt(Decimal(str(ask)))} is above {fmt(lim)}.")
         if not long and bid is not None and Decimal(str(bid)) < lim:
             return _bad(req, f"Price ran past the chase limit: bid {fmt(Decimal(str(bid)))} is below {fmt(lim)}.")
+        # At or through its trigger it goes as a LIMIT at the limit, the stop attached. A chase's
+        # trigger is the bid (short) or ask (long) itself, and Schwab rejects a sell stop that is not
+        # below the bid (a buy stop not above the ask): both HPE chases of the 2026-11-24 open were
+        # rejected so (Ash's card pick "All four fixes", project thread, 2026-11-25 16:17:08 UTC).
+        # Back inside the trigger it stays a stop-limit there, which Schwab takes.
+        through = ((long and ask is not None and Decimal(str(ask)) >= trig)
+                   or (not long and bid is not None and Decimal(str(bid)) <= trig))
     # The armed plan's send (limit_guards, change 2 of Ash's "do all 5"): through the level but not past
     # the limit goes as a LIMIT at the limit, which caps the fill; past the limit it could only rest,
     # so it is refused.
