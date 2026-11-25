@@ -453,6 +453,55 @@ def test_four_picks_go_out_one_at_a_time_nearest_first_each_exactly_the_break_en
     assert [x["ticker"] for x in lines(rig, "send_start")] == NEAREST_FIRST
 
 
+def unacknowledged(rig):
+    """Schwab takes each send and lists it as PENDING_ACKNOWLEDGEMENT first, as the 2026-11-24 open's
+    order list read 0.1 s after the armed AAOI send showed it."""
+    def hook(_n):
+        rig.broker.orders[max(rig.broker.orders)]["status"] = "PENDING_ACKNOWLEDGEMENT"
+    rig.broker.after_place = hook
+
+
+def test_a_send_schwab_has_not_acknowledged_yet_is_sent_not_unclear(rig):
+    """The 2026-11-24 open: the plan read its AAOI order as PENDING_ACKNOWLEDGEMENT, called it unclear
+    and disarmed after two of four sends. Within ACK_WAIT_S of the send it is "sent, not listed yet"."""
+    unacknowledged(rig)
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    assert rig.plan.panel()["armed"] and lines(rig, "disarm") == []
+    assert {rig.desk.auto_entry(s, rig.desk.records(), list(rig.broker.orders.values()))["state"]
+            for s in PICKS} == {"working"}
+    for o in rig.broker.orders.values():
+        o["status"] = "WORKING"                       # Schwab acknowledges them a moment later
+    run(rig, et(9, 31, 30))
+    assert rig.plan.panel()["armed"] and lines(rig, "disarm") == [] and len(rig.broker.placed) == 4
+
+
+def test_a_send_still_unacknowledged_after_the_wait_is_unclear_and_disarms(rig):
+    """Must still fire: past ACK_WAIT_S an unacknowledged order is unclear, as before."""
+    unacknowledged(rig)
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert rig.plan.panel()["armed"]
+    run(rig, et(9, 31, 0.1 + plan_entries.ACK_WAIT_S + 2))
+    assert not rig.plan.panel()["armed"]
+    assert "an unclear answer on the plan's" in lines(rig, "disarm")[0]["why"]
+
+
+def test_an_unacknowledged_order_with_a_fill_or_without_a_send_time_is_not_waited_on(rig):
+    desk = rig.desk
+    rec = {"sent_at": et(9, 31, 0).isoformat()}
+    rig.clock.t = et(9, 31, 1)
+    o = {"status": "PENDING_ACKNOWLEDGEMENT", "filledQuantity": 0.0}
+    assert desk._acknowledging(o, rec)
+    assert not desk._acknowledging({**o, "filledQuantity": 1.0}, rec)
+    assert not desk._acknowledging({**o, "filledQuantity": None}, rec)
+    assert not desk._acknowledging(o, {})
+    assert not desk._acknowledging({**o, "status": "AWAITING_MANUAL_REVIEW"}, rec)
+    rig.clock.t = et(9, 31, plan_entries.ACK_WAIT_S + 0.5)
+    assert not desk._acknowledging(o, rec)
+
+
 def test_the_record_names_each_armed_send_by_its_ticket(rig, rec):  # noqa: F811
     """The open of 2026-11-19: the armed plan's Schwab calls had no id and purpose "other", so they
     matched their pick only by time. Each send's calls now carry its ticket id (the auto log's

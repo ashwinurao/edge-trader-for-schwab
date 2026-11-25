@@ -80,6 +80,13 @@ RED = "RED"              # a flip stopped: nothing more from this row today
 BUSY = (SENDING, FLIPPING)
 
 DONE_UNFILLED = {"CANCELED", "REJECTED", "EXPIRED"}
+# Schwab's word for an order it took but has not yet acknowledged. The 2026-11-24 open: the order
+# list read 0.1 s after the armed AAOI send showed it, and WORKING 1.4 s later; the plan read it as
+# unclear and disarmed (Ash's card pick "All four fixes", project thread, 2026-11-25 16:17:08 UTC).
+# Not a resting state (orders.LIVE): it protects nothing yet. For ACK_WAIT_S after the plan's own
+# send it reads as "sent, not listed yet"; after that it is unclear again.
+ACKNOWLEDGING = {"PENDING_ACKNOWLEDGEMENT"}
+ACK_WAIT_S = 10.0
 # Architect's review of PR #19 (2026-11-13): a row reads "nothing resting", "ended unfilled" and "no
 # other working order on this name" from the poller's order list, so it never sends on an old one.
 ORDERS_OLD = "Schwab's order list is old. Nothing is sent until it is fresh."
@@ -395,6 +402,8 @@ class PlanDesk:
             d["text"] = f"{filled:g} filled. Manage the position on the dashboard."
         elif status in LIVE:
             d.update(resting=True, text=f"Resting at Schwab ({status}), nothing filled.")
+        elif status in ACKNOWLEDGING:
+            d["text"] = "Sent. Schwab has not acknowledged it yet."
         elif status in DONE_UNFILLED:
             why = o.get("statusDescription") or ""
             d.update(ended=True, text=f"Ended {status} with nothing filled." + (f" Schwab: {why}" if why else ""))
@@ -1383,8 +1392,9 @@ class PlanDesk:
         nums = ({k: sent.get(k) for k in ("trigger", "limit", "stop")}
                 if sent.get("ticket_id") == rec.get("ticket_id") else {})
         o = self._order(rec, orders)
-        if o is None:
-            # Accepted with an order id; the poller's list does not show it yet.
+        if o is None or self._acknowledging(o, rec):
+            # Accepted with an order id; the poller's list does not show it yet, or shows it as not
+            # yet acknowledged within ACK_WAIT_S of the send.
             return {**base, **nums, "shares": sent.get("shares"), "state": "working" if nums else "busy"}
         d = self._describe(o)
         if d["filled"] is None:
@@ -1397,6 +1407,16 @@ class PlanDesk:
             return {**base, "state": "unclear"}
         got = {k: v for k, v in self._order_numbers(o).items() if v is not None}
         return {**base, **nums, **got, "shares": sent.get("shares"), "state": "working"}
+
+    def _acknowledging(self, o: Mapping, rec: Mapping) -> bool:
+        """The plan's own order, nothing filled, in ACKNOWLEDGING at most ACK_WAIT_S after its send."""
+        if o.get("status") not in ACKNOWLEDGING or _num(o.get("filledQuantity")) != 0:
+            return False
+        try:
+            sent_at = datetime.fromisoformat(str(rec.get("sent_at")))
+            return 0 <= (self._now() - sent_at).total_seconds() <= ACK_WAIT_S
+        except (TypeError, ValueError):
+            return False                   # no send time: when unsure, unclear
 
     def records(self) -> dict:
         """Today's row records (a copy), after the UNKNOWN rows follow their tickets."""
