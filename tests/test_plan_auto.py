@@ -453,6 +453,55 @@ def test_four_picks_go_out_one_at_a_time_nearest_first_each_exactly_the_break_en
     assert [x["ticker"] for x in lines(rig, "send_start")] == NEAREST_FIRST
 
 
+def unacknowledged(rig):
+    """Schwab takes each send and lists it as PENDING_ACKNOWLEDGEMENT first, as the 2026-11-24 open's
+    order list read 0.1 s after the armed AAOI send showed it."""
+    def hook(_n):
+        rig.broker.orders[max(rig.broker.orders)]["status"] = "PENDING_ACKNOWLEDGEMENT"
+    rig.broker.after_place = hook
+
+
+def test_a_send_schwab_has_not_acknowledged_yet_is_sent_not_unclear(rig):
+    """The 2026-11-24 open: the plan read its AAOI order as PENDING_ACKNOWLEDGEMENT, called it unclear
+    and disarmed after two of four sends. Within ACK_WAIT_S of the send it is "sent, not listed yet"."""
+    unacknowledged(rig)
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    assert rig.plan.panel()["armed"] and lines(rig, "disarm") == []
+    assert {rig.desk.auto_entry(s, rig.desk.records(), list(rig.broker.orders.values()))["state"]
+            for s in PICKS} == {"working"}
+    for o in rig.broker.orders.values():
+        o["status"] = "WORKING"                       # Schwab acknowledges them a moment later
+    run(rig, et(9, 31, 30))
+    assert rig.plan.panel()["armed"] and lines(rig, "disarm") == [] and len(rig.broker.placed) == 4
+
+
+def test_a_send_still_unacknowledged_after_the_wait_is_unclear_and_disarms(rig):
+    """Must still fire: past ACK_WAIT_S an unacknowledged order is unclear, as before."""
+    unacknowledged(rig)
+    arm(rig)
+    run(rig, et(9, 31, 2), start=et(9, 31, 0.1))
+    assert rig.plan.panel()["armed"]
+    run(rig, et(9, 31, 0.1 + plan_entries.ACK_WAIT_S + 2))
+    assert not rig.plan.panel()["armed"]
+    assert "an unclear answer on the plan's" in lines(rig, "disarm")[0]["why"]
+
+
+def test_an_unacknowledged_order_with_a_fill_or_without_a_send_time_is_not_waited_on(rig):
+    desk = rig.desk
+    rec = {"sent_at": et(9, 31, 0).isoformat()}
+    rig.clock.t = et(9, 31, 1)
+    o = {"status": "PENDING_ACKNOWLEDGEMENT", "filledQuantity": 0.0}
+    assert desk._acknowledging(o, rec)
+    assert not desk._acknowledging({**o, "filledQuantity": 1.0}, rec)
+    assert not desk._acknowledging({**o, "filledQuantity": None}, rec)
+    assert not desk._acknowledging(o, {})
+    assert not desk._acknowledging({**o, "status": "AWAITING_MANUAL_REVIEW"}, rec)
+    rig.clock.t = et(9, 31, plan_entries.ACK_WAIT_S + 0.5)
+    assert not desk._acknowledging(o, rec)
+
+
 def test_the_record_names_each_armed_send_by_its_ticket(rig, rec):  # noqa: F811
     """The open of 2026-11-19: the armed plan's Schwab calls had no id and purpose "other", so they
     matched their pick only by time. Each send's calls now carry its ticket id (the auto log's
@@ -1139,29 +1188,48 @@ def test_a_partial_refund_keeps_the_rest_of_the_reservation_and_its_time(rig):
     assert rig.plan._calls_used() == 0
 
 
-def test_a_tape_quote_older_than_1_s_leaves_the_pick_for_the_day(rig):
-    """break_entry.prepare refuses the open tape's quote when it was more than TAPE_PRICE_MAX_AGE_MS
-    (1 s) old at the reading, before any order request, and the plan does not try again: that pick is
-    left. It was Schwab's quote and 5 s before change 2 of Ash's "do all 5"
-    (test_a_quote_older_than_5_s_leaves_the_pick_for_the_day; that rule still holds where the plan
-    falls back to Schwab's quote, tests/test_shared_quotes.py)."""
-    assert break_entry.TAPE_PRICE_MAX_AGE_MS == 1_000
-    arm(rig)
+def old_tape_quote(rig, sym, seconds):
     real = rig.tape.read
 
     def read():
         r = real()
         for p in r["picks"]:
-            if p["symbol"] == "DDDD":
-                p["quote_at"] = r["received"] - timedelta(seconds=1.2)
+            if p["symbol"] == sym:
+                p["quote_at"] = r["received"] - timedelta(seconds=seconds)
         return r
     rig.tape.read = read
+
+
+def test_a_tape_quote_older_than_1_s_is_checked_against_schwabs_quote(rig):
+    """The 2026-11-24 open: TXN's and HPE's bid and ask on the tape had not changed for 2.55 s and
+    1.10 s, and break_entry.prepare refused both sends, leaving the picks for the day. Since Ash's
+    card pick "All four fixes" (2026-11-25 16:17:08 UTC) a tape quote over TAPE_PRICE_MAX_AGE_MS (1 s)
+    is checked against Schwab's quote instead, and the pick goes. CHANGED EXPECTATION: this test was
+    test_a_tape_quote_older_than_1_s_leaves_the_pick_for_the_day (DDDD left, 3 sends)."""
+    assert break_entry.TAPE_PRICE_MAX_AGE_MS == 1_000
+    arm(rig)
+    old_tape_quote(rig, "DDDD", 1.2)
+    run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
+    assert placed(rig) == NEAREST_FIRST
+    assert [without_id(r) for r in rig.sent] == [want_req(s) for s in NEAREST_FIRST]
+    assert "DDDD" not in rig.plan.left
+    quotes = [c for c in rig.broker.calls if c[0] == "quote"]
+    assert quotes == [("quote", "DDDD")]                 # only the old tape quote asked Schwab
+
+
+def test_a_tape_quote_older_than_1_s_with_schwabs_price_past_the_limit_is_not_sent(rig):
+    """Must still refuse: Schwab's quote is checked as any break entry's (past the limit, no send)."""
+    arm(rig)
+    old_tape_quote(rig, "DDDD", 1.2)
+    real_quote = rig.trader.quote
+
+    def quote(sym, max_age=1.0):
+        q = real_quote(sym, max_age)
+        return {**q, "bid": 9.80, "ask": 9.82} if sym == "DDDD" else q
+    rig.trader.quote = quote
     run(rig, et(9, 31, 5), start=et(9, 31, 0.1))
     assert placed(rig) == ["AAAA", "BBBB", "CCCC"]
-    assert "The open tape's price is 1.20 s old" in rig.plan.left["DDDD"]
-    assert rig.plan.orders_pick["DDDD"] == 0 and rig.plan.arming.is_armed(rig.clock.now())
-    rec = rig.desk.records()["DDDD"]
-    assert rec["state"] == plan_entries.NONE and rec["order_id"] is None and "Not sent" in rec["text"]
+    assert "DDDD" in rig.plan.left and rig.plan.orders_pick["DDDD"] == 0
 
 
 # ---------------------------------------------------------------- Schwab says no

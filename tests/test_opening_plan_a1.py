@@ -527,11 +527,49 @@ def test_chase_cancels_the_resting_entry_then_sends_at_the_price(fr, monkeypatch
     assert mutating(fr) == [("cancel", oid), ("place", "BUY")]
     assert r["chase"]["trigger"] == "42.56" and r["chase"]["limit"] == "42.60" and r["chase"]["stop"] == "41.92"
     assert r["chase"]["shares"] == 1
+    # CHANGED EXPECTATION (Ash's card pick "All four fixes", 2026-11-25 16:17:08 UTC): a LIMIT at
+    # 42.60, not a STOP_LIMIT with its stop at the ask 42.56, which Schwab rejects (the 2026-11-24 HPE
+    # chases: "the stop price must be above the current ask for buy stop orders").
+    new = fr.broker.orders[r["order_id"]]
+    assert new["orderType"] == "LIMIT" and "stopPrice" not in new
+    assert Decimal(str(new["price"])) == Decimal("42.60")
+    assert any(c.get("orderType") == "STOP" and Decimal(str(c.get("stopPrice"))) == Decimal("41.92")
+               for c in _children(new))                  # the stop still attached
+    st = next(x for x in fr.desk.state()["rows"] if x["ticker"] == "AAAA")
+    assert st["click_chase"]["limit"] == "42.60" and st["entry"]["state"] == plan_entries.SENT
+
+
+def _children(o):
+    out = []
+    for ch in o.get("childOrderStrategies") or []:
+        out.append(ch)
+        out.extend(_children(ch))
+    return out
+
+
+def test_a_chase_whose_price_is_back_inside_its_trigger_by_the_send_rests_as_a_stop_limit(fr, monkeypatch):
+    """The click's ask 42.56 is the trigger; by the send the ask is 42.54, inside it. A LIMIT at 42.60
+    would buy at once below the chase price, so it rests as a stop-limit at 42.56 (above the ask, as
+    Schwab needs), limit 42.60."""
+    quote(monkeypatch, fr, (42.55, 42.56), (42.53, 42.54))
+    r = fr.desk.chase("AAAA", "LONG", CHASE_EXP)
+    assert r["ok"], r
     new = fr.broker.orders[r["order_id"]]
     assert new["orderType"] == "STOP_LIMIT" and Decimal(str(new["stopPrice"])) == Decimal("42.56")
     assert Decimal(str(new["price"])) == Decimal("42.60")
-    st = next(x for x in fr.desk.state()["rows"] if x["ticker"] == "AAAA")
-    assert st["click_chase"]["limit"] == "42.60" and st["entry"]["state"] == plan_entries.SENT
+
+
+def test_a_short_chase_at_the_bid_goes_as_a_limit_below_it(fr, monkeypatch):
+    """Hand-worked: bid 41.85 is the trigger, 0.1% is 0.04185 -> 0.04, limit 41.81 (a SELL_SHORT LIMIT,
+    never a sell stop at the bid, which Schwab rejected twice on 2026-11-24)."""
+    quote(monkeypatch, fr, (41.85, 41.86))
+    r = fr.desk.chase("AAAA", "SHORT", {"stop": "42.48", "shares": 1})
+    assert r["ok"], r
+    new = fr.broker.orders[r["order_id"]]
+    assert new["orderType"] == "LIMIT" and Decimal(str(new["price"])) == Decimal("41.81")
+    assert new["orderLegCollection"][0]["instruction"] == "SELL_SHORT"
+    assert any(c.get("orderType") == "STOP" and Decimal(str(c.get("stopPrice"))) == Decimal("42.48")
+               for c in _children(new))
 
 
 def test_chase_on_an_empty_row_sends_without_a_cancel(fr, monkeypatch):

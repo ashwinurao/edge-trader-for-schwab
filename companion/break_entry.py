@@ -79,7 +79,8 @@ CHASE_BUFFER = Decimal("0.001")      # Ash's 0.1%: the chase's limit past its tr
 # 2026-11-19 each Schwab quote before a send took 0.57 to 1.69 s at 09:31 ET, and ASTS was refused
 # for being 1 cent through. The tape is Edge Scanner's Alpaca SIP snapshot, read by the plan just
 # before the send. Its quote may be at most this old when the plan read it (a start number, not
-# approved by Ash on its own). Set by the armed plan only (tape_price), never a request field.
+# approved by Ash on its own); older, the send checks Schwab's quote instead (since the 2026-11-24 open).
+# Set by the armed plan only (tape_price), never a request field.
 TAPE_PRICE_MAX_AGE_MS = 1_000
 _tape_price: contextvars.ContextVar = contextvars.ContextVar("break_entry_tape_price", default=None)
 # Set by the armed plan around each send (limit_guards), whatever price it checks: through the level
@@ -109,7 +110,8 @@ def target_for(side: str, entry) -> Decimal:
 @contextmanager
 def click_chase():
     """While inside, a break entry may go with the price already through its trigger, as long as
-    the price is still inside its limit (the Chase click, companion/plan_entries.py)."""
+    the price is still inside its limit (the Chase click, companion/plan_entries.py). At or through
+    its trigger it goes as a LIMIT at the limit with its stop attached (make_plan)."""
     token = _click_chase.set(True)
     try:
         yield
@@ -160,7 +162,8 @@ def limit_guards():
 def tape_price(bid, ask, age_ms):
     """While inside, a break entry checks this price (the open tape's bid and ask, `age_ms` old when
     the plan read it) instead of a Schwab quote, and a price through its trigger but not past its limit
-    is sent as a LIMIT at the limit. Set by the armed plan around one send (handlers.on_place)."""
+    is sent as a LIMIT at the limit. Over TAPE_PRICE_MAX_AGE_MS old, the send checks Schwab's quote
+    instead (_send_quote). Set by the armed plan around one send (handlers.on_place)."""
     token = _tape_price.set({"bid": bid, "ask": ask, "age_ms": age_ms})
     try:
         yield
@@ -318,6 +321,13 @@ def make_plan(req: dict, q: dict) -> Plan:
             return _bad(req, f"Price ran past the chase limit: ask {fmt(Decimal(str(ask)))} is above {fmt(lim)}.")
         if not long and bid is not None and Decimal(str(bid)) < lim:
             return _bad(req, f"Price ran past the chase limit: bid {fmt(Decimal(str(bid)))} is below {fmt(lim)}.")
+        # At or through its trigger it goes as a LIMIT at the limit, the stop attached. A chase's
+        # trigger is the bid (short) or ask (long) itself, and Schwab rejects a sell stop that is not
+        # below the bid (a buy stop not above the ask): both HPE chases of the 2026-11-24 open were
+        # rejected so (Ash's card pick "All four fixes", project thread, 2026-11-25 16:17:08 UTC).
+        # Back inside the trigger it stays a stop-limit there, which Schwab takes.
+        through = ((long and ask is not None and Decimal(str(ask)) >= trig)
+                   or (not long and bid is not None and Decimal(str(bid)) <= trig))
     # The armed plan's send (limit_guards, change 2 of Ash's "do all 5"): through the level but not past
     # the limit goes as a LIMIT at the limit, which caps the fill; past the limit it could only rest,
     # so it is refused.
@@ -386,16 +396,20 @@ def prepare(trader, req: dict, now_ms: float | None = None) -> tuple[Plan | None
         return no(_cap_text() + ". Nothing was sent.")
     now_ms = time.time() * 1000 if now_ms is None else now_ms
     tp = _tape_price.get()
-    if tp is not None:
+    age = tp.get("age_ms") if tp is not None else None
+    if tp is not None and isinstance(age, (int, float)) and 0 <= age <= TAPE_PRICE_MAX_AGE_MS:
         # The armed plan's send: the open tape's price, no Schwab call (tape_price, change 2).
-        age = tp.get("age_ms")
-        if not isinstance(age, (int, float)) or age < 0 or age > TAPE_PRICE_MAX_AGE_MS:
-            said = f"{age / 1000:.2f} s old" if isinstance(age, (int, float)) else "without a time"
-            return no(f"The open tape's price is {said} (an armed send needs one under "
-                      f"{TAPE_PRICE_MAX_AGE_MS / 1000:g} s). Nothing was sent.")
         q = {"bid": tp.get("bid"), "ask": tp.get("ask"), "realtime": True, "quote_time": now_ms - age,
              "asset_type": "EQUITY"}
     else:
+        if tp is not None:
+            # The 2026-11-24 open: TXN's and HPE's bid and ask had not changed for 2.55 s and 1.10 s
+            # (their last trades were 0.24 s and 0.14 s old), and the send refused both. A quote that
+            # old on the tape is checked against Schwab's quote instead, under MAX_QUOTE_AGE_MS as
+            # any break entry (Ash's card pick "All four fixes", project thread, 2026-11-25 16:17:08 UTC).
+            said = f"{age / 1000:.2f} s old" if isinstance(age, (int, float)) else "without a time"
+            log.info("break entry: the open tape's quote for %s is %s; the send checks Schwab's quote",
+                     req.get("symbol"), said)
         q = _send_quote(trader, req["symbol"])
     if q.get("realtime") is not True:
         return no("Schwab's quote is not real-time, so the break level cannot be checked. Nothing was sent.")

@@ -203,9 +203,12 @@ def _wait_for(cond, seconds=3.0):
     return cond()
 
 
-def test_the_warm_up_reads_each_pick_once_3_s_before_0931(rig):
-    """Change 3 of Ash's "do all 5": one Schwab quotes read per pick at 09:30:57 ET, on its own threads,
-    without Trader's order lock and without an order; once per arm; counted in the calls bound."""
+def test_the_warm_up_reads_all_picks_in_one_call_3_s_before_0931(rig):
+    """Change 3 of Ash's "do all 5": a Schwab quotes read at 09:30:57 ET, on its own thread, without
+    Trader's order lock and without an order; once per arm; counted in the calls bound. CHANGED
+    EXPECTATION (Ash's card pick "All four fixes", 2026-11-25 16:17:08 UTC): one read for all four
+    picks, 1 call of the bound, not one read per pick (they queued on schwabdev's one client on
+    2026-11-24, the last waiting 1.49 s)."""
     calls = _schwab_quotes(rig)
     arm(rig, at=et(9, 29, 0))
     assert rig.plan.armed_rules.warm_up_seconds_before == 3.0
@@ -217,12 +220,12 @@ def test_the_warm_up_reads_each_pick_once_3_s_before_0931(rig):
         rig.clock.t = et(9, 30, s)
         assert not rig.plan.safe_step()
     assert _wait_for(lambda: len(lines(rig, "warm_up_answer")) == 4)
-    assert sorted(c[0] for c in calls) == [[s] for s in sorted(NEAREST_FIRST)]
+    assert len(calls) == 1 and sorted(calls[0][0]) == sorted(NEAREST_FIRST)
     assert not any(locked for _, locked in calls)
     (w,) = lines(rig, "warm_up")
     assert sorted(w["picks"]) == sorted(NEAREST_FIRST) and w["before_s"] == 3.0
     assert all(x["ok"] for x in lines(rig, "warm_up_answer"))
-    assert rig.broker.placed == [] and rig.plan.bounds_left("AAAA")["calls_minute"] == 36
+    assert rig.broker.placed == [] and rig.plan.bounds_left("AAAA")["calls_minute"] == 39
 
 
 def test_a_failed_warm_up_read_changes_nothing_but_its_line(rig):

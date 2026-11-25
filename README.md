@@ -619,15 +619,18 @@ sends what it showed; a difference refuses). Nothing is automatic.
   as the armed plan's do (see the armed plan's sends below).
 - **Chase** (`PlanDesk.chase`, `POST /api/opening-plan/chase`): reads one Schwab quote; when the price is
   still past the entry it cancels the resting entry (if one rests) and waits until Schwab confirms it
-  CANCELED with nothing filled, then sends a break entry with its trigger at the ask (long) or bid (short)
-  and its limit 0.1% past that, at least one cent (`break_entry.chase_levels`). The stop stays at the
+  CANCELED with nothing filled, then sends an entry with its trigger at the ask (long) or bid (short)
+  and its limit 0.1% past that, at least one cent (`break_entry.chase_levels`). With the price still at
+  or through that trigger at the send, it goes as a LIMIT at the limit with the stop and target attached;
+  back inside the trigger, as a stop-limit there. (It was always a stop-limit at the ask or bid until
+  2026-11-25: Schwab rejected both HPE chases of the 2026-11-24 open, "the stop price must be ... below
+  the bid for sell stop orders"; Ash's card pick "All four fixes".) The stop stays at the
   09:30 minute's other side. The plan's shares for the side are made smaller so the dollar risk does not
   grow (the stop is farther), never larger; then the size stage applies (1 share at the test stage). If
   the price is back inside, nothing is sent ("Use Place"). If by the send the price ran past the limit,
   the send is refused. A failed cancel turns the row red and sends nothing, like Flip. Only this click
   lets a break entry go with the price through its level (`break_entry.click_chase`, set by the server
-  around the one send); the ticket's own Break entry still refuses it. **Not confirmed yet:** that Schwab
-  accepts a buy stop-limit whose stop is at the ask; the first 1-share chase answers it.
+  around the one send); the ticket's own Break entry still refuses it.
 - **Take** (`POST /api/opening-plan/take`) hands a pick to you for the day: the plan's Place, Flip, Chase
   and Cancel refuse it and Flat all leaves it. Nothing is sent and its orders stay as they are. **Give
   back** undoes it.
@@ -929,14 +932,17 @@ pick at a time as before. On 2026-11-19, one at a time, the fourth order reached
 bar closed. A send checks the open tape's bid and ask, which the plan already holds, instead of asking
 Schwab for a quote (change 2: "let the limit guard the price"); that quote took 0.57 to 1.69 s at
 09:31. The tape's quote may be at most 1 second old when the plan read it
-(`break_entry.TAPE_PRICE_MAX_AGE_MS`, a start number), or the pick is left for the day. A pick already
+(`break_entry.TAPE_PRICE_MAX_AGE_MS`, a start number). Older, the send checks Schwab's quote
+instead, with the 5 second rule below (since 2026-11-25; on the 2026-11-24 open TXN's and HPE's bid and
+ask had not changed for 2.55 s and 1.10 s while they traded, and both sends were refused). A pick already
 through its trigger but not past its limit (the cap) goes as a LIMIT at the limit with the same stop
 attached, instead of being left: the limit caps the fill (ASTS was refused on 2026-11-19 for being
 1 cent through). Past the limit it is left to you, as before. Three seconds before 09:31:00
-(`armed.warm_up_seconds_before`) the plan makes one Schwab quotes read per pick on the trading
-client, all at once on their own threads, to open the connections the burst uses (change 3,
-`companion/plan_auto/warm.py`). They are counted in the calls bound, never hold the order lock, and a
-failed one changes nothing but its log line. From 09:30:59 to 09:31:03 the plan reads the tape every
+(`armed.warm_up_seconds_before`) the plan makes one Schwab quotes read for all the picks on the
+trading client, on its own thread, to open the connection the burst uses (change 3,
+`companion/plan_auto/warm.py`; one read per pick until 2026-11-25, which queued on schwabdev's one
+client). It counts as 1 call in the calls bound, never holds the order lock, and a failed one changes
+nothing but its log line. From 09:30:59 to 09:31:03 the plan reads the tape every
 0.1 s (`armed.fast_every_seconds`, change 4), every 0.25 s otherwise, and its first reading comes at
 09:31:00 itself. It cancels a plan entry that has not filled in two cases: its trigger traded
 but no price came back inside its limit within 120 s (`automatic.pullback_wait_seconds`, the shadow
@@ -1019,7 +1025,10 @@ On that fallback a Schwab quote older than 5 seconds (`break_entry.MAX_QUOTE_AGE
 nothing is sent and the pick is left to you for the day (on 2026-11-13 at 11:00 ET Schwab's quote was
 up to 3.6 s old on one name and 7.2 s on another). After any disarm the plan cancels nothing, also not
 at 09:35: entries already at Schwab stay, a red banner lists them, and you cancel each with its row's
-Cancel. A restart never restores "armed".
+Cancel. A restart never restores "armed". An order of the plan's own that Schwab lists as
+PENDING_ACKNOWLEDGEMENT with nothing filled counts as sent, not unclear, for 10 seconds after its send
+(`plan_entries.ACK_WAIT_S`); after that it is unclear. On the 2026-11-24 open the order list read 0.1 s
+after the AAOI send showed that status, and the plan disarmed after two of its four sends.
 
 Its bounds are in `companion/opening_plan/playbook.json` under `armed`, each a start number Ash has not
 approved: Arm from 09:25:00 to 09:30:45 ET, act from 09:31:00 ET, 1 order per pick, 4 orders a day, and
