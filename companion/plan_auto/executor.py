@@ -833,9 +833,9 @@ class AutoPlan:
         return False
 
     def _warm(self, now: datetime, act_from: datetime, snap: Mapping) -> None:
-        """Once per arm, warm_up_seconds_before act_from: one Schwab quotes read per pick on the trading
-        client, on their own threads, so the burst's sends find open connections (warm.py; Ash's go "do
-        all 5", change 3). Counted in the plan's calls bound like a send's quote."""
+        """Once per arm, warm_up_seconds_before act_from: one Schwab quotes read for all the picks on the
+        trading client, on its own thread, so the burst's sends find an open connection (warm.py; Ash's
+        go "do all 5", change 3). Counted in the plan's calls bound like a send's quote."""
         r = self.armed_rules
         if self.demo or now < act_from - timedelta(seconds=r.warm_up_seconds_before):
             return
@@ -845,7 +845,7 @@ class AutoPlan:
                 return
             self._warmed_for = key
         picks = [str(p) for p in (snap.get("terms") or {}).get("picks") or [] if p]
-        if not picks or self.spend("*", calls=len(picks)):
+        if not picks or self.spend("*", calls=1):
             return
 
         def done(sym: str, ok: bool, why: str) -> None:
